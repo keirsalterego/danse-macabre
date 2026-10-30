@@ -55,16 +55,10 @@
 //!
 //! Every step's measurements are in `PERF.md`.
 
-use std::cmp::Reverse;
-use std::error::Error;
-use std::fs::File;
-use std::num::NonZeroUsize;
-use std::ops::Range;
-use std::os::fd::AsRawFd;
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Barrier, Mutex, OnceLock};
-use std::thread;
+use std::{cmp::Reverse, error::Error, fs::File, num::NonZeroUsize, ops::Range, os::fd::AsRawFd};
+use std::{path::Path, thread};
 
 /// The number of hours a log can span.
 ///
@@ -127,33 +121,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// the pages then happen on all threads at once. Stores through a shared mapping land in the
 /// same page cache that `write` fills, so the file's bytes are identical.
 fn map_output(path: &Path, len: usize) -> Result<&'static mut [u8], Box<dyn Error>> {
-    // Mapping a file for writing needs it open for reading too.
-    let file = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
+    // `create` empties the file. Mapping it for writing needs it open for reading too.
+    File::create(path)?;
+    let file = File::options().read(true).write(true).open(path)?;
     if len == 0 {
         return Ok(&mut []); // mmap rejects a zero length
     }
     file.set_len(u64::try_from(len)?)?;
-    // SAFETY: a new shared read-write mapping of a file we just opened read-write and sized to
-    // `len`; the kernel picks the address.
-    let ptr = unsafe {
-        let prot = PROT_READ | PROT_WRITE;
-        mmap(
-            std::ptr::null_mut(),
-            len,
-            prot,
-            MAP_SHARED,
-            file.as_raw_fd(),
-            0,
-        )
-    };
-    if ptr.addr() == usize::MAX {
-        return Err(format!("mmap: {}", std::io::Error::last_os_error()).into());
-    }
+    let ptr = map(&file, len, PROT_READ | PROT_WRITE, MAP_SHARED)?;
     // SAFETY: the mapping holds `len` writable bytes, nothing else refers to them, and it is
     // never unmapped. It stays valid after `file` is closed.
     Ok(unsafe { std::slice::from_raw_parts_mut(ptr, len) })
@@ -171,24 +146,22 @@ fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
     if len == 0 {
         return Ok(&[]); // mmap rejects a zero length
     }
-    // SAFETY: a new read-only private mapping of an open fd; the kernel picks the address.
-    let ptr = unsafe {
-        mmap(
-            std::ptr::null_mut(),
-            len,
-            PROT_READ,
-            MAP_PRIVATE,
-            file.as_raw_fd(),
-            0,
-        )
-    };
-    if ptr.addr() == usize::MAX {
-        let err = std::io::Error::last_os_error();
-        return Err(format!("mmap {}: {err}", path.display()).into());
-    }
+    let ptr = map(&file, len, PROT_READ, MAP_PRIVATE)
+        .map_err(|e| format!("mmap {}: {e}", path.display()))?;
     // SAFETY: the mapping holds `len` readable bytes and is never unmapped, so it outlives every
     // borrow. /data is mounted read-only, so the bytes cannot change under us.
     Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
+/// Maps `len` bytes of `file` from its start with `mmap(2)` and returns the address, which the
+/// kernel picks.
+fn map(file: &File, len: usize, prot: i32, flags: i32) -> std::io::Result<*mut u8> {
+    // SAFETY: a new mapping at an address the kernel picks overlaps no memory we already use.
+    let ptr = unsafe { mmap(std::ptr::null_mut(), len, prot, flags, file.as_raw_fd(), 0) };
+    if ptr.addr() == usize::MAX {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ptr)
 }
 
 /// Runs the whole pipeline over `log` and writes the output to `out_path`.
@@ -294,10 +267,8 @@ fn summarize(log: &[u8], out_path: &Path) -> Result<(), Box<dyn Error>> {
 /// ignored.
 fn release<T>(items: &[T]) {
     let start = items.as_ptr().addr();
-    let (first, end) = (
-        start.next_multiple_of(4096),
-        (start + size_of_val(items)) & !4095,
-    );
+    let first = start.next_multiple_of(4096);
+    let end = (start + size_of_val(items)) & !4095;
     if first < end {
         let first = items.as_ptr().cast::<u8>().with_addr(first);
         // SAFETY: the pages lie inside `items`. In the input's private read-only file mapping, a
@@ -397,23 +368,18 @@ fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
         // `space` precedes the latency; before it sit the 3-digit status and its own space.
         let (latency_us, space) = latency(line, lf);
         let name = &line[start..space - 4];
-        let id = endpoints.intern(
-            name,
-            hash(name),
-            line.get(start..).and_then(|w| w.first_chunk()),
-        );
+        let window = line.get(start..).and_then(|w| w.first_chunk());
+        let id = endpoints.intern(name, hash(name), window);
         // Errors are exactly 500..=599, so the status's first digit decides.
         let error = u32::from(line[space - 3] == b'5');
         if hour != current {
             starts.push((hour, records.len(), large.len()));
             current = hour;
         }
-        let small = if latency_us < LARGE {
-            latency_us
-        } else {
+        let small = latency_us.min(LARGE);
+        if small == LARGE {
             large.push(latency_us);
-            LARGE
-        };
+        }
         records.push(id << 20 | error << 19 | small);
     }
     // The spec gives every seed 1,842 endpoints (§2), well below the 4,096 that 12 bits hold.
