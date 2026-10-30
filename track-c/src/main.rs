@@ -64,8 +64,9 @@
 //! The parser implements the grammar of spec §2.1 as written: a BOM at the start of any record,
 //! CRLF or LF, a final record without a terminator, and unquoted text that is not empty. Its
 //! output never depends on the narrower generator guarantees of §2.2; the sizes in §5 only set
-//! the name table's starting size. It does rely on §2.3, where country codes are `[A-Z]{3}`
-//! (checked while parsing), and on §3, where `id_sum` and `amount_sum` fit in 64 bits.
+//! the name table's starting size. It does rely on §2.3, where country codes are `[A-Z]{3}` and
+//! region ids ascend, so the last one is the largest (both checked while parsing), and on §3,
+//! where `id_sum` and `amount_sum` fit in 64 bits.
 //! Records outside the §2.1 grammar are not validated.
 
 use std::error::Error;
@@ -174,22 +175,34 @@ struct Regions {
     codes: Vec<[u8; 3]>,
 }
 
-/// Builds [`Regions`] from `regions.csv` in two passes over its rows.
+/// Builds [`Regions`] from `regions.csv` in one pass over its rows.
 ///
-/// The first pass marks which countries occur and finds the largest id; the second fills the
-/// array, which can only be sized once that id is known. Numbering the countries in between,
-/// by walking the [`CODES`] table in index order, sorts them bytewise for free. regions.csv is
-/// plain (spec §2.3), so rows split at LF with no quoting rules.
+/// Region ids ascend (spec §2.3), so the last row's id sizes the array before the pass. The pass
+/// stores each region's country code and marks which countries occur. Numbering the countries
+/// afterwards, by walking the [`CODES`] table in index order, sorts them bytewise for free, and
+/// one walk over the array then swaps each code for its group. Two passes that each split the
+/// rows at LF and then parsed them took three times as long.
 fn parse_regions(csv: &[u8]) -> Result<Regions, String> {
     let body = (csv.strip_prefix(b"region_id,country\n"))
         .ok_or("regions.csv: the header is not `region_id,country`")?;
-    let rows = body.split(|&b| b == b'\n').filter(|row| !row.is_empty());
+    let last_row = (body[..body.len().saturating_sub(1)].iter())
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |lf| lf + 1);
+    let max_id = if body.is_empty() {
+        0
+    } else {
+        region_row(body, last_row)?.0
+    };
+    // Until the last walk, an entry holds its country's code + 1, so that 0 still means no
+    // region. That is at most 26³, which fits a `u16`.
+    let mut group_of = vec![0u16; max_id + 1];
     let mut group_of_code = vec![0u16; CODES];
-    let mut max_id = 0;
-    for row in rows.clone() {
-        let (id, code) = region_row(row)?;
+    let mut at = 0;
+    while at < body.len() {
+        let (id, code, next) = region_row(body, at)?;
+        *(group_of.get_mut(id)).ok_or("regions.csv: ids do not ascend")? = code as u16 + 1;
         group_of_code[code] = 1;
-        max_id = max_id.max(id);
+        at = next;
     }
     let mut codes = Vec::new();
     for (code, group) in group_of_code.iter_mut().enumerate() {
@@ -199,31 +212,39 @@ fn parse_regions(csv: &[u8]) -> Result<Regions, String> {
             *group = codes.len() as u16;
         }
     }
-    let mut group_of = vec![0; max_id + 1];
-    for row in rows {
-        let (id, code) = region_row(row)?;
-        group_of[id] = group_of_code[code];
+    let group_of_entry: Vec<u16> = [0].into_iter().chain(group_of_code).collect();
+    for group in &mut group_of {
+        *group = group_of_entry[usize::from(*group)];
     }
     Ok(Regions { group_of, codes })
 }
 
-/// Parses one `region_id,country` row into the id and the country code as a base-26 number.
+/// Parses the row that starts at `body[start]`, `region_id,country` and an LF (spec §2.3), into
+/// the id, the country code as a base-26 number, and the start of the next row.
 ///
-/// This is the one place the program checks its input. A row that breaks spec §2.3 returns an
-/// error naming the row, because a bad code here would silently move every record of a region.
-fn region_row(row: &[u8]) -> Result<(usize, usize), String> {
-    let bad = || format!("regions.csv: bad row {:?}", String::from_utf8_lossy(row));
-    let comma = row.iter().position(|&b| b == b',').ok_or_else(bad)?;
-    let (id, code) = (&row[..comma], &row[comma + 1..]);
-    if id.is_empty() || !id.iter().all(u8::is_ascii_digit) {
-        return Err(bad());
+/// The digits run up to the comma, and the rest of the row has a fixed length, so the row's end
+/// comes out of the parse with no search for the LF. This is the one place the program checks its
+/// input. A row that breaks spec §2.3 returns an error naming the row, because a bad code here
+/// would silently move every record of a region.
+fn region_row(body: &[u8], start: usize) -> Result<(usize, usize, usize), String> {
+    let mut at = start;
+    let mut id = 0;
+    while let Some(&digit @ b'0'..=b'9') = body.get(at) {
+        id = id * 10 + usize::from(digit - b'0');
+        at += 1;
     }
-    if code.len() != 3 || !code.iter().all(u8::is_ascii_uppercase) {
-        return Err(bad());
+    if let Some(&[b',', a, b, c, b'\n']) = body.get(at..at + 5)
+        && at > start
+        && [a, b, c].iter().all(u8::is_ascii_uppercase)
+    {
+        let code = ([a, b, c].iter()).fold(0, |n, &c| n * 26 + usize::from(c - b'A'));
+        return Ok((id, code, at + 5));
     }
-    let id = id.iter().fold(0, |n, &d| n * 10 + usize::from(d - b'0'));
-    let code = code.iter().fold(0, |n, &c| n * 26 + usize::from(c - b'A'));
-    Ok((id, code))
+    let row = body[start..].split(|&b| b == b'\n').next();
+    Err(format!(
+        "regions.csv: bad row {:?}",
+        String::from_utf8_lossy(row.unwrap_or_default())
+    ))
 }
 
 /// Parses every record, joins it to its group and returns the output text.

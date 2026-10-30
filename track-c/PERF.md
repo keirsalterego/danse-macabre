@@ -6,9 +6,10 @@ Every step from the reference to your final version, each with the live-board ru
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 14.44 | 367 | 0 |
 | 1 | Rust v1: a quote-parity pre-pass splits the file for 12 threads, each runs a byte state machine, and one lock-free name table keeps a country bitset per name | run-7bddfb5dd3ec | 0.1204 | 39.3 | 57.4 |
-| 2 | Each distinct name copied into one arena entry next to its country bitset | | 0.1191 | | |
-| 3 | Transparent huge pages off | | | | |
+| 2 | Each distinct name copied into one arena entry next to its country bitset | run-edd394160002 | 0.1133 | 39.0 | 58.0 |
+| 3 | Transparent huge pages off | run-fbfe0ea92fbf | 0.1190 | 15.47 | 61.5 |
 | 4 | Distinct names counted by the workers, from the atomic OR's return value | | | | |
+| 5 | `regions.csv` parsed in one pass, each row's end found by the parse itself | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -35,7 +36,8 @@ touches only its hash slot and one entry, where the compare and the atomic OR sh
 - E-cores, `perf stat -r 5`: cycles:u 2.56 → 1.97 G, task-clock 1475 → 1145 ms, elapsed
   0.416 → 0.326 s, instructions:u 2.54 → 2.66 G. S 397 → 412.
 - P-cores: about 15% less wall time.
-- Board: 120.4 → 119.1 ms, one run each.
+- Board: 113.3, 118.5 and 119.1 ms over three runs of this code, against 120.4 ms for v1. A
+  single board run varies by about ±3%.
 
 ## Step 3: transparent huge pages off
 
@@ -63,8 +65,8 @@ P-cores, three interleaved rounds:
 | task-clock, `perf stat -r 10` (ms) | 1186 / 1172 / 1158 | 1202 / 1186 / 1202 |
 | elapsed (ms) | 123.3 / 122.0 / 124.4 | 124.7 / 122.8 / 124.5 |
 
-That should read about 16 MB on the board. The 4 KB pages cost about 2% more CPU time and 0.6%
-more wall time. S 412 → 415.
+The board measured 15.47 MB, down from 39.0 MB. The 4 KB pages cost about 2% more CPU time and
+0.6% more wall time. S 412 → 415.
 
 What remains, from the same instrumented copy with THP off: 4.0 MiB of hash slots, 5.2 MiB of
 arena in use (of 18 MiB reserved) and 1.9 MiB of region array, 11.4 MiB of anonymous memory in
@@ -90,6 +92,32 @@ S 415 → 402, and memory.peak is unchanged at 14.8–15.4 MiB. Because the old 
 the OR compiles to a `lock cmpxchg` loop instead of `lock or`. LLVM can emit `lock bts` for this
 pattern, but only if the optimizer has not already rewritten the bit test, which it had here. The
 loop did not show in task-clock.
+
+## Step 5: regions parsed in one pass
+
+Profiled alone on a P-core, the old parse of `regions.csv` (200k rows, 2.2 MB) took 10.1–10.5 ms,
+all before any other thread starts. It made two passes, and each one split the rows at LF
+(1.4–1.6 ms) and then parsed each row (3.5–4 ms), with a search for the comma, a validation loop
+per field and a fold per field.
+
+Region ids ascend (spec §2.3), so the last row's id now sizes the array up front and one pass is
+enough. That pass stores each region's country code and marks the countries present, and once the
+countries are numbered, one walk over the array swaps each code for its group. A row parses as
+digits up to the comma, followed by a fixed `,XYZ` and LF that one slice pattern checks, so the
+row's end comes out of the parse without a separate search. Alone, the new parse takes 2.9–3.1 ms:
+2.5–2.7 ms for the rows, 0.5–0.6 ms for the walk over the 1M-entry array and 0.03 ms to number the
+countries.
+
+P-cores, `perf stat -r 10`, three interleaved rounds:
+
+| | step 4 | step 5 |
+|---|---|---|
+| task-clock (ms) | 1144 / 1149 / 1164 | 1144 / 1150 / 1145 |
+| elapsed (ms) | 116.8 / 113.1 / 114.1 | 105.6 / 106.7 / 108.3 |
+
+S 402 → 416, and memory.peak is unchanged at 15.0–15.1 MiB. The parse is now stricter outside
+the spec: a blank line, a last row without its LF, or an id larger than the last row's returns an
+error, where the old parse accepted them.
 
 ## Experiments that did not stay
 
