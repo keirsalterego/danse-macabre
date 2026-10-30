@@ -507,7 +507,8 @@ countries without records.
 Local, on top of step 13 (P-cores, a loaded machine, 151 interleaved runs, median / min):
 42.34 / 39.60 → 42.08 / 39.53 ms. `perf stat -r 10`, three interleaved rounds: instructions
 1.637 → 1.549 G (−5.4%), cycles and task-clock flat, page faults 6,390 in both. Merged with
-step 14, S 534 → 523. Gate: 307 pass, 0 fail; full seeds 1–7; the 400 random and 400 hostile
+step 14, S 534 → 523, and 522 after inlining the single-use `KEY` constant, which leaves the machine code
+identical. Gate: 307 pass, 0 fail; full seeds 1–7; the 400 random and 400 hostile
 cases at 1, 3, 12, 37 and 64 threads; the forced-cut test on 490,079 offsets of 72 files.
 
 ## Experiments that did not stay

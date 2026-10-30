@@ -775,8 +775,6 @@ impl Exchange {
 const INLINE: usize = 24;
 /// The length field of a letter whose name is longer than [`INLINE`] bytes.
 const LONG: u64 = 0xFFFF;
-/// The bits of a letter's last word that belong to the key: the hash and the length.
-const KEY: u64 = (1 << 48) - 1;
 
 /// A letter for the name at `start..end` of `data`, without its group, which the poster adds to
 /// the top 16 bits: the name's bytes as three little-endian words zero-padded to [`INLINE`]
@@ -862,7 +860,8 @@ impl NameSet {
         for letter in letters.as_chunks::<4>().0 {
             let letter: [u64; 4] = std::array::from_fn(|i| letter[i].load(Relaxed));
             let group = (letter[3] >> 48) as usize;
-            let key = [letter[0], letter[1], letter[2], letter[3] & KEY];
+            // The key is the letter without its group: the hash and the length, 48 bits.
+            let key = [letter[0], letter[1], letter[2], letter[3] & ((1 << 48) - 1)];
             groups[group].distinct += u64::from(self.mark(key, group, data));
         }
     }
