@@ -597,8 +597,9 @@ impl<'g> Search<'g> {
     fn start(&mut self, node: u32) {
         self.queue.clear();
         self.queue.push(0, node);
-        self.dist.clear();
-        self.dist.insert(node, Dist(0));
+        self.dist.0.clear();
+        self.dist.1.clear();
+        self.dist.0.insert(node, 0);
     }
 
     /// Settles the node on top of the queue, which [`Queue::top`] found, and relaxes its edges.
@@ -626,12 +627,18 @@ impl<'g> Search<'g> {
         for &edge in self.graph.edges(node, &mut copy) {
             let (next, weight) = unpack(edge);
             let via = d + weight;
-            let label = self.dist.entry(next).or_insert(Dist(UNREACHABLE));
-            if via < label.0 {
-                label.0 = via;
+            // A new label starts at `u32::MAX`, which a `via` below 2^32 - 1 beats with one compare.
+            let label = self.dist.0.entry(next).or_insert(u32::MAX);
+            let long = || self.dist.1.get(&next).is_none_or(|&old| via < old);
+            if via < u64::from(*label) || *label == u32::MAX && long() {
+                *label = via.min(u64::from(u32::MAX)) as u32;
+                if *label == u32::MAX {
+                    self.dist.1.insert(next, via);
+                }
                 self.queue.push(via, next);
-                if let Some(&Dist(rest)) = other.get(&next) {
-                    *best = (*best).min(via + rest);
+                if let Some(&rest) = other.0.get(&next) {
+                    let short = (rest < u32::MAX).then_some(u64::from(rest));
+                    *best = (*best).min(via + short.unwrap_or_else(|| other.1[&next]));
                 }
             }
         }
@@ -770,20 +777,22 @@ impl Queue {
     }
 }
 
-/// Tentative distances of one search, keyed by node id.
+/// Tentative distances of one search, keyed by node id: the label as a `u32` in the first map,
+/// or, for a label of 2^32 - 1 or more, `u32::MAX` there and the label in the second.
 ///
 /// A search touches thousands of the n nodes, not millions, so a hash map costs memory for those
-/// only. A dense array would cost 8n bytes (14 MB at full scale) per thread and direction.
+/// only. A dense array would cost 4n bytes (7 MB at full scale) per thread and direction.
 /// `clear` keeps the map's capacity, so after the first few queries it stops reallocating.
-type Labels = HashMap<u32, Dist, std::hash::BuildHasherDefault<NodeHash>>;
+///
+/// Only paths over the edges near 2^32 (spec §2) get labels that long, so the second map is
+/// nearly always empty, and a lookup reads it only behind a `u32::MAX`. A slot of the first map
+/// takes 9 bytes with its control byte, against 13 for a `u64` label packed to 4-byte alignment.
+/// Every table grows to the largest search its thread ran, about 17.5 MB over the 24 at full
+/// scale with `u64` labels, so this cuts the end of the queries by about 5 MB.
+type Labels = (Short, HashMap<u32, u64>);
 
-/// A label's distance, aligned to 4 bytes so that a [`Labels`] entry takes 12 bytes instead of
-/// 16, of which 4 were padding after the `u32` key. With its control byte, a slot shrinks from 17
-/// bytes to 13. By the end of a run every table has grown to the largest search its thread ran,
-/// about 23 MB over the 24 tables at full scale, so this saves about 5 MB at the peak. An
-/// unaligned load costs the same on x86 unless it crosses a cache line.
-#[repr(C, packed(4))]
-struct Dist(u64);
+/// The first map of [`Labels`].
+type Short = HashMap<u32, u32, std::hash::BuildHasherDefault<NodeHash>>;
 
 /// The hasher for [`Labels`]: Fibonacci hashing, one multiply by 2^64 divided by the golden ratio.
 ///
