@@ -167,10 +167,11 @@ fn parse_queries<'q>(text: &'q [u8]) -> Result<(Vec<Query>, TermTable<'q>), Stri
     let mut list = Vec::new();
     for line in text.split_inclusive(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
-        // Rejecting anything but `[a-z0-9]+` keeps a term from matching a token that differs
-        // from it only in case, which the case-folding lookup below would otherwise allow.
+        // Rejecting anything but `[a-z0-9]{1,32}` keeps a term from matching a token that differs
+        // from it only in case, which the case-folding key would otherwise allow, and keeps
+        // every term within one `Key`.
         let mut term = |w: &'q [u8]| {
-            let valid = !w.is_empty()
+            let valid = (1..=MAX_TERM).contains(&w.len())
                 && w.iter()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
             valid.then(|| table.intern(w))
@@ -261,7 +262,7 @@ fn sample_hits(docs: &[u8], terms: &TermTable) -> Result<Vec<u32>, String> {
     let mut hits = vec![0; terms.len()];
     for line in docs.split_inclusive(|&b| b == b'\n').take(SAMPLE_DOCS) {
         for token in tokens(split_doc(line)?.1) {
-            if let Some(t) = terms.find(token) {
+            if let Some(t) = key(token).and_then(|key| terms.find(&key)) {
                 hits[t as usize] += 1;
             }
         }
@@ -305,7 +306,7 @@ fn scan(chunk: &[u8], queries: &[Query], plan: &Plan) -> Result<Segment, String>
         ids.clear();
         triggered.clear();
         for token in tokens(text) {
-            let Some(term) = plan.terms.find(token) else {
+            let Some(term) = key_in(chunk, token).and_then(|key| plan.terms.find(&key)) else {
                 ids.push(MISS);
                 continue;
             };
@@ -414,25 +415,67 @@ fn write_answer(out: &mut Vec<u8>, ids: &[u32]) {
     out.push(b'\n');
 }
 
-/// Hash of a token after ASCII lowercasing, so `Bail` and `bail` probe the same slot.
-fn term_hash(token: &[u8]) -> u64 {
-    (token.iter()).fold(0, |hash, &b| {
-        (hash.rotate_left(5) ^ u64::from(FOLD[b as usize])).wrapping_mul(0x517c_c1b7_2722_0a95)
+/// A token's bytes, ASCII-lowercased and zero-padded to `MAX_TERM`, as little-endian words.
+/// A token never holds a zero byte, so two keys are equal exactly when the tokens are.
+type Key = [u64; MAX_TERM / 8];
+/// The longest query term (spec §2.3), and so the longest token worth looking up.
+const MAX_TERM: usize = 32;
+
+/// The key of a token or query term, or `None` past `MAX_TERM` bytes: no query term is longer.
+fn key(token: &[u8]) -> Option<Key> {
+    let mut bytes = [0; MAX_TERM];
+    bytes.get_mut(..token.len())?.copy_from_slice(token);
+    Some(fold(&bytes, token.len()))
+}
+
+/// The key of `token`, a slice of `chunk`, read as one 32-byte load from `chunk` and masked to
+/// the token's length. Copying the token into a zeroed buffer first would call `memcpy` and
+/// then stall the load that reads the buffer back, once per token.
+fn key_in(chunk: &[u8], token: &[u8]) -> Option<Key> {
+    let start = token.as_ptr().addr() - chunk.as_ptr().addr();
+    match chunk[start..].first_chunk() {
+        Some(window) => (token.len() <= MAX_TERM).then(|| fold(window, token.len())),
+        None => key(token), // within 32 bytes of the chunk's end
+    }
+}
+
+/// Lowercases the first `len` bytes of `window`, all letters and digits, and zeroes the rest.
+fn fold(window: &[u8; MAX_TERM], len: usize) -> Key {
+    std::array::from_fn(|i| {
+        let word = u64::from_le_bytes(*window[8 * i..].first_chunk().expect("8 of 32 bytes"));
+        let kept = len.saturating_sub(8 * i).min(8);
+        let word = word & ((1u128 << (8 * kept)) - 1) as u64;
+        // Copying each byte's bit 6 into its bit 5 lowercases a letter (A-Z have bit 6 set)
+        // and leaves digits and the zero padding alone.
+        word | (word >> 1 & 0x2020_2020_2020_2020)
     })
 }
 
-/// Open-addressing map from query term to dense id. It doubles at half load, so it assumes
-/// nothing about how many distinct terms the queries use.
+/// Multiplicative hash of a key. Slots come from its top bits, which depend on every word.
+fn key_hash(key: &Key) -> u64 {
+    (key.iter()).fold(0, |hash, &word| {
+        (hash ^ word).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    })
+}
+
+/// Open-addressing map from query term to dense id. A probe reads a slot's id and compares
+/// that term's key, one fixed-size compare with no loop over bytes. Keys sit densely by id, so
+/// the table stays a few MB. It doubles at half load, so it assumes nothing about how many
+/// distinct terms the queries use.
 struct TermTable<'q> {
-    /// Id + 1 per slot; 0 marks an empty slot.
+    /// Id + 1 per slot; 0 marks an empty slot. The slot count is a power of two.
     slots: Vec<u32>,
-    names: Vec<(&'q [u8], u64)>,
+    /// Term id → its key.
+    keys: Vec<Key>,
+    /// Term id → the term as written in `queries.txt`.
+    names: Vec<&'q [u8]>,
 }
 
 impl Default for TermTable<'_> {
     fn default() -> Self {
         Self {
             slots: vec![0; 1024],
+            keys: Vec::new(),
             names: Vec::new(),
         }
     }
@@ -444,42 +487,40 @@ impl<'q> TermTable<'q> {
     }
 
     fn name(&self, id: u32) -> &'q [u8] {
-        self.names[id as usize].0
+        self.names[id as usize]
     }
 
-    /// The id of the query term that a corpus token spells, if any.
-    fn find(&self, token: &[u8]) -> Option<u32> {
-        self.slots[self.slot(token, term_hash(token))].checked_sub(1)
+    /// The id of the query term whose key this is, if any.
+    fn find(&self, key: &Key) -> Option<u32> {
+        self.slots[self.slot(key)].checked_sub(1)
     }
 
     fn intern(&mut self, name: &'q [u8]) -> u32 {
-        let hash = term_hash(name);
-        let slot = self.slot(name, hash);
-        if self.slots[slot] != 0 {
-            return self.slots[slot] - 1;
+        let key = key(name).expect("the parser rejects terms over MAX_TERM bytes");
+        let slot = self.slot(&key);
+        if let Some(id) = self.slots[slot].checked_sub(1) {
+            return id;
         }
-        self.names.push((name, hash));
+        self.keys.push(key);
+        self.names.push(name);
         self.slots[slot] = self.names.len() as u32;
         if self.names.len() * 2 > self.slots.len() {
             let grown = vec![0; self.slots.len() * 2];
             let old = std::mem::replace(&mut self.slots, grown);
             for id in old.into_iter().filter(|&id| id != 0) {
-                let (name, hash) = self.names[id as usize - 1];
-                let slot = self.slot(name, hash);
+                let slot = self.slot(&self.keys[id as usize - 1]);
                 self.slots[slot] = id;
             }
         }
         self.names.len() as u32 - 1
     }
 
-    /// The slot holding `name`, or the empty slot where it belongs (linear probing). Names are
-    /// all `[a-z0-9]`, so comparing without case is exactly the spec's lowercasing of a token.
-    fn slot(&self, name: &[u8], hash: u64) -> usize {
+    /// The slot holding `key`, or the empty slot where it belongs (linear probing).
+    fn slot(&self, key: &Key) -> usize {
         let mask = self.slots.len() - 1;
-        let mut slot = (hash >> 32) as usize & mask;
+        let mut slot = (key_hash(key) >> (64 - self.slots.len().trailing_zeros())) as usize;
         while let Some(id) = self.slots[slot].checked_sub(1) {
-            let (known, known_hash) = self.names[id as usize];
-            if known_hash == hash && known.eq_ignore_ascii_case(name) {
+            if self.keys[id as usize] == *key {
                 break;
             }
             slot = (slot + 1) & mask;
