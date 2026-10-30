@@ -133,7 +133,9 @@ impl Chunk<'_> {
 }
 
 /// Parses one chunk of whole lines. The spec guarantees well-formed input (§2), so fields are
-/// found by fixed offsets and single-byte checks rather than validated.
+/// found by fixed offsets and single-byte checks rather than validated. No field is scanned
+/// byte by byte: one AVX2 window finds the line end, and the latency, status and endpoint end
+/// are read backwards from it.
 fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
     let mut endpoints = Interner::default();
     let mut records = Vec::with_capacity(chunk.len() / MIN_LINE + 1);
@@ -141,23 +143,20 @@ fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
     let mut i = 0;
     while i < chunk.len() {
         let line = &chunk[i..];
+        let lf = line_end(line);
+        i += lf + 1;
         let hour = hour_index(line).ok_or_else(|| {
             let ts = String::from_utf8_lossy(&line[..27]);
             format!("timestamp {ts} is outside the spec's 72-hour span")
         })?;
         // The method is 3 to 7 bytes at offset 28, so the space after it is in the word at 31.
         let start = 32 + spaces(word(line, 31)).trailing_zeros() as usize / 8;
-        let (end, hash) = endpoint_end(line, start);
-        let id = endpoints.intern(&line[start..end], hash);
-        // The status is the three digits after the endpoint; errors are exactly 500..=599.
-        let error = u64::from(line[end + 1] == b'5');
-        let mut at = end + 5;
-        let mut latency_us = 0u32;
-        while line[at] != b'\n' {
-            latency_us = latency_us * 10 + u32::from(line[at] - b'0');
-            at += 1;
-        }
-        i += at + 1;
+        // `space` precedes the latency; before it sit the 3-digit status and its own space.
+        let (latency_us, space) = latency(line, lf);
+        let name = &line[start..space - 4];
+        let id = endpoints.intern(name, hash(name));
+        // Errors are exactly 500..=599, so the status's first digit decides.
+        let error = u64::from(line[space - 3] == b'5');
         per_hour[hour] += 1;
         records
             .push(u64::from(id) << 40 | (hour as u64) << 33 | error << 32 | u64::from(latency_us));
@@ -173,6 +172,43 @@ fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
     })
 }
 
+/// Index of the LF that ends `line`. No line is shorter than `MIN_LINE`, so the search starts
+/// at that line's last byte, and the first 64-byte window holds the LF for ~90% of lines.
+fn line_end(line: &[u8]) -> usize {
+    let mut at = MIN_LINE - 1;
+    while at + 64 <= line.len() {
+        let window = line[at..at + 64].try_into().expect("64-byte window");
+        // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
+        let newlines = unsafe { newline_mask(window) };
+        if newlines != 0 {
+            return at + newlines.trailing_zeros() as usize;
+        }
+        at += 64;
+    }
+    let tail = line[at..].iter().position(|&b| b == b'\n');
+    at + tail.expect("every line ends in LF (spec §2)")
+}
+
+/// Bit i is set where `block[i]` is an LF: two 32-byte AVX2 compares.
+#[target_feature(enable = "avx2")]
+fn newline_mask(block: &[u8; 64]) -> u64 {
+    use std::arch::x86_64::{
+        _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+    };
+    let lf = _mm256_set1_epi8(b'\n'.cast_signed());
+    // SAFETY: both 32-byte unaligned loads lie inside the 64-byte `block`.
+    let (low, high) = unsafe {
+        let at = block.as_ptr();
+        (
+            _mm256_loadu_si256(at.cast()),
+            _mm256_loadu_si256(at.add(32).cast()),
+        )
+    };
+    let low = _mm256_movemask_epi8(_mm256_cmpeq_epi8(low, lf)).cast_unsigned();
+    let high = _mm256_movemask_epi8(_mm256_cmpeq_epi8(high, lf)).cast_unsigned();
+    u64::from(low) | (u64::from(high) << 32)
+}
+
 /// Hour index 0..72 from the timestamp's fixed offsets: month at 5, day at 8, hour at 11.
 fn hour_index(line: &[u8]) -> Option<usize> {
     let two = |i: usize| usize::from(line[i] - b'0') * 10 + usize::from(line[i + 1] - b'0');
@@ -185,41 +221,60 @@ fn hour_index(line: &[u8]) -> Option<usize> {
     (hour < HOURS).then_some(hour)
 }
 
-/// Reads the 8 bytes at `at` as one little-endian word, zero-padded past the end of `bytes`.
-/// Only a chunk's last line ever needs the padding (see `endpoint_end`).
-fn word(bytes: &[u8], at: usize) -> u64 {
-    let mut padded = [0; 8];
-    let w = bytes[at..].first_chunk().unwrap_or_else(|| {
-        padded[..bytes.len() - at].copy_from_slice(&bytes[at..]);
-        &padded
-    });
-    u64::from_le_bytes(*w)
+/// The latency that ends at `lf`, and the index of the space before it. Up to 7 digits (99.9%
+/// of lines) take one branch-free step: find the last space in the 8 bytes before the LF, zero
+/// every byte up to it, and convert the remaining digit lanes all at once.
+fn latency(line: &[u8], lf: usize) -> (u32, usize) {
+    let w = word(line, lf - 8);
+    let found = spaces(w);
+    if found == 0 {
+        // 8 to 10 digits: rare enough for a plain loop.
+        let space = line[..lf].iter().rposition(|&b| b == b' ');
+        let space = space.expect("a space precedes the latency");
+        let digits = line[space + 1..lf].iter();
+        return (digits.fold(0, |v, &d| v * 10 + u32::from(d - b'0')), space);
+    }
+    let last_space = 7 - found.leading_zeros() as usize / 8;
+    let digit_lanes = u64::MAX << (8 * (last_space + 1));
+    let digits = (w & digit_lanes) - (0x3030_3030_3030_3030 & digit_lanes);
+    (eight_digits(digits), lf - 8 + last_space)
 }
 
-/// Sets bit 7 of every byte of `w` that is a space. Only the lowest set bit is exact (a borrow
-/// can mark bytes above it), and that is the only one we use.
+/// Converts eight digit lanes (values 0..=9, most significant in the lowest byte; leading lanes
+/// zeroed) to their value: pairs, then the halves of the number, in three multiplies instead of
+/// eight (Lemire, "Fast numeric string to int", 2018).
+fn eight_digits(lanes: u64) -> u32 {
+    let pairs = lanes * 10 + (lanes >> 8);
+    let high = (pairs & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32));
+    let low = ((pairs >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32));
+    ((high + low) >> 32) as u32
+}
+
+/// Reads the 8 bytes at `at` as one little-endian word.
+fn word(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(*bytes[at..].first_chunk().expect("8 bytes at `at`"))
+}
+
+/// Sets bit 7 of exactly the bytes of `w` that are spaces. No borrow crosses bytes, so the
+/// highest set bit is as trustworthy as the lowest.
 fn spaces(w: u64) -> u64 {
     let x = w ^ 0x2020_2020_2020_2020;
-    x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080
+    !(((x & 0x7F7F_7F7F_7F7F_7F7F) + 0x7F7F_7F7F_7F7F_7F7F) | x) & 0x8080_8080_8080_8080
 }
 
-/// Finds the space that ends the endpoint starting at `start`, hashing the endpoint 8 bytes per
-/// step on the way. At least ` 100 0\n` (7 bytes) follows an endpoint, so a word read here runs
-/// past the line only when the endpoint is 8k bytes long and the line ends its chunk.
-fn endpoint_end(line: &[u8], start: usize) -> (usize, u64) {
+/// Hashes an endpoint from its length and three 8-byte windows (first, middle, last), with no
+/// loop. Every window lies inside the name, so equal names hash equal; different names that
+/// share all three windows only cost an extra probe, since the interner compares bytes.
+fn hash(name: &[u8]) -> u64 {
     let mix = |hash: u64, w: u64| (hash.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
-    let mut hash = 0;
-    let mut at = start;
-    loop {
-        let w = word(line, at);
-        let found = spaces(w);
-        if found != 0 {
-            let len = found.trailing_zeros() as usize / 8;
-            return (at + len, mix(hash, w & ((1 << (8 * len)) - 1)));
-        }
-        hash = mix(hash, w);
-        at += 8;
+    let n = name.len();
+    if n < 8 {
+        let mut short = [0; 8];
+        short[..n].copy_from_slice(name);
+        return mix(n as u64, u64::from_le_bytes(short));
     }
+    let first_and_middle = mix(mix(n as u64, word(name, 0)), word(name, n / 2 - 4));
+    mix(first_and_middle, word(name, n - 8))
 }
 
 /// Open-addressing map from endpoint bytes to dense ids. It doubles at half load, so it assumes
