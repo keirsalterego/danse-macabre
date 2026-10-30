@@ -324,6 +324,23 @@ and 42.2 MB.
 
 ## Experiments that did not stay
 
+- **After step 17, on the serial start and the end** (local, alternating runs, 16 each, against
+  step 17 at 238.5–239.6 ms median). Where the time goes on seed 1: 2.1 ms from spawn to `main`,
+  parsing to 8.5 ms, the sample 5.3 ms, the per-query planning loop 5.2 ms and the rest of the
+  plan 2.9 ms, so the pass starts at about 22 ms. The threads' passes end over a 4–9 ms spread.
+  After its pass, a thread spends 0.6–0.8 ms on its last window flush, 0.1–0.3 ms each on
+  freeing the window and merging the check cells, and 1–2.7 ms grouping its first matches.
+  Formatting takes 1.5 ms, joining the workers and freeing the chunks, plan and queries 1.3–1.4
+  ms, writing 0.6 ms, and the exit 0.8 ms. None of these changes paid:
+  - The sample counted by all threads, one part each, then summed: the plan was ready 1.3 ms
+    sooner (21.4–21.8 → 20.0–20.7 ms), but the wall did not move (239.6 → 240.1 and 238.5 →
+    239.1 ms), for 16 more lines. The sample's slots prefetched as in the pass instead (4 more
+    lines) cut the sample from 5.3 to about 4.1 ms: 239.0 → 239.6 and 239.0 → 240.3 ms.
+  - The queries, plan and chunks leaked instead of freed after formatting: the exit then took
+    1.7–1.9 ms instead of 0.7–1.0, and the wall went from 238.5 to 240.6 ms.
+  - The grouping's two arrays written when allocated, as in step 16: 238.9 → 239.5 ms. Each
+    thread's first-match list reserved at its bound (`SHOWN_IDS` per query), so it never moves
+    while it grows: 238.5 → 238.6 ms.
 - **A static-pie build** (`+crt-static`, as tracks A and C use), on step 14 (local, turbo off):
   `ab.py`, 16 interleaved runs, median / min 246.00 / 245.60 ms against 245.75 / 244.05 ms. The
   dynamic loader's quarter of a millisecond is lost in a 245 ms run.
