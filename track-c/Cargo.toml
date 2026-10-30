@@ -26,5 +26,9 @@ perf = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 # Offsets, ids and counts are narrowed on purpose: the input is under 4 GiB with under 2^32 lines.
 cast_possible_truncation = "allow"
+# The other `as` casts are exact: digits widened to `u64`, and ids and byte counts, all far below
+# 2^63, made `i64` for the group sums. `From` and `cast_signed` would only lengthen the lines.
+cast_lossless = "allow"
+cast_possible_wrap = "allow"
 # Forced only where a measurement showed the call's cost (see `number` and `text_field`).
 inline_always = "allow"

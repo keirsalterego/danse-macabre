@@ -76,10 +76,6 @@
 //! `amount_sum` fit in 64 bits. The name pool of §2.2 and the sizes in §5 only set the name
 //! sets' starting sizes. Records outside the §2.1 grammar are not validated.
 
-// The `as` casts left are exact: digits widened to `u64`, and ids and byte counts, all far below
-// 2^63, made `i64` for the group sums. `From` and `cast_signed` would only lengthen the lines.
-#![allow(clippy::cast_lossless, clippy::cast_possible_wrap)]
-
 use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 use std::sync::atomic::{AtomicU64, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
 use std::{fs::File, io::Write, ops::Range, os::fd::AsRawFd, path::Path, thread, time::Duration};
@@ -237,8 +233,7 @@ fn parallel<T: Send>(n: usize, work: &(impl Fn(usize) -> T + Sync)) -> Vec<T> {
 /// over the rows writes each region's group. The join cannot start before this ends, and on one
 /// thread it took 3.8 ms (PERF.md, step 11).
 fn parse_regions(csv: &[u8], threads: usize) -> (Vec<u8>, Vec<[u8; 3]>) {
-    let header = csv.iter().position(|&b| b == b'\n').expect("a header line");
-    let body = &csv[header + 1..];
+    let body = &csv[csv.iter().position(|&b| b == b'\n').expect("a header line") + 1..];
     let len = body.len() - PAD;
     // The first row that starts at or after the `i`th of `threads` even cuts.
     let cut = |i| match len * i / threads {
@@ -320,8 +315,7 @@ fn join(data: &[u8], by_id: &[u8], group_count: usize, threads: usize) -> Vec<Gr
     // SAFETY: `AtomicU64` has the same layout as `u64`, and all-zero bits are a valid 0.
     let zeroed = |len| unsafe { Box::<[AtomicU64]>::new_zeroed_slice(len).assume_init() };
     let letters = zeroed(2 * threads * threads * MAILBOX * 4);
-    let counts = zeroed(2 * threads * threads);
-    let arrived = AtomicU64::new(0);
+    let (counts, arrived) = (zeroed(2 * threads * threads), AtomicU64::new(0));
     let mailbox = |half: usize, from: usize, to: usize| (half * threads + from) * threads + to;
     let mail = |mb: usize| &letters[mb * MAILBOX * 4..][..counts[mb].load(Relaxed) as usize * 4];
     // The hot loop, one run per worker `me`. The fields come in a fixed order, so the state is
@@ -346,8 +340,7 @@ fn join(data: &[u8], by_id: &[u8], group_count: usize, threads: usize) -> Vec<Gr
                 // The records of a batch are parsed and posted first, and added to their groups
                 // after, so that the prefetch of each record's byte in the region table, which
                 // misses the L2 cache about half the time, has the rest of the batch to arrive.
-                let mut batch = [(0, 0, 0, 0, 0, 0); 4];
-                let mut parsed = 0;
+                let (mut batch, mut parsed) = ([(0, 0, 0, 0, 0, 0); 4], 0);
                 while parsed < batch.len() && at < round_end {
                     // A BOM at the start of a record is not data (§2.1). It sits in front of the
                     // id, so missing it would show up in `id_sum`. The test of its first byte
@@ -513,8 +506,7 @@ fn text_field(data: &[u8], at: usize) -> (Range<usize>, i64, usize) {
         if data[end + 1] != b'"' {
             break;
         }
-        pairs += 1;
-        end += 2;
+        (pairs, end) = (pairs + 1, end + 2);
     }
     (start..end, (end - start - pairs) as i64, end + 2)
 }
