@@ -12,7 +12,12 @@ Every step from the reference to your final version, each with the live-board ru
 | 5 | Six numbers kept per output line; every hour formatted straight into the mapped output file | run-490479179585 | 0.0339 | 48.2 | 74.0 |
 | 6 | Transparent huge pages off; formatting from a shared queue; interner lookup inlined | run-b08360e1cf8c | 0.0313 | 37.0 | 75.9 |
 | 7 | 64-byte padded name copies instead of 128 | run-0793bc3ce213 | 0.0306 | 36.1 | 76.3 |
-| 8 | Records in file order, 6 bytes per line, one entry per run of an hour; no hour sort | | | | |
+| 8 | Records in file order, 6 bytes per line, one entry per run of an hour; no hour sort | run-bbeb5bdf69ce | 0.0283 | 30.3 | 78.0 |
+| 9 | Median selected first, then p95 and p99 in the shrinking upper part | run-26ed452b8751 | 0.0279 | 30.7 | 78.0 |
+| 10 | 4-byte records; latencies over 19 bits on a side list | run-00fdd1e29f86 | 0.0276 | 25.0 | 79.0 |
+| 11 | One team of threads summarizes and formats the hours, with a barrier between | run-23647f6bde01 | 0.0280 | 25.3 | 78.8 |
+| 12 | One mmap helper for input and output; 35 fewer code lines | run-ce9384368863 | 0.0269 | 25.1 | 79.4 |
+| 13 | Hour checked by comparing 8 timestamp bytes; exact 64-byte name compare without the hash; padded copies for the merge | | | | |
 
 ## Step 1: v1
 
@@ -66,7 +71,54 @@ promises no bound on the disorder, and correctness does not need one: a log whos
 on every line would have one run per line. Local, turbo off, P-cores, 40 alternating runs each:
 median wall 33.39 → 31.18 ms; peak memory 35.2 → 29.3 MB (three runs each).
 
+## Steps 9 to 12
+
+- **9:** each group needs three order statistics. Selecting p99 first and then p95 and p50 in
+  the prefixes left behind visits about 2.94 n values, because those prefixes hold 99% and
+  95% of the group. Selecting the median first leaves p95 and p99 in the upper half, and p95
+  then leaves p99 in the top 5%: about 1.55 n. Local, turbo off: median 31.39 → 30.81 ms over
+  40 alternating runs. The first board run of this code (run-944d7fc38010) drew 32.5 ms; the
+  table cites the second.
+- **10:** 97.5% of seed 1's latencies are below 2^19 µs, about half a second. A record is now
+  one `u32`: 12 bits of endpoint id (the spec has 1,842 endpoints), the error bit, and 19 bits
+  of latency. A latency that does not fit goes to a per-chunk side list, and its record holds
+  the all-ones value that sends a reader there. Local, turbo off: peak 29.5 → 23.8 MB, wall
+  unchanged (median 31.74 → 31.39 ms over 40 runs).
+- **11:** spawning twelve threads took up to 1 ms before the last one ran. The hour pass and
+  the formatting now run on the same threads: between them, each waits at a barrier while one
+  sorts the hours and maps the output file. Local, turbo off: median 30.34 → 29.91 ms (seed 1)
+  and 30.28 → 29.83 ms (seed 2), 40 runs each.
+- **12:** the input and output mappings share one `mmap` helper, the imports are grouped, and
+  a few statements that rustfmt spread over several lines are written more directly. S
+  525 → 490; wall time unchanged locally (median 30.04 → 29.89 ms over 30 runs).
+
+## Step 13: fewer instructions per line
+
+`perf stat` on the parse showed 1.94 instructions per cycle on each of a core's two hardware
+threads, so the core retires close to four per cycle between them and every instruction left
+out of the per-line work shortens the parse. Three changes, all in the parse and the merge:
+
+- The hour was decoded from six digits on every line. A run of one hour keeps the timestamp's
+  bytes 5 to 12 (`MM-DDTHH`) unchanged, so each line now compares those 8 bytes with the run's
+  and decodes the hour only when they differ: 1,159 → 1,026 million instructions.
+- A probe compared the 64-bit hash stored with the name before comparing the name, a load from
+  a 44 KB table on every line. The padded copy now holds the name's following space too, and
+  comparing the name plus that space is exact on its own, since endpoints never contain spaces
+  (§2). The table grows at a quarter full instead of half: second probes went from 7.8% to 3.4%
+  of seed 1's lines in a simulation of the probe sequences.
+- The serial merge of the chunks' names read each name from the input, where every chunk's
+  copy lies in a different place: about 20,000 cache misses while all other threads waited. It
+  now compares the chunks' padded copies, which are then freed.
+
+Local, turbo off, 30 alternating runs: median 30.29 → 29.60 ms (hour check) → 28.74 ms (both);
+instructions 1,159 → 974 million; peak memory and code lines unchanged.
+
 ## Experiments that did not stay
+
+- **Pieces handed out from a shared counter instead of one fixed chunk per thread** (local,
+  turbo off, on AC): with 16 pieces per thread the median went 30.68 → 31.54 ms, with 64 pieces
+  to 33.78 ms. `perf stat` showed 3.5% more cycles for the same instructions and 11% more dTLB
+  misses. On battery power, where some threads started 4 to 8 ms late, the pieces helped.
 
 - **Releasing the input inside the hour pass instead of after formatting** (local, turbo off):
   3 ms slower. Freeing pages interrupts every other thread of the process to flush its TLB.

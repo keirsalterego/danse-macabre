@@ -175,7 +175,7 @@ fn map(file: &File, len: usize, prot: i32, flags: i32) -> std::io::Result<*mut u
 fn summarize(log: &[u8], out_path: &Path) -> Result<(), Box<dyn Error>> {
     let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
     let bounds = line_bounds(log, threads);
-    let chunks = thread::scope(|s| {
+    let mut chunks = thread::scope(|s| {
         let parsers: Vec<_> = (bounds.windows(2))
             .map(|w| s.spawn(move || parse(&log[w[0]..w[1]])))
             .collect();
@@ -183,7 +183,7 @@ fn summarize(log: &[u8], out_path: &Path) -> Result<(), Box<dyn Error>> {
             .map(|p| p.join().expect("a panic aborts the process"))
             .collect::<Result<Vec<_>, _>>()
     })?;
-    let (names, ranks) = rank_endpoints(&chunks);
+    let (names, ranks) = rank_endpoints(&mut chunks);
     let mut runs: Vec<Vec<Run>> = vec![Vec::new(); HOURS];
     for (chunk, rank) in chunks.iter().zip(&ranks) {
         for (hour, lines, first) in &chunk.runs {
@@ -322,6 +322,9 @@ fn line_bounds(log: &[u8], parts: usize) -> Vec<usize> {
 struct Chunk<'a> {
     /// Local endpoint id → (name, hash). Names borrow the mapped file, so none are copied.
     names: Vec<(&'a [u8], u64)>,
+    /// Local endpoint id → the padded copy of [`Interner::padded`], which lets
+    /// [`rank_endpoints`] compare names without reading them from all over the input.
+    padded: Vec<[u8; 64]>,
     records: Vec<u32>,
     large: Vec<u32>,
     /// The runs in file order: each one's hour, its lines' indices, and the index in `large` of
@@ -351,18 +354,23 @@ const LARGE: u32 = (1 << 19) - 1;
 fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
     let mut endpoints = Interner::default();
     let (mut records, mut large) = (Vec::with_capacity(chunk.len() / MIN_LINE + 1), Vec::new());
-    // The hour, first line and first large latency of every run. No hour equals `usize::MAX`,
-    // so line 0 starts one.
-    let (mut starts, mut current) = (Vec::new(), usize::MAX);
+    // The hour, first line and first large latency of every run. A run lasts while the
+    // timestamp's bytes 5 to 12, `MM-DDTHH`, stay the same, so most lines compare those 8 bytes
+    // and decode nothing. No line's bytes are all zero, so line 0 starts a run.
+    let (mut starts, mut current) = (Vec::new(), 0);
     let mut i = 0;
     while i < chunk.len() {
         let line = &chunk[i..];
         let lf = line_end(line);
         i += lf + 1;
-        let hour = hour_index(line).ok_or_else(|| {
-            let ts = String::from_utf8_lossy(&line[..27]);
-            format!("timestamp {ts} is outside the spec's 72-hour span")
-        })?;
+        if word(line, 5) != current {
+            let hour = hour_index(line).ok_or_else(|| {
+                let ts = String::from_utf8_lossy(&line[..27]);
+                format!("timestamp {ts} is outside the spec's 72-hour span")
+            })?;
+            starts.push((hour, records.len(), large.len()));
+            current = word(line, 5);
+        }
         // The method is 3 to 7 bytes at offset 28, so the space after it is in the word at 31.
         let start = 32 + spaces(word(line, 31)).trailing_zeros() as usize / 8;
         // `space` precedes the latency; before it sit the 3-digit status and its own space.
@@ -372,10 +380,6 @@ fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
         let id = endpoints.intern(name, hash(name), window);
         // Errors are exactly 500..=599, so the status's first digit decides.
         let error = u32::from(line[space - 3] == b'5');
-        if hour != current {
-            starts.push((hour, records.len(), large.len()));
-            current = hour;
-        }
         let small = latency_us.min(LARGE);
         if small == LARGE {
             large.push(latency_us);
@@ -396,6 +400,7 @@ fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
         (starts.iter().zip(ends)).map(|(&(hour, start, first), end)| (hour, start..end, first));
     Ok(Chunk {
         names: endpoints.names,
+        padded: endpoints.padded,
         records,
         large,
         runs: runs.collect(),
@@ -548,15 +553,17 @@ fn hash(name: &[u8]) -> u64 {
 ///
 /// It uses open addressing with linear probing. A name's hash picks a slot, and on a collision
 /// we try the next slot until we find the name or an empty slot. The table doubles whenever it
-/// gets half full, which keeps probe sequences short and means it assumes nothing about how many
-/// distinct endpoints a seed has.
+/// gets a quarter full, which assumes nothing about how many distinct endpoints a seed has. At
+/// half full, 7.8% of seed 1's lines needed a second probe, each a mispredicted branch; at a
+/// quarter, 3.4% do.
 struct Interner<'a> {
     /// The table. A slot holds `id + 1`, so that 0 can mark an empty slot.
     slots: Vec<u32>,
-    /// Id → (name, hash). Keeping the hash lets a probe reject most non-matching slots without
-    /// comparing bytes, and lets the table grow without hashing anything again.
+    /// Id → (name, hash). The hash lets the table grow, and [`rank_endpoints`] merge the chunks'
+    /// names, without hashing anything again.
     names: Vec<(&'a [u8], u64)>,
-    /// Id → the name's first 64 bytes, zero-padded, for [`same_name`].
+    /// Id → the name and the space after it, zero-padded to 64 bytes, for [`same_name`]. A name of
+    /// 64 bytes or more has no room for the space and keeps only its first 64 bytes.
     padded: Vec<[u8; 64]>,
 }
 
@@ -576,10 +583,11 @@ impl Default for Interner<'_> {
 impl<'a> Interner<'a> {
     /// Returns `name`'s id, assigning the next free one if the name is new.
     ///
-    /// `window` is the 64 bytes that start with `name` when the input has that many left. Every
-    /// line but the last one of a chunk has them, and with them a probe compares a name of up
-    /// to 64 bytes without a call to `memcmp` (see [`same_name`]). That covers 1,791 of the
-    /// 1,842 endpoints of seed 1 and 94% of its lines; longer names compare with `==`.
+    /// `window` is the 64 bytes that start with `name` and the space after it, when the input has
+    /// that many left. Every line but the last one of a chunk has them, and with them a probe
+    /// compares a name of up to 63 bytes without a call to `memcmp` (see [`same_name`]). That
+    /// covers 1,791 of the 1,842 endpoints of seed 1 and 94% of its lines; longer names compare
+    /// with `==`.
     #[inline(always)]
     fn intern(&mut self, name: &'a [u8], hash: u64, window: Option<&[u8; 64]>) -> u32 {
         let slot = self.slot(name, hash, window);
@@ -594,13 +602,15 @@ impl<'a> Interner<'a> {
     #[cold]
     #[inline(never)]
     fn insert(&mut self, slot: usize, name: &'a [u8], hash: u64) -> u32 {
-        let mut padded = [0; 64];
+        // The name, then the space if there is room for it, then zeros.
+        let mut padded = [b' '; 64];
         let kept = name.len().min(64);
         padded[..kept].copy_from_slice(&name[..kept]);
+        padded[kept.min(63) + 1..].fill(0);
         self.padded.push(padded);
         self.names.push((name, hash));
         self.slots[slot] = self.names.len() as u32;
-        if self.names.len() * 2 > self.slots.len() {
+        if self.names.len() * 4 > self.slots.len() {
             let grown = vec![0; self.slots.len() * 2];
             let old = std::mem::replace(&mut self.slots, grown);
             for id in old.into_iter().filter(|&id| id != 0) {
@@ -618,15 +628,13 @@ impl<'a> Interner<'a> {
         let mask = self.slots.len() - 1;
         let mut slot = (hash >> 32) as usize & mask;
         while let Some(id) = self.slots[slot].checked_sub(1) {
-            let (known, known_hash) = self.names[id as usize];
-            if known_hash == hash
-                && match window {
-                    Some(window) if name.len() <= 64 => {
-                        same_name(window, &self.padded[id as usize], name.len())
-                    }
-                    _ => known == name,
+            let found = match window {
+                Some(window) if name.len() < 64 => {
+                    same_name(window, &self.padded[id as usize], name.len())
                 }
-            {
+                _ => self.names[id as usize].0 == name,
+            };
+            if found {
                 break;
             }
             slot = (slot + 1) & mask;
@@ -635,20 +643,20 @@ impl<'a> Interner<'a> {
     }
 }
 
-/// Returns whether the first `len` bytes of `window` and `known` agree, for `len <= 64`.
+/// Returns whether the name of `len < 64` bytes that starts `window`, followed by a space, is
+/// the name whose padded copy is `known`.
 ///
 /// Names vary in length from line to line, and the branches inside `memcmp` that pick a path
 /// by length mispredict often; that was about a quarter of the parse loop. Here the length
-/// never steers a branch: we compare all 64 bytes of both blocks at once and ignore the result
-/// for bytes past `len`. Bytes past the name differ, of course (the window goes on into the
-/// status and the latency, the padded copy holds zeros), which is why they are masked out:
-/// `u64::MAX >> (64 - len)` keeps bit `i` exactly for `i < len`. The copies are 64 bytes, not
-/// the 125 a name can reach, because half the size keeps more of them in cache: that was worth
-/// 0.8 ms.
+/// never steers a branch: we compare all 64 bytes of both blocks at once and keep the result
+/// for bytes `0..=len`, the name and the space: `u64::MAX >> (63 - len)` keeps bit `i` exactly
+/// for `i <= len`. Comparing the space makes the answer exact without comparing lengths. The
+/// spec rules out spaces in endpoints (§2), so a known name longer than `len` has no space at
+/// `len`, and one shorter has its space where the window still holds part of the name. The copies are 64 bytes, not the
+/// 125 a name can reach, because half the size keeps more of them in cache: that was worth 0.8 ms.
 fn same_name(window: &[u8; 64], known: &[u8; 64], len: usize) -> bool {
-    let wanted = u64::MAX.checked_shr(64 - len as u32).unwrap_or(0);
     // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
-    !unsafe { equal_mask(window, known) } & wanted == 0
+    !unsafe { equal_mask(window, known) } & u64::MAX >> (63 - len) == 0
 }
 
 /// Assigns every endpoint its global rank: its position in the bytewise sort of all names.
@@ -658,13 +666,17 @@ fn same_name(window: &[u8; 64], known: &[u8; 64], len: usize) -> bool {
 /// names. Only the 1,842 distinct names are then sorted. Rust's slice ordering is bytewise and
 /// puts a proper prefix first, which is exactly the order the spec asks for (§4). Returns the
 /// sorted names and, for each chunk, a table from its local ids to ranks.
-fn rank_endpoints<'a>(chunks: &[Chunk<'a>]) -> (Vec<&'a [u8]>, Vec<Vec<u32>>) {
+///
+/// The merge compares the chunks' padded copies, which then go: each name's bytes in the input
+/// lie in a different place, and reading them there took most of a millisecond, one cache miss
+/// after another, while every other thread waited.
+fn rank_endpoints<'a>(chunks: &mut [Chunk<'a>]) -> (Vec<&'a [u8]>, Vec<Vec<u32>>) {
     let mut all = Interner::default();
-    let global: Vec<Vec<u32>> = (chunks.iter())
+    let global: Vec<Vec<u32>> = (chunks.iter_mut())
         .map(|c| {
-            c.names
-                .iter()
-                .map(|&(name, hash)| all.intern(name, hash, None))
+            let padded = std::mem::take(&mut c.padded);
+            (c.names.iter().zip(&padded))
+                .map(|(&(name, hash), padded)| all.intern(name, hash, Some(padded)))
                 .collect()
         })
         .collect();
