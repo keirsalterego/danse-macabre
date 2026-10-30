@@ -12,7 +12,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 5 | Queries on sets evaluated every 4,096 documents inside the pass; glibc's mmap threshold fixed at 128 KiB | run-16bfddb1c5c1 | 0.3708 | 45.7 | 64.3 |
 | 6 | Per-document BOOL queries compiled to 64-bit truth tables with one packed tally each, prefetched at the trigger term; term keys folded through a mask table | run-a7a48ad2968d | 0.2838 | 43.1 | 67.2 |
 | 7 | Blocks of 2 MiB or more on transparent huge pages; a window's id lists hold 16-bit offsets | run-91f41d207c31 | 0.2793 | 46.3 | 67.0 |
-| 8 | Term table sized once from the queries' term count, and its keys trimmed after the intern | | | | |
+| 8 | Term table sized once from the queries' term count, and its keys trimmed after the intern | run-533a441d6902 | 0.2705 | 45.1 | 67.5 |
+| 9 | Tokens that are no query term take the id of a bit that is never set, so clearing the seen bits takes no branch | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -175,6 +176,18 @@ sampling 5.6, the plan loop 5.3, grouping and marking 3.2. A parallel sample, ma
 took start-up to 19.0 ms but added 55 lines, which costs more than it saves; a partitioned
 parallel intern would take about 45 lines for about 4 ms.
 
+## Step 9: one branch less per token
+
+At each line end the pass clears the seen bit of every token's term. A token that is no query
+term, 21% of them, had the id `u32::MAX` and was skipped with a test. That test mispredicted:
+7.8 M of the 76.6 M branch misses. Such a token now takes the id of the bit that pads the
+checks, which is never set, so clearing it changes nothing and the loop has no branch.
+
+Locally, on step 7 (the scan is the same at step 8): branch misses 76.6 → 68.8 M; over three
+interleaved rounds, cycles 7.07–7.10 → 6.81–6.84 G, task-clock 3,039–3,054 → 2,931–2,943 ms,
+elapsed 0.2858–0.2864 → 0.2781–0.2791 s in the two quiet rounds. Alternating runs, 20 each:
+median wall 286.0 → 277.3 ms (step 6: 297.9). S unchanged.
+
 ## Experiments that did not stay
 
 - **Transparent huge pages off on top of the fixed threshold** (`prctl(PR_SET_THP_DISABLE)`):
@@ -212,3 +225,6 @@ parallel intern would take about 45 lines for about 4 ms.
   step 5 code: cycles 8.40–8.44 → 9.09–9.12 G, as the extra pass stalls on the slot loads it
   reads. On step 6, skipping the long-key comparison altogether (wrong answers, as an upper
   bound) saved only 1.5–2.8% of cycles, too little for a prefetch scheme to chase.
+- **Phrase triggers pushed without a branch** (each position pushed, then dropped again unless
+  the term triggers phrases), on top of step 9: branch misses 68.8 → 67.2 M, but instructions
+  10.06 → 10.44 G and cycles 6.80 → 6.87 G.

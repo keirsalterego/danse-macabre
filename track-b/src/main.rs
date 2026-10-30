@@ -48,8 +48,6 @@ use std::thread;
 
 /// Documents tokenized up front to estimate how rare each query term is.
 const SAMPLE_DOCS: usize = 1000;
-/// The term id of a corpus token that no query uses.
-const MISS: u32 = u32::MAX;
 /// An output line lists at most this many ids (spec §4).
 const SHOWN_IDS: usize = 10;
 /// The low bits of a [`Tally`] cell hold the sum of the ids matched in a chunk, which
@@ -914,9 +912,10 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
     };
     let mut tally = Tally::new(queries.len(), plan.checks.len());
     // Bit `t` is set while the current doc contains term `t`. One more bit, never set, pads
-    // the checks ([`Check`]).
+    // the checks ([`Check`]) and stands for every token that is no query term, `miss`.
     let mut seen = vec![0u64; (plan.terms.len() + 1).div_ceil(64)];
-    // The current doc's term id per token (MISS for the rest), the positions of its phrase
+    let miss = plan.terms.len() as u32;
+    // The current doc's term id per token (`miss` for the rest), the positions of its phrase
     // triggers, the checks of its distinct BOOL triggers, and the phrases it matched, so none
     // counts twice.
     let (mut terms, mut phrase_at, mut bool_terms) = (Vec::new(), Vec::new(), Vec::new());
@@ -933,7 +932,7 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
         Event::LineEnd => {
             for probe in probes.drain(..) {
                 let Some(slot) = probe.and_then(|(key, at)| plan.terms.find_from(&key, at)) else {
-                    terms.push(MISS);
+                    terms.push(miss);
                     continue;
                 };
                 let (t, bit) = (slot.id as usize / 64, 1 << (slot.id % 64));
@@ -974,7 +973,7 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
                     tally.add_check(c, check.q, doc, check.matches(has));
                 }
             }
-            for &t in terms.iter().filter(|&&t| t != MISS) {
+            for &t in &terms {
                 seen[t as usize / 64] &= !(1 << (t % 64));
             }
             terms.clear();
