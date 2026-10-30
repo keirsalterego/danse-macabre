@@ -20,6 +20,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 13 | A token's hash multiplies the XOR of its key words once, instead of once per word | run-4a44efe39605 | 0.2403 | 43.4 | 69.0 |
 | 14 | The per-document checks count a query's first matches in a byte per query, not in its cell | run-f56225b92327 | 0.2350 | 45.1 | 69.1 |
 | 15 | Memory at its peak: a thread frees its window before grouping its first matches, and the grouping keeps no second copy of the group starts | run-7458013fd46b | 0.2346 | 42.3 | 69.2 |
+| 16 | The query and check cells are written when allocated, so the pass's first store to a page no longer replaces the shared zero page and interrupts every core | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -276,6 +277,29 @@ Locally, memory.peak over seven runs each: 41.1–43.3 MiB (median 42.6) → 39.
 (median 39.9). The window alone: median 40.0, but one run at 42.8. Cycles and wall unchanged:
 5.94–5.96 → 5.93–5.94 G; alternating runs, 12 each: median 246.0 → 245.1 ms. S 845 → 848.
 Gate: 507 pass, 0 fail.
+
+## Step 16: no zero page under the cells
+
+perf's kernel profile of step 15 had 9% of kernel cycles in `smp_call_function_many_cond`,
+called from `do_wp_page`: copy-on-write faults. `vec![0; n]` takes its cells from calloc, and
+calloc leaves fresh pages from mmap unwritten. The pass first touches a page of query or check
+cells with the load in `*cell += …` (load, add, store: the new value is compared next), so the
+read fault maps the shared zero page. The store then faults again, and replacing a mapping that
+other cores may cache sends an interrupt to every core running the process, to flush its TLB.
+On seed 1 that happened for 1,111 pages of query cells and 948 pages of check cells over 12
+threads, so 2,059 rounds of interrupts to 11 cores each. [`Tally::new`] now builds the cells with
+`[0].repeat(n)`, which writes them, so each page faults once, on a write.
+
+Locally, against step 15: page faults 18,800 → 16,710, kernel cycles 214 → 156–157 M, user
+cycles unchanged (5.95–6.00 → 5.88–5.99 G). Alternating runs, 16 each, twice: median 246.4 and
+246.1 → 244.9 and 243.4 ms, min 244.2 and 244.5 → 241.5 and 241.4 ms. memory.peak over seven
+runs: median 39.8 → 39.9 MiB. S 848 → 848. Gate: 507 pass, 0 fail.
+
+Not kept: the same writes as `black_box(&mut cells).fill(0)` after `vec!`, for the same time
+(median 244.6 and 242.9 ms in the same runs) and 5 more lines. Also measured: recording first
+matches in chunk 0 only, an upper bound on skipping the other chunks' first matches once chunk 0
+holds ten for a query. Median 244.6 and 245.1 → 248.2 and 248.0 ms: chunk 0 still records and
+groups all of its own, so its thread, the one the others wait for, does no less.
 
 ## Experiments that did not stay
 

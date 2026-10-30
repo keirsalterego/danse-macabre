@@ -719,9 +719,13 @@ struct Tally {
 
 impl Tally {
     fn new(queries: usize, checks: usize) -> Self {
+        // Written here, each page of cells faults in once, as a page of its own. Zeroed by
+        // calloc, as `vec!` does, the pass's first load from a page maps the shared zero page,
+        // and the store after that load replaces it, which interrupts every core to flush its
+        // TLB.
         Self {
-            queries: vec![0; queries],
-            checks: vec![0; checks],
+            queries: [0].repeat(queries),
+            checks: [0].repeat(checks),
             shown: vec![0; queries],
             first: Vec::new(),
         }
