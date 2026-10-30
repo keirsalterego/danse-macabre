@@ -671,6 +671,8 @@ fn summarize_hour(runs: &[Run], order: &[usize], names: &[&[u8]], buffer: &mut V
         release(records);
     }
     let (mut lines, mut len) = (Vec::with_capacity(order.len()), 0);
+    // The number of decimal digits `put_number` writes for `value`.
+    let digits = |value: u64| value.checked_ilog10().map_or(1, |log| log as usize + 1);
     for &e in order {
         let group = &mut buffer[start[e] as usize..start[e + 1] as usize];
         if !group.is_empty() {
@@ -696,9 +698,8 @@ fn summarize_hour(runs: &[Run], order: &[usize], names: &[&[u8]], buffer: &mut V
 /// values instead of the 2.94 n of going from p99 down. The suffixes start at the rank already
 /// found because the ranks coincide for small groups.
 fn percentiles(group: &mut [u32]) -> [u32; 3] {
-    let n = group.len();
-    let at @ [i50, i95, i99] = [50, 95, 99].map(|p| (p * n).div_ceil(100) - 1);
-    match n {
+    let at @ [i50, i95, i99] = [50, 95, 99].map(|p| (p * group.len()).div_ceil(100) - 1);
+    match group.len() {
         // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
         ..=8 => unsafe { sort_network::<1>(group, at) },
         // SAFETY: as above.
@@ -765,11 +766,6 @@ fn sort_network<const R: usize>(group: &[u32], at: [usize; 3]) -> [u32; 3] {
 fn numbers(&[_, count, p50, p95, p99, errors]: &[u32; 6]) -> [u64; 6] {
     let [count, p50, p95, p99, errors] = [count, p50, p95, p99, errors].map(u64::from);
     [count, p50, p95, p99, errors, errors * 1_000_000 / count]
-}
-
-/// The number of decimal digits [`put_number`] writes for `value`.
-fn digits(value: u64) -> usize {
-    value.checked_ilog10().map_or(1, |log| log as usize + 1)
 }
 
 /// Writes the formatted `lines` of hour index `hour` to `place`: the hour's label

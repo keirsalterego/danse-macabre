@@ -30,6 +30,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 23 | 5 fewer lines at the same speed: one `use` line, a recursive spawn tree, an hour as a tuple | run-6b577bd7fed9 | 0.0200 | 21.4 | 84.1 |
 | 24 | 2 fewer lines with the same machine code: one `use` line, and no alias for the hour buffer | run-3d33fc387ebc | 0.0199 | 21.2 | 84.2 |
 | 25 | 6 fewer lines with the same machine code: five variables written where they are used, and the last thread's exit on one line | run-6223c163632a | 0.0200 | 20.9 | 84.2 |
+| 26 | 3 fewer lines with the same machine code: `digits` a closure in its one caller, and a group's length read where it is used | | | | |
 
 ## Step 1: v1
 
@@ -310,6 +311,13 @@ with `count` and `current`; `line_end` passes its 64-byte window to `equal_mask`
 `first_chunk()`; `intern` computes the slot mask where it wraps; and the last thread's exit is one
 `bool::then`. The `.text` and `.rodata` sections are byte-identical to step 24's, so T and M
 cannot move. S 388 → 382. Gate: 307 pass, 0 fail.
+
+## Step 26: 3 more lines
+
+`digits` moves into `summarize_hour`, its only caller, as a one-line closure, and `percentiles`
+reads `group.len()` where it used `n`. `.rodata` is byte-identical to step 25's; `.text` differs
+in four compares of the group length, `cmp $9; jae` becoming `cmp $8; ja` and so on, the same test
+in an instruction of the same size, so T and M cannot move. S 382 → 379. Gate: 307 pass, 0 fail.
 
 ## Experiments that did not stay
 
