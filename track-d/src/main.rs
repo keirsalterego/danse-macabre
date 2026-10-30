@@ -388,12 +388,6 @@ fn sort(run: &mut [u32], places: &[u16], offsets: &mut [u32], first: u32) {
     }
 }
 
-/// `len` zeroed atomics. Atomics let the query threads share one answer array with no `unsafe`;
-/// `Relaxed` is enough, since the scope's join orders every write before `main` reads.
-fn atomic_zeros(len: usize) -> Vec<AtomicU64> {
-    (0..len).map(|_| AtomicU64::new(0)).collect()
-}
-
 /// Asks the CPU to start loading the cache line that holds `item` into L1, and returns without
 /// waiting for it.
 fn prefetch<T>(item: &T) {
@@ -482,19 +476,17 @@ impl Csr {
 /// counter instead of a fixed share, because query cost varies by orders of magnitude (the target
 /// is drawn by Dijkstra rank, 2 to 131,071, spec §2).
 fn answer(forward: &Csr, reverse: &Csr, queries: &[(u64, u64)], threads: usize) -> Vec<AtomicU64> {
-    let answers = atomic_zeros(queries.len());
+    // Atomics let the threads share one answer array with no `unsafe`. `Relaxed` is enough, since
+    // the threads are joined before `main` reads.
+    let answers: Vec<_> = queries.iter().map(|_| AtomicU64::new(0)).collect();
     let next = AtomicUsize::new(0);
-    thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| {
-                let (mut from_s, mut to_t) = (Search::new(forward), Search::new(reverse));
-                loop {
-                    let i = next.fetch_add(1, Relaxed);
-                    let Some(&(s, t)) = queries.get(i) else { break };
-                    let d = distance(&mut from_s, &mut to_t, s as u32, t as u32);
-                    answers[i].store(d, Relaxed);
-                }
-            });
+    on_threads(0..threads, |_| {
+        let (mut from_s, mut to_t) = (Search::new(forward), Search::new(reverse));
+        loop {
+            let i = next.fetch_add(1, Relaxed);
+            let Some(&(s, t)) = queries.get(i) else { break };
+            let d = distance(&mut from_s, &mut to_t, s as u32, t as u32);
+            answers[i].store(d, Relaxed);
         }
     });
     answers
@@ -527,7 +519,7 @@ fn distance(from_s: &mut Search, to_t: &mut Search, s: u32, t: u32) -> u64 {
     // instead would answer a round trip, or -1 on a node with no edges.
     let mut best = if s == t { 0 } else { UNREACHABLE };
     // Saturating, because an empty queue's top is u64::MAX.
-    while from_s.top().saturating_add(to_t.top()) < best {
+    while from_s.queue.top().saturating_add(to_t.queue.top()) < best {
         // Advance the smaller frontier, not the one with the smaller top key: a source with no
         // in-edges leaves through edges near 2^32 (spec §2), and comparing keys would make the
         // other side settle the whole graph before the source side took a second step.
@@ -568,13 +560,7 @@ impl<'g> Search<'g> {
         self.dist.insert(node, 0);
     }
 
-    /// The smallest distance in the queue, or [`UNREACHABLE`] when it is empty. No unsettled node
-    /// is closer than this, which is what the stopping rule in [`distance`] relies on.
-    fn top(&mut self) -> u64 {
-        self.queue.top()
-    }
-
-    /// Settles the node on top of the queue, which [`Search::top`] found, and relaxes its edges.
+    /// Settles the node on top of the queue, which [`Queue::top`] found, and relaxes its edges.
     /// Every label it improves on a node that `other` has labelled joins the two searches into a
     /// path, which is offered to `best`.
     fn step(&mut self, other: &Labels, best: &mut u64) {
@@ -587,10 +573,7 @@ impl<'g> Search<'g> {
         // (a push below may still cut in), so this fetches the edges of the node two pops ahead
         // and the offsets of the node three ahead. The previous step fetched the next node's
         // edges. Of the depths tried, this one measured fastest.
-        let mut upcoming = self.queue.upcoming(d);
-        let ahead: [_; 3] = std::array::from_fn(|_| upcoming.next());
-        drop(upcoming); // it borrows the queue, which the loop below pushes to
-        if let [_, Some(second), third] = ahead {
+        if let [_, Some(second), third] = self.queue.upcoming(d) {
             self.graph.prefetch(second);
             if let Some(third) = third {
                 prefetch(&self.graph.offsets[third as usize]);
@@ -641,8 +624,8 @@ struct Queue {
     free: u32,
     /// The key [`Queue::top`] found last: no entry is below it.
     cur: u64,
-    /// Entries pushed beyond the ring, as `key << 32 | node`: one compare orders them.
-    far: BinaryHeap<Reverse<u128>>,
+    /// Entries pushed beyond the ring.
+    far: BinaryHeap<Reverse<(u64, u32)>>,
     /// Entries queued, stale ones included.
     len: usize,
 }
@@ -664,26 +647,19 @@ impl Queue {
         }
     }
 
-    /// Empties the queue, visiting only the full buckets. It keeps its capacity.
+    /// Empties the queue. It keeps its capacity.
     fn clear(&mut self) {
-        for (w, word) in self.full.iter_mut().enumerate() {
-            while *word != 0 {
-                self.heads[w * 64 + word.trailing_zeros() as usize] = NIL;
-                *word &= *word - 1;
-            }
-        }
+        self.heads.fill(NIL);
         self.links.clear();
         self.far.clear();
-        (self.free, self.cur, self.len) = (NIL, 0, 0);
+        (self.full, self.free, self.cur, self.len) = ([0; RING / 64], NIL, 0, 0);
     }
 
     /// Queues `node` at distance `key`, which is at least `cur`.
     fn push(&mut self, key: u64, node: u32) {
         self.len += 1;
         if key - self.cur >= RING as u64 {
-            return self
-                .far
-                .push(Reverse(u128::from(key) << 32 | u128::from(node)));
+            return self.far.push(Reverse((key, node)));
         }
         let b = key as usize % RING;
         let entry = [node, self.heads[b]];
@@ -710,11 +686,11 @@ impl Queue {
         })
     }
 
-    /// The ring's nodes from key `key` on, in the order [`Queue::pop`] returns them. Only a hint
-    /// for prefetching: it skips `far`, and when it runs past the ring it starts over.
-    fn upcoming(&self, mut key: u64) -> impl Iterator<Item = u32> + '_ {
+    /// The next three nodes [`Queue::pop`] returns from key `key` on, unless a push cuts in. Only
+    /// a hint for prefetching: it skips `far`, and when it runs past the ring it starts over.
+    fn upcoming(&self, mut key: u64) -> [Option<u32>; 3] {
         let mut link = NIL;
-        std::iter::from_fn(move || {
+        std::array::from_fn(|_| {
             if link == NIL {
                 key = self.ahead(key)?;
                 link = self.heads[key as usize % RING];
@@ -726,9 +702,11 @@ impl Queue {
         })
     }
 
-    /// The smallest key queued, or [`UNREACHABLE`] when the queue is empty. It becomes `cur`.
+    /// The smallest key queued, or [`UNREACHABLE`] when the queue is empty. It becomes `cur`. No
+    /// unsettled node is closer than this, which is what the stopping rule in [`distance`] relies
+    /// on.
     fn top(&mut self) -> u64 {
-        let far = self.far.peek().map_or(UNREACHABLE, |r| (r.0 >> 32) as u64);
+        let far = self.far.peek().map_or(UNREACHABLE, |r| r.0.0);
         self.cur = self.ahead(self.cur).unwrap_or(UNREACHABLE).min(far);
         self.cur
     }
@@ -739,12 +717,11 @@ impl Queue {
         let b = self.cur as usize % RING;
         let head = self.heads[b];
         let Some(&[node, next]) = self.links.get(head as usize) else {
-            return (self.cur, self.far.pop().expect("top found a key").0 as u32);
+            return (self.cur, self.far.pop().expect("top found a key").0.1);
         };
         self.heads[b] = next;
-        if next == NIL {
-            self.full[b / 64] &= !(1 << (b % 64));
-        }
+        // Clears the bucket's bit if that was its last entry.
+        self.full[b / 64] &= !(u64::from(next == NIL) << (b % 64));
         self.links[head as usize][1] = std::mem::replace(&mut self.free, head);
         (self.cur, node)
     }
@@ -773,13 +750,10 @@ impl std::hash::Hasher for NodeHash {
         self.0
     }
 
-    /// Never called: [`Labels`] keys are `u32`, which hash through `write_u32`.
-    fn write(&mut self, _: &[u8]) {
-        unreachable!("labels hash only u32 node ids");
-    }
-
-    /// Hashes one node id.
-    fn write_u32(&mut self, node: u32) {
-        self.0 = u64::from(node).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    /// Hashes one node id. [`Labels`] keys are `u32`, and std's `write_u32` passes their 4 bytes
+    /// here.
+    fn write(&mut self, id: &[u8]) {
+        let id = u32::from_ne_bytes(id.try_into().expect("a u32 node id"));
+        self.0 = u64::from(id).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
 }

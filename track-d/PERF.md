@@ -10,8 +10,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 3 | Numbers parsed eight bytes at a time (85568b4) | run-49af01c44df1 | 0.1665 | 125.8 | 68.0 |
 | 4 | Heap entries ordered by one packed 128-bit key (542bc46) | run-05e531e8754c | 0.1565 | 125.2 | 68.6 |
 | 5 | Edges packed into 4 bytes and read through a 32-byte copy, and glibc's mmap threshold fixed at 64 KiB (680f4ad) | run-74c555d4ba4f | 0.1551 | 83.9 | 70.2 |
-| 6 | The build's arrays faulted in before pass 2, one write per 2 MB on half the threads | | | | |
-| 7 | Each search's binary heap replaced by a bucket queue: a ring of 4,096 one-unit buckets found through a bitmap, with a small heap for keys past the ring | | | | |
+| 6 | The build's arrays faulted in before pass 2, one write per 2 MB on half the threads (3d3e358; measured together with step 7) | run-bb1fd514f3b2 | 0.1279 | 81.4 | 71.6 |
+| 7 | Each search's binary heap replaced by a bucket queue: a ring of 4,096 one-unit buckets found through a bitmap, with a small heap for keys past the ring (fc4ed14) | run-bb1fd514f3b2 | 0.1279 | 81.4 | 71.6 |
+| 8 | The query code shortened by 24 lines at the same speed: `answer` reuses `on_threads`, and the queue's helpers are folded together | | | | |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
@@ -181,9 +182,9 @@ algorithm:
 - A key in `cur..cur + 4096`, where `cur` is the last key popped, goes into bucket `key % 4096` of
   a fixed ring. Keys only grow during a search and every edge weight is non-negative, so a pop
   takes the lowest non-empty bucket at or after `cur`, which a 64-word bitmap finds.
-- Each bucket is a LIFO stack of `(node, key)` entries kept in one shared arena with a free list,
-  so the arena only grows to the most entries queued at once. A vector per bucket was slower than
-  the heap, from its cache misses.
+- A bucket holds one key, so its LIFO stack stores nodes only: `[node, next]` entries linked
+  through one shared arena with a free list, so the arena only grows to the most entries queued at
+  once. A vector per bucket was slower than the heap, from its cache misses.
 - A key at or past the end of the ring goes to a small binary heap, `far`. Weights go up to
   2^32 - 1 (spec §2), and the near-2^32 edges in every seed take this path. The ring's size is a
   constant, not something read from the input, so a graph with only huge weights stays correct
@@ -207,6 +208,20 @@ Measured on P-cores, interleaved, medians:
 | Seed 1, 11 runs, on step 6 | | 160.02 → 133.06 |
 
 Peak memory is unchanged within noise: median 83.2 → 82.8 MB over 9 runs each. S 359 → 450.
+
+## Step 8: 24 fewer lines in the query code
+
+Lines count on D more than on any other track (S 450 against a reference of 43), so a pass over
+the query code removed what no longer paid for itself. `answer` uses the `on_threads` helper
+instead of its own scope-and-spawn loop. `Search::top` only forwarded to `Queue::top`, so it is
+gone. `Queue::upcoming` returns the next three nodes as an array instead of an iterator.
+`Queue::clear` resets every bucket head with one `fill`. The rare `far` heap holds `(key, node)`
+tuples instead of a packed `u128`. The node hasher hashes in `write` alone. Every doc comment
+stayed.
+
+S 450 → 426. Interleaved full runs, medians (fc4ed14 → step 8): seed 1 133.14 → 133.61,
+133.77 → 133.52 and 135.11 → 135.41 ms (11 runs each), seed 2 139.92 → 137.68 ms and seed 3
+141.70 → 140.94 ms (9 runs each). Peak memory median 83.7 → 82.9 MB (7 runs each).
 
 ## Tried and reverted (local, turbo off, no run ID)
 
@@ -242,9 +257,10 @@ between rows.
 | Pass 2's run lists sized up front | Runs set-up 1.28 → 1.10 ms | 0.18 ms is less than the lines cost |
 | A statically linked binary (`-C target-feature=+crt-static`) | Start-up 1.0 → 0.73–0.77 ms | Not adopted: untested in the Docker build, for about 0.25 ms |
 | Relabeling nodes in BFS order, computed during the run (on step 7) | Queries 93.8 → 84.8 ms, but the order took 80 ms and permuting the graph 52 ms. An ideal order from the generator's coordinates, which a submission cannot use, reached 83.3 ms | Even a 10× faster order would only about break even |
-| A locality-preserving hash for the label table (on step 7) | Queries 110.9 ms against 93.1 ms | Slower |
+| A locality-preserving hash for the label table, on the ideal order above (on step 7) | Queries 110.9 ms against 83.3 ms with the multiplicative hash on the same order | Slower |
 | Labels as 32-bit distances with a fallback map (on step 7) | Queries 95.2 against 93.1 ms, 0.9 MB saved | Slower, for little memory |
-| A ring of 1,024 or 2,048 buckets instead of 4,096 | Queries 94.9 and 96.2 against 93.1 ms | More keys go to the far heap |
+| A ring of 1,024 or 2,048 buckets instead of 4,096 | Queries 94.9 and 96.2 against 93.1 ms. Re-measured after the line-count pass: 95.9 against 93.5 ms, and 96.2 with `Queue` deriving `Default`, which a 2,048 ring allows (10 lines fewer) | Not from the far heap: at 2,048 only weights 2,047 to 4,095 move there, 0.07% of edges. Cause not found |
+| Balancing the two sides by label count, which drops the queue's length counter (3 lines fewer) | Queries 96.6 against 95.0 ms | Slower |
 | Linear-probing and epoch-packed label tables instead of `HashMap` | Lost clearly to hashbrown | Its control bytes make failed lookups cheap |
 | Exact pruning on `via + other_top >= best`, or checking the other side when a node is settled | Correct, no speedup | |
 | Prefetching the 4th or 5th node ahead, or pre-warming the label slots of the next node's neighbours | No gain | |
