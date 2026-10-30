@@ -50,6 +50,9 @@
 //!    The atomic OR that sets a bit returns the word it replaced, so exactly one record sees each
 //!    name's bit for a country go from 0 to 1, and its thread counts that name as new for the
 //!    country. The counts need no pass over the table afterwards.
+//!
+//!    A record loads its name's slot as soon as the name is scanned and uses it only once the
+//!    record is parsed, so the slot's cache miss overlaps that parse.
 //! 5. **Merge and print.** The per-thread [`Group`]s hold only integers, so merging them gives
 //!    the same result in any order, and [`format_output`] writes the lines.
 //!
@@ -405,7 +408,8 @@ impl Group {
 ///
 /// This is the hot loop. The fields come in a fixed order, so the state is simply the position in
 /// the record. The numbers parse as they are scanned, and [`text_field`] skips names and notes
-/// while counting their escapes.
+/// while counting their escapes. The name table is probed in two steps, [`NameTable::probe`]
+/// right after the name and [`NameTable::mark`] at the end of the record.
 fn aggregate(
     data: &[u8],
     range: Range<usize>,
@@ -422,6 +426,10 @@ fn aggregate(
         }
         let (id, comma) = number(data, at, b',');
         let (name, name_bytes, after_name) = text_field(data, comma + 1);
+        let name = &data[name];
+        // The name's slot is likely a cache miss, and nothing needs it before the end of the
+        // record, so it loads now and the miss overlaps the parse of the other fields.
+        let probe = names.probe(name);
         let (_, note_bytes, after_note) = text_field(data, after_name);
         let (region_id, comma) = number(data, after_note, b',');
         // The sign applies to the whole value, so -0.75 is -75 cents, not -0 * 100 + 75.
@@ -436,7 +444,7 @@ fn aggregate(
         // Records also reference ids past the table's largest (§2.2), so the lookup is
         // bounds-checked; those ids are unmatched like the holes inside the table.
         let group = (regions.group_of.get(region_id as usize)).map_or(0, |&g| usize::from(g));
-        let new_name = names.mark(&data[name], group)?;
+        let new_name = names.mark(name, probe, group)?;
         groups[group].merge(&Group {
             count: 1,
             id_sum: id,
@@ -577,29 +585,42 @@ impl NameTable {
         }
     }
 
+    /// Hashes `name` and loads its home slot. Returns the hash and the slot's value, which
+    /// [`NameTable::mark`] takes for the same name.
+    ///
+    /// This is the first step of `mark`, split off so that [`aggregate`] can start the slot's
+    /// cache miss as soon as it has the name and finish the record while the miss is pending.
+    /// The value can be out of date by the time `mark` uses it, but only in one direction: a
+    /// slot that holds a name never changes, and an empty one that has been filled since makes
+    /// [`NameTable::intern`] lose the race to publish, which it already handles.
+    fn probe(&self, name: &[u8]) -> (u64, u64) {
+        let hash = hash(name);
+        let slot = hash as usize & (self.slots.len() - 1);
+        (hash, self.slots[slot].load(Acquire))
+    }
+
     /// Adds `group` to the groups of `name` and returns `true` if this call is the one that added
-    /// it. Returns `None` when the table is full.
+    /// it. Returns `None` when the table is full. `probe` comes from [`NameTable::probe`].
     ///
     /// The OR is one atomic read-modify-write, so of all the calls for one name and group, in
     /// any threads, exactly one sees the bit clear.
-    fn mark(&self, name: &[u8], group: usize) -> Option<bool> {
-        let entry = self.intern(name)?;
+    fn mark(&self, name: &[u8], probe: (u64, u64), group: usize) -> Option<bool> {
+        let entry = self.intern(name, probe)?;
         let bit = 1 << (group % 64);
         Some(self.arena[entry + 1 + group / 64].fetch_or(bit, Relaxed) & bit == 0)
     }
 
-    /// Returns the offset of `name`'s entry, inserting the name if it is new.
+    /// Returns the offset of `name`'s entry, inserting the name if it is new. The probe starts
+    /// from the hash and home slot value that [`NameTable::probe`] returned.
     ///
     /// A new entry is written in full first and then published with a compare-and-swap on the
     /// empty slot. Release on that swap and Acquire on every slot load mean that any thread that
     /// sees the slot also sees the whole entry.
-    fn intern(&self, name: &[u8]) -> Option<usize> {
+    fn intern(&self, name: &[u8], (hash, mut seen): (u64, u64)) -> Option<usize> {
         const LOW: u64 = u32::MAX as u64;
-        let hash = hash(name);
         let mask = self.slots.len() - 1;
         let mut slot = hash as usize & mask;
         loop {
-            let mut seen = self.slots[slot].load(Acquire);
             if seen == 0 {
                 let entry = self.insert(name)?;
                 // A thread that loses the race leaves its entry unpublished. No record ever
@@ -615,6 +636,7 @@ impl NameTable {
                 return Some((seen & LOW) as usize - 1);
             }
             slot = (slot + 1) & mask;
+            seen = self.slots[slot].load(Acquire);
         }
     }
 

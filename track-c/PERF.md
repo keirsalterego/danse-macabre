@@ -11,6 +11,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 4 | Distinct names counted by the workers, from the atomic OR's return value | run-e05eb5fa2929 | 0.1101 | 15.58 | 62.4 |
 | 5 | `regions.csv` parsed in one pass, each row's end found by the parse itself | run-e703239bd822 | 0.1016 | 15.31 | 63.2 |
 | 6 | Names and notes scanned 32 bytes at a time for their next quote | | | | |
+| 7 | Each name's hash slot loaded as soon as the name is scanned, so its cache miss overlaps the rest of the record | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -159,6 +160,32 @@ P-cores, `perf stat -r 10`, three interleaved rounds:
 
 S 416 → 426, and memory.peak is unchanged, 14.7–15.0 MiB.
 
+## Step 7: each name's slot loaded as soon as the name is scanned
+
+Step 6's knockouts found that hashing a name and loading its slot cost only 0.1 G cycles when
+the slot load sat right after the name. In step 6 it sat at the end of the record, inside
+`mark`, after the note and the numbers, so each record stalled on the slot's cache miss with
+nothing left to parse. Now `NameTable::probe` hashes the name and loads its home slot as soon as
+`text_field` returns the name, and `mark` takes the hash and the slot's value at the end of the
+record. The note and the three numbers parse while the miss is pending.
+
+The early value can only be out of date in one way. A slot that holds a name never changes, and
+an empty slot that another thread fills in between makes `intern` lose the race to publish, a
+case it already handled. A full run still interns about 100.53 k names and wastes at most about
+15 entries more than before. A build whose probe always reports an empty slot, which sends every
+record down that path, passes the gate and 400 random cases against the reference.
+
+P-cores, `perf stat -r 10`, three interleaved rounds:
+
+| | step 6 | step 7 |
+|---|---|---|
+| task-clock (ms) | 1005 / 1032 / 1017 | 912 / 933 / 926 |
+| cycles:u (G) | 2.22 / 2.29 / 2.25 | 2.00 / 2.05 / 2.03 |
+| elapsed (ms) | 97.8 / 99.2 / 99.7 | 89.6 / 91.1 / 87.4 |
+
+Instructions barely move, 2.035 → 2.046 G. S 426 → 432, and memory.peak in the container with
+the harness's flags is unchanged, 14.8–15.0 MiB.
+
 ## Experiments that did not stay
 
 - **Batched table lookups** (local only): each thread parsed 32 records, then loaded every
@@ -173,6 +200,12 @@ S 416 → 426, and memory.peak is unchanged, 14.7–15.0 MiB.
   - Variants on E-cores: separate intern and OR steps 1.711–1.762 G (the fused form was equal or
     slightly faster), explicit `prefetcht0` 1.745–1.777 G, and batches of 16 or 64 within noise
     of 32.
+- **Prefetching the entry as well as loading the slot early** (local only, P-cores,
+  `perf stat -r 10`, interleaved, on top of step 5). In one variant, a prefetch of the entry was
+  issued as soon as the slot's value arrived. In the other, a one-record pipeline marked each
+  record one record late and prefetched its entry in between. They measured 1044–1055 ms and
+  1035–1053 ms of task-clock, against 1036–1068 ms for the early slot load alone (step 7) and
+  1145–1185 ms for step 5. Neither was kept.
 
 ## Profile notes
 
@@ -186,9 +219,3 @@ S 416 → 426, and memory.peak is unchanged, 14.7–15.0 MiB.
   104 ms, 85.1–86.8 ms each, so the chunks are balanced; merge about 1 ms; distinct counting
   105.3–114.2 ms on one thread; format and write 0.6 ms. About 20 ms of the 115 ms runs on one
   thread.
-- Loading each name's slot right after the name is scanned, so that its miss overlaps the rest
-  of the record (P-cores, `perf stat -r 10`, three interleaved rounds on top of step 6):
-  cycles:u 2.28 / 2.23 / 2.25 → 2.02 / 1.98 / 2.04 G, task-clock 1027 / 1009 / 1018 →
-  922 / 906 / 928 ms. On top of step 5, adding an explicit prefetch of the entry, or a
-  one-record pipeline that also prefetches the entry, measured no better than the early load
-  alone: 1035–1068 ms for all three, against 1145–1185 ms for step 5.
