@@ -1041,11 +1041,10 @@ fn fold(window: &[u8; MAX_TERM], len: usize) -> Key {
     })
 }
 
-/// Multiplicative hash of a key. Slots come from its top bits, which depend on every word.
+/// Multiplicative hash of the exclusive or of a key's words, one multiply rather than one per
+/// word. Slots come from its top bits, which depend on every word.
 fn key_hash(key: &Key) -> u64 {
-    (key.iter()).fold(0, |hash, &word| {
-        (hash ^ word).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-    })
+    (key.iter().fold(0, |hash, &word| hash ^ word)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 /// One slot of a [`TermTable`]: a term's first key word, its id and what the corpus pass does

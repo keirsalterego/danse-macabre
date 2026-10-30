@@ -17,6 +17,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 10 | Only the term table on transparent huge pages, allocated alone at a 2 MiB boundary; the global allocator is gone | run-b4d6bfbdd0e9 | 0.2698 | 43.9 | 67.7 |
 | 11 | A check's cell takes a match with a conditional move instead of a branch | run-6a27aa29cd80 | 0.2644 | 44.9 | 67.8 |
 | 12 | The corpus walk takes one callback per token and one per line end, so the per-token one is inlined | run-68a53e20303e | 0.2450 | 43.8 | 68.8 |
+| 13 | A token's hash multiplies the XOR of its key words once, instead of once per word | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -231,6 +232,18 @@ Locally, against step 11, three interleaved rounds: instructions 10.22 → 8.86 
 6.60–6.67 → 6.16–6.25 G, task-clock 2,858–2,893 → 2,669–2,710 ms. Alternating runs, 16 each,
 twice: median wall 272.0 and 270.5 → 255.4 and 254.0 ms (b-c4: 297.5 and 295.6). S 849 → 846.
 Gate: 507 pass, 0 fail.
+
+## Step 13: one multiply per token hash
+
+The hash of a token's key folded its four words with a multiply each, a chain of four dependent
+multiplies plus four extractions from the vector register, on every token. It now XORs the words
+in the vector register and multiplies once. Equal XORs of different keys only share a probe
+sequence, which the `head` compare still tells apart, and the slots still come from the top
+bits of the product.
+
+Locally, against step 12, three interleaved rounds: instructions 8.86 → 8.64 G, cycles
+6.18–6.19 → 6.01–6.04 G, task-clock 2,677–2,681 → 2,609–2,623 ms. Alternating runs, 16 each,
+twice: median wall 253.0 and 255.4 → 247.4 and 249.0 ms. S 846 → 844. Gate: 507 pass, 0 fail.
 
 ## Experiments that did not stay
 
