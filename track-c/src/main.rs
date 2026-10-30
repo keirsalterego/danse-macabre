@@ -36,13 +36,15 @@
 //! 3. **Each thread runs a scalar byte state machine.** [`aggregate`] walks its records one byte
 //!    at a time and sums into its own [`Group`] per country, so the hot loop shares nothing but
 //!    the name table. [`text_field`] measures a field as its raw length minus one per `""` pair,
-//!    so no field is ever unescaped or copied.
+//!    so no field is ever unescaped.
 //! 4. **Distinct names go through one shared interner.** All threads intern names in one
-//!    lock-free [`NameTable`], which gives each name's raw, still escaped bytes a dense id. Each
-//!    id owns a bitset with one bit per country. Escaping is one to one, so two raw names differ
-//!    exactly when their unescaped values do, and the quoted empty name `""` and the unquoted one
-//!    are both the empty slice. Twelve per-thread tables would each hold most of the ~100k names,
-//!    so a single shared table keeps one copy instead of twelve.
+//!    lock-free [`NameTable`]. Each distinct name's raw, still escaped bytes are copied once into
+//!    an arena entry that also holds a bitset with one bit per country, so a record's compare
+//!    and its bit land on the same cache line instead of a random line of the 200 MB file.
+//!    Escaping is one to one, so two raw names differ exactly when their unescaped values do,
+//!    and the quoted empty name `""` and the unquoted one are both the empty slice. Twelve
+//!    per-thread tables would each hold most of the ~100k names, so a single shared table keeps
+//!    one copy instead of twelve.
 //! 5. **Merge, count and print.** The per-thread [`Group`]s hold only integers, so merging them
 //!    gives the same result in any order. [`NameTable::distinct_per_group`] counts each
 //!    country's bits, and [`format_output`] writes the lines.
@@ -216,7 +218,7 @@ fn join(records: &'static [u8], regions: &Regions) -> Result<Vec<u8>, String> {
     // only slower.
     let mut slot_count = (records.len() / 512).next_power_of_two();
     loop {
-        let names = &NameTable::new(records, slot_count, group_count);
+        let names = &NameTable::new(slot_count, group_count);
         let parts = thread::scope(|s| {
             let workers: Vec<_> = (bounds.windows(2))
                 .map(|w| w[0]..w[1])
@@ -391,7 +393,7 @@ fn aggregate(
             name_bytes,
             note_bytes,
         });
-        names.mark(name, group)?;
+        names.mark(&data[name], group)?;
     }
     Some(groups)
 }
@@ -448,116 +450,139 @@ fn text_field(data: &[u8], at: usize) -> (Range<usize>, u64, usize) {
 /// The set of distinct names per country, shared by every thread without locks.
 ///
 /// It is a string interner built as an insert-only, lock-free hash table with open addressing
-/// and linear probing. A name's raw bytes get a dense id the first time any thread sees them,
-/// and each id owns a bitset with one bit per group. A record sets its group's bit with an
-/// atomic OR. A set union does not depend on which thread got there first, so the counts are
-/// deterministic.
+/// and linear probing. The first time any thread sees a name, it writes the name into one
+/// entry of a shared arena: its length, a bitset with one bit per group, and a copy of its bytes.
+/// A record then sets its group's bit with an atomic OR. A set union does not depend on which
+/// thread got there first, so the counts are deterministic.
+///
+/// The entry keeps everything a record needs side by side, so a record touches two places in
+/// the table: its slot and its entry, where the compare and the OR hit the same cache line. The
+/// copy of the bytes matters most. Comparing against the name's first occurrence in the 200 MB
+/// file instead cost a miss to DRAM on nearly every record, about 30% of all cycles.
 ///
 /// Names are interned still escaped. Escaping is one to one (each `"` becomes `""`), so two raw
 /// names are equal exactly when their unescaped values are. The empty quoted name `""` and the
-/// empty unquoted name both arrive as an empty range, so they are one name, as spec §3 asks.
-///
-/// Dense ids, instead of slot indexes, keep the bitsets contiguous: only the pages of ids in use
-/// are ever touched (see [`zeroed`]).
-struct NameTable<'a> {
-    /// The mapped `records.csv` that every name's span points into.
-    data: &'a [u8],
-    /// The hash's high 32 bits above `id + 1`, or 0 for an empty slot. Keeping a hash tag in
-    /// the slot means a probe compares bytes only when the tags match.
+/// empty unquoted name both arrive as an empty slice, so they are one name, as spec §3 asks.
+struct NameTable {
+    /// The hash's high 32 bits above `entry + 1`, the word offset of the name's entry in
+    /// `arena`, or 0 for an empty slot. Keeping a hash tag in the slot means a probe reads an
+    /// entry only when the tags match.
     slots: Box<[AtomicU64]>,
-    /// Name `id` is `data[spans[2 * id]..spans[2 * id + 1]]`.
-    spans: Box<[AtomicU64]>,
-    /// Name `id`'s groups are the set bits of `groups[id * words..(id + 1) * words]`.
-    groups: Box<[AtomicU64]>,
-    /// Bitset words per name: one bit per group, `_UNMATCHED` included.
+    /// The entries, back to back. An entry is one word holding the name's length in bytes, then
+    /// `words` bitset words, then the name in little-endian words (see [`words`]).
+    arena: Box<[AtomicU64]>,
+    /// The first free word of `arena`.
+    arena_used: AtomicUsize,
+    /// Entries written so far. They stop at half the slot count; see [`NameTable::insert`].
+    names: AtomicUsize,
+    /// Bitset words per entry: one bit per group, `_UNMATCHED` included.
     words: usize,
-    /// The next unused id. Ids stop at half the slot count; see [`NameTable::intern`].
-    next_id: AtomicUsize,
 }
 
-impl<'a> NameTable<'a> {
+impl NameTable {
     /// An empty table with `slot_count` slots (a power of two) and room for `slot_count / 2`
     /// names, each with a bit for every one of `group_count` groups.
-    fn new(data: &'a [u8], slot_count: usize, group_count: usize) -> Self {
-        let max_ids = slot_count / 2;
-        assert!(
-            max_ids < 1 << 32,
-            "a name id must fit the low half of its slot"
-        );
+    fn new(slot_count: usize, group_count: usize) -> Self {
         let words = group_count.div_ceil(64);
+        // Enough arena for names that average 32 bytes. Pages no entry reaches cost nothing
+        // (see [`zeroed`]), and a full arena reruns the join just like a full slot table.
+        let arena_words = slot_count / 2 * (1 + words + 4);
+        assert!(
+            arena_words < 1 << 32,
+            "an entry offset must fit the low half of its slot"
+        );
         Self {
-            data,
             slots: zeroed(slot_count),
-            spans: zeroed(2 * max_ids),
-            groups: zeroed(words * max_ids),
+            arena: zeroed(arena_words),
+            arena_used: AtomicUsize::new(0),
+            names: AtomicUsize::new(0),
             words,
-            next_id: AtomicUsize::new(0),
         }
     }
 
-    /// Adds `group` to the groups of the name at `data[name]`. Returns `None` when the table is
-    /// full.
-    fn mark(&self, name: Range<usize>, group: usize) -> Option<()> {
-        let id = self.intern(name)?;
-        self.groups[id * self.words + group / 64].fetch_or(1 << (group % 64), Relaxed);
+    /// Adds `group` to the groups of `name`. Returns `None` when the table is full.
+    fn mark(&self, name: &[u8], group: usize) -> Option<()> {
+        let entry = self.intern(name)?;
+        self.arena[entry + 1 + group / 64].fetch_or(1 << (group % 64), Relaxed);
         Some(())
     }
 
-    /// Returns the id of the name at `data[name]`, inserting it if it is new.
+    /// Returns the offset of `name`'s entry, inserting the name if it is new.
     ///
-    /// An insert claims an id, writes the name's span, then publishes both with a
-    /// compare-and-swap on the empty slot. The span is written before the slot, so any thread
-    /// that sees the slot also sees the span. Ids stop at half the slot count, so at least half
-    /// the slots stay empty and every probe ends at an empty slot. Past that this returns
-    /// `None`, and [`join`] reruns with a bigger table.
-    fn intern(&self, name: Range<usize>) -> Option<usize> {
+    /// A new entry is written in full first and then published with a compare-and-swap on the
+    /// empty slot. Release on that swap and Acquire on every slot load mean that any thread that
+    /// sees the slot also sees the whole entry.
+    fn intern(&self, name: &[u8]) -> Option<usize> {
         const LOW: u64 = u32::MAX as u64;
-        let bytes = &self.data[name.clone()];
-        let hash = hash(bytes);
+        let hash = hash(name);
         let mask = self.slots.len() - 1;
         let mut slot = hash as usize & mask;
         loop {
             let mut seen = self.slots[slot].load(Acquire);
             if seen == 0 {
-                let id = self.next_id.fetch_add(1, Relaxed);
-                if id >= self.slots.len() / 2 {
-                    return None;
-                }
-                self.spans[2 * id].store(name.start as u64, Relaxed);
-                self.spans[2 * id + 1].store(name.end as u64, Relaxed);
-                // Release publishes the span along with the slot. A thread that loses the race
-                // leaves `id` unused: its group bits stay 0, so it counts for nothing.
-                let new = hash & !LOW | (id as u64 + 1);
+                let entry = self.insert(name)?;
+                // A thread that loses the race leaves its entry unpublished: the entry's group
+                // bits stay 0, so it counts for nothing.
+                let new = hash & !LOW | (entry as u64 + 1);
                 match self.slots[slot].compare_exchange(0, new, Release, Acquire) {
-                    Ok(_) => return Some(id),
+                    Ok(_) => return Some(entry),
                     Err(winner) => seen = winner,
                 }
             }
             // A matching tag is not proof: names are always compared byte for byte.
-            if seen & !LOW == hash & !LOW {
-                let id = (seen & LOW) as usize - 1;
-                let start = self.spans[2 * id].load(Relaxed) as usize;
-                let end = self.spans[2 * id + 1].load(Relaxed) as usize;
-                if self.data[start..end] == *bytes {
-                    return Some(id);
-                }
+            if seen & !LOW == hash & !LOW && self.holds((seen & LOW) as usize - 1, name) {
+                return Some((seen & LOW) as usize - 1);
             }
             slot = (slot + 1) & mask;
         }
     }
 
-    /// Per group, the number of names whose bit for that group is set. It runs after every
-    /// thread has joined, so plain relaxed loads see every bit.
+    /// Writes a new, unpublished entry for `name` and returns its offset.
+    ///
+    /// Returns `None` once the arena is full or the entries reach half the slot count; then
+    /// [`join`] reruns with a bigger table. The second limit keeps at least half the slots
+    /// empty, so every probe in [`NameTable::intern`] ends at an empty slot.
+    fn insert(&self, name: &[u8]) -> Option<usize> {
+        let size = 1 + self.words + name.len().div_ceil(8);
+        let entry = self.arena_used.fetch_add(size, Relaxed);
+        if self.names.fetch_add(1, Relaxed) >= self.slots.len() / 2
+            || entry + size > self.arena.len()
+        {
+            return None;
+        }
+        self.arena[entry].store(name.len() as u64, Relaxed);
+        let text = &self.arena[entry + 1 + self.words..entry + size];
+        text.iter()
+            .zip(words(name))
+            .for_each(|(a, w)| a.store(w, Relaxed));
+        Some(entry)
+    }
+
+    /// Whether the entry at `entry` holds `name`: same length, then the same words.
+    fn holds(&self, entry: usize, name: &[u8]) -> bool {
+        let text = &self.arena[entry + 1 + self.words..];
+        self.arena[entry].load(Relaxed) == name.len() as u64
+            && words(name).zip(text).all(|(w, a)| a.load(Relaxed) == w)
+    }
+
+    /// Per group, the number of names whose bit for that group is set, found by walking the
+    /// arena entry by entry. It runs after every thread has joined, so relaxed loads see every
+    /// bit, and every entry in the arena is complete.
     fn distinct_per_group(&self) -> Vec<u64> {
-        let ids = self.next_id.load(Relaxed).min(self.slots.len() / 2);
         let mut distinct = vec![0; self.words * 64];
-        for (i, word) in self.groups[..ids * self.words].iter().enumerate() {
-            let mut bits = word.load(Relaxed);
-            // Visit only the set bits: take the lowest, then clear it.
-            while bits != 0 {
-                distinct[i % self.words * 64 + bits.trailing_zeros() as usize] += 1;
-                bits &= bits - 1;
+        let (mut entry, used) = (0, self.arena_used.load(Relaxed));
+        while entry < used {
+            let len = self.arena[entry].load(Relaxed) as usize;
+            let bitset = &self.arena[entry + 1..entry + 1 + self.words];
+            for (w, word) in bitset.iter().enumerate() {
+                let mut bits = word.load(Relaxed);
+                // Visit only the set bits: take the lowest, then clear it.
+                while bits != 0 {
+                    distinct[w * 64 + bits.trailing_zeros() as usize] += 1;
+                    bits &= bits - 1;
+                }
             }
+            entry += 1 + self.words + len.div_ceil(8);
         }
         distinct
     }
@@ -573,19 +598,25 @@ fn zeroed(len: usize) -> Box<[AtomicU64]> {
     unsafe { Box::new_zeroed_slice(len).assume_init() }
 }
 
+/// A name as little-endian 8-byte words, the last one zero-padded: the form [`hash`] mixes and
+/// the arena stores. Comparing words instead of bytes takes two steps for a typical 10-byte name.
+fn words(name: &[u8]) -> impl Iterator<Item = u64> {
+    let (whole, tail) = name.as_chunks::<8>();
+    let mut last = [0; 8];
+    last[..tail.len()].copy_from_slice(tail);
+    let last = (!tail.is_empty()).then_some(u64::from_le_bytes(last));
+    whole.iter().map(|w| u64::from_le_bytes(*w)).chain(last)
+}
+
 /// Hashes a name with `FxHash`, the rotate-XOR-multiply hash rustc uses for its own tables.
 ///
 /// It takes eight bytes per step, and a final fold mixes the high half into the low half, so
 /// the low bits (the slot) and the high bits (the tag) both depend on every byte. The length
 /// seeds the hash, so names that differ only by trailing spaces, such as `Betts` and `Betts `,
 /// differ from the first step.
-fn hash(bytes: &[u8]) -> u64 {
+fn hash(name: &[u8]) -> u64 {
     let mix = |h: u64, w: u64| (h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
-    let (words, tail) = bytes.as_chunks::<8>();
-    let h = (words.iter()).fold(bytes.len() as u64, |h, w| mix(h, u64::from_le_bytes(*w)));
-    let mut last = [0; 8];
-    last[..tail.len()].copy_from_slice(tail);
-    let h = mix(h, u64::from_le_bytes(last));
+    let h = words(name).fold(name.len() as u64, mix);
     h ^ (h >> 32)
 }
 
