@@ -25,6 +25,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 18 | The name table's padded copies aligned to cache lines, and its slot array a fixed-size box | run-01b9bf369035 | 0.0212 | 20.6 | 83.5 |
 | 19 | The name hash takes one multiply instead of three dependent ones, and the slot is the product's top bits | run-4d1c6d742295 | 0.0207 | 21.3 | 83.5 |
 | 20 | Each output line built in a stack buffer with digit counts from the SWAR conversion; 12 fewer lines | | | | |
+| 21 | Each small group loaded into the sorting network with one AVX2 masked load | | | | |
 
 ## Step 1: v1
 
@@ -249,6 +250,20 @@ Tried and dropped: faulting the output pages in ahead with `MADV_POPULATE_WRITE`
 (slower than plain faults in a 12-thread test, 1.15–1.26 against 1.04–1.07 ms) or during the hour
 pass (0.6 ms off the format phase, 1 ms onto the hour pass). A page fault on the output costs
 about 1.9 µs even without contention.
+
+## Step 21: masked loads into the sorting network
+
+A group of up to 64 latencies used to reach the sorting network one value at a time, each with
+a bounds check (`get().unwrap_or(MAX)`), through a stack buffer. Now each register is filled by
+`_mm256_maskload_epi32`: lanes past the group's end read nothing and hold 0, so they sort to the
+front, and the wanted ranks move up by the number of padding lanes. A real latency of 0 sorts
+among them, which is still right, since every padding lane is at most every real value. The
+masked lanes never fault, even past a page end.
+
+Local, turbo off, `ab.py` with 31 interleaved runs, two rounds: medians 22.81 → 22.52 and
+22.98 → 22.68 ms, minimums 22.24 → 22.00 and 22.24 → 21.98 ms. `perf stat`, 7 interleaved runs:
+user cycles 423.9 → 416.8 M, branch misses 1.25 → 1.12 M, instructions 779.1 → 773.9 M.
+memory.peak unchanged. S unchanged at 400. Gate: 307 pass, 0 fail.
 
 ## Experiments that did not stay
 
