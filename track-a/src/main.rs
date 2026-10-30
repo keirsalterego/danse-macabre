@@ -56,8 +56,7 @@
 //!
 //! Every step's measurements are in `PERF.md`.
 
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::sync::{Barrier, Mutex, OnceLock};
+use std::sync::{Barrier, Mutex, OnceLock, atomic::AtomicUsize, atomic::Ordering::Relaxed};
 use std::{cmp::Reverse, error::Error, fs::File, num::NonZeroUsize, ops::Range, os::fd::AsRawFd};
 use std::{io::Write, path::Path, ptr::null_mut, thread};
 
@@ -239,9 +238,9 @@ fn summarize(log: &[u8], out_path: &Path) {
         // Every hour's length is known now, so the first thread here gives each its place.
         let queue = places.get_or_init(|| {
             let hours: Vec<&Hour> = hours.iter().map(|h| h.get().expect("summarized")).collect();
-            let len = hours.iter().map(|hour| hour.len).sum();
+            let len = hours.iter().map(|(_, len)| len).sum();
             let mut rest = map_output(out_path, len).unwrap_or_else(|e| panic!("{e}"));
-            let mut place = |hour: &Hour| rest.split_off_mut(..hour.len).expect("lengths add up");
+            let mut place = |&(_, len): &Hour| rest.split_off_mut(..len).expect("lengths add up");
             let places = hours.into_iter().map(|hour| (hour, place(hour)));
             Mutex::new(places.enumerate().collect::<Vec<_>>())
         });
@@ -254,8 +253,8 @@ fn summarize(log: &[u8], out_path: &Path) {
         release(&chunk.records);
         release(&chunk.large);
         let next = || queue.lock().expect("panics abort").pop();
-        while let Some((index, (hour, place))) = next() {
-            format_hour(index, &hour.lines, names, place);
+        while let Some((index, ((lines, _), place))) = next() {
+            format_hour(index, lines, names, place);
         }
         release(&log[len * t / threads..len * (t + 1) / threads]);
         if finished.fetch_add(1, Relaxed) + 1 == threads {
@@ -271,11 +270,10 @@ fn summarize(log: &[u8], out_path: &Path) {
 /// the last of twelve threads starts after four spawns instead of eleven. A spawn took about
 /// 50 µs, and every thread parses an equal share, so the last to start was the last to finish.
 fn fan_out<'s, F: Fn(usize) + Sync>(s: &'s thread::Scope<'s, '_>, ts: Range<usize>, work: &'s F) {
-    let mut ts = ts;
-    while ts.len() > 1 {
-        let upper = ts.start + ts.len() / 2..ts.end;
-        ts.end = upper.start;
-        s.spawn(move || fan_out(s, upper, work));
+    if ts.len() > 1 {
+        let mid = ts.start + ts.len() / 2;
+        s.spawn(move || fan_out(s, mid..ts.end, work));
+        return fan_out(s, ts.start..mid, work);
     }
     work(ts.start);
 }
@@ -625,14 +623,12 @@ fn same_name(window: &[u8; 64], known: &[u8; 64], len: usize) -> bool {
 }
 
 /// One hour of output, ready to format: [`summarize_hour`] fills it, [`format_hour`] writes it.
-struct Hour {
-    /// One entry per output line, in output order: the endpoint's id, then the request count,
-    /// the p50, p95 and p99 latencies and the error count.
-    lines: Vec<[u32; 6]>,
-    /// The exact length of the formatted hour, in bytes, so that its place in the output file
-    /// is known before any hour is formatted.
-    len: usize,
-}
+///
+/// First its lines, one entry per output line in output order: the endpoint's id, then the
+/// request count, the p50, p95 and p99 latencies and the error count. Then the exact length of
+/// the formatted hour, in bytes, so that its place in the output file is known before any hour
+/// is formatted.
+type Hour = (Vec<[u32; 6]>, usize);
 
 /// One run of lines from one hour: their records, their chunk's large latencies from the run's
 /// first one on (see [`Chunk`]), and the table from their chunk's endpoint ids to global ids.
@@ -693,7 +689,7 @@ fn summarize_hour(runs: &[Run], order: &[usize], names: &[&[u8]], buffer: &mut V
             lines.push(line);
         }
     }
-    Hour { lines, len }
+    (lines, len)
 }
 
 /// Returns the p50, p95 and p99 of `group`, which it reorders.
@@ -802,7 +798,7 @@ fn format_hour(hour: usize, lines: &[[u32; 6]], names: &[&[u8]], mut place: &mut
             end = put_number(&mut text, end, value);
         }
         text[end] = b'\n';
-        place.write_all(&text[..=end]).expect("lengths add up"); // fails if `Hour::len` was short
+        place.write_all(&text[..=end]).expect("lengths add up"); // fails if the hour's length was short
     }
 }
 
