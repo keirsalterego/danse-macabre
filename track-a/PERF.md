@@ -24,7 +24,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 17 | The last thread to finish ends the process instead of joining the others; 15 fewer lines | run-3ba29a3569ef | 0.0209 | 21.1 | 83.5 |
 | 18 | The name table's padded copies aligned to cache lines, and its slot array a fixed-size box | run-01b9bf369035 | 0.0212 | 20.6 | 83.5 |
 | 19 | The name hash takes one multiply instead of three dependent ones, and the slot is the product's top bits | run-4d1c6d742295 | 0.0207 | 21.3 | 83.5 |
-| 20 | Each output line built in a stack buffer with digit counts from the SWAR conversion; 12 fewer lines | | | | |
+| 20 | Each output line built in a stack buffer with digit counts from the SWAR conversion; 12 fewer lines | run-1df3325795e7 | 0.0220 | 21.2 | 83.0 |
 | 21 | Each small group loaded into the sorting network with one AVX2 masked load | | | | |
 | 22 | The hour label formatted once per hour into the line buffer, and each number of up to 7 digits written with one store; 5 fewer lines | | | | |
 
@@ -234,6 +234,9 @@ Local, turbo off: instructions 822.3 → 801.2 M; user cycles, 3 interleaved set
 412. Gate: 307 pass, 0 fail.
 
 ## Step 20: a leaner formatter, and 12 fewer lines
+
+The board's first run of this code, run-9ab4c13e512d, drew 26.3 ms; the next, run-1df3325795e7,
+21.98 ms: that is the row.
 
 Each output line is built in a 256-byte stack buffer instead of a `Vec`, the hour label is
 written once per hour, and `put_number` writes at a cursor. The digit count comes from the
