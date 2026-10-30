@@ -54,28 +54,17 @@
 //! searches cannot leave the other threads idle. Every answer has its own slot, and `main` prints
 //! the slots in input order, so the output never depends on which thread answered what.
 
-use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-use std::error::Error;
-use std::io::{self, Write};
-use std::os::fd::AsRawFd;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::thread;
+use std::{cmp::Reverse, error::Error, io, io::Write, os::fd::AsRawFd, path::Path, thread};
 
 // `mmap(2)` and `mallopt(3)` from the C library, which std links already. Declaring them here
-// saves the `libc` crate.
+// saves the `libc` crate. The constants are Linux's, from `<sys/mman.h>` and `<malloc.h>`; a
+// comment at each call names them.
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
 }
-/// `mallopt` parameter: glibc serves every allocation of at least this many bytes with its own
-/// `mmap`, and unmaps it when it is freed.
-const M_MMAP_THRESHOLD: i32 = -3;
-/// `mmap` protection: the pages may be read, and nothing else.
-const PROT_READ: i32 = 1;
-/// `mmap` flag: a private mapping. We never write to it, so it shares the page cache's pages.
-const MAP_PRIVATE: i32 = 2;
 
 /// The answer for an unreachable target, and the top of an empty queue. Real distances are below
 /// 2^63 (spec §3), so they never collide with it, and it prints as `-1` once read as an `i64`.
@@ -85,14 +74,15 @@ const UNREACHABLE: u64 = u64::MAX;
 /// and writes `distances.txt`, one answer per query in input order, to the output directory
 /// (second argument, default `/out`).
 fn main() -> Result<(), Box<dyn Error>> {
-    // By default glibc raises that threshold to the size of each mapped block it frees, up to
-    // 32 MB: here to 10 MB, when the build frees its place arrays. The label tables then come
-    // from the heap, where each table a search outgrows stays behind as free space that still
-    // counts as used. A fixed threshold unmaps them instead. 64 KiB, half the default, also maps
-    // the tables of 4,096 buckets (70 KB) and up. On seed 1 the peak fell from 91-96 MB to
-    // 82 MB, at the same wall time.
+    // M_MMAP_THRESHOLD (-3): glibc serves every allocation of at least this many bytes with its
+    // own `mmap`, and unmaps it when it is freed. By default glibc raises that threshold to the
+    // size of each mapped block it frees, up to 32 MB: here to 10 MB, when the build frees its
+    // place arrays. The label tables then come from the heap, where each table a search outgrows
+    // stays behind as free space that still counts as used. A fixed threshold unmaps them
+    // instead. 64 KiB, half the default, also maps the tables of 4,096 buckets (70 KB) and up. On
+    // seed 1 the peak fell from 91-96 MB to 82 MB, at the same wall time.
     // SAFETY: sets a malloc parameter; no other thread exists yet.
-    unsafe { mallopt(M_MMAP_THRESHOLD, 64 << 10) };
+    unsafe { mallopt(-3, 64 << 10) };
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
@@ -108,8 +98,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let [forward, reverse] = build_graph(&graph_txt[at..], n as usize, threads)?;
 
     // One `s t` line per query, no header (spec §2).
-    let mut queries = Vec::new();
-    let mut at = 0;
+    let (mut queries, mut at) = (Vec::new(), 0);
     while at < queries_txt.len() {
         queries.push((number(queries_txt, &mut at), number(queries_txt, &mut at)));
     }
@@ -137,9 +126,10 @@ fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
     if len == 0 {
         return Ok(&[]); // mmap rejects a zero length, and an empty queries.txt is legal (spec §2)
     }
-    let fd = file.as_raw_fd();
+    // PROT_READ (1): the pages may only be read. MAP_PRIVATE (2): we never write to them, so the
+    // mapping shares the page cache's pages.
     // SAFETY: a new read-only private mapping of an open fd; the kernel picks the address.
-    let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0) };
+    let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0) };
     if ptr.addr() == usize::MAX {
         return Err(format!("mmap {}: {}", path.display(), io::Error::last_os_error()).into());
     }
@@ -250,8 +240,7 @@ fn on_threads<T: Send>(items: impl IntoIterator<Item = T>, work: impl Fn(T) + Sy
 /// a label, a duplicate changes nothing, and a self-loop never improves one (spec §3). Each
 /// node's edges end up in an order set by the chunking, and no distance depends on it.
 fn build_graph(body: &[u8], n: usize, threads: usize) -> Result<[Csr; 2], Box<dyn Error>> {
-    let chunks = line_chunks(body, threads);
-    let blocks = n.div_ceil(BLOCK);
+    let (chunks, blocks) = (line_chunks(body, threads), n.div_ceil(BLOCK));
     // Pass 1: counts[chunk][direction][block]. Direction 0 is keyed by the tail (the forward
     // graph), direction 1 by the head (the reverse graph).
     let mut counts = vec![[vec![0; blocks], vec![0; blocks]]; chunks.len()];

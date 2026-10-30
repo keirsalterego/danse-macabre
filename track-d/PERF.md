@@ -18,6 +18,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 11 | Each queue's top kept between steps; a step recomputes only its own side's | run-37fab0938045 | 0.1280 | 69.4 | 72.3 |
 | 12 | Pass 2's runs kept as two slice iterators instead of their `zip`: 32 bytes a run instead of 48 | run-0581a96cbf3c | 0.1259 | 70.7 | 72.4 |
 | 13 | Labels as `u32` distances, with the rare longer ones behind a `u32::MAX` in a second map | | | | |
+| 14 | 11 fewer lines with the same machine code: the single-item `use` lines in one, the `mmap` and `mallopt` constants written at their one call each with their names in a comment, the file descriptor passed straight to `mmap`, and two pairs of variables declared together | | | | |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
@@ -377,6 +378,16 @@ the other side has the node in 5,031 of the 8.65M lookups.
 - S 448 → 453. Gate: 509 pass, 0 fail. Fresh seeds 5 to 9, 31 and 47: byte-identical to the
   reference.
 
+## Step 14: 11 fewer lines
+
+The six single-item `use` lines become one; `M_MMAP_THRESHOLD`, `PROT_READ` and `MAP_PRIVATE`
+are written as numbers at their one call each, with their names and meaning in the comment above
+it; `map_file` passes `file.as_raw_fd()` straight to `mmap`; and `main` and `build_graph` each
+declare a pair of variables together. `.text` and `.rodata` are byte-identical to step 13's, so T
+and M cannot move. S 453 → 442. Gate: 509 pass, 0 fail.
+
+Steps 13 and 14 went to the board in one push, so both rows cite the same run.
+
 ## Tried and reverted (local, turbo off, no run ID)
 
 Each row's baseline ran in the same interleaved session as the experiment, so baselines differ
@@ -430,3 +441,4 @@ between rows.
 | Each pass-2 thread drops its chunk's pages of graph.txt (`madvise(MADV_DONTNEED)`, 3 lines), so the exit has fewer to unmap, as track B's step 17 does | `ab.py`, 30 interleaved runs, medians 132.68 → 131.95, 133.93 → 134.01 (seed 2) and 133.41 → 133.53 ms, minimums 0.6–1.3 ms lower; kernel cycles 155–157 → 163–165 M | No gain in the median: 22k page-cache entries take little time to unmap, and the drops interrupt the threads still parsing |
 | A node's edge back to the node that labelled it skipped, with that parent carried in the queue entry, and a label's old ring entry unlinked when the label improves (on step 12) | `ab.py`, 31 runs: the skip alone 132.85 → 133.60 ms, both 132.25 → 132.40 ms (medians). Instructions 5.10 → 4.98 G, branch misses 19.0 → 23.6 M, cycles 3.36 G in both | The skip is a branch on the data that mispredicts, and the 450k stale pops of 7.57M (seed 1) that the unlinking removes saved no time |
 | Every label table made with room for 32,768 labels (65,536 buckets) from the start, to skip its growth (on a first version of step 13) | `ab.py`, 31 runs, same session: median 130.67 → 135.73 ms | Most queries had run in 32,768 buckets; spread over twice as many, their labels miss the caches more |
+| Line cuts that change the machine code, on step 12: `split_runs` through `split_off_mut` (4 lines), `sort`'s prefix sum as a `fold` (3), its copy iterated in the loop header (1) | `.text` differs from step 12's in 4,175 and 573 lines of disassembly with addresses stripped; the third keeps it but draws a clippy warning (`unnecessary_to_owned`) | Not measured: code placement alone moved this track's time by about 1 ms (step 12) |
