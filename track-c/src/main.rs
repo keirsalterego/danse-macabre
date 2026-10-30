@@ -103,10 +103,16 @@ const BOM: &[u8] = b"\xEF\xBB\xBF";
 /// The first line of `records.csv`, after its optional BOM.
 const HEADER: &[u8] = b"id,name,note,region_id,amount";
 /// One more record, which [`map_file`] puts after the last byte of `records.csv`, on a line of
-/// its own. Its name and note are quoted and hold more than quotes, so a parse that starts
-/// inside a record stops within it at the latest (see [`guess_bounds`]), and no parse can run
-/// off the end of the input. No run covers it, so it never reaches the output.
-const SENTINEL: &[u8] = b"\n0,\"a\",\"a\",0,0.00\n";
+/// its own, and then 32 zero bytes. The record's name and note are quoted and hold more than
+/// quotes, so a parse that starts inside a record stops within it at the latest (see
+/// [`guess_bounds`]), and no parse can run off the end of the input. No run covers it, so it
+/// never reaches the output.
+///
+/// The zeros are padding. Every position a parse reaches lies before them, so the fixed-size
+/// reads of [`number`] (8 bytes), [`name_letter`] (24) and [`text_field`] (32) always fit in the
+/// input, and none of them needs a shorter path for its end.
+const SENTINEL: &[u8] = b"\n0,\"a\",\"a\",0,0.00\n\
+    \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 /// The number of possible country codes. Codes are `[A-Z]{3}` (spec §2.3), so a code read as a
 /// base-26 number indexes a table of 26³ entries, and that number sorts like the code's bytes.
 const CODES: usize = 26 * 26 * 26;
@@ -415,10 +421,8 @@ fn body_start(records: &[u8]) -> Result<usize, String> {
 fn guess_bounds(file: &[u8], body: usize, parts: usize) -> Vec<usize> {
     // After an LF, a digit or a BOM, whose first byte is 0xEF. The first guess is `body` itself.
     let start = |&k: &usize| file[k - 1] == b'\n' && matches!(file[k], b'0'..=b'9' | 0xEF);
-    let guess = |i| {
-        let cut = body + (file.len() - body) * i / parts;
-        (cut..file.len()).find(start).unwrap_or(file.len())
-    };
+    let cut = |i| body + (file.len() - body) * i / parts;
+    let guess = |i| (cut(i)..file.len()).find(start).unwrap_or(file.len());
     (0..parts).map(guess).chain([file.len()]).collect()
 }
 
@@ -566,28 +570,26 @@ fn aggregate(
 /// `stop` into a zero byte, which a zero-byte test finds. Shifting the digits to the top of the
 /// word turns the missing ones into leading zeros, and three multiplies then join neighbouring
 /// digits into pairs, pairs into fours and fours into the value. Longer fields, such as an id
-/// with leading zeros (§2.1 allows them), and the last 7 bytes of `data` take the loop over
-/// bytes.
+/// with leading zeros (§2.1 allows them), take the loop over bytes. The word is always there,
+/// because the [`SENTINEL`] pads the input.
 ///
 /// It is always inlined. At each of its three call sites `stop` is a constant, so the call and
 /// the multiply that copies `stop` into every byte disappear, 29 instructions per record.
 #[inline(always)]
 fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
     const ONES: u64 = u64::from_le_bytes([1; 8]);
-    if let Some(&chunk) = data[at..].first_chunk() {
-        let word = u64::from_le_bytes(chunk);
-        let x = word ^ (ONES * u64::from(stop));
-        // The lowest set bit marks the first zero byte of `x`, so the first `stop`. Bits above
-        // it can be false, which is why only the lowest one is used.
-        let stops = x.wrapping_sub(ONES) & !x & (ONES << 7);
-        if stops != 0 {
-            let len = stops.trailing_zeros() as usize / 8;
-            // In two steps, because a 0-digit field would need a shift by 64.
-            let digits = ((word & (ONES * 0x0F)) << (56 - 8 * len)) << 8;
-            let pairs = (digits.wrapping_mul(10 << 8 | 1) >> 8) & 0x00FF_00FF_00FF_00FF;
-            let fours = (pairs.wrapping_mul(100 << 16 | 1) >> 16) & 0x0000_FFFF_0000_FFFF;
-            return (fours.wrapping_mul(10000 << 32 | 1) >> 32, at + len);
-        }
+    let word = u64::from_le_bytes(*data[at..].first_chunk().expect("the input is padded"));
+    let x = word ^ (ONES * u64::from(stop));
+    // The lowest set bit marks the first zero byte of `x`, so the first `stop`. Bits above it
+    // can be false, which is why only the lowest one is used.
+    let stops = x.wrapping_sub(ONES) & !x & (ONES << 7);
+    if stops != 0 {
+        let len = stops.trailing_zeros() as usize / 8;
+        // In two steps, because a 0-digit field would need a shift by 64.
+        let digits = ((word & (ONES * 0x0F)) << (56 - 8 * len)) << 8;
+        let pairs = (digits.wrapping_mul(10 << 8 | 1) >> 8) & 0x00FF_00FF_00FF_00FF;
+        let fours = (pairs.wrapping_mul(100 << 16 | 1) >> 16) & 0x0000_FFFF_0000_FFFF;
+        return (fours.wrapping_mul(10000 << 32 | 1) >> 32, at + len);
     }
     let mut value = 0;
     while data[at] != stop {
@@ -607,8 +609,8 @@ fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
 ///
 /// Inside quotes only the quotes matter, so the scan jumps from one quote to the next with
 /// [`byte_mask`], 32 bytes per step. A name or a note usually ends within the first step, where
-/// a loop over bytes took one step and one branch per byte. The last 31 bytes of `data`, too few
-/// for a step, go one byte at a time.
+/// a loop over bytes took one step and one branch per byte. Every step has its 32 bytes, because
+/// the [`SENTINEL`] pads the input.
 ///
 /// It is always inlined. As a call it returned its four words through the stack, and the caller
 /// read two of them back with one 16-byte load, which waits until both 8-byte stores reach the
@@ -634,10 +636,8 @@ fn text_field(data: &[u8], at: usize) -> (Range<usize>, u64, usize) {
     loop {
         // On to the next quote. An empty mask has 32 trailing zeros, so a step that finds no
         // quote moves on by all 32 bytes.
-        end += match data[end..].first_chunk() {
-            Some(chunk) => byte_mask(chunk, b'"').trailing_zeros() as usize,
-            None => usize::from(data[end] != b'"'),
-        };
+        let chunk = data[end..end + 32].try_into().expect("32 bytes");
+        end += byte_mask(chunk, b'"').trailing_zeros() as usize;
         if data[end] != b'"' {
             continue;
         }
@@ -785,7 +785,8 @@ const KEY: u64 = (1 << 48) - 1;
 ///
 /// The three words come from one fixed-size read past the name's start, masked to its length,
 /// so short names need no variable-length copy. The bytes after a name are the rest of its
-/// record, so the read stays in the file except for the last few bytes.
+/// record, and the [`SENTINEL`] pads the input, so the read always fits. With a shorter copy for
+/// the end of the input as well, LLVM merges both copies into one call to `memcpy` per record.
 ///
 /// The hash is `FxHash`, the rotate-XOR-multiply hash rustc uses for its own tables, with a
 /// final fold of the high half into the low half, so the 32 bits kept depend on every word. The
@@ -794,12 +795,7 @@ const KEY: u64 = (1 << 48) - 1;
 /// enough to pick an owner, and the owner compares long names in full.
 fn name_letter(data: &[u8], Range { start, end }: Range<usize>) -> [u64; 4] {
     let len = end - start;
-    let mut bytes = [0; INLINE];
-    match data.get(start..start + INLINE) {
-        Some(window) => bytes.copy_from_slice(window),
-        // Only a name shorter than the window can end this close to the end of the file.
-        None => bytes[..len].copy_from_slice(&data[start..end]),
-    }
+    let bytes: &[u8; INLINE] = data[start..].first_chunk().expect("the input is padded");
     let words: [u64; 3] = std::array::from_fn(|i| {
         let keep = len.saturating_sub(8 * i).min(8);
         u64::from_le_bytes(bytes.as_chunks().0[i]) & ((1u128 << (8 * keep)) - 1) as u64
@@ -945,10 +941,9 @@ fn format_output(groups: &[Group], regions: &Regions) -> Vec<u8> {
     let mut out = Vec::new();
     // Group k + 1 is country k, and group 0, `_UNMATCHED`, goes last.
     let keys = (regions.codes.iter().map(|code| &code[..])).chain([&b"_UNMATCHED"[..]]);
-    for (key, group) in keys.zip(groups[1..].iter().chain(&groups[..1])) {
-        if group.count == 0 {
-            continue; // a country without records prints nothing (§3)
-        }
+    let lines = keys.zip(groups[1..].iter().chain(&groups[..1]));
+    // A country without records prints nothing (§3).
+    for (key, group) in lines.filter(|(_, group)| group.count > 0) {
         out.extend_from_slice(key);
         writeln!(
             out,

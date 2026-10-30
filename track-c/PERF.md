@@ -19,6 +19,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 12 | The BOM test reads one byte before it compares three, which takes a `bcmp` call off every record. A sentinel record after the mapped input replaces step 10's exact tail, and one thread replaces the quote pre-pass after a wrong guess | run-213d735f8f1d | 0.0368 | 12.2 | 74.3 |
 | 13 | 18 fewer lines in the region table, the exchange and the name set, at the same speed | run-5fd07fa31be9 | 0.0415 | 13.0 | 72.8 |
 | 14 | 11 fewer lines: one helper runs both thread groups, and the exchange wakes every worker | | | | |
+| 15 | The input padded with 32 zero bytes after the sentinel record, so the field parsers lose their end-of-input paths and a per-record `memcpy`; 11 fewer lines | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -491,6 +492,23 @@ hot loop's register allocation.
 regions only (100 each) 4.73 / 4.24 → 4.81 / 4.16 ms. memory.peak, 4 runs: 12.23 → 12.22 MiB.
 S 545 → 534. Gate: 307 pass, 0 fail; the 402 random cases at 1, 3, 12, 37 and 64 threads and in
 the tiny-round build; the output hash is unchanged.
+
+## Step 15: a padded input, and no `memcpy` per record
+
+The sentinel record after the file is now followed by 32 zero bytes. Every position a parse
+reaches lies before those zeros, so the fixed-size reads of `number`, `text_field` and
+`name_letter` always fit, and their paths for the end of the input go. That also removes the
+one libc call left on the per-record path: LLVM had merged `name_letter`'s 24-byte copy and its
+shorter end-of-input copy into one `memcpy` with a variable length. An audit of the per-record
+path finds no other call; the `bcmp` in `NameSet::read` runs only for names over 24 bytes.
+Two smaller cuts: `guess_bounds` computes its cut in a closure, and the output loop filters out
+countries without records.
+
+Local, on top of step 13 (P-cores, a loaded machine, 151 interleaved runs, median / min):
+42.34 / 39.60 → 42.08 / 39.53 ms. `perf stat -r 10`, three interleaved rounds: instructions
+1.637 → 1.549 G (−5.4%), cycles and task-clock flat, page faults 6,390 in both. Merged with
+step 14, S 534 → 523. Gate: 307 pass, 0 fail; full seeds 1–7; the 400 random and 400 hostile
+cases at 1, 3, 12, 37 and 64 threads; the forced-cut test on 490,079 offsets of 72 files.
 
 ## Experiments that did not stay
 
