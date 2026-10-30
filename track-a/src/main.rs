@@ -59,6 +59,7 @@ use std::fs::File;
 use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
@@ -221,17 +222,19 @@ fn summarize(log: &[u8], out_path: &Path) -> Result<(), Box<dyn Error>> {
         places.push((hour, place));
         rest = after;
     }
-    // Every hour has its place in the file now, so the threads format in parallel. Each takes
-    // an equal run of hours, and first frees one chunk's records: no hour needs them any more.
+    // Every hour has its place in the file now, so the threads format in parallel, taking the
+    // next hour from a shared queue until none is left. Each first frees one chunk's records:
+    // no hour needs them any more. Releasing the input waits until the end, because freeing
+    // pages interrupts every other thread to flush its TLB, which cost 3 ms in the hour pass.
+    let queue = Mutex::new(places.into_iter());
+    let queue = &queue;
     thread::scope(|s| {
-        let mut places = &mut places[..];
         for (t, chunk) in chunks.iter().enumerate() {
-            let (mine, others) = places.split_at_mut(places.len() / (threads - t));
-            places = others;
             s.spawn(move || {
                 release(&chunk.records);
                 let mut text = Vec::new();
-                for (hour, place) in mine {
+                let next = || queue.lock().expect("a panic aborts the process").next();
+                for (hour, place) in std::iter::from_fn(next) {
                     text.clear();
                     format_hour(hour, names, &mut text);
                     place.copy_from_slice(&text); // panics if `Hour::len` was wrong
