@@ -429,11 +429,37 @@ fn summarize_hours(
             out.extend_from_slice(label.as_bytes());
             out.push(b' ');
             out.extend_from_slice(name);
-            writeln!(out, " {n} {p50} {p95} {p99} {errors} {error_ppm}")
-                .expect("writing to a Vec cannot fail");
+            for value in [
+                n as u64,
+                p50.into(),
+                p95.into(),
+                p99.into(),
+                errors,
+                error_ppm,
+            ] {
+                push_number(&mut out, value);
+            }
+            out.push(b'\n');
         }
     }
     out
+}
+
+/// Appends a space and `value` in decimal. 760k numbers go through here, and `write!`'s
+/// formatting machinery cost more than the digits themselves.
+fn push_number(out: &mut Vec<u8>, mut value: u64) {
+    let mut digits = [0; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    out.push(b' ');
+    out.extend_from_slice(&digits[at..]);
 }
 
 /// `YYYY-MM-DDTHH:00:00Z` for hour index `hour` of the span that starts 2026-10-30T18:00Z.
