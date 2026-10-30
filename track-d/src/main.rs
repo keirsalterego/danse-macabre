@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // size of each mapped block it frees, up to 32 MB: here to 10 MB, when the build frees its
     // place arrays. The label tables then come from the heap, where each table a search outgrows
     // stays behind as free space that still counts as used. A fixed threshold unmaps them
-    // instead. 64 KiB, half the default, also maps the tables of 4,096 buckets (70 KB) and up. On
+    // instead. 64 KiB, half the default, also maps the tables of 8,192 buckets (74 KB) and up. On
     // seed 1 the peak fell from 91-96 MB to 82 MB, at the same wall time.
     // SAFETY: sets a malloc parameter; no other thread exists yet.
     unsafe { mallopt(-3, 64 << 10) };
