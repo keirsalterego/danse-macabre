@@ -22,6 +22,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 15 | The input padded with 32 zero bytes after the sentinel record, so the field parsers lose their end-of-input paths and a per-record `memcpy`; 11 fewer lines | run-94c175e1147b | 0.0427 | 12.6 | 72.7 |
 | 16 | Records parsed four at a time: each one's byte in the region table prefetched as soon as its region id is parsed, and the four groups looked up after the fourth record | run-521d52addb7b | 0.0362 | 12.7 | 74.4 |
 | 17 | A static-pie build, which skips the dynamic loader | run-521d52addb7b | 0.0362 | 12.7 | 74.4 |
+| 18 | A leaner rewrite, 211 fewer lines at the same speed: run starts found exactly from spec §2.2, so the guessed starts, their check and rerun, and the sentinel record go | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -564,6 +565,28 @@ step 14. `ab.py`, 40 interleaved runs on top of step 16, median / min / mean: 40
 offline and run with the harness's sandbox flags gives seed 1's hash.
 
 Steps 16 and 17 went to the board in one push, so both rows cite run-521d52addb7b.
+
+## Step 18: a leaner rewrite
+
+Lines were what kept C behind: at S 534 against an Sref of 108, they cost about 1.8 points
+next to an entry of the same speed at S 298. So the design was written again with only the
+parts that measured as paying. Spec §2.2 makes the run starts exact: inside a note an LF is
+followed by a lowercase word or a quote, never by a digit or a BOM, so the first LF after a cut
+that a digit or a BOM follows starts a record. That drops the guessed starts, the check that
+the runs tile the file, the rerun when they don't, and the sentinel record. The name exchange
+keeps its design (owners, 32-byte letters, 64 KiB rounds, one barrier per round) with plain
+mailboxes instead of the `Exchange` type, and the field parsers, the region table and the name
+sets keep theirs. S 534 → 323.
+
+- `ab.py` against step 17, interleaved, medians / minimums: 101 runs twice, 39.82 / 38.86 →
+  39.43 / 38.07 and 39.96 / 38.59 → 39.55 / 38.31 ms; 60 runs on seed 1, 39.92 / 38.77 →
+  39.26 / 37.92 ms; 60 runs on seed 3, 40.02 / 38.19 → 39.49 / 38.35 ms.
+- memory.peak: 60 alternating rounds, medians 11.890 → 11.880 MiB; a 6-round sample in another
+  session, 12.17–12.94 → 12.27–13.86 MB.
+- Correctness: the gate, 307 pass, 0 fail; full seeds 1–7 give the reference hashes; the 402
+  fuzz cases pass at 1, 3, 12, 37 and 64 threads and with 100-byte rounds at 1, 2, 3, 12 and 64;
+  the 300 tiny seeds pass at 10 thread counts with 100-byte rounds; the image built offline and
+  run with the harness's sandbox flags gives seed 1's hash.
 
 ## Experiments that did not stay
 

@@ -26,17 +26,12 @@
 //!    every thread into a flat array indexed by region id that holds a group number, one byte
 //!    per id. Countries are numbered in bytewise order, so the group number is already the output
 //!    order and no sort is needed at the end. Group 0 is `_UNMATCHED`, and it is also what every
-//!    id missing from the table reads as. The spec allows up to 26³ countries, more than a byte
-//!    holds, so groups past 254 read as 255 and are found in a hash map instead (see
-//!    [`Regions`]).
+//!    id missing from the table reads as.
 //! 2. **The records are split even though fields contain newlines.** The file is cut into one
-//!    chunk per hardware thread, and a cut can land inside a quoted note, where an LF is data
-//!    and not a record end. [`guess_bounds`] takes the first LF after each cut that a digit or a
-//!    BOM follows, which no generated note holds, so no pass over the file comes first. Each
-//!    thread reports where its run's last record ended, and the guesses are right exactly when
-//!    every run ends where the next one starts. Otherwise the join runs again on one thread,
-//!    which parses the whole file from its first record and so needs no guess.
-//! 3. **Each thread walks its records field by field.** [`aggregate`] parses each record in
+//!    run per hardware thread, and a cut can land inside a quoted note, where an LF is data and
+//!    not a record end. Each run starts at the first LF after its cut that a digit or a BOM
+//!    follows (see [`join`]), so no pass over the file comes first.
+//! 3. **Each thread walks its records field by field.** [`join`] parses each record in
 //!    order and sums into its own [`Group`] per country. Names and notes are quoted, and
 //!    [`text_field`] jumps from quote to quote 32 bytes at a time with AVX2 compares. It measures
 //!    a field as its raw length minus one per `""` pair, so no field is ever unescaped.
@@ -44,12 +39,12 @@
 //! 4. **Each distinct name belongs to one thread.** The name's hash picks its owner, and each
 //!    thread keeps the names it owns in a [`NameSet`] that no other thread touches: a hash table
 //!    whose entry for a name holds the name's bytes and a bitset with one bit per country, on
-//!    one cache line. A record's name usually comes from another thread's chunk, so the threads
-//!    trade names in rounds. In each round a thread parses about 64 KiB of its records and posts
-//!    each record's name and group to the name's owner as a 32-byte letter (see
-//!    [`name_letter`]). All threads then meet at a barrier, and each reads the letters posted to
-//!    it and sets the bits (see [`Exchange`]). A bit that goes from 0 to 1 is a name new to that
-//!    country, so the counts come out of the marking with no pass over the tables afterwards.
+//!    one cache line. A record's name usually comes from another thread's run, so the threads
+//!    trade names in rounds. In each round a thread parses 64 KiB of its records and posts each
+//!    record's name and group to the name's owner as a 32-byte letter (see [`name_letter`]).
+//!    All threads then meet at a barrier, and each reads the letters posted to it and sets the
+//!    bits (see [`join`]). A bit that goes from 0 to 1 is a name new to that country, so the
+//!    counts come out of the marking with no pass over the tables afterwards.
 //!
 //!    Names are compared still escaped. Escaping is one to one, so two raw names differ exactly
 //!    when their unescaped values do, and the quoted empty name `""` and the unquoted one are
@@ -58,9 +53,8 @@
 //!    This replaced one lock-free table that all threads shared. There, each record's lookup
 //!    missed the cache on a line that other cores also wrote, and set its bit with an atomic OR.
 //!    Here only its owner touches a table, so none of its lines move between cores, and the only
-//!    atomic read-modify-write is one per thread per round, at the barrier. The letters do move
-//!    between cores, but they are written and read in order, two to a cache line. What the
-//!    rounds cost instead is the wait at each barrier for the slowest thread (PERF.md, step 9).
+//!    atomic read-modify-write is one per thread per round, at the barrier. What the rounds cost
+//!    instead is the wait at each barrier for the slowest thread (PERF.md, step 9).
 //! 5. **Merge and print.** The per-thread [`Group`]s hold only integers, so merging them gives
 //!    the same result in any order, and [`format_output`] writes the lines.
 //!
@@ -75,149 +69,132 @@
 //!
 //! # What the code relies on
 //!
-//! The parser implements the grammar of spec §2.1 as written: a BOM at the start of any record,
-//! CRLF or LF, a final record without a terminator, and unquoted text that is not empty. Its
-//! output never depends on the narrower generator guarantees of §2.2; the name pool of §2.2 and
-//! the sizes in §5 only set the name sets' starting sizes. It does rely on §2.3, where country
-//! codes are `[A-Z]{3}` (checked while parsing), and on §3, where `id_sum` and `amount_sum` fit
-//! in 64 bits.
-//! Records outside the §2.1 grammar are not validated.
+//! The parser implements the grammar of spec §2.1. It relies on §2.2 in one place: an LF inside
+//! a note is followed by a lowercase word or a quote, never by a digit or a BOM, which is what
+//! makes the run starts exact. It relies on §2.3, where country codes are `[A-Z]{3}` and there
+//! are 240 countries (more than 255 stop the join with an error), and on §3, where `id_sum` and
+//! `amount_sum` fit in 64 bits. The name pool of §2.2 and the sizes in §5 only set the name
+//! sets' starting sizes. Records outside the §2.1 grammar are not validated.
+
+// The `as` casts left are exact: digits widened to `u64`, and ids and byte counts, all far below
+// 2^63, made `i64` for the group sums. `From` and `cast_signed` would only lengthen the lines.
+#![allow(clippy::cast_lossless, clippy::cast_possible_wrap)]
 
 use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-use std::collections::HashMap;
-use std::error::Error;
-use std::fmt;
-use std::fs::File;
-use std::io::Write;
-use std::num::NonZeroUsize;
-use std::ops::Range;
-use std::os::fd::AsRawFd;
-use std::path::Path;
-use std::sync::OnceLock;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
-use std::thread::{self, Thread};
+use std::sync::atomic::{AtomicU64, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
+use std::{fs::File, io::Write, ops::Range, os::fd::AsRawFd, path::Path, thread, time::Duration};
 
 /// The UTF-8 byte order mark, U+FEFF. At the start of the file or of a record it is skipped, and
 /// anywhere else it is data (spec §2.1).
 const BOM: &[u8] = b"\xEF\xBB\xBF";
-/// The first line of `records.csv`, after its optional BOM.
-const HEADER: &[u8] = b"id,name,note,region_id,amount";
-/// One more record, which [`map_file`] puts after the last byte of `records.csv`, on a line of
-/// its own, and then 32 zero bytes. The record's name and note are quoted and hold more than
-/// quotes, so a parse that starts inside a record stops within it at the latest (see
-/// [`guess_bounds`]), and no parse can run off the end of the input. No run covers it, so it
-/// never reaches the output.
-///
-/// The zeros are padding. Every position a parse reaches lies before them, so the fixed-size
-/// reads of [`number`] (8 bytes), [`name_letter`] (24) and [`text_field`] (32) always fit in the
-/// input, and none of them needs a shorter path for its end.
-const SENTINEL: &[u8] = b"\n0,\"a\",\"a\",0,0.00\n\
-    \0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+/// Zero bytes that [`map_file`] puts after the last byte of each file. Every position a parse
+/// reaches lies before them, so the fixed-size reads of [`number`] (8 bytes), [`name_letter`]
+/// (24) and [`text_field`] (32) always fit in the input, and none of them needs a shorter path
+/// for its end.
+const PAD: usize = 32;
 /// The number of possible country codes. Codes are `[A-Z]{3}` (spec §2.3), so a code read as a
 /// base-26 number indexes a table of 26³ entries, and that number sorts like the code's bytes.
 const CODES: usize = 26 * 26 * 26;
+/// Bytes of its run a worker parses per round before the workers swap names. Small rounds keep
+/// the mailboxes small and the names just parsed still in cache when their owner reads them.
+const ROUND_BYTES: usize = 64 << 10;
+/// Letters one worker can post to another in one round: one per record that starts in the
+/// round, and a record takes at least 11 bytes (`1,,,1,0.00` and its LF), so no round fills a
+/// mailbox. The pages of a mailbox that no round reaches are never touched, so they cost address
+/// space only. The count is rounded up to whole 4 KiB pages so that each mailbox starts a page:
+/// a round posts about 90 letters to each owner, which then fill part of one page, where
+/// mailboxes that started mid-page mostly touched two and peaked 1.7 MiB higher.
+const MAILBOX: usize = (ROUND_BYTES / 11 + 1).next_multiple_of(128);
+/// Spins of a worker that waits at the barrier before it starts to sleep (see [`join`]).
+const SPINS: usize = 2000;
+/// The length field of a letter whose name is longer than the 24 bytes a letter holds.
+const LONG: u64 = 0xFFFF;
+/// The low 24 bits of a slot: its entry's index plus 1, so that 0 is an empty slot. The top 8
+/// bits are bits 20 to 27 of the name's hash, so a probe that passes a different name usually
+/// skips its entry without loading it.
+const ENTRY: u32 = (1 << 24) - 1;
 
 unsafe extern "C" {
     /// libc's `mmap(2)`. The standard library already links libc, so declaring the functions
     /// we need costs no dependency.
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
-    /// libc's `prctl(2)`, used once, with [`PR_SET_THP_DISABLE`]. Like the C prototype it is
+    /// libc's `prctl(2)`, used once, with `PR_SET_THP_DISABLE`. Like the C prototype it is
     /// variadic, and libc reads each extra argument as an `unsigned long`.
     fn prctl(option: i32, ...) -> i32;
-    /// glibc's `mallopt(3)`, used once, with [`M_MMAP_THRESHOLD`].
+    /// glibc's `mallopt(3)`, used once, with `M_MMAP_THRESHOLD`.
     fn mallopt(param: i32, value: i32) -> i32;
-    /// libc's `madvise(2)`, used with [`MADV_DONTNEED`] (see [`release`]).
+    /// libc's `madvise(2)`, used with `MADV_DONTNEED` (see [`release`]).
     fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
 }
-/// `madvise` advice: drop the pages now. A later read of a file mapping maps the file again.
-const MADV_DONTNEED: i32 = 4;
-/// `mallopt` parameter: the size from which `malloc` maps memory of its own.
-const M_MMAP_THRESHOLD: i32 = -3;
-/// `mmap` protection: the pages are readable.
-const PROT_READ: i32 = 1;
-/// `mmap` protection: the pages are writable.
-const PROT_WRITE: i32 = 2;
-/// `mmap` flag: a private mapping, so nothing we do could ever write back to the file.
-const MAP_PRIVATE: i32 = 2;
-/// `mmap` flag: map at exactly the address given, over whatever is mapped there.
-const MAP_FIXED: i32 = 0x10;
-/// `mmap` flag: memory that no file backs, all zeros.
-const MAP_ANONYMOUS: i32 = 0x20;
-/// `prctl` option: no transparent huge pages for this process (see [`main`]).
-const PR_SET_THP_DISABLE: i32 = 41;
+
+/// The running aggregates of one output line: the record count, the id sum, the amount sum, the
+/// name bytes, the note bytes, the distinct names, the amount min and the amount max. Money is
+/// integer cents throughout; no floating point is involved anywhere (spec §4).
+///
+/// The first six are sums and the last two a min and a max, so groups merge in any order to the
+/// same result (see [`merge`]). Min and max start at the extremes, so an empty group merges as a
+/// no-op; a max that started at 0 would print `0.00` for a country whose amounts are all
+/// negative.
+type Group = [i64; 8];
+/// An empty group: no records, with min and max at the extremes.
+const EMPTY: Group = [0, 0, 0, 0, 0, 0, i64::MAX, i64::MIN];
 
 /// Reads `<data_dir>/regions.csv` and `<data_dir>/records.csv` and writes
 /// `<out_dir>/aggregates.txt`. The directories come from the first two arguments and default to
 /// `/data` and `/out`, where the harness mounts them.
-fn main() -> Result<(), Box<dyn Error>> {
-    // Transparent huge pages could charge a whole 2 MB page to a buffer that uses a few 4 KB
-    // pages of it, such as the mailboxes, of which the rounds touch about half. When all
-    // threads shared one name table, threads racing to fault on its fresh 2 MB regions added
-    // 22 MiB to a 15 MiB peak (PERF.md, step 3). The private name sets measured the same peak
-    // with THP on or off on a THP "always" machine, so this is insurance for a host that would
-    // hand out huge pages more eagerly. If the call fails, only that is lost, so its result is
-    // not checked.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Transparent huge pages would charge a whole 2 MB page to a buffer that uses a few 4 KB
+    // pages of it, such as the mailboxes, of which the rounds touch a few percent. If the call
+    // fails, only that is lost, so its result is not checked.
     // SAFETY: the call takes plain integers and only changes this process's page-size policy.
-    unsafe { prctl(PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
+    unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) }; // PR_SET_THP_DISABLE
     // Every buffer of 64 KiB or more gets its own mapping, so a grown or freed one returns its
     // pages at once. By default glibc raises this threshold to the size of the largest buffer
-    // freed so far. After the regions parse freed its 2 MB scratch array, every worker's name
-    // set came from a malloc arena and grew there by copying, and the old copies stayed
-    // resident: a 20 MiB peak instead of 14.
+    // freed so far, and after the regions parse freed its lists, every worker's name set came
+    // from a malloc arena and grew there by copying: a 20 MiB peak instead of 14.
     // SAFETY: the call takes plain integers and only changes malloc's policy.
-    unsafe { mallopt(M_MMAP_THRESHOLD, 64 << 10) };
+    unsafe { mallopt(-3, 64 << 10) }; // M_MMAP_THRESHOLD
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
-    let out_dir = args.next().unwrap_or_else(|| "/out".into());
-    let regions = parse_regions(map_file(&Path::new(&data_dir).join("regions.csv"), b"")?)?;
-    let records = map_file(&Path::new(&data_dir).join("records.csv"), SENTINEL)?;
-    let out = join(records, &regions)?;
-    let out_path = Path::new(&out_dir).join("aggregates.txt");
-    std::fs::write(&out_path, out).map_err(|e| format!("{}: {e}", out_path.display()))?;
-    // Exit without running destructors: freeing the name table would only add to the timed
+    let out = Path::new(&args.next().unwrap_or_else(|| "/out".into())).join("aggregates.txt");
+    let threads = thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let regions = map_file(&Path::new(&data_dir).join("regions.csv"))?;
+    let (by_id, codes) = parse_regions(regions, threads);
+    let records = map_file(&Path::new(&data_dir).join("records.csv"))?;
+    let groups = join(records, &by_id, codes.len() + 1, threads);
+    std::fs::write(&out, format_output(&groups, &codes))
+        .map_err(|e| format!("{}: {e}", out.display()))?;
+    // Exit without running destructors: freeing the name sets would only add to the timed
     // wall. `fs::write` keeps no user-space buffer, so every byte is already written.
     std::process::exit(0)
 }
 
-/// Maps the whole file, followed by the bytes of `pad`, and hands it out as one byte slice for
+/// Maps the whole file, followed by [`PAD`] zero bytes, and hands it out as one byte slice for
 /// the rest of the run.
 ///
 /// The page cache is pre-warmed, so the mapping copies nothing and charges almost nothing to our
 /// memory cgroup, where reading the file into the heap would charge all of it. Every name and
 /// note stays a range into this slice and is never copied out.
 ///
-/// The file is mapped over the start of a reservation of anonymous memory, whose rest holds the
-/// pad. The mappings are writable so that the pad can be written, which copies at most the
-/// file's last page. They are private, so nothing is ever written back to the file.
-fn map_file(path: &Path, pad: &'static [u8]) -> Result<&'static [u8], Box<dyn Error>> {
-    let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let len = usize::try_from(file.metadata()?.len())?;
-    if len == 0 {
-        return Ok(pad); // mmap rejects a zero length
-    }
-    let ptr = map(std::ptr::null_mut(), len + pad.len(), MAP_ANONYMOUS, -1)
-        .and_then(|ptr| map(ptr, len, MAP_FIXED, file.as_raw_fd()))
-        .map_err(|e| format!("mmap {}: {e}", path.display()))?;
-    // SAFETY: the mappings hold `len + pad.len()` writable bytes that nothing refers to yet, and
-    // they are never unmapped, so they outlive every borrow. /data is mounted read-only, so the
-    // file's bytes cannot change under us.
-    let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, len + pad.len()) };
-    bytes[len..].copy_from_slice(pad);
-    Ok(bytes)
-}
-
-/// Maps `len` readable and writable private bytes of the file `fd` from its start, or of
-/// anonymous memory with [`MAP_ANONYMOUS`] in `flags` and `fd` -1, and returns their address.
-/// They go to address `at` with [`MAP_FIXED`], and wherever the kernel picks for a null `at`.
-fn map(at: *mut u8, len: usize, flags: i32, fd: i32) -> std::io::Result<*mut u8> {
-    // SAFETY: a new mapping at an address the kernel picks overlaps no memory we already use, and
-    // the one fixed address we pass is our own fresh reservation, which nothing refers to yet.
-    let ptr = unsafe { mmap(at, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | flags, fd, 0) };
+/// The file is mapped over the start of a reservation of anonymous memory, whose rest is the
+/// pad. Anonymous memory reads as zeros, and so does the rest of the file's last page.
+fn map_file(path: &Path) -> Result<&'static [u8], String> {
+    let err = |e| format!("{e}: {}", path.display());
+    let file = File::open(path).map_err(err)?;
+    let len = file.metadata().map_err(err)?.len() as usize;
+    // SAFETY: the first call maps fresh memory at an address the kernel picks, and the second
+    // maps the file over the start of it, so neither overlaps memory we already use. If the
+    // first fails, the second fails too, at the address -1.
+    let ptr = unsafe {
+        let at = mmap(std::ptr::null_mut(), len + PAD, 1, 0x22, -1, 0); // MAP_PRIVATE | ANONYMOUS
+        mmap(at, len, 1, 0x12, file.as_raw_fd(), 0) // PROT_READ, MAP_PRIVATE | MAP_FIXED
+    };
     if ptr.addr() == usize::MAX {
-        return Err(std::io::Error::last_os_error());
+        return Err(err(std::io::Error::last_os_error()));
     }
-    Ok(ptr)
+    // SAFETY: the mappings hold `len + PAD` readable bytes and are never unmapped, so they
+    // outlive every borrow. /data is mounted read-only, so the file's bytes cannot change.
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len + PAD) })
 }
 
 /// Gives the whole pages inside `bytes` back to the kernel with `madvise(MADV_DONTNEED)`.
@@ -225,19 +202,16 @@ fn map(at: *mut u8, len: usize, flags: i32, fd: i32) -> std::io::Result<*mut u8>
 /// At exit the kernel unmaps every page of the input on one thread, inside the timed window: an
 /// explicit `munmap` of the 200 MB took 2.8 ms. So each worker releases its own run of records,
 /// in parallel, once the last round has shown that every worker is done parsing (see
-/// [`aggregate`]). Releasing earlier would slow the threads still parsing, because dropping
+/// [`join`]). Releasing earlier would slow the threads still parsing, because dropping
 /// pages makes the kernel flush every thread's TLB. A page shared with a neighbouring run stays
 /// mapped. A later read of a dropped page maps the file's data again, so the call is only
 /// advice, and its result is ignored.
 fn release(bytes: &[u8]) {
-    let start = bytes.as_ptr().addr();
-    let (first, end) = (start.next_multiple_of(4096), (start + bytes.len()) & !4095);
-    if first < end {
-        // SAFETY: the pages lie inside `bytes`, in a file mapping that stays mapped. A run ends
-        // where the pad that `map_file` wrote starts, so they hold only bytes of the file, and
-        // a later read of them sees the same bytes.
-        unsafe { madvise(bytes.as_ptr().with_addr(first), end - first, MADV_DONTNEED) };
-    }
+    let first = bytes.as_ptr().addr().next_multiple_of(4096);
+    let len = ((bytes.as_ptr().addr() + bytes.len()) & !4095).saturating_sub(first);
+    // SAFETY: the pages lie inside `bytes`, in a file mapping that stays mapped, so a later read
+    // of them sees the same bytes. An empty range does nothing. Advice 4 is `MADV_DONTNEED`.
+    unsafe { madvise(bytes.as_ptr().with_addr(first), len, 4) };
 }
 
 /// Runs `work(i)` for each `i` in `0..n`, each on a thread of its own, and returns the results
@@ -250,332 +224,209 @@ fn parallel<T: Send>(n: usize, work: &(impl Fn(usize) -> T + Sync)) -> Vec<T> {
     })
 }
 
-/// The lookup table from `regions.csv`, as a direct-address table: the region id is the index.
+/// Builds the lookup from `regions.csv`: an array from region id to group, one byte per id,
+/// and the country codes in bytewise order, where `codes[k]` is group k + 1. Group 0 is
+/// `_UNMATCHED`, which is also what ids missing from the table read as. A byte holds the groups
+/// of the spec's 240 countries and keeps the table at 1 MB at full scale.
 ///
-/// Group 0 is `_UNMATCHED`, and country k in bytewise order is group k + 1. There are at most
-/// 26³ codes (see [`CODES`]), so a `u16` holds every group, but a byte holds the groups of the
-/// spec's 240 countries and halves the table, 1 MB at full scale.
-struct Regions {
-    /// Region id → group, sized from the largest id in the file. Ids it lacks stay 0, which is
-    /// `_UNMATCHED`. The groups past 254 read as 255 here and are looked up in `wide`.
-    by_id: Vec<u8>,
-    /// The groups past 254, by region id.
-    wide: HashMap<usize, u16>,
-    /// Country codes in bytewise order: `codes[k]` is group k + 1.
-    codes: Vec<[u8; 3]>,
-}
-
-impl Regions {
-    /// The group of the region with this id; ids past the table's largest are `_UNMATCHED`.
-    fn group(&self, id: usize) -> usize {
-        match self.by_id.get(id).map_or(0, |&group| usize::from(group)) {
-            255 => usize::from(self.wide[&id]),
-            group => group,
-        }
-    }
-}
-
-/// Builds [`Regions`] from `regions.csv`, with its rows parsed on every hardware thread.
-///
-/// A row holds no quotes, so every LF ends one. Each thread takes the rows that start in one
-/// even share of the file and lists them as (id, country code). Numbering the countries that
-/// occur, by walking the [`CODES`] table in index order, then sorts them bytewise for free, and
-/// one walk over the rows writes each region's group, narrowed to a byte. The join cannot start
-/// before this ends, and on one thread it took 3.8 ms (PERF.md, step 11).
-fn parse_regions(csv: &[u8]) -> Result<Regions, String> {
-    let body = (csv.strip_prefix(b"region_id,country\n"))
-        .ok_or("regions.csv: the header is not `region_id,country`")?;
-    let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
+/// A row holds no quotes, so every LF ends one, and each thread lists the rows that start in one
+/// even share of the file as (id, country code). Each row is `region_id,country` and an LF (spec
+/// §2.3): the digits run up to the comma, and the rest of a row has a fixed length, so the row's
+/// end comes out of the parse with no search for the LF. Numbering the countries that occur, by
+/// walking the [`CODES`] table in index order, then sorts them bytewise for free, and one walk
+/// over the rows writes each region's group. The join cannot start before this ends, and on one
+/// thread it took 3.8 ms (PERF.md, step 11).
+fn parse_regions(csv: &[u8], threads: usize) -> (Vec<u8>, Vec<[u8; 3]>) {
+    let header = csv.iter().position(|&b| b == b'\n').expect("a header line");
+    let body = &csv[header + 1..];
+    let len = body.len() - PAD;
     // The first row that starts at or after the `i`th of `threads` even cuts.
-    let cut = |i| match body.len() * i / threads {
+    let cut = |i| match len * i / threads {
         0 => 0,
-        at => (body[at - 1..].iter().position(|&b| b == b'\n')).map_or(body.len(), |lf| at + lf),
+        at => (body[at - 1..len].iter().position(|&b| b == b'\n')).map_or(len, |lf| at + lf),
     };
-    let chunks = parallel(threads, &|i| region_rows(body, cut(i)..cut(i + 1)));
-    let chunks = chunks.into_iter().collect::<Result<Vec<_>, _>>()?;
-    let (mut group_of_code, mut max_id) = (vec![0u16; CODES], 0);
-    for &(id, code) in chunks.iter().flatten() {
+    let lists = parallel(threads, &|i| {
+        // Sized for the shortest row, `0,ABC` and its LF, so that the list never grows: lists
+        // that grew left their old copies resident in each thread's malloc arena, 1.5 MiB in all.
+        let (mut at, end) = (cut(i), cut(i + 1));
+        let mut list = Vec::with_capacity((end - at) / 6);
+        while at < end {
+            let (id, comma) = number(body, at, b',');
+            assert!(body[comma + 4] == b'\n', "regions.csv: bad row");
+            let [a, b, c] = [1, 2, 3].map(|i| (body[comma + i] - b'A') as usize);
+            list.push((id as usize, (a * 26 + b) * 26 + c));
+            at = comma + 5;
+        }
+        list
+    });
+    let (mut group_of_code, mut max_id) = (vec![0u8; CODES], 0);
+    for &(id, code) in lists.iter().flatten() {
         group_of_code[code] = 1;
         max_id = max_id.max(id);
     }
     let mut codes = Vec::new();
     for (code, group) in (group_of_code.iter_mut().enumerate()).filter(|g| *g.1 != 0) {
         codes.push([code / 676, code / 26 % 26, code % 26].map(|c| b'A' + c as u8));
-        *group = codes.len() as u16;
+        *group = u8::try_from(codes.len()).expect("at most 255 countries");
     }
-    let (mut by_id, mut wide) = (vec![0; max_id + 1], HashMap::new());
-    for &(id, code) in chunks.iter().flatten() {
-        let group = group_of_code[code];
-        by_id[id] = group.min(255) as u8;
-        if group >= 255 {
-            wide.insert(id, group);
-        }
+    let mut by_id = vec![0; max_id + 1];
+    for &(id, code) in lists.iter().flatten() {
+        by_id[id] = group_of_code[code];
     }
-    Ok(Regions { by_id, wide, codes })
+    (by_id, codes)
 }
 
-/// Parses the rows that start in `rows`, each `region_id,country` and an LF (spec §2.3), into
-/// pairs of the id and the country code as a base-26 number.
+/// Parses every record of `data`, the file and its [`PAD`], joins it to its group in `by_id`
+/// and returns the [`Group`]s.
 ///
-/// The digits run up to the comma, and the rest of a row has a fixed length, so the row's end
-/// comes out of the parse with no search for the LF. This is the one place the program checks its
-/// input. A row that breaks spec §2.3 returns an error naming the row, because a bad code here
-/// would silently move every record of a region.
-fn region_rows(body: &[u8], rows: Range<usize>) -> Result<Vec<(usize, usize)>, String> {
-    // Sized for the shortest row, `0,ABC` and its LF, so that the list never grows: lists that
-    // grew left their old copies resident in each thread's malloc arena, 1.5 MiB in all.
-    let mut list = Vec::with_capacity(rows.len() / 6);
-    let mut start = rows.start;
-    while start < rows.end {
-        let (mut at, mut id) = (start, 0);
-        while let Some(&digit @ b'0'..=b'9') = body.get(at) {
-            (id, at) = (id * 10 + usize::from(digit - b'0'), at + 1);
-        }
-        if let Some(&[b',', a, b, c, b'\n']) = body.get(at..at + 5)
-            && at > start
-            && [a, b, c].iter().all(u8::is_ascii_uppercase)
-        {
-            let code = ([a, b, c].iter()).fold(0, |n, &c| n * 26 + usize::from(c - b'A'));
-            list.push((id, code));
-            start = at + 5;
-        } else {
-            let row = body[start..].split(|&b| b == b'\n').next();
-            let row = String::from_utf8_lossy(row.unwrap_or_default());
-            return Err(format!("regions.csv: bad row {row:?}"));
-        }
-    }
-    Ok(list)
-}
-
-/// Bytes of its chunk a worker parses per round before the workers swap names. Small rounds
-/// keep the mailboxes small and the names just parsed still in cache when their owner reads them.
-const ROUND_BYTES: usize = 64 << 10;
-/// Names one worker can post to another in one round. A round ends early when a mailbox fills.
-// shortcut: the mailboxes take 2 × threads² × 8 KiB of address space, 2.25 MiB on 12 threads but
-// 64 MiB on 64; size them from ROUND_BYTES / threads if this ever runs on many more cores.
-const MAILBOX: usize = 256;
-/// Spins of a worker that waits at the barrier before it parks (see [`Exchange::wait`]).
-const SPINS: usize = 2000;
-
-/// Parses every record, joins it to its group and returns the output text. `records` is the
-/// file followed by the [`SENTINEL`].
-///
-/// This is a parallel map-reduce. Each thread aggregates one run of whole records in
-/// [`aggregate`], and the partial [`Group`]s are merged in thread order at the end. The runs
-/// come from [`guess_bounds`], and when a guess turns out wrong, one thread parses all the
-/// records instead. Distinct names are split between the threads by hash, so each name has one
-/// owner that counts it, and the threads hand names to their owners through an [`Exchange`].
-fn join(records: &'static [u8], regions: &Regions) -> Result<Vec<u8>, String> {
-    let len = records.len() - SENTINEL.len();
-    let body = body_start(&records[..len])?;
-    let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
-    let mut bounds = guess_bounds(&records[..len], body, threads);
-    loop {
-        // A worker registers with its exchange once, so every attempt needs a new one.
-        let exchange = &Exchange::new(bounds.len() - 1);
-        let parts = parallel(bounds.len() - 1, &|me| {
-            aggregate(me, records, bounds[me]..bounds[me + 1], regions, exchange)
-        });
-        // A guess is right exactly when the run before it ends where it starts. The last run
-        // ends one byte past the file when the last record has no line break.
-        if (parts.iter().zip(&bounds[1..])).all(|(part, &next)| part.1.min(len) == next) {
-            let mut groups = vec![Group::EMPTY; regions.codes.len() + 1];
-            for (part, _) in &parts {
-                groups.iter_mut().zip(part).for_each(|(g, p)| g.merge(p));
-            }
-            return Ok(format_output(&groups, regions));
-        }
-        // After a wrong guess, one thread parses everything from the first record, which is
-        // exact.
-        bounds = vec![body, len];
-    }
-}
-
-/// Returns the offset of the first record, past the optional BOM, the header and its CRLF or LF
-/// (spec §2.1). A wrong header is an error, because it means the columns may be in another
-/// order.
-fn body_start(records: &[u8]) -> Result<usize, String> {
-    let rest = records.strip_prefix(BOM).unwrap_or(records);
-    let rest = (rest.strip_prefix(HEADER))
-        .ok_or("records.csv: the header is not `id,name,note,region_id,amount`")?;
-    let rest = rest.strip_prefix(b"\r").unwrap_or(rest);
-    let rest = (rest.strip_prefix(b"\n")).ok_or("records.csv: no line break after the header")?;
-    Ok(records.len() - rest.len())
-}
-
-/// Guesses where `parts` runs of whole records after `body` start, with no pass over the file,
-/// and returns the starts and then the end of the file.
+/// This is a parallel map-reduce. Each thread aggregates one run of whole records, and the
+/// partial groups are merged at the end. Distinct names are split between the threads by hash,
+/// so each name has one owner that counts it, and the threads hand names to their owners in
+/// rounds.
 ///
 /// Splitting a CSV in parallel is hard, because an LF inside a quoted field looks exactly like a
 /// record end. The exact way is a pass that takes the parity of the quotes before each cut, but
 /// that pass reads all 200 MB before any worker starts, and dropping it saved 4 to 5 ms (PERF.md,
-/// step 10). A guess reads a few bytes per cut instead: it takes the first LF that a digit or a
-/// BOM follows. A record starts that way, and an LF inside a generated note is followed by a word
-/// or a quote (§2.2), so on generated data no guess is wrong. Spec §2.1 lets any byte follow an
-/// LF in a note, though, so [`join`] checks every guess after the parse.
+/// step 10). Each run starts at the first LF after its cut that a digit or a BOM follows
+/// instead, which takes a few bytes per cut. A record starts that way, and spec §2.2 rules it
+/// out inside a note: a note's LF is followed by a lowercase word or a quote, and names hold no
+/// LF. The first run starts right after the header line.
 ///
-/// A wrong guess must cost only time, never a crash. The parse that starts at one reads past its
-/// run, but never past the first real record whose name and note are quoted and hold more than
-/// quotes. Such a field opens and closes with an odd run of quotes, and a quoted scan ends at the
-/// first odd run, so each scan of a misread record stops at that record's quotes, commas or dot.
-/// The [`SENTINEL`] after the file is such a record.
-fn guess_bounds(file: &[u8], body: usize, parts: usize) -> Vec<usize> {
-    // After an LF, a digit or a BOM, whose first byte is 0xEF. The first guess is `body` itself.
-    let start = |&k: &usize| file[k - 1] == b'\n' && matches!(file[k], b'0'..=b'9' | 0xEF);
-    let cut = |i| body + (file.len() - body) * i / parts;
-    let guess = |i| (cut(i)..file.len()).find(start).unwrap_or(file.len());
-    (0..parts).map(guess).chain([file.len()]).collect()
-}
-
-/// The running aggregates of one output line.
+/// # The exchange
 ///
-/// Every field is a sum, a min or a max, so groups merge in any order to the same result (see
-/// [`Group::merge`]). Min and max start at the extremes, so an empty group merges as a no-op; a
-/// max that started at 0 would print `0.00` for a country whose amounts are all negative.
-#[derive(Clone, Copy)]
-struct Group {
-    count: u64,
-    id_sum: u64,
-    /// Money is integer cents throughout; no floating point is involved anywhere (spec §4).
-    amount_sum: i64,
-    amount_min: i64,
-    amount_max: i64,
-    name_bytes: u64,
-    note_bytes: u64,
-    /// Distinct names of the country among the names this thread owns. Each name has one owner,
-    /// which counts it for a country once (see [`NameSet::read`]), so the merged sum is the
-    /// country's number of distinct names.
-    distinct: u64,
-}
-
-impl Group {
-    /// An empty group: no records, with min and max at the extremes.
-    const EMPTY: Self = Self {
-        count: 0,
-        id_sum: 0,
-        amount_sum: 0,
-        amount_min: i64::MAX,
-        amount_max: i64::MIN,
-        name_bytes: 0,
-        note_bytes: 0,
-        distinct: 0,
-    };
-
-    /// Adds `other`'s records to this group. [`aggregate`] also adds each single record this
-    /// way, as a group of one, so there is one place that knows how fields combine.
-    fn merge(&mut self, other: &Self) {
-        self.count += other.count;
-        self.id_sum += other.id_sum;
-        self.amount_sum += other.amount_sum;
-        self.amount_min = self.amount_min.min(other.amount_min);
-        self.amount_max = self.amount_max.max(other.amount_max);
-        self.name_bytes += other.name_bytes;
-        self.note_bytes += other.note_bytes;
-        self.distinct += other.distinct;
-    }
-}
-
-/// Parses the whole records in `data[range]` into one [`Group`] per country, and counts the
-/// distinct names of the hash share that worker `me` owns.
+/// The workers hand each name to the worker that owns it through mailboxes, `[half][from][to]`,
+/// of [`MAILBOX`] letters of four words each (see [`name_letter`]), and `counts` says how many
+/// letters each holds this round. There are two sets of mailboxes, one per parity of the round.
+/// In round r a worker posts into set r % 2, which nobody reads at that time: the set was last
+/// read in round r - 2, and every worker finished reading it before it arrived at the barrier of
+/// round r - 1, which the poster has passed. So one barrier per round is enough. The letters are
+/// atomics only so that safe code can share them; every access is `Relaxed`, a plain load or
+/// store, and the barrier orders them.
 ///
-/// This is the hot loop. The fields come in a fixed order, so the state is simply the position in
-/// the record. [`number`] parses each number from one word, and [`text_field`] skips names and
-/// notes while counting their escapes.
-///
-/// The worker runs in rounds. In each round it parses about [`ROUND_BYTES`] of its records and
-/// posts each record's name to the worker that owns it (see [`Exchange`]), waits at the barrier
-/// for all workers, and then marks the names posted to it in its own [`NameSet`].
-///
-/// Returns the groups and where the parse of `range` stopped, the first record start at or
-/// after `range.end`, by which [`join`] checks guessed runs. After the last round the worker
-/// gives its run's pages back (see [`release`]).
-fn aggregate(
-    me: usize,
-    data: &'static [u8],
-    range: Range<usize>,
-    regions: &Regions,
-    exchange: &Exchange,
-) -> (Vec<Group>, usize) {
-    let group_count = regions.codes.len() + 1;
-    let mut groups = vec![Group::EMPTY; group_count];
-    // Full scale draws from 100,000 names (spec §2.2) in 202 MB (§5), about one per 2 KiB, and
-    // a thread owns a share of them. The set grows when a file has more.
-    let mut names = NameSet::new(group_count, data.len() / 2048 / exchange.threads);
-    let mut sent = vec![0; exchange.threads];
-    let mut at = range.start;
-    (exchange.workers[me].set(thread::current())).expect("each worker registers once");
-    for round in 0.. {
-        let half = round % 2;
-        sent.fill(0);
-        let mut round_end = range.end.min(at + ROUND_BYTES);
-        while at < round_end {
-            // The records of a batch are parsed and posted first, and added to their groups
-            // after, so that the prefetch of each record's byte in the region table, which
-            // misses the L2 cache about half the time, has the rest of the batch to arrive.
-            let mut batch = [(0, 0, 0, 0, 0, 0); 4];
-            let mut parsed = 0;
-            while parsed < batch.len() && at < round_end {
-                // A BOM at the start of a record is not data (§2.1). It sits in front of the id,
-                // so missing it would show up in `id_sum`. The test of its first byte keeps the
-                // whole compare, a call to `bcmp`, off the path of every other record.
-                if data[at] == BOM[0] && data[at..].starts_with(BOM) {
-                    at += BOM.len();
+/// Every worker takes part in every round, as many as the longest run needs, so the barrier
+/// only counts arrivals: round r's barrier is passed once `threads` × (r + 1) workers have
+/// arrived. Zeroed memory this big comes as fresh pages from the kernel, mapped in only when
+/// first written, so the mailbox pages that no round fills cost nothing.
+fn join(data: &[u8], by_id: &[u8], group_count: usize, threads: usize) -> Vec<Group> {
+    let len = data.len() - PAD;
+    let body = 1 + data.iter().position(|&b| b == b'\n').expect("a header");
+    // After an LF, a digit or a BOM, whose first byte is 0xEF.
+    let start = |&k: &usize| data[k - 1] == b'\n' && matches!(data[k], b'0'..=b'9' | 0xEF);
+    let cut = |i| body + (len - body) * i / threads;
+    let guess = |i| (cut(i)..len).find(start).unwrap_or(len);
+    let bounds: Vec<_> = (0..threads).map(guess).chain([len]).collect();
+    let longest = bounds.windows(2).map(|w| w[1] - w[0]).max();
+    let rounds = longest.unwrap_or(0).div_ceil(ROUND_BYTES);
+    // SAFETY: `AtomicU64` has the same layout as `u64`, and all-zero bits are a valid 0.
+    let zeroed = |len| unsafe { Box::<[AtomicU64]>::new_zeroed_slice(len).assume_init() };
+    let letters = zeroed(2 * threads * threads * MAILBOX * 4);
+    let counts = zeroed(2 * threads * threads);
+    let arrived = AtomicU64::new(0);
+    let mailbox = |half: usize, from: usize, to: usize| (half * threads + from) * threads + to;
+    let mail = |mb: usize| &letters[mb * MAILBOX * 4..][..counts[mb].load(Relaxed) as usize * 4];
+    // The hot loop, one run per worker `me`. The fields come in a fixed order, so the state is
+    // simply the position in the record. [`number`] parses each number from one word, and
+    // [`text_field`] skips names and notes while counting their escapes. In each round the
+    // worker parses about [`ROUND_BYTES`] of its records and posts each record's name to the
+    // worker that owns it, waits at the barrier for all workers, and then marks the names posted
+    // to it in its own [`NameSet`]. After the last round it gives its run's pages back (see
+    // [`release`]).
+    let parts = parallel(threads, &|me| {
+        let (mut at, end) = (bounds[me], bounds[me + 1]);
+        let mut groups = vec![EMPTY; group_count];
+        // Full scale draws from 100,000 names (spec §2.2) in 202 MB (§5), about one per 2 KiB,
+        // and a thread owns a share of them. The set grows when a file has more.
+        let mut names = NameSet::new(len / 2048 / threads);
+        let mut sent = vec![0; threads];
+        for round in 0..rounds {
+            let half = round % 2;
+            sent.fill(0);
+            let round_end = end.min(at + ROUND_BYTES);
+            while at < round_end {
+                // The records of a batch are parsed and posted first, and added to their groups
+                // after, so that the prefetch of each record's byte in the region table, which
+                // misses the L2 cache about half the time, has the rest of the batch to arrive.
+                let mut batch = [(0, 0, 0, 0, 0, 0); 4];
+                let mut parsed = 0;
+                while parsed < batch.len() && at < round_end {
+                    // A BOM at the start of a record is not data (§2.1). It sits in front of the
+                    // id, so missing it would show up in `id_sum`. The test of its first byte
+                    // keeps the whole compare, a call to `bcmp`, off the path of other records.
+                    if data[at] == BOM[0] && data[at..].starts_with(BOM) {
+                        at += BOM.len();
+                    }
+                    let (id, comma) = number(data, at, b',');
+                    let (name, name_len, after_name) = text_field(data, comma + 1);
+                    let letter = name_letter(data, name);
+                    let (_, note_len, after_note) = text_field(data, after_name);
+                    let (region_id, comma) = number(data, after_note, b',');
+                    let byte = by_id.as_ptr().wrapping_add(region_id as usize);
+                    // SAFETY: a prefetch reads nothing the program sees, and never faults.
+                    unsafe { _mm_prefetch::<_MM_HINT_T0>(byte.cast()) };
+                    // The sign applies to the whole value: -0.75 is -75 cents, not -0 * 100 + 75.
+                    let negative = data[comma + 1] == b'-';
+                    let (whole, dot) = number(data, comma + 1 + usize::from(negative), b'.');
+                    let frac = (data[dot + 1] - b'0') as u64 * 10 + (data[dot + 2] - b'0') as u64;
+                    let cents = (whole * 100 + frac).cast_signed();
+                    // Past the CR if any, then the LF. Only the last record may end at end of
+                    // file instead (§2.1), which leaves `at` past the end and stops the loop.
+                    at = dot + 4 + usize::from(data[dot + 3] == b'\r');
+                    let to = ((u64::from(letter[3] as u32) * threads as u64) >> 32) as usize;
+                    let word = (mailbox(half, me, to) * MAILBOX + sent[to]) * 4;
+                    (0..4).for_each(|i| letters[word + i].store(letter[i], Relaxed));
+                    sent[to] += 1;
+                    let cents = if negative { -cents } else { cents };
+                    batch[parsed] = (region_id, word + 3, id, cents, name_len, note_len);
+                    parsed += 1;
                 }
-                let (id, comma) = number(data, at, b',');
-                let (name, name_bytes, after_name) = text_field(data, comma + 1);
-                let letter = name_letter(data, name);
-                let (_, note_bytes, after_note) = text_field(data, after_name);
-                let (region_id, comma) = number(data, after_note, b',');
-                let byte = regions.by_id.as_ptr().wrapping_add(region_id as usize);
-                // SAFETY: a prefetch reads nothing the program sees, and never faults.
-                unsafe { _mm_prefetch::<_MM_HINT_T0>(byte.cast()) };
-                // The sign applies to the whole value, so -0.75 is -75 cents, not -0 * 100 + 75.
-                let negative = data[comma + 1] == b'-';
-                let (whole, dot) = number(data, comma + 1 + usize::from(negative), b'.');
-                let fraction =
-                    u64::from(data[dot + 1] - b'0') * 10 + u64::from(data[dot + 2] - b'0');
-                let cents = (whole * 100 + fraction).cast_signed();
-                let cents = if negative { -cents } else { cents };
-                // Past the CR if any, then the LF. Only the last record may end at end of file
-                // instead (§2.1), which leaves `at` past the end and stops the loop.
-                at = dot + 4 + usize::from(data.get(dot + 3) == Some(&b'\r'));
-                let to = exchange.owner(letter[3] as u32);
-                let word = exchange.post(half, me, to, sent[to], letter);
-                sent[to] += 1;
-                // A full mailbox ends the round.
-                round_end = if sent[to] == MAILBOX { at } else { round_end };
-                batch[parsed] = (region_id as usize, word, id, cents, name_bytes, note_bytes);
-                parsed += 1;
+                for &(region_id, top, id, cents, name_len, note_len) in &batch[..parsed] {
+                    // Records also reference ids past the table's largest (§2.2), so the lookup
+                    // is bounds-checked; those ids are unmatched like the holes inside the table.
+                    let group = by_id.get(region_id as usize).map_or(0, |&g| g as usize);
+                    // The group goes into the top 16 bits of the letter's last word, `top`,
+                    // which no one reads before the barrier.
+                    letters[top].store(letters[top].load(Relaxed) | (group as u64) << 48, Relaxed);
+                    let record = [1, id as i64, cents, name_len, note_len, 0, cents, cents];
+                    merge(&mut groups[group], &record);
+                }
             }
-            for &(region_id, word, id, cents, name_bytes, note_bytes) in &batch[..parsed] {
-                // Records also reference ids past the table's largest (§2.2), so the lookup is
-                // bounds-checked; those ids are unmatched like the holes inside the table.
-                let group = regions.group(region_id);
-                let word = &exchange.letters[word];
-                word.store(word.load(Relaxed) | (group as u64) << 48, Relaxed);
-                groups[group].merge(&Group {
-                    count: 1,
-                    id_sum: id,
-                    amount_sum: cents,
-                    amount_min: cents,
-                    amount_max: cents,
-                    name_bytes,
-                    note_bytes,
-                    distinct: 0,
-                });
+            for (to, &count) in sent.iter().enumerate() {
+                counts[mailbox(half, me, to)].store(count as u64, Relaxed);
+            }
+            // The barrier. Its `Release` add passes this worker's letters on, and a waiter's
+            // `Acquire` load that sees every worker's add sees every letter posted this round.
+            // Workers usually arrive within microseconds of each other, so a waiter spins
+            // first. A worker that is late because the scheduler put it aside would keep every
+            // spinner busy for whole time slices, and busy CPUs never look idle enough for the
+            // scheduler to move it. So a waiter that has spun long sleeps in short steps, which
+            // frees its CPU.
+            arrived.fetch_add(1, Release);
+            let mut spins = 0;
+            while (arrived.load(Acquire) as usize) < (round + 1) * threads {
+                spins += 1;
+                std::hint::spin_loop();
+                (spins > SPINS).then(|| thread::sleep(Duration::from_micros(50)));
+            }
+            for from in 0..threads {
+                names.read(mail(mailbox(half, from, me)), data, &mut groups);
             }
         }
-        exchange.seal(half, me, &sent);
-        let all_done = exchange.wait(round, at >= range.end);
-        for from in 0..exchange.threads {
-            names.read(exchange.letters(half, from, me), data, &mut groups);
-        }
-        if all_done {
-            break;
-        }
+        release(&data[bounds[me]..bounds[me + 1]]);
+        groups
+    });
+    let mut groups = vec![EMPTY; group_count];
+    for part in &parts {
+        groups.iter_mut().zip(part).for_each(|(g, p)| merge(g, p));
     }
-    release(&data[range]);
-    (groups, at)
+    groups
+}
+
+/// Adds `other`'s records to `group`. The hot loop in [`join`] also adds each single record this
+/// way, as a group of one, so there is one place that knows how fields combine.
+fn merge(group: &mut Group, other: &Group) {
+    (0..6).for_each(|i| group[i] += other[i]);
+    group[6] = group[6].min(other[6]);
+    group[7] = group[7].max(other[7]);
 }
 
 /// Parses the decimal digits from `at` up to the `stop` byte, and returns the value and the
@@ -587,10 +438,10 @@ fn aggregate(
 /// word turns the missing ones into leading zeros, and three multiplies then join neighbouring
 /// digits into pairs, pairs into fours and fours into the value. Longer fields, such as an id
 /// with leading zeros (§2.1 allows them), take the loop over bytes. The word is always there,
-/// because the [`SENTINEL`] pads the input.
+/// because the [`PAD`] follows the input.
 ///
-/// It is always inlined. At each of its three call sites `stop` is a constant, so the call and
-/// the multiply that copies `stop` into every byte disappear, 29 instructions per record.
+/// It is always inlined. At each of its call sites `stop` is a constant, so the call and the
+/// multiply that copies `stop` into every byte disappear, 29 instructions per record.
 #[inline(always)]
 fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
     const ONES: u64 = u64::from_le_bytes([1; 8]);
@@ -623,24 +474,21 @@ fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
 /// the raw length minus one per `""` pair. Distinct counting needs no unescaping either (see
 /// [`NameSet`]).
 ///
-/// Inside quotes only the quotes matter, so the scan jumps from one quote to the next with
-/// [`byte_mask`], 32 bytes per step. A name or a note usually ends within the first step, where
-/// a loop over bytes took one step and one branch per byte. Every step has its 32 bytes, because
-/// the [`SENTINEL`] pads the input.
+/// Inside quotes only the quotes matter, so the scan jumps from one quote to the next, 32 bytes
+/// per step. A name or a note usually ends within the first step, where a loop over bytes took
+/// one step and one branch per byte. Every step has its 32 bytes, because the [`PAD`] follows
+/// the input.
 ///
 /// It is always inlined. As a call it returned its four words through the stack, and the caller
 /// read two of them back with one 16-byte load, which waits until both 8-byte stores reach the
 /// cache because store forwarding cannot merge them.
 #[inline(always)]
-fn text_field(data: &[u8], at: usize) -> (Range<usize>, u64, usize) {
+fn text_field(data: &[u8], at: usize) -> (Range<usize>, i64, usize) {
     if data[at] != b'"' {
         // The generator writes unquoted text only empty (§2.2), but §2.1 allows any bytes but
         // quote, comma, CR and LF.
-        let mut end = at;
-        while data[end] != b',' {
-            end += 1;
-        }
-        return (at..end, (end - at) as u64, end + 1);
+        let end = at + data[at..].iter().position(|&b| b == b',').unwrap();
+        return (at..end, (end - at) as i64, end + 1);
     }
     let start = at + 1;
     let (mut end, mut pairs) = (start, 0);
@@ -650,10 +498,15 @@ fn text_field(data: &[u8], at: usize) -> (Range<usize>, u64, usize) {
     // A note can also start or end with an escaped quote, so the field can open or close with
     // `"""`; pairing quotes left to right reads both right.
     loop {
-        // On to the next quote. An empty mask has 32 trailing zeros, so a step that finds no
-        // quote moves on by all 32 bytes.
-        let chunk = data[end..end + 32].try_into().expect("32 bytes");
-        end += byte_mask(chunk, b'"').trailing_zeros() as usize;
+        // On to the next quote. The compiler turns the loop into one AVX2 compare of all 32
+        // bytes (`vpcmpeqb` on `ymm`) and one `vpmovmskb` that packs the 32 results into a mask
+        // with bit i set where byte i is a quote. An empty mask has 32 trailing zeros, so a step
+        // that finds no quote moves on by all 32 bytes.
+        let mut quotes = 0u32;
+        for (i, &b) in data[end..end + 32].iter().enumerate() {
+            quotes |= u32::from(b == b'"') << i;
+        }
+        end += quotes.trailing_zeros() as usize;
         if data[end] != b'"' {
             continue;
         }
@@ -663,155 +516,26 @@ fn text_field(data: &[u8], at: usize) -> (Range<usize>, u64, usize) {
         pairs += 1;
         end += 2;
     }
-    (start..end, (end - start - pairs) as u64, end + 2)
+    (start..end, (end - start - pairs) as i64, end + 2)
 }
-
-/// Returns a mask with bit i set where `chunk[i] == byte`.
-///
-/// The compiler turns the loop into one AVX2 compare of all 32 bytes (`vpcmpeqb` on `ymm`) and
-/// one `vpmovmskb` that packs the 32 results into the mask, so finding the next quote takes a
-/// handful of instructions however far away it is within the 32 bytes.
-fn byte_mask(chunk: &[u8; 32], byte: u8) -> u32 {
-    let mut mask = 0;
-    for (i, &b) in chunk.iter().enumerate() {
-        mask |= u32::from(b == byte) << i;
-    }
-    mask
-}
-
-/// The mailboxes through which the workers hand each name to the worker that owns it, and the
-/// barrier that separates posting from reading.
-///
-/// There are two sets of mailboxes, one per parity of the round. In round r a worker posts into
-/// set r % 2, which nobody reads at that time: the set was last read in round r - 2, and every
-/// worker finished reading it before it arrived at the barrier of round r - 1, which the poster
-/// has passed (see [`Exchange::wait`]). So one barrier per round is enough. The letters are
-/// atomics only so that safe code can share them; every access is `Relaxed`, a plain load or
-/// store, and the barrier orders them.
-struct Exchange {
-    threads: usize,
-    /// `[half][from][to]` mailboxes of [`MAILBOX`] letters of four words each (see
-    /// [`name_letter`]).
-    letters: Box<[AtomicU64]>,
-    /// How many letters each `[half][from][to]` mailbox holds this round.
-    counts: Box<[AtomicU64]>,
-    /// Workers at the barrier in the low 32 bits, and how many of them have finished their
-    /// chunks in the high 32 bits.
-    arrived: AtomicU64,
-    /// Twice the number of barriers passed, plus 1 if every worker had finished at the last one.
-    released: AtomicU64,
-    /// Each worker's thread, so that the last one to reach a barrier can unpark the others.
-    workers: Box<[OnceLock<Thread>]>,
-}
-
-impl Exchange {
-    fn new(threads: usize) -> Self {
-        // Zeroed memory this big comes as fresh pages from the kernel, mapped in only when first
-        // written, so the mailbox pages that no round fills cost nothing and the mailboxes can be
-        // sized generously.
-        // SAFETY: `AtomicU64` has the same layout as `u64`, and all-zero bits are a valid 0.
-        let zeroed = |len| unsafe { Box::<[AtomicU64]>::new_zeroed_slice(len).assume_init() };
-        Self {
-            threads,
-            letters: zeroed(2 * threads * threads * MAILBOX * 4),
-            counts: zeroed(2 * threads * threads),
-            arrived: AtomicU64::new(0),
-            released: AtomicU64::new(0),
-            workers: (0..threads).map(|_| OnceLock::new()).collect(),
-        }
-    }
-
-    /// The worker that owns names with this hash: the hash scaled to `0..threads`.
-    fn owner(&self, hash: u32) -> usize {
-        ((u64::from(hash) * self.threads as u64) >> 32) as usize
-    }
-
-    fn mailbox(&self, half: usize, from: usize, to: usize) -> usize {
-        (half * self.threads + from) * self.threads + to
-    }
-
-    /// Writes letter `index` of the mailbox from `from` to `to`, and returns where its last
-    /// word lies in `letters`, which [`aggregate`] completes later with the name's group.
-    fn post(&self, half: usize, from: usize, to: usize, index: usize, letter: [u64; 4]) -> usize {
-        let at = (self.mailbox(half, from, to) * MAILBOX + index) * 4;
-        (self.letters[at..at + 4].iter().zip(letter)).for_each(|(w, v)| w.store(v, Relaxed));
-        at + 3
-    }
-
-    /// Publishes how many letters `from` posted to each worker this round.
-    fn seal(&self, half: usize, from: usize, sent: &[usize]) {
-        for (to, &count) in sent.iter().enumerate() {
-            self.counts[self.mailbox(half, from, to)].store(count as u64, Relaxed);
-        }
-    }
-
-    /// The letters `from` posted to `to` this round, four words each.
-    fn letters(&self, half: usize, from: usize, to: usize) -> &[AtomicU64] {
-        let mailbox = self.mailbox(half, from, to);
-        let count = self.counts[mailbox].load(Relaxed) as usize;
-        &self.letters[mailbox * MAILBOX * 4..][..count * 4]
-    }
-
-    /// Waits until every worker has reached the barrier of `round`, and returns whether every
-    /// worker had `done` its chunk by then. All workers get the same answer, so they all stop
-    /// after the same round.
-    ///
-    /// The last worker to arrive resets the count and releases the others. Its `AcqRel` add
-    /// sees every earlier arrival's writes, and its `Release` store passes them on to the
-    /// `Acquire` loads of the waiters, so every letter posted before the barrier is visible after.
-    /// It unparks every worker, itself too, which only makes its own next `park` return at once.
-    fn wait(&self, round: usize, done: bool) -> bool {
-        let arrival = 1 + (u64::from(done) << 32);
-        let arrived = self.arrived.fetch_add(arrival, AcqRel) + arrival;
-        let next = 2 * (round as u64 + 1);
-        if arrived as u32 as usize == self.threads {
-            self.arrived.store(0, Relaxed);
-            let all_done = (arrived >> 32) as usize == self.threads;
-            self.released.store(next + u64::from(all_done), Release);
-            (self.workers.iter()).for_each(|t| t.get().expect("set before round 0").unpark());
-            return all_done;
-        }
-        let mut spins = 0;
-        while self.released.load(Acquire) < next {
-            spins += 1;
-            // Workers usually arrive within microseconds of each other, so a waiter spins
-            // first. A worker that is late because the scheduler put it aside, or put two workers
-            // on one CPU, would keep every spinner busy for whole time slices, and busy CPUs never
-            // look idle enough for the scheduler to move it. So a waiter that has spun long
-            // parks, which frees its CPU, and the last worker to arrive unparks everyone.
-            std::hint::spin_loop();
-            if spins > SPINS {
-                thread::park();
-            }
-        }
-        // No barrier can pass before this worker arrives at it, so `released` holds still.
-        self.released.load(Acquire) & 1 == 1
-    }
-}
-
-/// Names of up to this many bytes travel inside their letter and are keyed by their bytes.
-const INLINE: usize = 24;
-/// The length field of a letter whose name is longer than [`INLINE`] bytes.
-const LONG: u64 = 0xFFFF;
 
 /// A letter for the name at `start..end` of `data`, without its group, which the poster adds to
-/// the top 16 bits: the name's bytes as three little-endian words zero-padded to [`INLINE`]
-/// bytes, then its 32-bit hash with its length above it. A name longer than that travels as its
-/// start and end offsets instead, with [`LONG`] as length.
+/// the top 16 bits: the name's bytes as three little-endian words zero-padded to 24 bytes, then
+/// its 32-bit hash with its length above it. A name longer than that travels as its start and
+/// end offsets instead, with [`LONG`] as length.
 ///
 /// The three words come from one fixed-size read past the name's start, masked to its length,
 /// so short names need no variable-length copy. The bytes after a name are the rest of its
-/// record, and the [`SENTINEL`] pads the input, so the read always fits. With a shorter copy for
-/// the end of the input as well, LLVM merges both copies into one call to `memcpy` per record.
+/// record, and the [`PAD`] follows the input, so the read always fits.
 ///
 /// The hash is `FxHash`, the rotate-XOR-multiply hash rustc uses for its own tables, with a
 /// final fold of the high half into the low half, so the 32 bits kept depend on every word. The
 /// length seeds it, so names that differ only by trailing spaces, such as `Betts` and `Betts `,
-/// differ from the first step. For a long name it covers the first [`INLINE`] bytes, which is
-/// enough to pick an owner, and the owner compares long names in full.
+/// differ from the first step. For a long name it covers the first 24 bytes, which is enough to
+/// pick an owner, and the owner compares long names in full.
 fn name_letter(data: &[u8], Range { start, end }: Range<usize>) -> [u64; 4] {
     let len = end - start;
-    let bytes: &[u8; INLINE] = data[start..].first_chunk().expect("the input is padded");
+    let bytes: &[u8; 24] = data[start..].first_chunk().expect("the input is padded");
     let words: [u64; 3] = std::array::from_fn(|i| {
         let keep = len.saturating_sub(8 * i).min(8);
         u64::from_le_bytes(bytes.as_chunks().0[i]) & ((1u128 << (8 * keep)) - 1) as u64
@@ -819,19 +543,14 @@ fn name_letter(data: &[u8], Range { start, end }: Range<usize>) -> [u64; 4] {
     let mix = |h: u64, w: u64| (h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
     let h = words.iter().fold(len as u64, |h, &w| mix(h, w));
     let hash = (h ^ (h >> 32)) & 0xFFFF_FFFF;
-    if len > INLINE {
+    if len > 24 {
         return [start as u64, end as u64, 0, hash | LONG << 32];
     }
     [words[0], words[1], words[2], hash | (len as u64) << 32]
 }
 
-/// The low 24 bits of a slot: its entry's index plus 1, so that 0 is an empty slot. The top 8
-/// bits are bits 20 to 27 of the name's hash, so a probe that passes a different name usually
-/// skips its entry without loading it.
-const ENTRY: u32 = (1 << 24) - 1;
-
-/// One cache line of a [`NameSet`] entry.
-#[derive(Clone, Copy)]
+/// One [`NameSet`] entry, one cache line: the four-word key from [`name_letter`], then one bit
+/// per group. 255 countries and `_UNMATCHED` fill the 256 bits.
 #[repr(align(64))]
 struct Line([u64; 8]);
 
@@ -839,12 +558,11 @@ struct Line([u64; 8]);
 ///
 /// It is a hash table with open addressing and linear probing that only its worker ever
 /// touches: no atomics and no cache line shared with another core. Each distinct name has one
-/// entry of whole cache lines: its four-word key from [`name_letter`], then a bitset with one bit
-/// per group. With up to 256 groups an entry is one line, so a record's compare and its bit land
-/// on the same line. A slot holds an entry's number and 8 more bits of the name's hash (see
-/// [`ENTRY`]), so an empty slot costs 4 bytes, and a probe loads an entry only when those bits
-/// match. Names longer than [`INLINE`] bytes are rare. Their keys say where they lie in the file,
-/// and two of them are compared there (see [`NameSet::holds`]).
+/// entry of one cache line, so a record's compare and its bit land on the same line. A slot
+/// holds an entry's number and 8 more bits of the name's hash (see [`ENTRY`]), so an empty slot
+/// costs 4 bytes, and a probe loads an entry only when those bits match. Names longer than 24
+/// bytes are rare. Their keys say where they lie in the file, and two of them are compared there
+/// (see [`NameSet::holds`]).
 ///
 /// Names are keyed still escaped. Escaping is one to one (each `"` becomes `""`), so two raw
 /// names are equal exactly when their unescaped values are. The empty quoted name `""` and the
@@ -852,23 +570,17 @@ struct Line([u64; 8]);
 struct NameSet {
     /// The entry of each name, with 8 bits of its hash on top (see [`ENTRY`]), or 0.
     slots: Vec<u32>,
-    /// The entries, `stride` lines each.
     lines: Vec<Line>,
-    /// Lines per entry: four key words, then one bit per group.
-    stride: usize,
 }
 
 impl NameSet {
-    /// An empty set with room for about `names` names over `group_count` groups.
-    fn new(group_count: usize, names: usize) -> Self {
-        let stride = (4 + group_count.div_ceil(64)).div_ceil(8);
-        Self {
-            // The slots may fill to three quarters before they grow (see `insert`).
-            slots: vec![0; (4 * names / 3).next_power_of_two().max(16)],
-            // Pages of the capacity that no entry reaches cost nothing, so this is generous.
-            lines: Vec::with_capacity(2 * names * stride),
-            stride,
-        }
+    /// An empty set with room for about `names` names.
+    fn new(names: usize) -> Self {
+        // The slots may fill to three quarters before they grow (see `insert`). Pages of the
+        // entries' capacity that no entry reaches cost nothing, so it is generous.
+        let slots = vec![0; (4 * names / 3).next_power_of_two().max(16)];
+        let lines = Vec::with_capacity(2 * names);
+        Self { slots, lines }
     }
 
     /// Marks the names of `letters` and counts each name that is new for its group in
@@ -880,115 +592,77 @@ impl NameSet {
             let group = (letter[3] >> 48) as usize;
             // The key is the letter without its group: the hash and the length, 48 bits.
             let key = [letter[0], letter[1], letter[2], letter[3] & ((1 << 48) - 1)];
-            groups[group].distinct += u64::from(self.mark(key, group, data));
+            let mask = self.slots.len() - 1;
+            let mut slot = key[3] as u32 as usize & mask;
+            let tag = (key[3] as u32 >> 20) << 24;
+            let entry = loop {
+                let found = self.slots[slot];
+                match (found & ENTRY) as usize {
+                    0 => break self.insert(slot, tag, key),
+                    e if found & !ENTRY == tag && self.holds(e - 1, key, data) => break e - 1,
+                    _ => slot = (slot + 1) & mask,
+                }
+            };
+            let word = &mut self.lines[entry].0[4 + group / 64];
+            groups[group][5] += i64::from(*word >> (group % 64) & 1 == 0);
+            *word |= 1 << (group % 64);
         }
-    }
-
-    /// Adds `group` to the groups of the name with this key and returns `true` if it was not
-    /// there yet.
-    fn mark(&mut self, key: [u64; 4], group: usize, data: &[u8]) -> bool {
-        let mask = self.slots.len() - 1;
-        let mut slot = key[3] as u32 as usize & mask;
-        let tag = (key[3] as u32 >> 20) << 24;
-        let entry = loop {
-            let found = self.slots[slot];
-            match (found & ENTRY) as usize {
-                0 => break self.insert(slot, tag, key),
-                e if found & !ENTRY == tag && self.holds(e - 1, key, data) => break e - 1,
-                _ => slot = (slot + 1) & mask,
-            }
-        };
-        let word = 4 + group / 64;
-        let word = &mut self.lines[entry * self.stride + word / 8].0[word % 8];
-        let new = *word >> (group % 64) & 1 == 0;
-        *word |= 1 << (group % 64);
-        new
     }
 
     /// Whether `entry` is the name of `key`. A short name's key is the whole name, so equal keys
     /// are equal names. A long name's key says where the name lies in `data`, so two long names
     /// with the same hash are compared there.
     fn holds(&self, entry: usize, key: [u64; 4], data: &[u8]) -> bool {
-        let held = self.key(entry);
+        let held = &self.lines[entry].0[..4];
         let text = |key: &[u64]| &data[key[0] as usize..key[1] as usize];
         held == key || held[3] == key[3] && key[3] >> 32 == LONG && text(held) == text(&key)
     }
 
     /// Appends an entry with this key and no groups, puts it in the empty `slot` with its `tag`,
-    /// and returns its index. The slots grow when the entries fill three quarters of them; see
-    /// [`NameSet::grow`].
+    /// and returns its index. When the entries fill three quarters of the slots, the slots
+    /// double and every entry is placed again, so every probe ends at an empty slot.
     fn insert(&mut self, slot: usize, tag: u32, key: [u64; 4]) -> usize {
-        let entry = self.lines.len() / self.stride;
-        assert!(entry < ENTRY as usize, "under 2^24 names per thread");
-        self.lines.resize((entry + 1) * self.stride, Line([0; 8]));
-        self.lines[entry * self.stride].0[..4].copy_from_slice(&key);
-        self.slots[slot] = tag | (entry + 1) as u32;
-        if 4 * (entry + 1) > 3 * self.slots.len() {
-            self.grow();
-        }
-        entry
-    }
-
-    /// Doubles the slots and places every entry again, tag and all, so at least a quarter of the
-    /// slots stay empty and every probe ends at an empty slot.
-    fn grow(&mut self) {
-        let mut slots = vec![0; 2 * self.slots.len()];
-        let mask = slots.len() - 1;
-        for &found in self.slots.iter().filter(|&&found| found != 0) {
-            let mut slot = self.key((found & ENTRY) as usize - 1)[3] as u32 as usize & mask;
-            while slots[slot] != 0 {
-                slot = (slot + 1) & mask;
+        assert!(self.lines.len() < ENTRY as usize, "over 2^24 names");
+        let line = Line([key[0], key[1], key[2], key[3], 0, 0, 0, 0]);
+        self.lines.push(line);
+        self.slots[slot] = tag | self.lines.len() as u32;
+        if 4 * self.lines.len() > 3 * self.slots.len() {
+            self.slots = vec![0; 2 * self.slots.len()];
+            let mask = self.slots.len() - 1;
+            for (entry, line) in self.lines.iter().enumerate() {
+                let mut slot = line.0[3] as u32 as usize & mask;
+                while self.slots[slot] != 0 {
+                    slot = (slot + 1) & mask;
+                }
+                self.slots[slot] = (line.0[3] as u32 >> 20) << 24 | (entry + 1) as u32;
             }
-            slots[slot] = found;
         }
-        self.slots = slots;
-    }
-
-    /// The key that `entry` starts with.
-    fn key(&self, entry: usize) -> &[u64] {
-        &self.lines[entry * self.stride].0[..4]
+        self.lines.len() - 1
     }
 }
 
 /// Writes one line per group that has records: the countries in bytewise order, then
 /// `_UNMATCHED`, which sorts after every capital letter because `_` is 0x5F (spec §4).
 ///
-/// Group numbers already follow bytewise order (see [`Regions`]), so this is a walk, not a sort.
-fn format_output(groups: &[Group], regions: &Regions) -> Vec<u8> {
+/// Group numbers already follow bytewise order (see [`parse_regions`]), so this is a walk, not
+/// a sort. Money prints as `-?I.DD`: -525 is `-5.25`, -5 is `-0.05`, and zero is `0.00`, never
+/// `-0.00`, because the sign is printed only for a negative value.
+fn format_output(groups: &[Group], codes: &[[u8; 3]]) -> Vec<u8> {
+    let money = |c: i64| {
+        let (sign, abs) = (if c < 0 { "-" } else { "" }, c.abs());
+        format!("{sign}{}.{:02}", abs / 100, abs % 100)
+    };
     let mut out = Vec::new();
     // Group k + 1 is country k, and group 0, `_UNMATCHED`, goes last.
-    let keys = (regions.codes.iter().map(|code| &code[..])).chain([&b"_UNMATCHED"[..]]);
+    let keys = (codes.iter().map(|code| &code[..])).chain([&b"_UNMATCHED"[..]]);
     let lines = keys.zip(groups[1..].iter().chain(&groups[..1]));
     // A country without records prints nothing (§3).
-    for (key, group) in lines.filter(|(_, group)| group.count > 0) {
+    for (key, group) in lines.filter(|(_, group)| group[0] > 0) {
+        let [count, ids, sum, name_bytes, note_bytes, distinct, min, max] = *group;
+        let (sum, min, max) = (money(sum), money(min), money(max));
         out.extend_from_slice(key);
-        writeln!(
-            out,
-            " {} {} {} {} {} {} {} {}",
-            group.count,
-            group.id_sum,
-            Cents(group.amount_sum),
-            Cents(group.amount_min),
-            Cents(group.amount_max),
-            group.distinct,
-            group.name_bytes,
-            group.note_bytes
-        )
-        .expect("writing to a Vec cannot fail");
+        write!(out, " {count} {ids} {sum} {min} {max}").unwrap();
+        writeln!(out, " {distinct} {name_bytes} {note_bytes}").unwrap();
     }
     out
-}
-
-/// Integer cents that display as money, `-?I.DD`: -525 is `-5.25`, -5 is `-0.05`, and zero is
-/// `0.00`, never `-0.00` (spec §4).
-struct Cents(i64);
-
-impl fmt::Display for Cents {
-    /// Splits the magnitude into whole units and two digits. The sign is printed only for a
-    /// negative value, which is what rules out `-0.00`.
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let sign = if self.0 < 0 { "-" } else { "" };
-        let abs = self.0.unsigned_abs();
-        write!(f, "{sign}{}.{:02}", abs / 100, abs % 100)
-    }
 }
