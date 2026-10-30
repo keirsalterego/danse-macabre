@@ -18,7 +18,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 11 | One team of threads summarizes and formats the hours, with a barrier between | run-23647f6bde01 | 0.0280 | 25.3 | 78.8 |
 | 12 | One mmap helper for input and output; 35 fewer code lines | run-ce9384368863 | 0.0269 | 25.1 | 79.4 |
 | 13 | Hour checked by comparing 8 timestamp bytes; exact 64-byte name compare without the hash; padded copies for the merge | run-b262ef9cc01a | 0.0258 | 25.2 | 79.9 |
-| 14 | Lean parse on a padded mapping, SWAR number output, names merged inside the parse, sorting networks for groups of up to 64, threads spawned as a tree, and a static-pie build | | | | |
+| 14 | Lean parse on a padded mapping, SWAR number output, names merged inside the parse, sorting networks for groups of up to 64, threads spawned as a tree, and a static-pie build | run-3c59aa35895d | 0.0220 | 24.5 | 81.3 |
+| 15 | 137 fewer code lines: a fixed-size name table, `OnceLock` hand-offs instead of a barrier leader, records written straight into each chunk | | | | |
 
 ## Step 1: v1
 
@@ -137,6 +138,29 @@ checked with an offline `docker build` of the track: its output for full seed 1 
 
 Tried and dropped: an LSD radix sort instead of the scatter and selection (no gain: the count
 pass doubled and it added page faults).
+
+The board's first run of this code, run-e4abec729a4f, drew 28.1 ms. The next push changed only
+track B, and its run of the same track A code, run-3c59aa35895d, took 21.98 ms: that is the row.
+
+## Step 15: 137 fewer lines at the same speed
+
+S 561 → 424 (417 Rust lines and the 7-line Dockerfile), with the same output:
+
+- The name table never grows: 8,192 slots and an assert at 4,096 names. The spec gives every
+  seed 1,842 endpoints, so the table is never more than a quarter full.
+- `OnceLock::get_or_init` replaces the barrier leader and its two hand-off slots, and each hour's
+  result goes into its own `OnceLock` slot, so the hour pass collects nothing.
+- Records and large latencies are written straight into the chunk, and a run's end is the next
+  run's start, with a sentinel after the last one.
+- One queue of places instead of two, formatting appends to one `Vec`, and `hour_index` reads a
+  table of days.
+- The name table still stores each name's hash. Recomputing it in the merge cost 0.4 ms, because
+  it reads the names' bytes from the input again, cold.
+
+Local, turbo off, against step 14 in the same sessions (`ab.py`, two rounds of 30 interleaved
+runs): medians 24.15 and 24.26 ms against 24.52 and 24.57 ms. `perf stat`, 10 runs: instructions
+818.8 M against 817.4 M, cycles +0.9%. memory.peak, 6 runs each: 22.4–23.1 MB against
+22.7–23.8 MB. Gate: 307 pass, 0 fail.
 
 ## Experiments that did not stay
 
