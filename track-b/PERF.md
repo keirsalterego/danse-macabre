@@ -319,6 +319,9 @@ rise a little, 171–182 → 178–192 M in a noisy session (the same work, spre
 one TLB-flush interrupt per thread), but no longer at the end. memory.peak over seven
 interleaved runs: median 40.0 → 40.1 MiB. S 848 → 852. Gate: 507 pass, 0 fail.
 
+A second board run of the same code, run-7a898680a856 (from the next push), measured 0.2293 s
+and 42.2 MB.
+
 ## Experiments that did not stay
 
 - **A static-pie build** (`+crt-static`, as tracks A and C use), on step 14 (local, turbo off):
