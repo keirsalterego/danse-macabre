@@ -30,7 +30,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 23 | 5 fewer lines at the same speed: one `use` line, a recursive spawn tree, an hour as a tuple | run-6b577bd7fed9 | 0.0200 | 21.4 | 84.1 |
 | 24 | 2 fewer lines with the same machine code: one `use` line, and no alias for the hour buffer | run-3d33fc387ebc | 0.0199 | 21.2 | 84.2 |
 | 25 | 6 fewer lines with the same machine code: five variables written where they are used, and the last thread's exit on one line | run-6223c163632a | 0.0200 | 20.9 | 84.2 |
-| 26 | 3 fewer lines with the same machine code: `digits` a closure in its one caller, and a group's length read where it is used | | | | |
+| 26 | 3 fewer lines with the same machine code: `digits` a closure in its one caller, and a group's length read where it is used | run-b3536f948213 | 0.0200 | 21.2 | 84.2 |
+| 27 | The sorting network's stages within one register take each lane's partner from the register itself, not from the stage's copy | | | | |
 
 ## Step 1: v1
 
@@ -318,6 +319,21 @@ cannot move. S 388 → 382. Gate: 307 pass, 0 fail.
 reads `group.len()` where it used `n`. `.rodata` is byte-identical to step 25's; `.text` differs
 in four compares of the group length, `cmp $9; jae` becoming `cmp $8; ja` and so on, the same test
 in an instruction of the same size, so T and M cannot move. S 382 → 379. Gate: 307 pass, 0 fail.
+
+## Step 27: the network's in-register stages without the copy
+
+Each stage of `sort_network` compares every lane with a partner, and a stage reads the partners
+from `old`, a copy of the registers taken before the stage, because a stage that pairs two
+registers overwrites the first before the second reads it. A stage within one register (m < 8)
+pairs lanes of the same register, which has not been written yet when its partners are read, so
+it now permutes the register itself, and the compiler no longer stores and reloads it.
+
+Instructions 774.28 → 770.72 M (−0.46%). Cycles of the network per call, rdtsc on an instrumented
+copy, two runs: up to 16 latencies 125 → 117, up to 32 623 → 563, up to 64 1,414 → 1,230. The
+percentiles and lines of an hour, timed per hour, 5 runs each: median 2.34 → 2.29 ms per thread.
+That is about 0.06–0.1 ms per thread, under 0.5% of the run: user cycles 417.21 → 416.96 M over
+15 interleaved runs and `ab.py` (61 runs per round, two rounds: medians 22.37 → 22.36 and
+22.43 → 22.55 ms) are within noise. S unchanged at 379. Gate: 307 pass, 0 fail.
 
 ## Experiments that did not stay
 
