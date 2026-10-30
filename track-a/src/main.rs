@@ -21,11 +21,12 @@
 //!
 //! 1. **Map and split.** We `mmap` the log instead of reading it ([`map_file`]) and cut it into
 //!    one chunk per thread at line breaks ([`line_bounds`]).
-//! 2. **Parse once.** Each thread turns every line of its chunk into a 6-byte record: endpoint
-//!    id, error bit and latency ([`parse`]). Endpoint names become small integer ids through a
-//!    per-thread hash table ([`Interner`]). The hour is not stored per line: the records stay in
-//!    file order, where lines come in long runs of one hour, and the thread notes where each run
-//!    starts ([`Chunk`]).
+//! 2. **Parse once.** Each thread turns every line of its chunk into a 4-byte record: endpoint
+//!    id, error bit and latency, with the rare latency too large for its 19 bits kept on a side
+//!    list ([`parse`]). Endpoint names become small integer ids through a per-thread hash table
+//!    ([`Interner`]). The hour is not stored per line: the records stay in file order, where
+//!    lines come in long runs of one hour, and the thread notes where each run starts
+//!    ([`Chunk`]).
 //! 3. **Merge.** We collect every thread's endpoint names, drop duplicates and sort them bytewise
 //!    ([`rank_endpoints`]). An endpoint's position in that list, its *rank*, is also its position
 //!    within an hour of the output, so the output never needs sorting.
@@ -42,7 +43,7 @@
 //! ## Why it is fast
 //!
 //! - **One pass over the input.** The log is 239 MB, ten times the L3 cache, so every pass over
-//!   it streams from main memory. We parse it once and keep 19 MB of compact records instead.
+//!   it streams from main memory. We parse it once and keep 12 MB of compact records instead.
 //! - **No byte-by-byte scanning.** One AVX2 compare finds a line's end ([`line_end`]). The
 //!   latency, the status and the end of the endpoint are then read backwards from it at known
 //!   offsets, and the latency's digits convert in a single SWAR step ([`latency`]).
@@ -209,9 +210,8 @@ fn summarize(log: &[u8], out_path: &Path) -> Result<(), Box<dyn Error>> {
     let (names, ranks) = rank_endpoints(&chunks);
     let mut runs: Vec<Vec<Run>> = vec![Vec::new(); HOURS];
     for (chunk, rank) in chunks.iter().zip(&ranks) {
-        for (hour, lines) in &chunk.runs {
-            let records = (&chunk.ids[lines.clone()], &chunk.latencies[lines.clone()]);
-            runs[*hour].push((records.0, records.1, rank));
+        for (hour, lines, first) in &chunk.runs {
+            runs[*hour].push((&chunk.records[lines.clone()], &chunk.large[*first..], rank));
         }
     }
     // Night hours carry about half the traffic of day hours, so fixed blocks of hours would
@@ -252,8 +252,8 @@ fn summarize(log: &[u8], out_path: &Path) -> Result<(), Box<dyn Error>> {
     thread::scope(|s| {
         for (t, chunk) in chunks.iter().enumerate() {
             s.spawn(move || {
-                release(&chunk.latencies);
-                release(&chunk.ids);
+                release(&chunk.records);
+                release(&chunk.large);
                 let mut text = Vec::new();
                 let next = || queue.lock().expect("a panic aborts the process").next();
                 for (hour, place) in std::iter::from_fn(next) {
@@ -311,12 +311,18 @@ fn line_bounds(log: &[u8], parts: usize) -> Vec<usize> {
 
 /// One thread's share of the log after parsing.
 ///
-/// Every line becomes a 6-byte record, split over two arrays so that the counting pass of
-/// [`summarize_hours`] reads only the 2-byte half. For line `i` of the chunk:
+/// Every line becomes one `u32` record, packed like this:
 ///
-/// - `latencies[i]` is its latency in microseconds;
-/// - `ids[i]` is its endpoint's id in this chunk, shifted left by one, with the low bit set if
-///   its status is 500–599.
+/// | bits    | field                                                  |
+/// |---------|--------------------------------------------------------|
+/// | 31 – 20 | the endpoint's id in this chunk (12 bits)              |
+/// | 19      | 1 if the status is 500–599                             |
+/// | 18 – 0  | the latency in microseconds, or [`LARGE`]              |
+///
+/// The spec allows any 32-bit latency, but 97.5% of seed 1's lines took under half a second,
+/// which fits in 19 bits. A latency of [`LARGE`] or more goes to the `large` list instead, in
+/// line order, and its record holds [`LARGE`]: whoever reads the records in order takes the
+/// next value from `large` each time they meet it.
 ///
 /// The hour is not stored per line. Shards upload their lines in time order, so consecutive
 /// lines of the log almost always share an hour: seed 1's 3.1 million lines form just 1,054 runs
@@ -325,16 +331,21 @@ fn line_bounds(log: &[u8], parts: usize) -> Vec<usize> {
 /// no bound on the disorder: a log whose hour changed on every line would simply have one run
 /// per line.
 ///
-/// Six bytes per line keep all 3.1 million records at 19 MB. The ids are local to the chunk:
+/// Four bytes per line keep all 3.1 million records at 12.4 MB. The ids are local to the chunk:
 /// [`rank_endpoints`] later maps them to global ranks.
 struct Chunk<'a> {
     /// Local endpoint id → (name, hash). Names borrow the mapped file, so none are copied.
     names: Vec<(&'a [u8], u64)>,
-    latencies: Vec<u32>,
-    ids: Vec<u16>,
-    /// The runs in file order: each one's hour and its lines' indices.
-    runs: Vec<(usize, Range<usize>)>,
+    records: Vec<u32>,
+    large: Vec<u32>,
+    /// The runs in file order: each one's hour, its lines' indices, and the index in `large` of
+    /// its first large latency.
+    runs: Vec<(usize, Range<usize>, usize)>,
 }
+
+/// The value of a record's 19-bit latency field that sends readers to the chunk's list of large
+/// latencies (see [`Chunk`]).
+const LARGE: u32 = (1 << 19) - 1;
 
 /// Parses one chunk of whole lines into records.
 ///
@@ -353,9 +364,9 @@ struct Chunk<'a> {
 /// Here `space` is the last space of the line, which [`latency`] finds.
 fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
     let mut endpoints = Interner::default();
-    let mut latencies = Vec::with_capacity(chunk.len() / MIN_LINE + 1);
-    let mut ids = Vec::with_capacity(chunk.len() / MIN_LINE + 1);
-    // The hour and first line of every run. No hour equals `usize::MAX`, so line 0 starts one.
+    let (mut records, mut large) = (Vec::with_capacity(chunk.len() / MIN_LINE + 1), Vec::new());
+    // The hour, first line and first large latency of every run. No hour equals `usize::MAX`,
+    // so line 0 starts one.
     let (mut starts, mut current) = (Vec::new(), usize::MAX);
     let mut i = 0;
     while i < chunk.len() {
@@ -379,27 +390,33 @@ fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
         // Errors are exactly 500..=599, so the status's first digit decides.
         let error = u32::from(line[space - 3] == b'5');
         if hour != current {
-            starts.push((hour, ids.len()));
+            starts.push((hour, records.len(), large.len()));
             current = hour;
         }
-        latencies.push(latency_us);
-        ids.push((id << 1 | error) as u16);
+        let small = if latency_us < LARGE {
+            latency_us
+        } else {
+            large.push(latency_us);
+            LARGE
+        };
+        records.push(id << 20 | error << 19 | small);
     }
-    // The spec gives every seed 1,842 endpoints (§2), far below the 2^15 that fit beside the
-    // error bit. Past that, the ids above were cut short, so we stop instead.
-    if endpoints.names.len() > 1 << 15 {
-        return Err("over 32,768 distinct endpoints in one chunk: ids overflow 15 bits".into());
+    // The spec gives every seed 1,842 endpoints (§2), well below the 4,096 that 12 bits hold.
+    // Past that, the ids above were cut short, so we stop instead.
+    if endpoints.names.len() > 1 << 12 {
+        return Err("over 4,096 distinct endpoints in one chunk: ids overflow 12 bits".into());
     }
     let ends = starts
         .iter()
         .skip(1)
-        .map(|&(_, start)| start)
-        .chain([ids.len()]);
-    let runs = (starts.iter().zip(ends)).map(|(&(hour, start), end)| (hour, start..end));
+        .map(|run| run.1)
+        .chain([records.len()]);
+    let runs =
+        (starts.iter().zip(ends)).map(|(&(hour, start, first), end)| (hour, start..end, first));
     Ok(Chunk {
         names: endpoints.names,
-        latencies,
-        ids,
+        records,
+        large,
         runs: runs.collect(),
     })
 }
@@ -695,9 +712,9 @@ struct Hour {
     len: usize,
 }
 
-/// One run of lines from one hour: their endpoint ids and latencies (see [`Chunk`]), and the
-/// table from their chunk's endpoint ids to ranks.
-type Run<'a> = (&'a [u16], &'a [u32], &'a [u32]);
+/// One run of lines from one hour: their records, their chunk's large latencies from the run's
+/// first one on (see [`Chunk`]), and the table from their chunk's endpoint ids to ranks.
+type Run<'a> = (&'a [u32], &'a [u32], &'a [u32]);
 
 /// Computes the output lines of each hour in `hours`, from `runs[hour]`.
 ///
@@ -726,11 +743,11 @@ fn summarize_hours(
         let mut len = 0;
         start.fill(0);
         errors.fill(0);
-        for &(ids, _, rank) in &runs[hour] {
-            for &id in ids {
-                let e = rank[usize::from(id >> 1)] as usize;
+        for &(records, _, rank) in &runs[hour] {
+            for &r in records {
+                let e = rank[(r >> 20) as usize] as usize;
                 start[e + 1] += 1;
-                errors[e] += u32::from(id & 1);
+                errors[e] += r >> 19 & 1;
             }
         }
         for e in 0..names.len() {
@@ -738,10 +755,14 @@ fn summarize_hours(
         }
         next.copy_from_slice(&start[..names.len()]);
         latencies.resize(start[names.len()] as usize, 0);
-        for &(ids, run_latencies, rank) in &runs[hour] {
-            for (&id, &latency) in ids.iter().zip(run_latencies) {
-                let e = rank[usize::from(id >> 1)] as usize;
-                latencies[next[e] as usize] = latency;
+        for &(records, large, rank) in &runs[hour] {
+            let mut large = large.iter().copied();
+            for &r in records {
+                let e = rank[(r >> 20) as usize] as usize;
+                latencies[next[e] as usize] = match r & LARGE {
+                    LARGE => large.next().expect("one large latency per LARGE record"),
+                    small => small,
+                };
                 next[e] += 1;
             }
         }
