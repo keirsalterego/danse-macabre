@@ -12,6 +12,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 5 | Queries on sets evaluated every 4,096 documents inside the pass; glibc's mmap threshold fixed at 128 KiB | run-16bfddb1c5c1 | 0.3708 | 45.7 | 64.3 |
 | 6 | Per-document BOOL queries compiled to 64-bit truth tables with one packed tally each, prefetched at the trigger term; term keys folded through a mask table | run-a7a48ad2968d | 0.2838 | 43.1 | 67.2 |
 | 7 | Blocks of 2 MiB or more on transparent huge pages; a window's id lists hold 16-bit offsets | | | | |
+| 8 | Term table sized once from the queries' term count, and its keys trimmed after the intern | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -155,6 +156,24 @@ Locally, step 6 → 7, three interleaved rounds: cycles 7.07–7.23 → 6.89–7
 3,059–3,131 → 2,958–3,014 ms, elapsed 0.2997–0.3045 → 0.2838–0.2843 s in the two quiet rounds.
 Alternating runs, 20 each: median wall 295.2 → 285.3 ms. memory.peak over eight runs each:
 41.1–44.2 → 40.2–45.1 MB (medians 41.9 and 43.3). S went from 837 to 871.
+
+## Step 8: the term table sized once
+
+The intern grew the term table from 1,024 slots by doubling, which rebuilt it eight times. The
+table is now created with one slot per term occurrence in the queries, rounded up to a power of
+two (about 153K occurrences and 75.7K distinct terms on all seven seeds, so 262,144 slots, the
+size the doubling reached anyway). The intern drops from about 11 to 6.5 ms. The keys are trimmed
+to their length once the intern ends, since the spare capacity would stay resident on huge pages.
+The scan's machine code is unchanged.
+
+Local, the time from start to the end of planning, medians of 6 interleaved runs: 27.96 → 23.5
+ms. User instructions 10.23 → 10.06 G. memory.peak 40.2 → 40.6 MiB (noise about ±1 MiB). S
+unchanged. Gate: 507 pass, 0 fail; full seeds 1–7 match.
+
+What is left of start-up, and why it stays: query parsing 3 ms (already parallel), intern 6.3,
+sampling 5.6, the plan loop 5.3, grouping and marking 3.2. A parallel sample, mark and plan loop
+took start-up to 19.0 ms but added 55 lines, which costs more than it saves; a partitioned
+parallel intern would take about 45 lines for about 4 ms.
 
 ## Experiments that did not stay
 

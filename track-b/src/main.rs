@@ -298,7 +298,8 @@ fn parse_queries(text: &[u8], threads: usize) -> Result<(Queries, TermTable), St
             .map(|w| w.join().expect("a panic aborts the process"))
             .collect::<Result<Vec<_>, _>>()
     })?;
-    let (mut queries, mut table) = (Queries::default(), TermTable::default());
+    let occurrences = parts.iter().map(|part| part.keys.len()).sum();
+    let (mut queries, mut table) = (Queries::default(), TermTable::new(occurrences));
     queries.at.push(0);
     for part in parts {
         queries.phrase.extend(part.phrase);
@@ -313,6 +314,8 @@ fn parse_queries(text: &[u8], threads: usize) -> Result<(Queries, TermTable), St
             queries.terms.push(table.intern(*key));
         }
     }
+    // The keys grew by doubling; the spare capacity would sit in resident huge pages.
+    table.keys.shrink_to_fit();
     Ok((queries, table))
 }
 
@@ -1138,16 +1141,16 @@ struct TermTable {
     keys: Vec<Key>,
 }
 
-impl Default for TermTable {
-    fn default() -> Self {
+impl TermTable {
+    /// An empty table with a slot per term occurrence, rounded up to a power of two: it only
+    /// doubles when more than half of `occurrences` are distinct terms.
+    fn new(occurrences: usize) -> Self {
         Self {
-            slots: vec![Slot::default(); 1024],
+            slots: vec![Slot::default(); occurrences.next_power_of_two()],
             keys: Vec::new(),
         }
     }
-}
 
-impl TermTable {
     fn len(&self) -> usize {
         self.keys.len()
     }
