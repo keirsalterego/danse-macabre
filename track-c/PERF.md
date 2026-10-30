@@ -8,8 +8,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 1 | Rust v1: a quote-parity pre-pass splits the file for 12 threads, each runs a byte state machine, and one lock-free name table keeps a country bitset per name | run-7bddfb5dd3ec | 0.1204 | 39.3 | 57.4 |
 | 2 | Each distinct name copied into one arena entry next to its country bitset | run-edd394160002 | 0.1133 | 39.0 | 58.0 |
 | 3 | Transparent huge pages off | run-fbfe0ea92fbf | 0.1190 | 15.47 | 61.5 |
-| 4 | Distinct names counted by the workers, from the atomic OR's return value | | | | |
-| 5 | `regions.csv` parsed in one pass, each row's end found by the parse itself | | | | |
+| 4 | Distinct names counted by the workers, from the atomic OR's return value | run-e05eb5fa2929 | 0.1101 | 15.58 | 62.4 |
+| 5 | `regions.csv` parsed in one pass, each row's end found by the parse itself | run-e703239bd822 | 0.1016 | 15.31 | 63.2 |
+| 6 | Names and notes scanned 32 bytes at a time for their next quote | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -88,6 +89,8 @@ P-cores, `perf stat -r 10`, three interleaved rounds:
 | task-clock (ms) | 1200 / 1198 / 1198 | 1139 / 1147 / 1169 |
 | elapsed (ms) | 123.9 / 124.0 / 124.0 | 111.5 / 113.1 / 114.2 |
 
+On the board this code measured 110.1 ms in run-e05eb5fa2929 and 111.3 ms in run-a133933027d0.
+
 S 415 → 402, and memory.peak is unchanged at 14.8–15.4 MiB. Because the old value is now used,
 the OR compiles to a `lock cmpxchg` loop instead of `lock or`. LLVM can emit `lock bts` for this
 pattern, but only if the optimizer has not already rewritten the bit test, which it had here. The
@@ -119,6 +122,43 @@ S 402 → 416, and memory.peak is unchanged at 15.0–15.1 MiB. The parse is now
 the spec: a blank line, a last row without its LF, or an id larger than the last row's returns an
 error, where the old parse accepted them.
 
+## Step 6: quoted fields scanned 32 bytes at a time
+
+`perf record` on P-cores put 76% of the samples in the worker loop, which has the name table
+inlined into it, 17% in `text_field`, 4.6% in the quote pre-pass and 0.2% in the regions parse.
+Knockouts of step 5 then split the worker loop (P-cores, `perf stat`, each knockout beside its
+baseline in the same session):
+
+- Without the name table a run takes 557 ms of task-clock and 58–59 ms elapsed, against
+  1129–1142 ms and 106–118 ms. Without the region lookup as well, 553 ms and 56–57 ms. The scan
+  is half the time, the name table the other half, and the region lookup about 2%.
+- Hashing each name and loading its slot costs 0.1 G cycles: 1.39 G against 1.29 G for the scan
+  alone. Finding the arena entry, comparing the name and setting the bit cost 0.92 G more when
+  the slot is loaded right after the name. The entry adds 2.7 L2 misses per record and 3.8 M page
+  walks, which are active in 7% of all cycles, since the arena has had 4 KB pages since step 3.
+- The atomic OR costs 7% of task-clock: 1059–1089 ms when the bitset word is only read, against
+  1146–1166 ms with the OR. It also moves lines between cores: 1.37 M loads are served from
+  another core's cache, against 0.28 M without it. Testing the bit before the OR (1172–1199 ms)
+  saves nothing, because 90% of records set a new bit.
+
+Names and notes are 37 of a record's 60 bytes on average, and the old `text_field` stepped
+through them one byte at a time, with a compare and a branch per byte. Inside a quoted field only
+the quotes matter, so `text_field` now compares 32 bytes with `"` at once and jumps to the first
+match, the lowest set bit of the 32-bit mask. A name or a note usually ends within the first
+step. The mask is built by a plain loop over a `[u8; 32]`, which compiles to one `vpcmpeqb` and
+one `vpmovmskb`, so the scan needs no `unsafe` and no intrinsics. Instructions fall from 2.585 G
+to 2.035 G.
+
+P-cores, `perf stat -r 10`, three interleaved rounds:
+
+| | step 5 | step 6 |
+|---|---|---|
+| task-clock (ms) | 1152 / 1143 / 1136 | 1021 / 1002 / 985 |
+| cycles:u (G) | 2.58 / 2.55 / 2.54 | 2.27 / 2.22 / 2.17 |
+| elapsed (ms) | 110.6 / 105.6 / 108.9 | 94.7 / 95.2 / 93.1 |
+
+S 416 → 426, and memory.peak is unchanged, 14.7–15.0 MiB.
+
 ## Experiments that did not stay
 
 - **Batched table lookups** (local only): each thread parsed 32 records, then loaded every
@@ -146,3 +186,9 @@ error, where the old parse accepted them.
   104 ms, 85.1–86.8 ms each, so the chunks are balanced; merge about 1 ms; distinct counting
   105.3–114.2 ms on one thread; format and write 0.6 ms. About 20 ms of the 115 ms runs on one
   thread.
+- Loading each name's slot right after the name is scanned, so that its miss overlaps the rest
+  of the record (P-cores, `perf stat -r 10`, three interleaved rounds on top of step 6):
+  cycles:u 2.28 / 2.23 / 2.25 → 2.02 / 1.98 / 2.04 G, task-clock 1027 / 1009 / 1018 →
+  922 / 906 / 928 ms. On top of step 5, adding an explicit prefetch of the entry, or a
+  one-record pipeline that also prefetches the entry, measured no better than the early load
+  alone: 1035–1068 ms for all three, against 1145–1185 ms for step 5.

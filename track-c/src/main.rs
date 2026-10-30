@@ -33,10 +33,11 @@
 //!    each chunk's quotes. A prefix XOR over those parities tells every cut whether it is inside
 //!    quotes, and [`next_record_start`] then walks to the first real record. No thread has to
 //!    parse the chunks before its own.
-//! 3. **Each thread runs a scalar byte state machine.** [`aggregate`] walks its records one byte
-//!    at a time and sums into its own [`Group`] per country, so the hot loop shares nothing but
-//!    the name table. [`text_field`] measures a field as its raw length minus one per `""` pair,
-//!    so no field is ever unescaped.
+//! 3. **Each thread walks its records field by field.** [`aggregate`] parses each record in
+//!    order and sums into its own [`Group`] per country, so the hot loop shares nothing but the
+//!    name table. Names and notes are quoted, and [`text_field`] jumps from quote to quote 32
+//!    bytes at a time with AVX2 compares. It measures a field as its raw length minus one per
+//!    `""` pair, so no field is ever unescaped.
 //! 4. **Distinct names go through one shared interner.** All threads intern names in one
 //!    lock-free [`NameTable`]. Each distinct name's raw, still escaped bytes are copied once into
 //!    an arena entry that also holds a bitset with one bit per country, so a record's compare
@@ -402,9 +403,9 @@ impl Group {
 /// Parses the whole records in `data[range]` into one [`Group`] per country and marks each
 /// record's name in `names`. Returns `None` when the name table is full.
 ///
-/// This is the hot loop: a scalar state machine that reads each byte once, in order. The fields
-/// come in a fixed order, so the state is simply the position in the record. The numbers parse as
-/// they are scanned, and [`text_field`] skips names and notes while counting their escapes.
+/// This is the hot loop. The fields come in a fixed order, so the state is simply the position in
+/// the record. The numbers parse as they are scanned, and [`text_field`] skips names and notes
+/// while counting their escapes.
 fn aggregate(
     data: &[u8],
     range: Range<usize>,
@@ -468,6 +469,11 @@ fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
 /// Unescaping would copy every field. The spec's byte counts need only the length, and that is
 /// the raw length minus one per `""` pair. Distinct counting needs no unescaping either (see
 /// [`NameTable`]).
+///
+/// Inside quotes only the quotes matter, so the scan jumps from one quote to the next with
+/// [`byte_mask`], 32 bytes per step. A name or a note usually ends within the first step, where
+/// a loop over bytes took one step and one branch per byte. The file's last 31 bytes, too few for
+/// a step, go one byte at a time.
 fn text_field(data: &[u8], at: usize) -> (Range<usize>, u64, usize) {
     if data[at] != b'"' {
         // The generator writes unquoted text only empty (§2.2), but §2.1 allows any bytes but
@@ -486,17 +492,35 @@ fn text_field(data: &[u8], at: usize) -> (Range<usize>, u64, usize) {
     // A note can also start or end with an escaped quote, so the field can open or close with
     // `"""`; pairing quotes left to right reads both right.
     loop {
-        if data[end] == b'"' {
-            if data[end + 1] != b'"' {
-                break;
-            }
-            pairs += 1;
-            end += 2;
-        } else {
-            end += 1;
+        // On to the next quote. An empty mask has 32 trailing zeros, so a step that finds no
+        // quote moves on by all 32 bytes.
+        end += match data[end..].first_chunk() {
+            Some(chunk) => byte_mask(chunk, b'"').trailing_zeros() as usize,
+            None => usize::from(data[end] != b'"'),
+        };
+        if data[end] != b'"' {
+            continue;
         }
+        if data[end + 1] != b'"' {
+            break;
+        }
+        pairs += 1;
+        end += 2;
     }
     (start..end, (end - start - pairs) as u64, end + 2)
+}
+
+/// Returns a mask with bit i set where `chunk[i] == byte`.
+///
+/// The compiler turns the loop into one AVX2 compare of all 32 bytes (`vpcmpeqb` on `ymm`) and
+/// one `vpmovmskb` that packs the 32 results into the mask, so finding the next quote takes a
+/// handful of instructions however far away it is within the 32 bytes.
+fn byte_mask(chunk: &[u8; 32], byte: u8) -> u32 {
+    let mut mask = 0;
+    for (i, &b) in chunk.iter().enumerate() {
+        mask |= u32::from(b == byte) << i;
+    }
+    mask
 }
 
 /// The set of distinct names per country, shared by every thread without locks.
