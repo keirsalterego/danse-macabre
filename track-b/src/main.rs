@@ -562,18 +562,16 @@ fn sample_hits(docs: &[u8], terms: &TermTable) -> (Vec<u32>, usize) {
     // Per term, the last sampled document counted, so a document counts once.
     let mut counted = vec![usize::MAX; terms.len()];
     let mut doc = 0;
-    walk(sample, |event| match event {
-        Event::Token { start, end } => {
-            if let Some(key) = key_in(sample, start, end)
-                && let Some(slot) = terms.find_from(&key, terms.home(&key))
-                && counted[slot.id as usize] != doc
-            {
-                counted[slot.id as usize] = doc;
-                hits[slot.id as usize] += 1;
-            }
+    let token = |&mut doc: &mut usize, start, end| {
+        if let Some(key) = key_in(sample, start, end)
+            && let Some(slot) = terms.find_from(&key, terms.home(&key))
+            && counted[slot.id as usize] != doc
+        {
+            counted[slot.id as usize] = doc;
+            hits[slot.id as usize] += 1;
         }
-        Event::LineEnd => doc += 1,
-    });
+    };
+    walk(sample, &mut doc, token, |doc| *doc += 1);
     (hits, doc)
 }
 
@@ -601,16 +599,10 @@ fn id_at(docs: &[u8], at: usize) -> Result<u32, String> {
     Ok((docs[at..at + digits].iter()).fold(0, |id, &digit| id * 10 + u32::from(digit - b'0')))
 }
 
-/// What [`walk`] finds in a chunk of `docs.txt`, in input order.
-enum Event {
-    /// A token of a document's text, at `chunk[start..end]`.
-    Token { start: usize, end: usize },
-    /// The LF that ends a document's line.
-    LineEnd,
-}
-
-/// Calls `on` with every token of every document in `chunk`, and with every line end, in
-/// order. `chunk` holds whole lines, the last one ending in LF.
+/// Calls `on_token(state, start, end)` with every token `chunk[start..end]` of every document
+/// in `chunk`, and `on_line_end(state)` at every line end, in order. `chunk` holds whole lines,
+/// the last one ending in LF. Two calls that share `state`, rather than one that takes either
+/// event, let the compiler inline the call made once per token.
 ///
 /// No loop here looks at single bytes. [`classify`] turns 64 bytes at a time into two masks:
 /// `token`, with bit `i` set when byte `i` is a letter or digit, and `lf`. A token starts where
@@ -628,7 +620,12 @@ enum Event {
 /// oldest open start, and a token still open at a block's end carries into the next block.
 /// A line starts with its id, digits that look like a token, so a token that starts a line is
 /// skipped: document text only begins after the TAB.
-fn walk(chunk: &[u8], mut on: impl FnMut(Event)) {
+fn walk<S>(
+    chunk: &[u8],
+    state: &mut S,
+    mut on_token: impl FnMut(&mut S, usize, usize),
+    mut on_line_end: impl FnMut(&mut S),
+) {
     let mut prev_bit = 0; // 1 when the byte before the block is a token byte
     let mut open = None; // the start of a token that runs on past the block
     let mut line_start = 0;
@@ -656,10 +653,10 @@ fn walk(chunk: &[u8], mut on: impl FnMut(Event)) {
             while lfs != 0 && base + (lfs.trailing_zeros() as usize) < start {
                 line_start = base + lfs.trailing_zeros() as usize + 1;
                 lfs &= lfs - 1;
-                on(Event::LineEnd);
+                on_line_end(state);
             }
             if start != line_start {
-                on(Event::Token { start, end });
+                on_token(state, start, end);
             }
         }
         if starts != 0 {
@@ -668,7 +665,7 @@ fn walk(chunk: &[u8], mut on: impl FnMut(Event)) {
         while lfs != 0 {
             line_start = base + lfs.trailing_zeros() as usize + 1;
             lfs &= lfs - 1;
-            on(Event::LineEnd);
+            on_line_end(state);
         }
     }
 }
@@ -873,65 +870,63 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
     // slot load is long under way ([`TermTable::prefetch`]), instead of each stalling in turn.
     let mut probes: Vec<Option<(Key, usize)>> = Vec::new();
     let mut doc = ids.start;
-    walk(text, |event| match event {
-        Event::Token { start, end } => {
-            let key = key_in(text, start, end);
-            probes.push(key.map(|key| (key, plan.terms.prefetch(&key))));
+    let token = |probes: &mut Vec<_>, start, end| {
+        let key = key_in(text, start, end);
+        probes.push(key.map(|key| (key, plan.terms.prefetch(&key))));
+    };
+    walk(text, &mut probes, token, |probes| {
+        for probe in probes.drain(..) {
+            let Some(slot) = probe.and_then(|(key, at)| plan.terms.find_from(&key, at)) else {
+                terms.push(miss);
+                continue;
+            };
+            let (t, bit) = (slot.id as usize / 64, 1 << (slot.id % 64));
+            if seen[t] & bit == 0 {
+                seen[t] |= bit;
+                if slot.flags & Slot::STORED != 0 {
+                    sets.add(plan.store[slot.id as usize], doc);
+                }
+                if slot.flags & Slot::BOOL != 0 {
+                    // Start loading its checks and their cells now, to use at the line end.
+                    let checks = plan.check_range(slot.id);
+                    prefetch(&plan.checks[checks.start]);
+                    prefetch(&tally.checks[checks.start]);
+                    bool_terms.push(checks);
+                }
+            }
+            if slot.flags & Slot::PHRASE != 0 {
+                phrase_at.push(terms.len());
+            }
+            terms.push(slot.id);
         }
-        Event::LineEnd => {
-            for probe in probes.drain(..) {
-                let Some(slot) = probe.and_then(|(key, at)| plan.terms.find_from(&key, at)) else {
-                    terms.push(miss);
-                    continue;
-                };
-                let (t, bit) = (slot.id as usize / 64, 1 << (slot.id % 64));
-                if seen[t] & bit == 0 {
-                    seen[t] |= bit;
-                    if slot.flags & Slot::STORED != 0 {
-                        sets.add(plan.store[slot.id as usize], doc);
-                    }
-                    if slot.flags & Slot::BOOL != 0 {
-                        // Start loading its checks and their cells now, to use at the line end.
-                        let checks = plan.check_range(slot.id);
-                        prefetch(&plan.checks[checks.start]);
-                        prefetch(&tally.checks[checks.start]);
-                        bool_terms.push(checks);
-                    }
-                }
-                if slot.flags & Slot::PHRASE != 0 {
-                    phrase_at.push(terms.len());
-                }
-                terms.push(slot.id);
-            }
-            for &at in &phrase_at {
-                for &(q, offset) in plan.phrases(terms[at]) {
-                    let phrase = queries.terms(q as usize);
-                    // `terms` holds this doc only, so a match never spans two docs (spec §3).
-                    let start = at.checked_sub(offset as usize);
-                    let span = start.and_then(|s| terms.get(s..s + phrase.len()));
-                    if span == Some(phrase) && !found.contains(&q) {
-                        found.push(q);
-                        tally.add(q, doc);
-                    }
+        for &at in &phrase_at {
+            for &(q, offset) in plan.phrases(terms[at]) {
+                let phrase = queries.terms(q as usize);
+                // `terms` holds this doc only, so a match never spans two docs (spec §3).
+                let start = at.checked_sub(offset as usize);
+                let span = start.and_then(|s| terms.get(s..s + phrase.len()));
+                if span == Some(phrase) && !found.contains(&q) {
+                    found.push(q);
+                    tally.add(q, doc);
                 }
             }
-            let has = |t: u32| seen[t as usize / 64] >> (t % 64) & 1;
-            for checks in bool_terms.drain(..) {
-                for c in checks {
-                    let check = &plan.checks[c];
-                    tally.add_check(c, check.q, doc, check.matches(has));
-                }
+        }
+        let has = |t: u32| seen[t as usize / 64] >> (t % 64) & 1;
+        for checks in bool_terms.drain(..) {
+            for c in checks {
+                let check = &plan.checks[c];
+                tally.add_check(c, check.q, doc, check.matches(has));
             }
-            for &t in &terms {
-                seen[t as usize / 64] &= !(1 << (t % 64));
-            }
-            terms.clear();
-            phrase_at.clear();
-            found.clear();
-            doc += 1;
-            if doc - sets.start == 64 * WINDOW as u32 {
-                sets.flush(queries, plan, &mut tally);
-            }
+        }
+        for &t in &terms {
+            seen[t as usize / 64] &= !(1 << (t % 64));
+        }
+        terms.clear();
+        phrase_at.clear();
+        found.clear();
+        doc += 1;
+        if doc - sets.start == 64 * WINDOW as u32 {
+            sets.flush(queries, plan, &mut tally);
         }
     });
     sets.flush(queries, plan, &mut tally);

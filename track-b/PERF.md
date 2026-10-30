@@ -16,6 +16,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 9 | Tokens that are no query term take the id of a bit that is never set, so clearing the seen bits takes no branch | run-d85affefdce5 | 0.2679 | 44.2 | 67.7 |
 | 10 | Only the term table on transparent huge pages, allocated alone at a 2 MiB boundary; the global allocator is gone | run-b4d6bfbdd0e9 | 0.2698 | 43.9 | 67.7 |
 | 11 | A check's cell takes a match with a conditional move instead of a branch | run-6a27aa29cd80 | 0.2644 | 44.9 | 67.8 |
+| 12 | The corpus walk takes one callback per token and one per line end, so the per-token one is inlined | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -215,6 +216,20 @@ makes it a conditional move.
 Locally, against step 10, three interleaved rounds: branch misses 68.2 → 64.0 M, cycles
 6.80–6.84 → 6.61–6.68 G, task-clock 2,948–2,966 → 2,864–2,896 ms, instructions 10.06 → 10.22 G.
 Alternating runs, 16 each, twice: median wall 278.2 and 276.3 → 270.1 and 269.2 ms. S unchanged.
+Gate: 507 pass, 0 fail.
+
+## Step 12: the per-token call inlined
+
+[`walk`] reported tokens and line ends through one callback that took an enum. The callback held
+the whole line-end logic as well, so the compiler kept it out of line and called it once per
+token, 36.3 M times on seed 1: each call saved and restored six registers and reloaded the
+captured state. `walk` now takes a token callback and a line-end callback that share a state
+argument (the probes), so the token callback, a key, a hash and a prefetch, is inlined into the
+loop. The `Event` enum goes.
+
+Locally, against step 11, three interleaved rounds: instructions 10.22 → 8.86 G, cycles
+6.60–6.67 → 6.16–6.25 G, task-clock 2,858–2,893 → 2,669–2,710 ms. Alternating runs, 16 each,
+twice: median wall 272.0 and 270.5 → 255.4 and 254.0 ms (b-c4: 297.5 and 295.6). S 849 → 846.
 Gate: 507 pass, 0 fail.
 
 ## Experiments that did not stay
