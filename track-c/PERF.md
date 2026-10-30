@@ -15,7 +15,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 8 | Numbers parsed from one 8-byte word each, and the number and text-field parsers inlined | run-c66327de718b | 0.0734 | 15.2 | 66.6 |
 | 9 | Each distinct name owned by one thread: names travel to their owner in rounds, and each owner marks them in a private table. Region table at one byte per id | run-b8279a47babc | 0.0510 | 14.83 | 69.7 |
 | 10 | Each run's first record guessed instead of found by a quote pre-pass, with a check after the parse and an exact rerun when a guess is wrong. Each worker gives its input pages back after the last round | run-b480cbf26ce8 | 0.0418 | 14.8 | 71.7 |
-| 11 | Hash slots tagged with 8 bits of the name's hash, at half the size; `regions.csv` parsed on all threads; long names kept in the same table | | | | |
+| 11 | Hash slots tagged with 8 bits of the name's hash, at half the size; `regions.csv` parsed on all threads; long names kept in the same table | run-cddb49a6dc40 | 0.0422 | 12.3 | 72.4 |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
