@@ -18,7 +18,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 11 | Hash slots tagged with 8 bits of the name's hash, at half the size; `regions.csv` parsed on all threads; long names kept in the same table | run-cddb49a6dc40 | 0.0422 | 12.3 | 72.4 |
 | 12 | The BOM test reads one byte before it compares three, which takes a `bcmp` call off every record. A sentinel record after the mapped input replaces step 10's exact tail, and one thread replaces the quote pre-pass after a wrong guess | run-213d735f8f1d | 0.0368 | 12.2 | 74.3 |
 | 13 | 18 fewer lines in the region table, the exchange and the name set, at the same speed | run-5fd07fa31be9 | 0.0415 | 13.0 | 72.8 |
-| 14 | 11 fewer lines: one helper runs both thread groups, and the exchange wakes every worker | | | | |
+| 14 | 11 fewer lines: one helper runs both thread groups, and the exchange wakes every worker | run-701b81269ca6 | 0.0368 | 12.4 | 74.3 |
 | 15 | The input padded with 32 zero bytes after the sentinel record, so the field parsers lose their end-of-input paths and a per-record `memcpy`; 11 fewer lines | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
