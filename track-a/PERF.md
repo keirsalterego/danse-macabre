@@ -23,6 +23,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 16 | Records freed run by run once their hour is placed, buffers freed after the hour pass, name tables allocated once, output formatted line by line straight into place | run-1ea5237a6e04 | 0.0212 | 21.5 | 83.1 |
 | 17 | The last thread to finish ends the process instead of joining the others; 15 fewer lines | run-3ba29a3569ef | 0.0209 | 21.1 | 83.5 |
 | 18 | The name table's padded copies aligned to cache lines, and its slot array a fixed-size box | run-01b9bf369035 | 0.0212 | 20.6 | 83.5 |
+| 19 | The name hash takes one multiply instead of three dependent ones, and the slot is the product's top bits | | | | |
 
 ## Step 1: v1
 
@@ -213,6 +214,21 @@ Local, turbo off, `ab.py` with 31 interleaved runs, two rounds: medians 23.52 �
 23.56 → 23.07 ms, minimums 23.16 → 22.64 and 22.98 → 22.72 ms. User cycles, 4 interleaved sets
 of 5 runs: 448.6 → 441.5 M. memory.peak 18.95–19.88 → 18.53–19.90 MB. S 410 → 412. Gate: 307
 pass, 0 fail.
+
+## Step 19: one multiply per name hash
+
+The name hash mixed three 8-byte windows of the name (first, middle and last) through three
+dependent multiply-and-rotate steps. Now the windows are rotated apart (by 0, 21 and 42 bits),
+XORed with the length and multiplied once by the same FxHash constant. The slot is the
+product's top 13 bits, the bits every input bit reaches, which also drops the mask. In a
+simulation of the 8,192-slot table on seeds 1, 3 and 5, 3.2% of lines need a second probe,
+against 3.1% before (the old hash with top bits would need 3.8–7.6%). The table compares the
+bytes exactly, so the hash cannot change the output.
+
+Local, turbo off: instructions 822.3 → 801.2 M; user cycles, 3 interleaved sets of 5 runs,
+443.5 → 430.3 M. `ab.py`, 31 interleaved runs, two rounds: medians 23.25 → 22.92 and 23.40 →
+22.93 ms, minimums 22.73 → 22.45 and 22.75 → 22.41 ms. memory.peak unchanged. S unchanged at
+412. Gate: 307 pass, 0 fail.
 
 ## Experiments that did not stay
 
