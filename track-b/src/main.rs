@@ -485,11 +485,14 @@ fn group<T: Copy + Default>(keys: usize, items: &[(u32, T)]) -> (Vec<u32>, Vec<T
     for k in 0..keys {
         at[k + 1] += at[k];
     }
-    let (mut next, mut grouped) = (at.clone(), vec![T::default(); items.len()]);
+    let mut grouped = vec![T::default(); items.len()];
     for &(k, item) in items {
-        grouped[next[k as usize] as usize] = item;
-        next[k as usize] += 1;
+        grouped[at[k as usize] as usize] = item;
+        at[k as usize] += 1;
     }
+    // Each group's start moved to its end, the next group's start.
+    at.rotate_right(1);
+    at[0] = 0;
     (at, grouped)
 }
 
@@ -933,6 +936,9 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
         }
     });
     sets.flush(queries, plan, &mut tally);
+    // The window's bitsets go back to the kernel before the first matches are grouped, when
+    // memory peaks.
+    drop(sets);
     // The checks' cells hold their queries' whole counts and sums.
     for (check, cell) in plan.checks.iter().zip(std::mem::take(&mut tally.checks)) {
         tally.queries[check.q as usize] += cell;

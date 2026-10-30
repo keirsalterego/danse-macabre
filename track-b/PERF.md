@@ -19,6 +19,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 12 | The corpus walk takes one callback per token and one per line end, so the per-token one is inlined | run-68a53e20303e | 0.2450 | 43.8 | 68.8 |
 | 13 | A token's hash multiplies the XOR of its key words once, instead of once per word | run-4a44efe39605 | 0.2403 | 43.4 | 69.0 |
 | 14 | The per-document checks count a query's first matches in a byte per query, not in its cell | run-f56225b92327 | 0.2350 | 45.1 | 69.1 |
+| 15 | Memory at its peak: a thread frees its window before grouping its first matches, and the grouping keeps no second copy of the group starts | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -262,8 +263,25 @@ over 12 threads). S 844 → 845. Gate: 507 pass, 0 fail.
 Not kept: each check pushing its first ten matches with no per-query count (format already takes
 ten per query) gave the same time, 6 M more branch misses, and 4 MB more memory.
 
+## Step 15: memory at the peak
+
+Memory peaks when every thread groups its first matches at the end of its chunk: the ungrouped
+(query, doc) pairs, about 122,000 per thread on seed 1 (976 KB), coexist with the grouped ids and
+the group starts. Two things sat there for nothing. Each thread's window was still allocated,
+its 349 bitset rows (179 KB) included, and [`group`] cloned its 50,001 group starts (200 KB) as
+fill cursors. The window is now dropped after its last flush, and the grouping uses the starts
+themselves as cursors, then shifts them back by one place.
+
+Locally, memory.peak over seven runs each: 41.1–43.3 MiB (median 42.6) → 39.6–40.5 MiB
+(median 39.9). The window alone: median 40.0, but one run at 42.8. Cycles and wall unchanged:
+5.94–5.96 → 5.93–5.94 G; alternating runs, 12 each: median 246.0 → 245.1 ms. S 845 → 848.
+Gate: 507 pass, 0 fail.
+
 ## Experiments that did not stay
 
+- **A static-pie build** (`+crt-static`, as tracks A and C use), on step 14 (local, turbo off):
+  `ab.py`, 16 interleaved runs, median / min 246.00 / 245.60 ms against 245.75 / 244.05 ms. The
+  dynamic loader's quarter of a millisecond is lost in a 245 ms run.
 - **Transparent huge pages off on top of the fixed threshold** (`prctl(PR_SET_THP_DISABLE)`):
   41.1–41.2 MB against 42.4–45.3 in the same session, but cycles 9.79–9.83 → 9.91–9.97 G and
   elapsed 0.383–0.385 → 0.392–0.397 s. Huge pages off without the fixed threshold gave
