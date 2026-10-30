@@ -15,6 +15,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 8 | Term table sized once from the queries' term count, and its keys trimmed after the intern | run-533a441d6902 | 0.2705 | 45.1 | 67.5 |
 | 9 | Tokens that are no query term take the id of a bit that is never set, so clearing the seen bits takes no branch | run-d85affefdce5 | 0.2679 | 44.2 | 67.7 |
 | 10 | Only the term table on transparent huge pages, allocated alone at a 2 MiB boundary; the global allocator is gone | run-b4d6bfbdd0e9 | 0.2698 | 43.9 | 67.7 |
+| 11 | A check's cell takes a match with a conditional move instead of a branch | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -203,6 +204,18 @@ Locally, against step 9, three interleaved rounds: cycles 6.87–6.90 → 6.85�
 twice: median wall 275.6 and 276.9 → 276.8 and 278.7 ms (no huge pages at all: 282.5 and 282.2).
 memory.peak over six runs each: 39.4–42.8 → 39.3–41.8 MiB; this machine does not show the
 board's difference. S 871 → 849. Gate: 507 pass, 0 fail.
+
+## Step 11: no branch on a check's result
+
+A check adds `hit` times `1 << SUM_BITS | doc` to its cell ([`Tally::add_check`]), and the
+compiler made that product a branch on `hit`. Whether a document matches a check follows no
+pattern, so the branch missed 4.2 M times, 6% of all branch misses. `std::hint::select_unpredictable`
+makes it a conditional move.
+
+Locally, against step 10, three interleaved rounds: branch misses 68.2 → 64.0 M, cycles
+6.80–6.84 → 6.61–6.68 G, task-clock 2,948–2,966 → 2,864–2,896 ms, instructions 10.06 → 10.22 G.
+Alternating runs, 16 each, twice: median wall 278.2 and 276.3 → 270.1 and 269.2 ms. S unchanged.
+Gate: 507 pass, 0 fail.
 
 ## Experiments that did not stay
 

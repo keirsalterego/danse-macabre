@@ -738,7 +738,9 @@ impl Tally {
     /// the pass ends, the query's own cell counts only its first matches so far.
     fn add_check(&mut self, c: usize, q: u32, doc: u32, hit: bool) {
         let cell = &mut self.checks[c];
-        *cell += u64::from(hit) * (1 << SUM_BITS | u64::from(doc));
+        // A conditional move: `hit` follows no pattern, and the compiler makes a product with
+        // it a branch.
+        *cell += std::hint::select_unpredictable(hit, 1 << SUM_BITS | u64::from(doc), 0);
         let shown = &mut self.queries[q as usize];
         if hit && *cell >> SUM_BITS <= SHOWN_IDS as u64 && *shown >> SUM_BITS < SHOWN_IDS as u64 {
             *shown += 1 << SUM_BITS;
