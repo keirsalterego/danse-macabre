@@ -14,6 +14,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 7 | Each search's binary heap replaced by a bucket queue: a ring of 4,096 one-unit buckets found through a bitmap, with a small heap for keys past the ring (fc4ed14) | run-bb1fd514f3b2 | 0.1279 | 81.4 | 71.6 |
 | 8 | The query code shortened by 24 lines at the same speed: `answer` reuses `on_threads`, and the queue's helpers are folded together | run-966433fb4d85 | 0.1264 | 84.0 | 71.8 |
 | 9 | Each node's edge range kept in 2 bytes instead of a 4-byte offset, in groups of 4 nodes, and pass 3 run one direction at a time with its index faulted in first | run-ee72c614f94f | 0.1297 | 75.5 | 71.8 |
+| 10 | Label distances aligned to 4 bytes, so a label table entry takes 12 bytes instead of 16 | | | | |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
@@ -280,6 +281,22 @@ short by n. All 200 outputs are byte-identical to step 8's, and with the wide ro
 the 60 random graphs changed.
 
 S 426 → 443.
+
+## Step 10: label distances aligned to 4 bytes
+
+After step 9 the label tables were the biggest item at the peak after the graph. Each of the 24
+keeps the size of the largest search its thread ran, about 23 MB in all at full scale. A
+`HashMap<u32, u64>` entry is 16 bytes, 4 of them padding after the key. `Labels` now maps to
+`Dist`, a `u64` in a `#[repr(C, packed(4))]` struct, so an entry is 12 bytes, and a slot with its
+control byte 13 instead of 17.
+
+- Peak memory, 5 runs each, alternating: seed 1 74.4–76.6 → 69.6–71.7 MB (medians 75.8 → 71.3),
+  seed 2 70.5–73.1 → 67.6–68.8 MB (medians 71.5 → 67.8).
+- `ab.py`, alternating full runs, medians, step 9 → step 10 (31 runs each): seed 1 136.1 → 134.7
+  and 136.7 → 136.8 ms, seed 2 137.9 → 135.8 and 137.3 → 136.1 ms, seed 3 142.7 → 141.4 ms.
+- `perf stat -r 5` on P-cores, seed 1, 3 rounds: task-clock 1.430–1.451 → 1.416–1.431 s, cycles
+  3.25–3.30 → 3.22–3.27 G, instructions 5.04 → 5.11 G.
+- S 443 → 445.
 
 ## Tried and reverted (local, turbo off, no run ID)
 

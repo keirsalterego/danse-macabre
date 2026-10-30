@@ -594,7 +594,7 @@ impl<'g> Search<'g> {
         self.queue.clear();
         self.queue.push(0, node);
         self.dist.clear();
-        self.dist.insert(node, 0);
+        self.dist.insert(node, Dist(0));
     }
 
     /// Settles the node on top of the queue, which [`Queue::top`] found, and relaxes its edges.
@@ -621,11 +621,11 @@ impl<'g> Search<'g> {
         for &edge in self.graph.edges(node, &mut copy) {
             let (next, weight) = unpack(edge);
             let via = d + weight;
-            let label = self.dist.entry(next).or_insert(UNREACHABLE);
-            if via < *label {
-                *label = via;
+            let label = self.dist.entry(next).or_insert(Dist(UNREACHABLE));
+            if via < label.0 {
+                label.0 = via;
                 self.queue.push(via, next);
-                if let Some(&rest) = other.get(&next) {
+                if let Some(&Dist(rest)) = other.get(&next) {
                     *best = (*best).min(via + rest);
                 }
             }
@@ -769,7 +769,15 @@ impl Queue {
 /// A search touches thousands of the n nodes, not millions, so a hash map costs memory for those
 /// only. A dense array would cost 8n bytes (14 MB at full scale) per thread and direction.
 /// `clear` keeps the map's capacity, so after the first few queries it stops reallocating.
-type Labels = HashMap<u32, u64, std::hash::BuildHasherDefault<NodeHash>>;
+type Labels = HashMap<u32, Dist, std::hash::BuildHasherDefault<NodeHash>>;
+
+/// A label's distance, aligned to 4 bytes so that a [`Labels`] entry takes 12 bytes instead of
+/// 16, of which 4 were padding after the `u32` key. With its control byte, a slot shrinks from 17
+/// bytes to 13. By the end of a run every table has grown to the largest search its thread ran,
+/// about 23 MB over the 24 tables at full scale, so this saves about 5 MB at the peak. An
+/// unaligned load costs the same on x86 unless it crosses a cache line.
+#[repr(C, packed(4))]
+struct Dist(u64);
 
 /// The hasher for [`Labels`]: Fibonacci hashing, one multiply by 2^64 divided by the golden ratio.
 ///
