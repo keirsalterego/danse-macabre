@@ -12,7 +12,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 5 | `regions.csv` parsed in one pass, each row's end found by the parse itself | run-e703239bd822 | 0.1016 | 15.31 | 63.2 |
 | 6 | Names and notes scanned 32 bytes at a time for their next quote | run-599ba20d6eb1 | 0.0920 | 15.5 | 64.2 |
 | 7 | Each name's hash slot loaded as soon as the name is scanned, so its cache miss overlaps the rest of the record | run-7b03d961ed16 | 0.0799 | 15.3 | 65.7 |
-| 8 | Numbers parsed from one 8-byte word each, and the number and text-field parsers inlined | | | | |
+| 8 | Numbers parsed from one 8-byte word each, and the number and text-field parsers inlined | run-c66327de718b | 0.0734 | 15.2 | 66.6 |
+| 9 | Each distinct name owned by one thread: names travel to their owner in rounds, and each owner marks them in a private table. Region table at one byte per id | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -234,6 +235,94 @@ Step 7 → step 8 on P-cores, three interleaved rounds:
 S 432 → 447: 13 lines for the word parse and 2 for the attributes. memory.peak in the container
 with the harness's flags is unchanged, 14.7–14.8 MiB against 14.8–15.2 MiB for step 7.
 
+## Step 9: each distinct name owned by one thread
+
+Steps 2 to 7 tuned one name table that all threads shared, and it still cost about half the
+time. With all name hashing, posting and marking knocked out of the prototype below, the rest ran
+in 42.6 ms (local, median of 11), against 85–88 ms for step 7 in the sessions around it. In
+step 7 each record's lookup missed the cache on a line that other cores also wrote, and set its
+bit with a `lock cmpxchg` loop.
+
+Now each name has one owner thread, picked by its hash, and only the owner touches the name's
+entry. The workers run in rounds. In each round a worker parses 64 KiB of its chunk and posts
+each record's name and group to the owner's mailbox as a 32-byte letter, and then all workers
+meet at a barrier. After it, each worker marks the letters posted to it in its own hash table.
+
+- A name of up to 24 bytes travels inside its letter, zero-padded, with its hash and length in
+  the fourth word, so the owner compares 32-byte keys and never reads the file. Longer names
+  travel as offsets into the file and go to a `HashMap`. They are rare: 203 of seed 1's 3.32 M
+  records.
+- An entry is one 64-byte line: the 4-word key, then the 241-bit country bitset. The compare and
+  the bit share the line, and the bit is set with a plain OR.
+- The mailboxes come in two sets that alternate by round, so one barrier per round separates
+  posting from reading. A waiting worker spins 2000 times and then parks, and the last worker to
+  arrive unparks the others.
+- The region table holds one byte per id, 1 MB instead of 2 MB. Groups past 254, which the
+  grammar allows and the generator never writes, read as 255 and are looked up in a sorted side
+  list.
+- `mallopt(M_MMAP_THRESHOLD, 64 KiB)` runs at startup, and each table reserves room for twice
+  its expected names (pages that are never written are never charged). A build without either
+  peaked at 19.8–20.2 MiB. Freeing the regions parse's 2 MB scratch array had raised glibc's
+  dynamic mmap threshold to 2 MB, so the tables came from malloc arenas and grew there by
+  copying, and the old copies stayed resident.
+
+The prototype was built on step 7, before step 8 existed, in stages (local, P-cores, medians of
+15 interleaved runs against the build before it unless noted):
+
+1. Names sent as offsets into the file and compared there, with a barrier that only spins:
+   69.6 ms against 88.0 ms for step 7, but with runs of 161 and 171 ms. When the scheduler
+   delays one worker, the other eleven keep their CPUs busy spinning.
+2. A barrier that yields instead: 69.8 against 85.0 ms, with runs of 90, 129 and 147 ms.
+3. Spinning 2000 times and then parking: 70.2 against 86.1 ms, worst run 77 ms. Kept.
+4. Names of up to 24 bytes inside the letter, and entries of one cache line: 64.2 against
+   70.3 ms.
+5. The marking loop kept out of line (63.4 against 64.0 ms, 11 runs), then the byte-wide
+   region table, `mallopt` and the doubled reserve: 59.4 against 63.9 ms.
+
+Knockouts of stage 3 (medians of 11, one session): 71.5 ms in full, 51.6 ms with the letters
+posted and read but no name marked, and 42.6 ms with no name hashed, posted or marked (the rounds
+and barriers stay). So marking cost about
+20 ms and the exchange about 9 ms, and stage 4 went after the marking. `perf stat -r 5`:
+
+| | step 7 | stage 3 | stage 4 | no name work |
+|---|---|---|---|---|
+| task-clock (ms) | 891 | 727 | 620 | 390 |
+| cycles:u (G) | 1.949 | 1.669 | 1.403 | 0.890 |
+| instructions:u (G) | 2.046 | 2.257 | 2.094 | 1.379 |
+| branch misses (M) | 9.06 | 12.75 | 6.21 | 5.68 |
+| loads that missed L2 (M) | 12.1 | 9.08 | 6.44 | 2.89 |
+| elapsed (ms) | 87.7 | 71.8 | 64.2 | 42.6 |
+
+Phases of stage 4, from an instrumented copy that logged timestamps per thread: each worker
+spends 31.5–32.1 ms parsing and posting, 4.5–5.5 ms waiting at 257 barriers (parking 18–21
+times), and 10.2–11.0 ms marking. A wait takes 4–6 µs at the median, 13–21 µs at p90 and
+330–380 µs at p99. Of the marking, reading the letters takes 2.44 ms per worker and finding
+their slots 0.09 ms more (2.53 ms in all), against 10.79 ms in full. The entries cost 69
+instructions, 87 cycles and 1.01 L2 misses per letter on top of reading it.
+
+Step 9 is that prototype on top of step 8. P-cores, three interleaved rounds:
+
+| | step 8 | step 9 |
+|---|---|---|
+| task-clock, `perf stat -r 10` (ms) | 837 / 841 / 829 | 498 / 498 / 497 |
+| elapsed, `perf stat -r 10` (ms) | 81.6 / 79.2 / 81.9 | 52.3 / 52.3 / 51.7 |
+| cycles:u (G) | 1.83 / 1.84 / 1.80 | 1.12 / 1.12 / 1.12 |
+| instructions:u (G) | 1.673 | 1.659 |
+| branch misses (M) | 5.09 | 2.90 |
+| memory.peak, user scope (MiB) | 14.42 / 14.56 / 14.29 / 14.76 | 13.90 / 13.77 / 14.18 / 13.96 |
+
+Over 21 interleaved runs, the wall-time medians are 80.71 ms for step 8 (min 75.40) and 52.77 ms
+for step 9 (min 51.65), with the stage-5 prototype on step 7 at 59.54 ms in the same session.
+With the private tables, THP no longer changes the peak: 13.80–14.18 MiB with the `prctl` and
+13.76–14.28 MiB without it (4 runs each), so the call stays only as insurance. S 447 → 587.
+
+Correctness checks: the gate (307 pass, 0 fail); fresh seeds 5–7; full seeds 2 and 3 at 1 and
+64 threads; and the 400 random cases plus two long-name sets against the reference, at 1, 3,
+12, 37 and 64 threads, and again with 100-byte rounds and 3-letter mailboxes at 1, 2, 3, 12
+and 64 threads, which forces thousands of rounds and early round ends. The long-name sets hold
+every name length from 0 to 80 bytes, names equal in their first 24 bytes, trailing-space
+twins, `""` escapes at the 8-byte word edges, and quoted and unquoted spellings of one value.
+
 ## Experiments that did not stay
 
 - **Batched table lookups** (local only): each thread parsed 32 records, then loaded every
@@ -254,6 +343,22 @@ with the harness's flags is unchanged, 14.7–14.8 MiB against 14.8–15.2 MiB f
   record one record late and prefetched its entry in between. They measured 1044–1055 ms and
   1035–1053 ms of task-clock, against 1036–1068 ms for the early slot load alone (step 7) and
   1145–1185 ms for step 5. Neither was kept.
+- **Prefetching entries a few letters ahead while marking** (local only, step 9's stage 4,
+  medians of 11 interleaved runs): 4, 8 and 16 letters ahead measured 64.17, 63.39 and
+  64.46 ms, against 64.18 ms without.
+- **A region table indexed by rank** (local only, on stage 5 before the byte-wide table): a
+  bitset of the ids present plus a running count, so the group array holds only the 200k
+  regions. 65.65 and 67.35 ms against 63.82 and 64.51 ms in two sessions, for 13.99–14.45 MiB
+  against 15.70–15.74 MiB. The byte-wide table with `mallopt` reached 13.9–14.1 MiB at no cost
+  in time (stage 5).
+- **Slots at three-quarters load instead of half** (local only, on the rank-table build):
+  69.09 against 65.65 ms, for 11.53–12.46 MiB against 13.99–14.11 MiB.
+- **Pinning each worker** to the i-th CPU it may run on, with `sched_setaffinity` (local only,
+  on stage 5 before the byte-wide table): 63.37 against 63.67 ms over 21 runs, and 63.94
+  against 64.17 ms over 15. Letting hyperthread siblings mark in alternate phases on top of
+  that: 63.44 ms in the second session. Both are within that build's spread across sessions,
+  63.4–64.5 ms.
+- **A longer spin before parking**, 20,000 spins instead of 2,000: 59.71 against 59.44 ms.
 
 ## Profile notes
 

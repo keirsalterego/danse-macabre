@@ -23,10 +23,11 @@
 //! # The pipeline
 //!
 //! 1. **The lookup becomes a direct-address table.** [`parse_regions`] turns `regions.csv` into a
-//!    flat array indexed by region id that holds a group number. Countries are numbered in
-//!    bytewise order, so the group number is already the output order and no sort is needed at
-//!    the end. Group 0 is `_UNMATCHED`, and it is also what every id missing from the table
-//!    reads as.
+//!    flat array indexed by region id that holds a group number, one byte per id. Countries are
+//!    numbered in bytewise order, so the group number is already the output order and no sort is
+//!    needed at the end. Group 0 is `_UNMATCHED`, and it is also what every id missing from the
+//!    table reads as. The spec allows up to 26³ countries, more than a byte holds, so groups past
+//!    254 read as 255 and are found in a short sorted list instead (see [`Regions`]).
 //! 2. **The records are split even though fields contain newlines.** The file is cut into one
 //!    chunk per hardware thread, and a cut can land inside a quoted note, where an LF is data
 //!    and not a record end. [`record_bounds`] runs a parallel pre-pass that takes the parity of
@@ -34,46 +35,53 @@
 //!    quotes, and [`next_record_start`] then walks to the first real record. No thread has to
 //!    parse the chunks before its own.
 //! 3. **Each thread walks its records field by field.** [`aggregate`] parses each record in
-//!    order and sums into its own [`Group`] per country, so the hot loop shares nothing but the
-//!    name table. Names and notes are quoted, and [`text_field`] jumps from quote to quote 32
-//!    bytes at a time with AVX2 compares. It measures a field as its raw length minus one per
-//!    `""` pair, so no field is ever unescaped. [`number`] reads each number from one 8-byte
-//!    word, with no loop over its digits.
-//! 4. **Distinct names go through one shared interner.** All threads intern names in one
-//!    lock-free [`NameTable`]. Each distinct name's raw, still escaped bytes are copied once into
-//!    an arena entry that also holds a bitset with one bit per country, so a record's compare
-//!    and its bit land on the same cache line instead of a random line of the 200 MB file.
-//!    Escaping is one to one, so two raw names differ exactly when their unescaped values do,
-//!    and the quoted empty name `""` and the unquoted one are both the empty slice. Twelve
-//!    per-thread tables would each hold most of the ~100k names, so a single shared table keeps
-//!    one copy instead of twelve.
+//!    order and sums into its own [`Group`] per country. Names and notes are quoted, and
+//!    [`text_field`] jumps from quote to quote 32 bytes at a time with AVX2 compares. It measures
+//!    a field as its raw length minus one per `""` pair, so no field is ever unescaped.
+//!    [`number`] reads each number from one 8-byte word, with no loop over its digits.
+//! 4. **Each distinct name belongs to one thread.** The name's hash picks its owner, and each
+//!    thread keeps the names it owns in a [`NameSet`] that no other thread touches: a hash table
+//!    whose entry for a name holds the name's bytes and a bitset with one bit per country, on
+//!    one cache line. A record's name usually comes from another thread's chunk, so the threads
+//!    trade names in rounds. In each round a thread parses about 64 KiB of its records and posts
+//!    each record's name and group to the name's owner as a 32-byte letter (see
+//!    [`name_letter`]). All threads then meet at a barrier, and each reads the letters posted to
+//!    it and sets the bits (see [`Exchange`]). A bit that goes from 0 to 1 is a name new to that
+//!    country, so the counts come out of the marking with no pass over the tables afterwards.
 //!
-//!    The atomic OR that sets a bit returns the word it replaced, so exactly one record sees each
-//!    name's bit for a country go from 0 to 1, and its thread counts that name as new for the
-//!    country. The counts need no pass over the table afterwards.
+//!    Names are compared still escaped. Escaping is one to one, so two raw names differ exactly
+//!    when their unescaped values do, and the quoted empty name `""` and the unquoted one are
+//!    both the empty slice.
 //!
-//!    A record loads its name's slot as soon as the name is scanned and uses it only once the
-//!    record is parsed, so the slot's cache miss overlaps that parse.
+//!    This replaced one lock-free table that all threads shared. There, each record's lookup
+//!    missed the cache on a line that other cores also wrote, and set its bit with an atomic OR.
+//!    Here only its owner touches a table, so none of its lines move between cores, and the only
+//!    atomic read-modify-write is one per thread per round, at the barrier. The letters do move
+//!    between cores, but they are written and read in order, two to a cache line. What the
+//!    rounds cost instead is the wait at each barrier for the slowest thread (PERF.md, step 9).
 //! 5. **Merge and print.** The per-thread [`Group`]s hold only integers, so merging them gives
 //!    the same result in any order, and [`format_output`] writes the lines.
 //!
 //! # Memory
 //!
 //! The input is mapped and never copied (see [`map_file`]). What the program allocates is
-//! mostly the name table, 4 MB of slots and about 5 MB of arena in use at full scale, and the
-//! 2 MB array from region id to group. Transparent huge pages are off, because twelve threads
-//! faulting on the same fresh 2 MB region at once more than doubled the peak (see [`main`]).
+//! mostly the name sets, about 6.4 MB of entries (one 64-byte line for each of ~100k names) and
+//! 1.5 MB of slots at full scale, then about 1.2 MB of mailbox pages that the rounds touch and
+//! the 1 MB array from region id to group. Every buffer of 64 KiB or more gets its own mapping,
+//! so a freed buffer returns its pages at once, and transparent huge pages are off (see
+//! [`main`]).
 //!
 //! # What the code relies on
 //!
 //! The parser implements the grammar of spec §2.1 as written: a BOM at the start of any record,
 //! CRLF or LF, a final record without a terminator, and unquoted text that is not empty. Its
-//! output never depends on the narrower generator guarantees of §2.2; the sizes in §5 only set
-//! the name table's starting size. It does rely on §2.3, where country codes are `[A-Z]{3}` and
-//! region ids ascend, so the last one is the largest (both checked while parsing), and on §3,
-//! where `id_sum` and `amount_sum` fit in 64 bits.
+//! output never depends on the narrower generator guarantees of §2.2; the name pool of §2.2 and
+//! the sizes in §5 only set the name sets' starting sizes. It does rely on §2.3, where country
+//! codes are `[A-Z]{3}` and region ids ascend, so the last one is the largest (both checked
+//! while parsing), and on §3, where `id_sum` and `amount_sum` fit in 64 bits.
 //! Records outside the §2.1 grammar are not validated.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
@@ -82,10 +90,10 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use std::thread;
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+use std::thread::{self, Thread};
 
 /// The UTF-8 byte order mark, U+FEFF. At the start of the file or of a record it is skipped, and
 /// anywhere else it is data (spec §2.1).
@@ -103,7 +111,11 @@ unsafe extern "C" {
     /// libc's `prctl(2)`, used once, with [`PR_SET_THP_DISABLE`]. Like the C prototype it is
     /// variadic, and libc reads each extra argument as an `unsigned long`.
     fn prctl(option: i32, ...) -> i32;
+    /// glibc's `mallopt(3)`, used once, with [`M_MMAP_THRESHOLD`].
+    fn mallopt(param: i32, value: i32) -> i32;
 }
+/// `mallopt` parameter: the size from which `malloc` maps memory of its own.
+const M_MMAP_THRESHOLD: i32 = -3;
 /// `mmap` protection: the pages are readable and nothing else.
 const PROT_READ: i32 = 1;
 /// `mmap` flag: a private mapping, so nothing we do could ever write back to the file.
@@ -115,15 +127,22 @@ const PR_SET_THP_DISABLE: i32 = 41;
 /// `<out_dir>/aggregates.txt`. The directories come from the first two arguments and default to
 /// `/data` and `/out`, where the harness mounts them.
 fn main() -> Result<(), Box<dyn Error>> {
-    // Transparent huge pages cost memory here and buy little speed. The name table's arena
-    // grows at one front that every thread writes. When the front reaches a fresh 2 MB region,
-    // each thread that faults on it before the first fault finishes allocates and zeroes a
-    // 2 MB page of its own, and memory.peak counts them all until the losers free theirs. On
-    // 12 cores that added 22 MiB to a 15 MiB peak, while 4 KB pages cost 2% more CPU time and
-    // under 1% more wall time. If the call fails, only that saving is lost, so its result is
+    // Transparent huge pages could charge a whole 2 MB page to a buffer that uses a few 4 KB
+    // pages of it, such as the mailboxes, of which the rounds touch about half. When all
+    // threads shared one name table, threads racing to fault on its fresh 2 MB regions added
+    // 22 MiB to a 15 MiB peak (PERF.md, step 3). The private name sets measured the same peak
+    // with THP on or off on a THP "always" machine, so this is insurance for a host that would
+    // hand out huge pages more eagerly. If the call fails, only that is lost, so its result is
     // not checked.
     // SAFETY: the call takes plain integers and only changes this process's page-size policy.
     unsafe { prctl(PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
+    // Every buffer of 64 KiB or more gets its own mapping, so a grown or freed one returns its
+    // pages at once. By default glibc raises this threshold to the size of the largest buffer
+    // freed so far. After the regions parse freed its 2 MB scratch array, every worker's name
+    // set came from a malloc arena and grew there by copying, and the old copies stayed
+    // resident: a 20 MiB peak instead of 14.
+    // SAFETY: the call takes plain integers and only changes malloc's policy.
+    unsafe { mallopt(M_MMAP_THRESHOLD, 64 << 10) };
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
@@ -170,14 +189,31 @@ fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
 
 /// The lookup table from `regions.csv`, as a direct-address table: the region id is the index.
 ///
-/// Group 0 is `_UNMATCHED`, and country k in bytewise order is group k + 1. A `u16` holds every
-/// group, because there are at most 26³ codes (see [`CODES`]).
+/// Group 0 is `_UNMATCHED`, and country k in bytewise order is group k + 1. There are at most
+/// 26³ codes (see [`CODES`]), so a `u16` holds every group, but a byte holds the groups of the
+/// spec's 240 countries and halves the table, 1 MB at full scale.
 struct Regions {
     /// Region id → group, sized from the largest id in the file. Ids it lacks stay 0, which is
-    /// `_UNMATCHED`.
-    group_of: Vec<u16>,
+    /// `_UNMATCHED`. The groups past 254 read as 255 here and are looked up in `wide`.
+    group_of: Vec<u8>,
+    /// The regions of groups past 254, as (id, group) in ascending id order.
+    wide: Vec<(usize, u16)>,
     /// Country codes in bytewise order: `codes[k]` is group k + 1.
     codes: Vec<[u8; 3]>,
+}
+
+impl Regions {
+    /// The group of the region with this id; ids past the table's largest are `_UNMATCHED`.
+    fn group(&self, id: usize) -> usize {
+        match self.group_of.get(id) {
+            Some(255) => {
+                let at = (self.wide.binary_search_by_key(&id, |&(id, _)| id)).expect("a wide id");
+                usize::from(self.wide[at].1)
+            }
+            Some(&group) => usize::from(group),
+            None => 0,
+        }
+    }
 }
 
 /// Builds [`Regions`] from `regions.csv` in one pass over its rows.
@@ -185,8 +221,8 @@ struct Regions {
 /// Region ids ascend (spec §2.3), so the last row's id sizes the array before the pass. The pass
 /// stores each region's country code and marks which countries occur. Numbering the countries
 /// afterwards, by walking the [`CODES`] table in index order, sorts them bytewise for free, and
-/// one walk over the array then swaps each code for its group. Two passes that each split the
-/// rows at LF and then parsed them took three times as long.
+/// one walk over the array then swaps each code for its group, narrowed to a byte. Two passes
+/// that each split the rows at LF and then parsed them took three times as long.
 fn parse_regions(csv: &[u8]) -> Result<Regions, String> {
     let body = (csv.strip_prefix(b"region_id,country\n"))
         .ok_or("regions.csv: the header is not `region_id,country`")?;
@@ -218,10 +254,21 @@ fn parse_regions(csv: &[u8]) -> Result<Regions, String> {
         }
     }
     let group_of_entry: Vec<u16> = [0].into_iter().chain(group_of_code).collect();
-    for group in &mut group_of {
-        *group = group_of_entry[usize::from(*group)];
-    }
-    Ok(Regions { group_of, codes })
+    let mut wide = Vec::new();
+    let group_of = (group_of.iter().enumerate())
+        .map(|(id, &code)| match group_of_entry[usize::from(code)] {
+            group @ 0..255 => group as u8,
+            group => {
+                wide.push((id, group));
+                255
+            }
+        })
+        .collect();
+    Ok(Regions {
+        group_of,
+        wide,
+        codes,
+    })
 }
 
 /// Parses the row that starts at `body[start]`, `region_id,country` and an LF (spec §2.3), into
@@ -252,41 +299,41 @@ fn region_row(body: &[u8], start: usize) -> Result<(usize, usize, usize), String
     ))
 }
 
+/// Bytes of its chunk a worker parses per round before the workers swap names. Small rounds
+/// keep the mailboxes small and the names just parsed still in cache when their owner reads them.
+const ROUND_BYTES: usize = 64 << 10;
+/// Names one worker can post to another in one round. A round ends early when a mailbox fills.
+// shortcut: the mailboxes take 2 × threads² × 8 KiB of address space, 2.25 MiB on 12 threads but
+// 64 MiB on 64; size them from ROUND_BYTES / threads if this ever runs on many more cores.
+const MAILBOX: usize = 256;
+/// Spins of a worker that waits at the barrier before it parks (see [`Exchange::wait`]).
+const SPINS: usize = 2000;
+
 /// Parses every record, joins it to its group and returns the output text.
 ///
 /// This is a parallel map-reduce. Each thread aggregates one run of whole records from
-/// [`record_bounds`] in [`aggregate`], all threads share one [`NameTable`], and the partial
-/// [`Group`]s are merged in thread order at the end.
+/// [`record_bounds`] in [`aggregate`], and the partial [`Group`]s are merged in thread order at
+/// the end. Distinct names are split between the threads by hash, so each name has one owner
+/// that counts it, and the threads hand names to their owners through an [`Exchange`].
 fn join(records: &'static [u8], regions: &Regions) -> Result<Vec<u8>, String> {
     let body = body_start(records)?;
     let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
     let bounds = record_bounds(records, body, threads);
-    let group_count = regions.codes.len() + 1;
-    // Records average about 64 bytes (spec §5), and one slot per 8 records gives full scale
-    // 2^19 slots for its ~100k distinct names. The table cannot grow while threads insert into
-    // it, so a full table is rebuilt 4x larger and the join reruns: no input is too big for it,
-    // only slower.
-    let mut slot_count = (records.len() / 512).next_power_of_two();
-    loop {
-        let names = &NameTable::new(slot_count, group_count);
-        let parts = thread::scope(|s| {
-            let workers: Vec<_> = (bounds.windows(2))
-                .map(|w| w[0]..w[1])
-                .map(|range| s.spawn(move || aggregate(records, range, regions, names)))
-                .collect();
-            (workers.into_iter())
-                .map(|w| w.join().expect("a panic aborts the process"))
-                .collect::<Option<Vec<_>>>()
-        });
-        if let Some(parts) = parts {
-            let mut groups = vec![Group::default(); group_count];
-            for part in &parts {
-                groups.iter_mut().zip(part).for_each(|(g, p)| g.merge(p));
-            }
-            return Ok(format_output(&groups, regions));
-        }
-        slot_count *= 4;
+    let exchange = &Exchange::new(threads);
+    let parts: Vec<Vec<Group>> = thread::scope(|s| {
+        let workers: Vec<_> = (bounds.windows(2).enumerate())
+            .map(|(me, w)| (me, w[0]..w[1]))
+            .map(|(me, range)| s.spawn(move || aggregate(me, records, range, regions, exchange)))
+            .collect();
+        (workers.into_iter())
+            .map(|w| w.join().expect("a panic aborts the process"))
+            .collect()
+    });
+    let mut groups = vec![Group::default(); regions.codes.len() + 1];
+    for part in &parts {
+        groups.iter_mut().zip(part).for_each(|(g, p)| g.merge(p));
     }
+    Ok(format_output(&groups, regions))
 }
 
 /// Returns the offset of the first record, past the optional BOM, the header and its CRLF or LF
@@ -367,9 +414,9 @@ struct Group {
     amount_max: i64,
     name_bytes: u64,
     note_bytes: u64,
-    /// Names that one of these records added to the country's set of names. Across all threads
-    /// each name is added to a country exactly once (see [`NameTable::mark`]), so the merged sum
-    /// is the country's number of distinct names.
+    /// Distinct names of the country among the names this thread owns. Each name has one owner,
+    /// which counts it for a country once (see [`NameSet::read`]), so the merged sum is the
+    /// country's number of distinct names.
     distinct: u64,
 }
 
@@ -404,60 +451,86 @@ impl Group {
     }
 }
 
-/// Parses the whole records in `data[range]` into one [`Group`] per country and marks each
-/// record's name in `names`. Returns `None` when the name table is full.
+/// Parses the whole records in `data[range]` into one [`Group`] per country, and counts the
+/// distinct names of the hash share that worker `me` owns.
 ///
 /// This is the hot loop. The fields come in a fixed order, so the state is simply the position in
 /// the record. [`number`] parses each number from one word, and [`text_field`] skips names and
-/// notes while counting their escapes. The name table is probed in two steps, [`NameTable::probe`]
-/// right after the name and [`NameTable::mark`] at the end of the record.
+/// notes while counting their escapes.
+///
+/// The worker runs in rounds. In each round it parses about [`ROUND_BYTES`] of its records and
+/// posts each record's name to the worker that owns it (see [`Exchange`]), waits at the barrier
+/// for all workers, and then marks the names posted to it in its own [`NameSet`].
 fn aggregate(
-    data: &[u8],
+    me: usize,
+    data: &'static [u8],
     range: Range<usize>,
     regions: &Regions,
-    names: &NameTable,
-) -> Option<Vec<Group>> {
-    let mut groups = vec![Group::default(); regions.codes.len() + 1];
+    exchange: &Exchange,
+) -> Vec<Group> {
+    let group_count = regions.codes.len() + 1;
+    let mut groups = vec![Group::default(); group_count];
+    // Full scale draws from 100,000 names (spec §2.2) in 202 MB (§5), about one per 2 KiB, and
+    // a thread owns a share of them. The set grows when a file has more.
+    let mut names = NameSet::new(group_count, data.len() / 2048 / exchange.threads);
+    let mut sent = vec![0; exchange.threads];
     let mut at = range.start;
-    while at < range.end {
-        // A BOM at the start of a record is not data (§2.1). It sits in front of the id, so
-        // missing it would show up in `id_sum`.
-        if data[at..].starts_with(BOM) {
-            at += BOM.len();
+    (exchange.workers[me].set(thread::current())).expect("each worker registers once");
+    for round in 0.. {
+        let half = round % 2;
+        sent.fill(0);
+        let round_end = range.end.min(at + ROUND_BYTES);
+        while at < round_end {
+            // A BOM at the start of a record is not data (§2.1). It sits in front of the id, so
+            // missing it would show up in `id_sum`.
+            if data[at..].starts_with(BOM) {
+                at += BOM.len();
+            }
+            let (id, comma) = number(data, at, b',');
+            let (name, name_bytes, after_name) = text_field(data, comma + 1);
+            let mut letter = name_letter(data, name);
+            let (_, note_bytes, after_note) = text_field(data, after_name);
+            let (region_id, comma) = number(data, after_note, b',');
+            // The sign applies to the whole value, so -0.75 is -75 cents, not -0 * 100 + 75.
+            let negative = data[comma + 1] == b'-';
+            let (whole, dot) = number(data, comma + 1 + usize::from(negative), b'.');
+            let fraction = u64::from(data[dot + 1] - b'0') * 10 + u64::from(data[dot + 2] - b'0');
+            let cents = (whole * 100 + fraction).cast_signed();
+            let cents = if negative { -cents } else { cents };
+            // Past the CR if any, then the LF. Only the last record may end at end of file instead
+            // (§2.1), which leaves `at` past the end and stops the loop.
+            at = dot + 4 + usize::from(data.get(dot + 3) == Some(&b'\r'));
+            // Records also reference ids past the table's largest (§2.2), so the lookup is
+            // bounds-checked; those ids are unmatched like the holes inside the table.
+            let group = regions.group(region_id as usize);
+            letter[3] |= (group as u64) << 48;
+            let to = exchange.owner(letter[3] as u32);
+            exchange.post(half, me, to, sent[to], letter);
+            sent[to] += 1;
+            groups[group].merge(&Group {
+                count: 1,
+                id_sum: id,
+                amount_sum: cents,
+                amount_min: cents,
+                amount_max: cents,
+                name_bytes,
+                note_bytes,
+                distinct: 0,
+            });
+            if sent[to] == MAILBOX {
+                break;
+            }
         }
-        let (id, comma) = number(data, at, b',');
-        let (name, name_bytes, after_name) = text_field(data, comma + 1);
-        let name = &data[name];
-        // The name's slot is likely a cache miss, and nothing needs it before the end of the
-        // record, so it loads now and the miss overlaps the parse of the other fields.
-        let probe = names.probe(name);
-        let (_, note_bytes, after_note) = text_field(data, after_name);
-        let (region_id, comma) = number(data, after_note, b',');
-        // The sign applies to the whole value, so -0.75 is -75 cents, not -0 * 100 + 75.
-        let negative = data[comma + 1] == b'-';
-        let (whole, dot) = number(data, comma + 1 + usize::from(negative), b'.');
-        let fraction = u64::from(data[dot + 1] - b'0') * 10 + u64::from(data[dot + 2] - b'0');
-        let cents = (whole * 100 + fraction).cast_signed();
-        let cents = if negative { -cents } else { cents };
-        // Past the CR if any, then the LF. Only the last record may end at end of file instead
-        // (§2.1), which leaves `at` past the end and stops the loop.
-        at = dot + 4 + usize::from(data.get(dot + 3) == Some(&b'\r'));
-        // Records also reference ids past the table's largest (§2.2), so the lookup is
-        // bounds-checked; those ids are unmatched like the holes inside the table.
-        let group = (regions.group_of.get(region_id as usize)).map_or(0, |&g| usize::from(g));
-        let new_name = names.mark(name, probe, group)?;
-        groups[group].merge(&Group {
-            count: 1,
-            id_sum: id,
-            amount_sum: cents,
-            amount_min: cents,
-            amount_max: cents,
-            name_bytes,
-            note_bytes,
-            distinct: u64::from(new_name),
-        });
+        exchange.seal(half, me, &sent);
+        let all_done = exchange.wait(me, round, at >= range.end);
+        for from in 0..exchange.threads {
+            names.read(exchange.letters(half, from, me), data, &mut groups);
+        }
+        if all_done {
+            break;
+        }
     }
-    Some(groups)
+    groups
 }
 
 /// Parses the decimal digits from `at` up to the `stop` byte, and returns the value and the
@@ -504,7 +577,7 @@ fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
 ///
 /// Unescaping would copy every field. The spec's byte counts need only the length, and that is
 /// the raw length minus one per `""` pair. Distinct counting needs no unescaping either (see
-/// [`NameTable`]).
+/// [`NameSet`]).
 ///
 /// Inside quotes only the quotes matter, so the scan jumps from one quote to the next with
 /// [`byte_mask`], 32 bytes per step. A name or a note usually ends within the first step, where
@@ -564,174 +637,293 @@ fn byte_mask(chunk: &[u8; 32], byte: u8) -> u32 {
     mask
 }
 
-/// The set of distinct names per country, shared by every thread without locks.
+/// The mailboxes through which the workers hand each name to the worker that owns it, and the
+/// barrier that separates posting from reading.
 ///
-/// It is a string interner built as an insert-only, lock-free hash table with open addressing
-/// and linear probing. The first time any thread sees a name, it writes the name into one
-/// entry of a shared arena: its length, a bitset with one bit per group, and a copy of its bytes.
-/// A record then sets its group's bit with an atomic OR, which also says whether the bit was
-/// already set. Which thread sets a bit first changes from run to run, but each bit is set first
-/// exactly once, so the counts are deterministic.
-///
-/// The entry keeps everything a record needs side by side, so a record touches two places in
-/// the table: its slot and its entry, where the compare and the OR hit the same cache line. The
-/// copy of the bytes matters most. Comparing against the name's first occurrence in the 200 MB
-/// file instead cost a miss to DRAM on nearly every record, about 30% of all cycles.
-///
-/// Names are interned still escaped. Escaping is one to one (each `"` becomes `""`), so two raw
-/// names are equal exactly when their unescaped values are. The empty quoted name `""` and the
-/// empty unquoted name both arrive as an empty slice, so they are one name, as spec §3 asks.
-struct NameTable {
-    /// The hash's high 32 bits above `entry + 1`, the word offset of the name's entry in
-    /// `arena`, or 0 for an empty slot. Keeping a hash tag in the slot means a probe reads an
-    /// entry only when the tags match.
-    slots: Box<[AtomicU64]>,
-    /// The entries, back to back. An entry is one word holding the name's length in bytes, then
-    /// `words` bitset words, then the name in little-endian words (see [`words`]).
-    arena: Box<[AtomicU64]>,
-    /// The first free word of `arena`.
-    arena_used: AtomicUsize,
-    /// Entries written so far. They stop at half the slot count; see [`NameTable::insert`].
-    names: AtomicUsize,
-    /// Bitset words per entry: one bit per group, `_UNMATCHED` included.
-    words: usize,
+/// There are two sets of mailboxes, one per parity of the round. In round r a worker posts into
+/// set r % 2, which nobody reads at that time: the set was last read in round r - 2, and every
+/// worker finished reading it before it arrived at the barrier of round r - 1, which the poster
+/// has passed (see [`Exchange::wait`]). So one barrier per round is enough. The letters are
+/// atomics only so that safe code can share them; every access is `Relaxed`, a plain load or
+/// store, and the barrier orders them.
+struct Exchange {
+    threads: usize,
+    /// `[half][from][to]` mailboxes of [`MAILBOX`] letters of four words each (see
+    /// [`name_letter`]).
+    letters: Box<[AtomicU64]>,
+    /// How many letters each `[half][from][to]` mailbox holds this round.
+    counts: Box<[AtomicU64]>,
+    /// Workers at the barrier in the low 32 bits, and how many of them have finished their
+    /// chunks in the high 32 bits.
+    arrived: AtomicU64,
+    /// Twice the number of barriers passed, plus 1 if every worker had finished at the last one.
+    released: AtomicU64,
+    /// Each worker's thread, so that the last one to reach a barrier can unpark the others.
+    workers: Box<[OnceLock<Thread>]>,
 }
 
-impl NameTable {
-    /// An empty table with `slot_count` slots (a power of two) and room for `slot_count / 2`
-    /// names, each with a bit for every one of `group_count` groups.
-    fn new(slot_count: usize, group_count: usize) -> Self {
-        let words = group_count.div_ceil(64);
-        // Enough arena for names that average 32 bytes. Pages no entry reaches cost nothing
-        // (see [`zeroed`]), and a full arena reruns the join just like a full slot table.
-        let arena_words = slot_count / 2 * (1 + words + 4);
-        assert!(
-            arena_words < 1 << 32,
-            "an entry offset must fit the low half of its slot"
-        );
+impl Exchange {
+    fn new(threads: usize) -> Self {
         Self {
-            slots: zeroed(slot_count),
-            arena: zeroed(arena_words),
-            arena_used: AtomicUsize::new(0),
-            names: AtomicUsize::new(0),
-            words,
+            threads,
+            letters: zeroed(2 * threads * threads * MAILBOX * 4),
+            counts: zeroed(2 * threads * threads),
+            arrived: AtomicU64::new(0),
+            released: AtomicU64::new(0),
+            workers: (0..threads).map(|_| OnceLock::new()).collect(),
         }
     }
 
-    /// Hashes `name` and loads its home slot. Returns the hash and the slot's value, which
-    /// [`NameTable::mark`] takes for the same name.
-    ///
-    /// This is the first step of `mark`, split off so that [`aggregate`] can start the slot's
-    /// cache miss as soon as it has the name and finish the record while the miss is pending.
-    /// The value can be out of date by the time `mark` uses it, but only in one direction: a
-    /// slot that holds a name never changes, and an empty one that has been filled since makes
-    /// [`NameTable::intern`] lose the race to publish, which it already handles.
-    fn probe(&self, name: &[u8]) -> (u64, u64) {
-        let hash = hash(name);
-        let slot = hash as usize & (self.slots.len() - 1);
-        (hash, self.slots[slot].load(Acquire))
+    /// The worker that owns names with this hash: the hash scaled to `0..threads`.
+    fn owner(&self, hash: u32) -> usize {
+        ((u64::from(hash) * self.threads as u64) >> 32) as usize
     }
 
-    /// Adds `group` to the groups of `name` and returns `true` if this call is the one that added
-    /// it. Returns `None` when the table is full. `probe` comes from [`NameTable::probe`].
-    ///
-    /// The OR is one atomic read-modify-write, so of all the calls for one name and group, in
-    /// any threads, exactly one sees the bit clear.
-    fn mark(&self, name: &[u8], probe: (u64, u64), group: usize) -> Option<bool> {
-        let entry = self.intern(name, probe)?;
-        let bit = 1 << (group % 64);
-        Some(self.arena[entry + 1 + group / 64].fetch_or(bit, Relaxed) & bit == 0)
+    fn mailbox(&self, half: usize, from: usize, to: usize) -> usize {
+        (half * self.threads + from) * self.threads + to
     }
 
-    /// Returns the offset of `name`'s entry, inserting the name if it is new. The probe starts
-    /// from the hash and home slot value that [`NameTable::probe`] returned.
+    /// Writes letter `index` of the mailbox from `from` to `to`.
+    fn post(&self, half: usize, from: usize, to: usize, index: usize, letter: [u64; 4]) {
+        let at = (self.mailbox(half, from, to) * MAILBOX + index) * 4;
+        for (word, value) in self.letters[at..at + 4].iter().zip(letter) {
+            word.store(value, Relaxed);
+        }
+    }
+
+    /// Publishes how many letters `from` posted to each worker this round.
+    fn seal(&self, half: usize, from: usize, sent: &[usize]) {
+        for (to, &count) in sent.iter().enumerate() {
+            self.counts[self.mailbox(half, from, to)].store(count as u64, Relaxed);
+        }
+    }
+
+    /// The letters `from` posted to `to` this round, four words each.
+    fn letters(&self, half: usize, from: usize, to: usize) -> &[AtomicU64] {
+        let mailbox = self.mailbox(half, from, to);
+        let count = self.counts[mailbox].load(Relaxed) as usize;
+        &self.letters[mailbox * MAILBOX * 4..][..count * 4]
+    }
+
+    /// Waits until every worker has reached the barrier of `round`, and returns whether every
+    /// worker had `done` its chunk by then. All workers get the same answer, so they all stop
+    /// after the same round.
     ///
-    /// A new entry is written in full first and then published with a compare-and-swap on the
-    /// empty slot. Release on that swap and Acquire on every slot load mean that any thread that
-    /// sees the slot also sees the whole entry.
-    fn intern(&self, name: &[u8], (hash, mut seen): (u64, u64)) -> Option<usize> {
-        const LOW: u64 = u32::MAX as u64;
+    /// The last worker to arrive resets the count and releases the others. Its `AcqRel` add
+    /// sees every earlier arrival's writes, and its `Release` store passes them on to the
+    /// `Acquire` loads of the waiters, so every letter posted before the barrier is visible after.
+    fn wait(&self, me: usize, round: usize, done: bool) -> bool {
+        let arrival = 1 + (u64::from(done) << 32);
+        let arrived = self.arrived.fetch_add(arrival, AcqRel) + arrival;
+        let next = 2 * (round as u64 + 1);
+        if arrived as u32 as usize == self.threads {
+            self.arrived.store(0, Relaxed);
+            let all_done = (arrived >> 32) as usize == self.threads;
+            self.released.store(next + u64::from(all_done), Release);
+            (self.workers.iter().enumerate())
+                .filter(|&(worker, _)| worker != me)
+                .for_each(|(_, thread)| thread.get().expect("set before round 0").unpark());
+            return all_done;
+        }
+        for spins in 0usize.. {
+            let released = self.released.load(Acquire);
+            if released >= next {
+                return released & 1 == 1;
+            }
+            // Workers usually arrive within microseconds of each other, so a waiter spins
+            // first. A worker that is late because the scheduler put it aside, or put two workers
+            // on one CPU, would keep every spinner busy for whole time slices, and busy CPUs never
+            // look idle enough for the scheduler to move it. So a waiter that has spun long
+            // parks, which frees its CPU, and the last worker to arrive unparks everyone.
+            if spins < SPINS {
+                std::hint::spin_loop();
+            } else {
+                thread::park();
+            }
+        }
+        unreachable!("the loop above only returns")
+    }
+}
+
+/// Names of up to this many bytes travel inside their letter and are keyed by their bytes.
+const INLINE: usize = 24;
+/// The length field of a letter whose name is longer than [`INLINE`] bytes.
+const LONG: u64 = 0xFFFF;
+/// The bits of a letter's last word that belong to the key: the hash and the length.
+const KEY: u64 = (1 << 48) - 1;
+
+/// A letter for the name at `start..end` of `data`, without its group, which the poster adds to
+/// the top 16 bits: the name's bytes as three little-endian words zero-padded to [`INLINE`]
+/// bytes, then its 32-bit hash with its length above it. A name longer than that travels as its
+/// start and end offsets instead, with [`LONG`] as length.
+///
+/// The three words come from one fixed-size read past the name's start, masked to its length,
+/// so short names need no variable-length copy. The bytes after a name are the rest of its
+/// record, so the read stays in the file except for the last few bytes.
+///
+/// The hash is `FxHash`, the rotate-XOR-multiply hash rustc uses for its own tables, with a
+/// final fold of the high half into the low half, so the 32 bits kept depend on every word. The
+/// length seeds it, so names that differ only by trailing spaces, such as `Betts` and `Betts `,
+/// differ from the first step. For a long name it covers the first [`INLINE`] bytes, which is
+/// enough to pick an owner, and the owner compares long names in full.
+fn name_letter(data: &[u8], Range { start, end }: Range<usize>) -> [u64; 4] {
+    let len = end - start;
+    let mut bytes = [0; INLINE];
+    match data.get(start..start + INLINE) {
+        Some(window) => bytes.copy_from_slice(window),
+        // Only a name shorter than the window can end this close to the end of the file.
+        None => bytes[..len].copy_from_slice(&data[start..end]),
+    }
+    let words: [u64; 3] = std::array::from_fn(|i| {
+        let keep = len.saturating_sub(8 * i).min(8);
+        let word = u64::from_le_bytes(bytes[8 * i..][..8].try_into().expect("8 bytes"));
+        word & ((1u128 << (8 * keep)) - 1) as u64
+    });
+    let mix = |h: u64, w: u64| (h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
+    let h = words.iter().fold(len as u64, |h, &w| mix(h, w));
+    let hash = (h ^ (h >> 32)) & 0xFFFF_FFFF;
+    if len > INLINE {
+        return [start as u64, end as u64, 0, hash | LONG << 32];
+    }
+    [words[0], words[1], words[2], hash | (len as u64) << 32]
+}
+
+/// One cache line of a [`NameSet`] entry.
+#[derive(Clone, Copy)]
+#[repr(align(64))]
+struct Line([u64; 8]);
+
+/// One worker's share of the distinct names, with the countries each name occurs in.
+///
+/// It is a hash table with open addressing and linear probing that only its worker ever
+/// touches: no atomics and no cache line shared with another core. Each distinct name has one
+/// entry of whole cache lines: its four-word key from [`name_letter`], then a bitset with one bit
+/// per group. With up to 256 groups an entry is one line, so a record's compare and its bit land
+/// on the same line. Names longer than [`INLINE`] bytes are rare and are kept in a `HashMap`
+/// keyed by their bytes in the file, pointing at entries of the same kind.
+///
+/// Names are keyed still escaped. Escaping is one to one (each `"` becomes `""`), so two raw
+/// names are equal exactly when their unescaped values are. The empty quoted name `""` and the
+/// empty unquoted name both arrive as an empty slice, so they are one name, as spec §3 asks.
+struct NameSet {
+    /// `entry + 1` for the entry of a short name, or 0 for an empty slot.
+    slots: Vec<u32>,
+    /// The entries, `stride` lines each.
+    lines: Vec<Line>,
+    /// Lines per entry: four key words, then one bit per group.
+    stride: usize,
+    /// The entries of the names longer than [`INLINE`] bytes.
+    long: HashMap<&'static [u8], usize>,
+}
+
+impl NameSet {
+    /// An empty set with room for about `names` names over `group_count` groups.
+    fn new(group_count: usize, names: usize) -> Self {
+        let stride = (4 + group_count.div_ceil(64)).div_ceil(8);
+        Self {
+            slots: vec![0; (2 * names).next_power_of_two().max(16)],
+            // Pages of the capacity that no entry reaches cost nothing, so this is generous.
+            lines: Vec::with_capacity(2 * names * stride),
+            stride,
+            long: HashMap::new(),
+        }
+    }
+
+    /// Adds `group` to the groups of the short name with this key and returns `true` if it was
+    /// not there yet. The key holds the whole name, so equal keys are equal names.
+    fn mark(&mut self, key: [u64; 4], group: usize) -> bool {
         let mask = self.slots.len() - 1;
-        let mut slot = hash as usize & mask;
-        loop {
-            if seen == 0 {
-                let entry = self.insert(name)?;
-                // A thread that loses the race leaves its entry unpublished. No record ever
-                // marks it, so it counts for nothing.
-                let new = hash & !LOW | (entry as u64 + 1);
-                match self.slots[slot].compare_exchange(0, new, Release, Acquire) {
-                    Ok(_) => return Some(entry),
-                    Err(winner) => seen = winner,
-                }
+        let mut slot = key[3] as u32 as usize & mask;
+        let entry = loop {
+            match self.slots[slot] as usize {
+                0 => break self.insert(slot, key),
+                entry if self.lines[(entry - 1) * self.stride].0[..4] == key => break entry - 1,
+                _ => slot = (slot + 1) & mask,
             }
-            // A matching tag is not proof: names are always compared byte for byte.
-            if seen & !LOW == hash & !LOW && self.holds((seen & LOW) as usize - 1, name) {
-                return Some((seen & LOW) as usize - 1);
-            }
-            slot = (slot + 1) & mask;
-            seen = self.slots[slot].load(Acquire);
+        };
+        self.set(entry, group)
+    }
+
+    /// Marks the names of `letters` and counts each name that is new for its group in
+    /// `groups`. Kept out of line so that this loop gets the registers to itself.
+    #[inline(never)]
+    fn read(&mut self, letters: &[AtomicU64], data: &'static [u8], groups: &mut [Group]) {
+        for letter in letters.as_chunks::<4>().0 {
+            let letter: [u64; 4] = std::array::from_fn(|i| letter[i].load(Relaxed));
+            let group = (letter[3] >> 48) as usize;
+            let new = if letter[3] >> 32 & 0xFFFF == LONG {
+                self.mark_long(&data[letter[0] as usize..letter[1] as usize], group)
+            } else {
+                self.mark([letter[0], letter[1], letter[2], letter[3] & KEY], group)
+            };
+            groups[group].distinct += u64::from(new);
         }
     }
 
-    /// Writes a new, unpublished entry for `name` and returns its offset.
-    ///
-    /// Returns `None` once the arena is full or the entries reach half the slot count; then
-    /// [`join`] reruns with a bigger table. The second limit keeps at least half the slots
-    /// empty, so every probe in [`NameTable::intern`] ends at an empty slot.
-    fn insert(&self, name: &[u8]) -> Option<usize> {
-        let size = 1 + self.words + name.len().div_ceil(8);
-        let entry = self.arena_used.fetch_add(size, Relaxed);
-        if self.names.fetch_add(1, Relaxed) >= self.slots.len() / 2
-            || entry + size > self.arena.len()
-        {
-            return None;
+    /// [`NameSet::mark`] for a name longer than [`INLINE`] bytes.
+    fn mark_long(&mut self, name: &'static [u8], group: usize) -> bool {
+        let next = self.lines.len() / self.stride;
+        let entry = *self.long.entry(name).or_insert(next);
+        if entry == next {
+            self.add([0; 4]);
         }
-        self.arena[entry].store(name.len() as u64, Relaxed);
-        let text = &self.arena[entry + 1 + self.words..entry + size];
-        text.iter()
-            .zip(words(name))
-            .for_each(|(a, w)| a.store(w, Relaxed));
-        Some(entry)
+        self.set(entry, group)
     }
 
-    /// Whether the entry at `entry` holds `name`: same length, then the same words.
-    fn holds(&self, entry: usize, name: &[u8]) -> bool {
-        let text = &self.arena[entry + 1 + self.words..];
-        self.arena[entry].load(Relaxed) == name.len() as u64
-            && words(name).zip(text).all(|(w, a)| a.load(Relaxed) == w)
+    /// Sets `group`'s bit in `entry` and returns whether it was clear.
+    fn set(&mut self, entry: usize, group: usize) -> bool {
+        let word = 4 + group / 64;
+        let word = &mut self.lines[entry * self.stride + word / 8].0[word % 8];
+        let bit = 1 << (group % 64);
+        let new = *word & bit == 0;
+        *word |= bit;
+        new
+    }
+
+    /// Appends an entry with this key and no groups, and returns its index.
+    fn add(&mut self, key: [u64; 4]) -> usize {
+        let entry = self.lines.len() / self.stride;
+        self.lines.resize((entry + 1) * self.stride, Line([0; 8]));
+        self.lines[entry * self.stride].0[..4].copy_from_slice(&key);
+        entry
+    }
+
+    /// Adds a short name's entry into the empty `slot` and returns its index. The slots grow
+    /// when the entries, long names' included, reach half their count; see [`NameSet::grow`].
+    fn insert(&mut self, slot: usize, key: [u64; 4]) -> usize {
+        let entry = self.add(key);
+        self.slots[slot] = u32::try_from(entry + 1).expect("under 2^32 names");
+        if 2 * (entry + 1) > self.slots.len() {
+            self.grow();
+        }
+        entry
+    }
+
+    /// Doubles the slots and places every entry again, so at least half the slots stay empty
+    /// and every probe ends at an empty slot.
+    fn grow(&mut self) {
+        let mut slots = vec![0; 2 * self.slots.len()];
+        let mask = slots.len() - 1;
+        for &entry in self.slots.iter().filter(|&&entry| entry != 0) {
+            let key = self.lines[(entry as usize - 1) * self.stride].0[3];
+            let mut slot = key as u32 as usize & mask;
+            while slots[slot] != 0 {
+                slot = (slot + 1) & mask;
+            }
+            slots[slot] = entry;
+        }
+        self.slots = slots;
     }
 }
 
 /// Allocates `len` atomics that are all 0.
 ///
 /// The memory comes zeroed from the allocator, which for big sizes means fresh pages from the
-/// kernel that are mapped in only when first written. So the parts of the [`NameTable`] that no
-/// name reaches cost no memory, and the table can be sized generously.
+/// kernel that are mapped in only when first written. So the mailbox pages that no round fills
+/// cost no memory, and the mailboxes can be sized generously.
 fn zeroed(len: usize) -> Box<[AtomicU64]> {
     // SAFETY: `AtomicU64` has the same layout as `u64`, and all-zero bits are a valid 0.
     unsafe { Box::new_zeroed_slice(len).assume_init() }
-}
-
-/// A name as little-endian 8-byte words, the last one zero-padded: the form [`hash`] mixes and
-/// the arena stores. Comparing words instead of bytes takes two steps for a typical 10-byte name.
-fn words(name: &[u8]) -> impl Iterator<Item = u64> {
-    let (whole, tail) = name.as_chunks::<8>();
-    let mut last = [0; 8];
-    last[..tail.len()].copy_from_slice(tail);
-    let last = (!tail.is_empty()).then_some(u64::from_le_bytes(last));
-    whole.iter().map(|w| u64::from_le_bytes(*w)).chain(last)
-}
-
-/// Hashes a name with `FxHash`, the rotate-XOR-multiply hash rustc uses for its own tables.
-///
-/// It takes eight bytes per step, and a final fold mixes the high half into the low half, so
-/// the low bits (the slot) and the high bits (the tag) both depend on every byte. The length
-/// seeds the hash, so names that differ only by trailing spaces, such as `Betts` and `Betts `,
-/// differ from the first step.
-fn hash(name: &[u8]) -> u64 {
-    let mix = |h: u64, w: u64| (h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
-    let h = words(name).fold(name.len() as u64, mix);
-    h ^ (h >> 32)
 }
 
 /// Writes one line per group that has records: the countries in bytewise order, then
