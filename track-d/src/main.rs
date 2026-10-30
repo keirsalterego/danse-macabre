@@ -134,7 +134,34 @@ fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
 /// The spec guarantees the format (§2): unsigned decimals with no sign or leading zeros, and
 /// exactly one space or LF between fields. So the parser needs no validation, and the same
 /// function reads the header, the edge lines and the queries.
+///
+/// The fast path is SWAR, SIMD within a register: it reads 8 bytes as one little-endian `u64`
+/// and handles all of their digits at once, with no branch per byte. A byte-at-a-time loop
+/// mispredicts its exit once per number, since the lengths vary, and that cost more than the
+/// arithmetic. Take `"904 7\n..."`:
+///
+/// 1. Every digit (0x30..=0x39) has bit 4 set, and the separators, space (0x20) and LF (0x0A),
+///    have it clear. So the lowest clear bit 4 marks the end: here byte 3, so `len` is 3.
+/// 2. The low nibbles of the 3 digit bytes, `[9, 0, 4]`, are shifted to the top of the word.
+///    That drops the bytes after the number and leaves zero bytes below, which read as leading
+///    zeros: the word now holds the digits `00000904`, first digit in the lowest byte.
+/// 3. Three multiplies merge neighbours: digit pairs into 2-digit numbers (`00 00 09 04`), those
+///    into 4-digit numbers (`0000 0904`), and those into the value, 904.
+///
+/// Numbers of 8 digits or more (in practice only weights near 2^32), and numbers that start in
+/// the last 7 bytes of `bytes`, take the byte loop below.
 fn number(bytes: &[u8], at: &mut usize) -> u64 {
+    if let Some(&word) = bytes.get(*at..).and_then(<[u8]>::first_chunk::<8>) {
+        let word = u64::from_le_bytes(word);
+        let len = (!word & 0x1010_1010_1010_1010).trailing_zeros() / 8;
+        if (1..8).contains(&len) {
+            let digits = (word & 0x0F0F_0F0F_0F0F_0F0F) << (64 - 8 * len);
+            let pairs = digits.wrapping_mul(10 << 8 | 1) >> 8 & 0x00FF_00FF_00FF_00FF;
+            let quads = pairs.wrapping_mul(100 << 16 | 1) >> 16 & 0x0000_FFFF_0000_FFFF;
+            *at += len as usize + 1;
+            return quads.wrapping_mul(10_000 << 32 | 1) >> 32;
+        }
+    }
     let mut value = 0;
     while let Some(&digit @ b'0'..=b'9') = bytes.get(*at) {
         value = value * 10 + u64::from(digit - b'0');
