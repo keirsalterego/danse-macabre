@@ -76,10 +76,11 @@ const HOURS: usize = 72;
 /// for the worst case of all-minimal lines, and [`line_end`] starts looking for the LF at byte 39.
 const MIN_LINE: usize = 40;
 
-// We declare `mmap` ourselves instead of pulling in the `libc` crate: every dependency costs
-// points on the D axis, and the C library is already linked into every Rust binary. The
-// constants are the values from Linux's `<sys/mman.h>`.
+// We declare `mmap` and friends ourselves instead of pulling in the `libc` crate: every
+// dependency costs points on the D axis, and the C library is already linked into every Rust
+// binary. The constants are the values from Linux's `<sys/mman.h>` and `<sys/prctl.h>`.
 unsafe extern "C" {
+    fn prctl(option: i32, ...) -> i32;
     fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
 }
@@ -88,12 +89,20 @@ const PROT_WRITE: i32 = 2;
 const MAP_SHARED: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const MADV_DONTNEED: i32 = 4;
+const PR_SET_THP_DISABLE: i32 = 41;
 
 /// Reads `<data_dir>/requests.log` and writes `<out_dir>/summary.txt`.
 ///
 /// The directories default to `/data` and `/out`, where the scoring harness mounts them; the
 /// local test scripts pass their own.
 fn main() -> Result<(), Box<dyn Error>> {
+    // A system that enables transparent huge pages for every process (`always`, as on our test
+    // machine and, judging by its memory numbers, on the scoring box) backs anonymous memory in
+    // 2 MB pages. A thread's 2 MB of records then usually straddles two of them, and that padding
+    // was 13 of the 50 MB peak. With plain 4 KB pages the records cost what they hold; the extra
+    // page faults did not change the time measurably. The call is advice, so failure is ignored.
+    // SAFETY: PR_SET_THP_DISABLE only changes how the kernel backs our future memory.
+    unsafe { prctl(PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
