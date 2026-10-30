@@ -178,13 +178,13 @@ fn map_file(path: &Path) -> Result<&'static [u8], String> {
     let err = |e| format!("{e}: {}", path.display());
     let file = File::open(path).map_err(err)?;
     let len = file.metadata().map_err(err)?.len() as usize;
-    // SAFETY: the first call maps fresh memory at an address the kernel picks, and the second
-    // maps the file over the start of it, so neither overlaps memory we already use. If the
-    // first fails, the second fails too, at the address -1.
-    let ptr = unsafe {
-        let at = mmap(std::ptr::null_mut(), len + PAD, 1, 0x22, -1, 0); // MAP_PRIVATE | ANONYMOUS
-        mmap(at, len, 1, 0x12, file.as_raw_fd(), 0) // PROT_READ, MAP_PRIVATE | MAP_FIXED
-    };
+    // SAFETY: fresh memory at an address the kernel picks overlaps no memory we already use.
+    // PROT_READ (1), MAP_PRIVATE | MAP_ANONYMOUS (0x22).
+    let at = unsafe { mmap(std::ptr::null_mut(), len + PAD, 1, 0x22, -1, 0) };
+    // SAFETY: the file goes over the start of that fresh memory, which nothing refers to yet. If
+    // the first call failed, this one fails too, at the address -1.
+    // PROT_READ (1), MAP_PRIVATE | MAP_FIXED (0x12).
+    let ptr = unsafe { mmap(at, len, 1, 0x12, file.as_raw_fd(), 0) };
     if ptr.addr() == usize::MAX {
         return Err(err(std::io::Error::last_os_error()));
     }
@@ -452,8 +452,7 @@ fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
     }
     let mut value = 0;
     while data[at] != stop {
-        value = value * 10 + u64::from(data[at] - b'0');
-        at += 1;
+        (value, at) = (value * 10 + u64::from(data[at] - b'0'), at + 1);
     }
     (value, at)
 }

@@ -25,6 +25,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 18 | A leaner rewrite, 211 fewer lines at the same speed: run starts found exactly from spec §2.2, so the guessed starts, their check and rerun, and the sentinel record go | run-5cc15fc89abe | 0.0351 | 12.4 | 76.5 |
 | 19 | 5 fewer lines with the same machine code: three pairs of variables set in one statement each, the regions header skipped in one line, and the cast lint exceptions in `Cargo.toml` | run-ad4d88cb83d7 | 0.0370 | 12.4 | 76.0 |
 | 20 | 2 fewer lines with the same machine code: a worker's position, run end and groups set in one statement, and so are a quoted field's start and end | | | | |
+| 21 | 3 fewer lines with the same machine code: one `unsafe` statement per `mmap` call, and the digit loop's two updates in one assignment | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -608,6 +609,14 @@ binary: each worker sets its position, its run's end and its groups in one state
 one. Dropped because the machine code changed: the round's `half` and `round_end` declared
 together, and `regions.csv` mapped inside the `parse_regions` call, which drops its path later.
 S 318 → 316. Gate: 307 pass, 0 fail; clippy reports no warnings.
+
+## Step 21: 3 fewer lines, the same machine code
+
+On step 20, with `.text` and `.rodata` byte-identical to step 19's binary: `map_file` makes its
+two `mmap` calls as two statements, each with its own safety comment and its flags named above
+it, instead of one `unsafe` block, and the byte loop of `number` updates the value and the
+position in one assignment. Dropped because the machine code changed: `merge` setting the min
+and the max in one assignment. S 316 → 313. Gate: 307 pass, 0 fail; clippy reports no warnings.
 
 ## Experiments that did not stay
 
