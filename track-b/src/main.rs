@@ -5,10 +5,11 @@
 //!    tokens that no query uses are looked up once and then forgotten.
 //! 2. Tokenize the first `SAMPLE_DOCS` documents and count each term's hits. A phrase's trigger
 //!    is its rarest term in that sample. The choice only affects speed: every match contains it.
-//! 3. One parallel pass over `docs.txt`, one chunk of whole lines per thread. A BOOL term
-//!    appends the doc id to the thread's posting list for it. At the end of each doc, every
-//!    trigger occurrence checks its phrases' windows against the doc's token ids, so no document
-//!    is ever tokenized twice.
+//! 3. One parallel pass over `docs.txt`, one chunk of whole lines per thread. [`walk`] finds
+//!    tokens 64 bytes at a time from AVX2 bit masks, never byte by byte. A BOOL term appends
+//!    the doc id to the thread's posting list for it. At the end of each doc, every trigger
+//!    occurrence checks its phrases' windows against the doc's token ids, so no document is
+//!    ever tokenized twice.
 //! 4. Threads answer contiguous ranges of queries. BOOL merges the sorted lists strictly left
 //!    to right, chunk by chunk; PHRASE reads the matches the pass recorded.
 //!
@@ -30,21 +31,6 @@ const SAMPLE_DOCS: usize = 1000;
 const MISS: u32 = u32::MAX;
 /// An output line lists at most this many ids (spec §4).
 const SHOWN_IDS: usize = 10;
-
-/// Byte → its token character after ASCII lowercasing, or 0 for a separator (spec §2.2). Every
-/// byte from 0x80 up is a separator, even inside a UTF-8 letter.
-const FOLD: [u8; 256] = {
-    let mut table = [0; 256];
-    let mut b = 0;
-    while b < 256 {
-        let c = (b as u8).to_ascii_lowercase();
-        if c.is_ascii_lowercase() || c.is_ascii_digit() {
-            table[b] = c;
-        }
-        b += 1;
-    }
-    table
-};
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
@@ -101,8 +87,11 @@ fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
 
 /// Returns the output in pieces, one per thread, to be written in order.
 fn answer_all(query_text: &[u8], docs: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    if docs.last().is_some_and(|&b| b != b'\n') {
+        return Err("docs.txt: the last line has no LF (spec §2.1)".into());
+    }
     let (queries, terms) = parse_queries(query_text)?;
-    let plan = Plan::new(&queries, terms, docs)?;
+    let plan = Plan::new(&queries, terms, docs);
     let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
     let bounds = line_bounds(docs, threads);
     let (queries, plan) = (&queries, &plan);
@@ -229,7 +218,7 @@ struct Plan<'q> {
 }
 
 impl<'q> Plan<'q> {
-    fn new(queries: &[Query], terms: TermTable<'q>, docs: &[u8]) -> Result<Self, String> {
+    fn new(queries: &[Query], terms: TermTable<'q>, docs: &[u8]) -> Self {
         let mut in_bool = vec![false; terms.len()];
         for query in queries.iter().filter(|q| !q.phrase) {
             for &t in &query.terms {
@@ -240,7 +229,7 @@ impl<'q> Plan<'q> {
         // start, so checking the windows around one term's occurrences finds all of them.
         // Checking around the rarest term costs the fewest windows. A term absent from the
         // corpus never fires, which leaves the phrase at `0 0` with no special case.
-        let hits = sample_hits(docs, &terms)?;
+        let hits = sample_hits(docs, &terms);
         let mut triggers = vec![Vec::new(); terms.len()];
         for (i, query) in queries.iter().enumerate().filter(|(_, q)| q.phrase) {
             // Ties (often zero hits) go to the longer term, which tends to be rarer.
@@ -249,41 +238,145 @@ impl<'q> Plan<'q> {
                 .expect("the parser rejects a phrase without terms");
             triggers[term as usize].push((i as u32, offset as u32));
         }
-        Ok(Self {
+        Self {
             terms,
             in_bool,
             triggers,
-        })
+        }
     }
 }
 
 /// Hits per term in the first `SAMPLE_DOCS` documents: a cheap stand-in for document frequency.
-fn sample_hits(docs: &[u8], terms: &TermTable) -> Result<Vec<u32>, String> {
+fn sample_hits(docs: &[u8], terms: &TermTable) -> Vec<u32> {
+    let mut lines = docs.iter().enumerate().filter(|&(_, &b)| b == b'\n');
+    let end = lines
+        .nth(SAMPLE_DOCS - 1)
+        .map_or(docs.len(), |(at, _)| at + 1);
+    let sample = &docs[..end];
     let mut hits = vec![0; terms.len()];
-    for line in docs.split_inclusive(|&b| b == b'\n').take(SAMPLE_DOCS) {
-        for token in tokens(split_doc(line)?.1) {
-            if let Some(t) = key(token).and_then(|key| terms.find(&key)) {
-                hits[t as usize] += 1;
+    walk(sample, |event| {
+        if let Event::Token { start, end } = event
+            && let Some(t) = key_in(sample, start, end).and_then(|key| terms.find(&key))
+        {
+            hits[t as usize] += 1;
+        }
+    });
+    hits
+}
+
+/// The id on the first line of `chunk`. Line `i` of `docs.txt` holds id `i` (spec §2.1), so
+/// the ids of the lines after it follow by counting LFs.
+fn first_id(chunk: &[u8]) -> Result<u32, String> {
+    let digits = chunk.iter().take_while(|b| b.is_ascii_digit()).count();
+    if !chunk.is_empty() && (digits == 0 || chunk.get(digits) != Some(&b'\t')) {
+        let start = String::from_utf8_lossy(&chunk[..chunk.len().min(40)]);
+        return Err(format!(
+            "docs.txt: no id and TAB at the line starting {start:?}"
+        ));
+    }
+    Ok((chunk[..digits].iter()).fold(0, |id, &digit| id * 10 + u32::from(digit - b'0')))
+}
+
+/// What [`walk`] finds in a chunk of `docs.txt`, in input order.
+enum Event {
+    /// A token of a document's text, at `chunk[start..end]`.
+    Token { start: usize, end: usize },
+    /// The LF that ends a document's line.
+    LineEnd,
+}
+
+/// Calls `on` with every token of every document in `chunk`, and with every line end, in
+/// order. `chunk` holds whole lines, the last one ending in LF.
+///
+/// No loop here looks at single bytes. [`classify`] turns 64 bytes at a time into two masks:
+/// `token`, with bit `i` set when byte `i` is a letter or digit, and `lf`. A token starts where
+/// a token byte follows a separator and ends at the separator after its last byte. With `prev`
+/// the `token` mask shifted by one byte (the previous block's last bit shifted in), that is:
+///
+/// ```text
+/// bytes    T h e   s u r e t y ,   b a i l
+/// token    1 1 1 0 1 1 1 1 1 1 0 0 1 1 1 1
+/// starts   1 0 0 0 1 0 0 0 0 0 0 0 1 0 0 0    token & !prev
+/// ends     0 0 0 1 0 0 0 0 0 0 1 0 0 0 0 0    !token & prev
+/// ```
+///
+/// `trailing_zeros` walks the set bits. Starts and ends alternate, so each end closes the
+/// oldest open start, and a token still open at a block's end carries into the next block.
+/// A line starts with its id, digits that look like a token, so a token that starts a line is
+/// skipped: document text only begins after the TAB.
+fn walk(chunk: &[u8], mut on: impl FnMut(Event)) {
+    let mut prev_bit = 0; // 1 when the byte before the block is a token byte
+    let mut open = None; // the start of a token that runs on past the block
+    let mut line_start = 0;
+    let mut padded = [0; 64]; // zero bytes are separators
+    for base in (0..chunk.len()).step_by(64) {
+        let block = if let Some(block) = chunk[base..].first_chunk() {
+            block
+        } else {
+            padded[..chunk.len() - base].copy_from_slice(&chunk[base..]);
+            &padded
+        };
+        // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
+        let (token, lf) = unsafe { classify(block) };
+        let prev = token << 1 | prev_bit;
+        let (mut starts, mut ends, mut lfs) = (token & !prev, !token & prev, lf);
+        prev_bit = token >> 63;
+        while ends != 0 {
+            let end = base + ends.trailing_zeros() as usize;
+            ends &= ends - 1;
+            let start = open.take().unwrap_or_else(|| {
+                let start = base + starts.trailing_zeros() as usize;
+                starts &= starts - 1;
+                start
+            });
+            while lfs != 0 && base + (lfs.trailing_zeros() as usize) < start {
+                line_start = base + lfs.trailing_zeros() as usize + 1;
+                lfs &= lfs - 1;
+                on(Event::LineEnd);
+            }
+            if start != line_start {
+                on(Event::Token { start, end });
             }
         }
+        if starts != 0 {
+            open = Some(base + starts.trailing_zeros() as usize);
+        }
+        while lfs != 0 {
+            line_start = base + lfs.trailing_zeros() as usize + 1;
+            lfs &= lfs - 1;
+            on(Event::LineEnd);
+        }
     }
-    Ok(hits)
 }
 
-/// Splits a line of `docs.txt` into its id and its text (spec §2.1). The text keeps the LF,
-/// which the tokenizer treats as one more separator.
-fn split_doc(line: &[u8]) -> Result<(u32, &[u8]), String> {
-    let tab = (line.iter().position(|&b| b == b'\t')).ok_or_else(|| {
-        let start = String::from_utf8_lossy(&line[..line.len().min(40)]);
-        format!("docs.txt: no TAB in the line starting {start:?}")
-    })?;
-    let id = (line[..tab].iter()).fold(0, |id, &digit| id * 10 + u32::from(digit - b'0'));
-    Ok((id, &line[tab + 1..]))
-}
-
-/// The tokens of a document's text, as slices of the raw (not yet lowercased) bytes (spec §2.2).
-fn tokens(text: &[u8]) -> impl Iterator<Item = &[u8]> {
-    (text.split(|&b| FOLD[b as usize] == 0)).filter(|token| !token.is_empty())
+/// Returns `(token, lf)` for a 64-byte block: bit `i` of `token` is set when `block[i]` is a
+/// token byte, an ASCII letter or digit (spec §2.2), and bit `i` of `lf` when it is an LF.
+///
+/// Each half of the block is one AVX2 register. A byte is a letter when `(b | 0x20) - b'a'`
+/// is at most 25 as an unsigned byte, and a digit when `b - b'0'` is at most 9, so every byte
+/// from 0x80 up, TAB and LF included, is a separator. `_mm256_movemask_epi8` then packs the
+/// top bit of each byte's 0x00 or 0xFF result into one bit.
+#[target_feature(enable = "avx2")]
+fn classify(block: &[u8; 64]) -> (u64, u64) {
+    use std::arch::x86_64::{
+        _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_min_epu8, _mm256_movemask_epi8,
+        _mm256_or_si256, _mm256_set1_epi8, _mm256_sub_epi8,
+    };
+    let (mut token, mut lf) = (0, 0);
+    for offset in [0, 32] {
+        // SAFETY: the 32-byte unaligned load lies inside the 64-byte block.
+        let bytes = unsafe { _mm256_loadu_si256(block.as_ptr().add(offset).cast()) };
+        let lower = _mm256_or_si256(bytes, _mm256_set1_epi8(0x20));
+        let letter = _mm256_sub_epi8(lower, _mm256_set1_epi8(b'a'.cast_signed()));
+        let letter = _mm256_cmpeq_epi8(_mm256_min_epu8(letter, _mm256_set1_epi8(25)), letter);
+        let digit = _mm256_sub_epi8(bytes, _mm256_set1_epi8(b'0'.cast_signed()));
+        let digit = _mm256_cmpeq_epi8(_mm256_min_epu8(digit, _mm256_set1_epi8(9)), digit);
+        let newline = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'\n'.cast_signed()));
+        let is_token = _mm256_movemask_epi8(_mm256_or_si256(letter, digit)).cast_unsigned();
+        token |= u64::from(is_token) << offset;
+        lf |= u64::from(_mm256_movemask_epi8(newline).cast_unsigned()) << offset;
+    }
+    (token, lf)
 }
 
 /// What one thread keeps from its chunk of whole lines, which covers one contiguous, ascending
@@ -295,20 +388,20 @@ struct Segment {
     matches: Vec<(u32, u32)>,
 }
 
+/// Runs the corpus pass over one chunk of whole lines: posting lists for BOOL terms and the
+/// phrase matches, each phrase checked at the end of its document.
 fn scan(chunk: &[u8], queries: &[Query], plan: &Plan) -> Result<Segment, String> {
     let mut postings = vec![Vec::new(); plan.in_bool.len()];
     let mut matches = Vec::new();
     // The current doc's term id per token (MISS for the rest), and where its triggers sit.
     let mut ids = Vec::new();
     let mut triggered = Vec::new();
-    for line in chunk.split_inclusive(|&b| b == b'\n') {
-        let (doc, text) = split_doc(line)?;
-        ids.clear();
-        triggered.clear();
-        for token in tokens(text) {
-            let Some(term) = key_in(chunk, token).and_then(|key| plan.terms.find(&key)) else {
+    let mut doc = first_id(chunk)?;
+    walk(chunk, |event| match event {
+        Event::Token { start, end } => {
+            let Some(term) = key_in(chunk, start, end).and_then(|key| plan.terms.find(&key)) else {
                 ids.push(MISS);
-                continue;
+                return;
             };
             let t = term as usize;
             // Docs arrive in id order, so a term seen earlier in this doc is the list's tail.
@@ -320,17 +413,22 @@ fn scan(chunk: &[u8], queries: &[Query], plan: &Plan) -> Result<Segment, String>
             }
             ids.push(term);
         }
-        for &at in &triggered {
-            for &(query, offset) in &plan.triggers[ids[at] as usize] {
-                let phrase: &[u32] = &queries[query as usize].terms;
-                // `ids` holds this doc only, so a window can never span two docs (spec §3).
-                let start = at.checked_sub(offset as usize);
-                if start.and_then(|s| ids.get(s..s + phrase.len())) == Some(phrase) {
-                    matches.push((query, doc));
+        Event::LineEnd => {
+            for &at in &triggered {
+                for &(query, offset) in &plan.triggers[ids[at] as usize] {
+                    let phrase: &[u32] = &queries[query as usize].terms;
+                    // `ids` holds this doc only, so a window never spans two docs (spec §3).
+                    let start = at.checked_sub(offset as usize);
+                    if start.and_then(|s| ids.get(s..s + phrase.len())) == Some(phrase) {
+                        matches.push((query, doc));
+                    }
                 }
             }
+            ids.clear();
+            triggered.clear();
+            doc += 1;
         }
-    }
+    });
     Ok(Segment { postings, matches })
 }
 
@@ -428,14 +526,14 @@ fn key(token: &[u8]) -> Option<Key> {
     Some(fold(&bytes, token.len()))
 }
 
-/// The key of `token`, a slice of `chunk`, read as one 32-byte load from `chunk` and masked to
-/// the token's length. Copying the token into a zeroed buffer first would call `memcpy` and
-/// then stall the load that reads the buffer back, once per token.
-fn key_in(chunk: &[u8], token: &[u8]) -> Option<Key> {
-    let start = token.as_ptr().addr() - chunk.as_ptr().addr();
+/// The key of the token at `chunk[start..end]`, read as one 32-byte load from `chunk` and
+/// masked to the token's length, or `None` past `MAX_TERM` bytes. Copying the token into a
+/// zeroed buffer first would call `memcpy` and then stall the load that reads the buffer
+/// back, once per token.
+fn key_in(chunk: &[u8], start: usize, end: usize) -> Option<Key> {
     match chunk[start..].first_chunk() {
-        Some(window) => (token.len() <= MAX_TERM).then(|| fold(window, token.len())),
-        None => key(token), // within 32 bytes of the chunk's end
+        Some(window) => (end - start <= MAX_TERM).then(|| fold(window, end - start)),
+        None => key(&chunk[start..end]), // within 32 bytes of the chunk's end
     }
 }
 
