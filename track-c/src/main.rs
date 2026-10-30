@@ -241,7 +241,7 @@ fn release(bytes: &[u8]) {
 struct Regions {
     /// Region id → group, sized from the largest id in the file. Ids it lacks stay 0, which is
     /// `_UNMATCHED`. The groups past 254 read as 255 here and are looked up in `wide`.
-    group_of: Vec<u8>,
+    by_id: Vec<u8>,
     /// The groups past 254, by region id.
     wide: HashMap<usize, u16>,
     /// Country codes in bytewise order: `codes[k]` is group k + 1.
@@ -251,10 +251,9 @@ struct Regions {
 impl Regions {
     /// The group of the region with this id; ids past the table's largest are `_UNMATCHED`.
     fn group(&self, id: usize) -> usize {
-        match self.group_of.get(id) {
-            Some(255) => usize::from(self.wide[&id]),
-            Some(&group) => usize::from(group),
-            None => 0,
+        match self.by_id.get(id).map_or(0, |&group| usize::from(group)) {
+            255 => usize::from(self.wide[&id]),
+            group => group,
         }
     }
 }
@@ -289,26 +288,19 @@ fn parse_regions(csv: &[u8]) -> Result<Regions, String> {
         max_id = max_id.max(id);
     }
     let mut codes = Vec::new();
-    for (code, group) in group_of_code.iter_mut().enumerate() {
-        if *group != 0 {
-            let letter = |place: usize| b'A' + (code / place % 26) as u8;
-            codes.push([letter(26 * 26), letter(26), letter(1)]);
-            *group = codes.len() as u16;
-        }
+    for (code, group) in (group_of_code.iter_mut().enumerate()).filter(|g| *g.1 != 0) {
+        codes.push([code / 676, code / 26 % 26, code % 26].map(|c| b'A' + c as u8));
+        *group = codes.len() as u16;
     }
-    let (mut group_of, mut wide) = (vec![0; max_id + 1], HashMap::new());
+    let (mut by_id, mut wide) = (vec![0; max_id + 1], HashMap::new());
     for &(id, code) in chunks.iter().flatten() {
         let group = group_of_code[code];
-        group_of[id] = group.min(255) as u8;
+        by_id[id] = group.min(255) as u8;
         if group >= 255 {
             wide.insert(id, group);
         }
     }
-    Ok(Regions {
-        group_of,
-        wide,
-        codes,
-    })
+    Ok(Regions { by_id, wide, codes })
 }
 
 /// Parses the rows that start in `rows`, each `region_id,country` and an LF (spec §2.3), into
@@ -333,17 +325,13 @@ fn region_rows(body: &[u8], rows: Range<usize>) -> Result<Vec<(usize, usize)>, S
             && at > start
             && [a, b, c].iter().all(u8::is_ascii_uppercase)
         {
-            list.push((
-                id,
-                ([a, b, c].iter()).fold(0, |n, &c| n * 26 + usize::from(c - b'A')),
-            ));
+            let code = ([a, b, c].iter()).fold(0, |n, &c| n * 26 + usize::from(c - b'A'));
+            list.push((id, code));
             start = at + 5;
         } else {
             let row = body[start..].split(|&b| b == b'\n').next();
-            return Err(format!(
-                "regions.csv: bad row {:?}",
-                String::from_utf8_lossy(row.unwrap_or_default())
-            ));
+            let row = String::from_utf8_lossy(row.unwrap_or_default());
+            return Err(format!("regions.csv: bad row {row:?}"));
         }
     }
     Ok(list)
@@ -705,6 +693,11 @@ struct Exchange {
 
 impl Exchange {
     fn new(threads: usize) -> Self {
+        // Zeroed memory this big comes as fresh pages from the kernel, mapped in only when first
+        // written, so the mailbox pages that no round fills cost nothing and the mailboxes can be
+        // sized generously.
+        // SAFETY: `AtomicU64` has the same layout as `u64`, and all-zero bits are a valid 0.
+        let zeroed = |len| unsafe { Box::<[AtomicU64]>::new_zeroed_slice(len).assume_init() };
         Self {
             threads,
             letters: zeroed(2 * threads * threads * MAILBOX * 4),
@@ -766,23 +759,21 @@ impl Exchange {
                 .for_each(|(_, thread)| thread.get().expect("set before round 0").unpark());
             return all_done;
         }
-        for spins in 0usize.. {
-            let released = self.released.load(Acquire);
-            if released >= next {
-                return released & 1 == 1;
-            }
+        let mut spins = 0;
+        while self.released.load(Acquire) < next {
+            spins += 1;
             // Workers usually arrive within microseconds of each other, so a waiter spins
             // first. A worker that is late because the scheduler put it aside, or put two workers
             // on one CPU, would keep every spinner busy for whole time slices, and busy CPUs never
             // look idle enough for the scheduler to move it. So a waiter that has spun long
             // parks, which frees its CPU, and the last worker to arrive unparks everyone.
-            if spins < SPINS {
-                std::hint::spin_loop();
-            } else {
+            std::hint::spin_loop();
+            if spins > SPINS {
                 thread::park();
             }
         }
-        unreachable!("the loop above only returns")
+        // No barrier can pass before this worker arrives at it, so `released` holds still.
+        self.released.load(Acquire) & 1 == 1
     }
 }
 
@@ -902,9 +893,8 @@ impl NameSet {
         };
         let word = 4 + group / 64;
         let word = &mut self.lines[entry * self.stride + word / 8].0[word % 8];
-        let bit = 1 << (group % 64);
-        let new = *word & bit == 0;
-        *word |= bit;
+        let new = *word >> (group % 64) & 1 == 0;
+        *word |= 1 << (group % 64);
         new
     }
 
@@ -951,16 +941,6 @@ impl NameSet {
     fn key(&self, entry: usize) -> &[u64] {
         &self.lines[entry * self.stride].0[..4]
     }
-}
-
-/// Allocates `len` atomics that are all 0.
-///
-/// The memory comes zeroed from the allocator, which for big sizes means fresh pages from the
-/// kernel that are mapped in only when first written. So the mailbox pages that no round fills
-/// cost no memory, and the mailboxes can be sized generously.
-fn zeroed(len: usize) -> Box<[AtomicU64]> {
-    // SAFETY: `AtomicU64` has the same layout as `u64`, and all-zero bits are a valid 0.
-    unsafe { Box::new_zeroed_slice(len).assume_init() }
 }
 
 /// Writes one line per group that has records: the countries in bytewise order, then
