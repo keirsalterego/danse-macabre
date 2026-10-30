@@ -567,6 +567,11 @@ Steps 16 and 17 went to the board in one push, so both rows cite run-521d52addb7
 
 ## Experiments that did not stay
 
+- **The name slots written at allocation** (`[0].repeat(n)` instead of `vec![0; n]`, local, turbo
+  off, on step 17), after track B found that a first load from a calloc'd page maps the shared
+  zero page and the store after it interrupts every core: `ab.py`, 40 interleaved runs, medians
+  40.16 → 40.18 ms on seed 1 and 39.74 → 39.80 ms on seed 2; page faults 6,350 → 6,351, kernel
+  cycles 64.8 → 62.9–64.2 M. The slots do not fault that way here.
 - **Batched table lookups** (local only): each thread parsed 32 records, then loaded every
   record's region entry and hash slot, then found every name's entry, so the cache misses within
   a batch overlap instead of following one another.
