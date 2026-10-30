@@ -21,11 +21,11 @@
 //! There are two of them: `forward` groups the edges by tail for the search from `s`, and
 //! `reverse` groups them by head for the search from `t`.
 //!
-//! [`build_graph`] fills both in two parallel passes over the mapped text, one thread per chunk
-//! of lines. The first pass counts each node's degree with atomic adds. An exclusive prefix sum
-//! turns the counts into start offsets. The second pass parses the text again and drops every
-//! edge into the next free slot of its node, which an atomic cursor hands out. This is a counting
-//! sort by node, done in place: no list of parsed edges ever exists.
+//! [`build_graph`] fills both with a parallel counting sort in three passes, one thread per chunk
+//! of lines, and no atomics. Pass 1 counts each chunk's edges per block of 2,048 consecutive node
+//! ids. Pass 2 parses the text again and writes every edge into a run of the final array that
+//! belongs to its chunk and its block alone. Pass 3 sorts each block, which fits in L2, by node.
+//! No list of parsed edges ever exists next to the CSR.
 //!
 //! ## Queries: bidirectional Dijkstra
 //!
@@ -86,7 +86,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let n = u32::try_from(number(graph_txt, &mut at)).map_err(|_| "n is over 2^32 - 1")?;
     number(graph_txt, &mut at);
     let threads = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let (forward, reverse) = build_graph(&graph_txt[at..], n as usize, threads);
+    let [forward, reverse] = build_graph(&graph_txt[at..], n as usize, threads)?;
 
     // One `s t` line per query, no header (spec §2).
     let mut queries = Vec::new();
@@ -157,92 +157,211 @@ fn line_chunks(text: &[u8], parts: usize) -> Vec<&[u8]> {
     bounds.windows(2).map(|w| &text[w[0]..w[1]]).collect()
 }
 
-/// Parses every `u v w` edge line and calls `visit(tail, head, weight)` on it, one scoped thread
-/// per chunk. [`build_graph`] runs this twice, once to count and once to scatter.
-fn for_each_edge(chunks: &[&[u8]], visit: &(impl Fn(usize, usize, u64) + Sync)) {
+/// Parses every `u v w` edge line of one chunk and calls `visit(tail, head, weight)` on it.
+fn for_each_edge(chunk: &[u8], mut visit: impl FnMut(usize, usize, u64)) {
+    let mut at = 0;
+    while at < chunk.len() {
+        let tail = number(chunk, &mut at) as usize;
+        let head = number(chunk, &mut at) as usize;
+        visit(tail, head, number(chunk, &mut at));
+    }
+}
+
+/// Runs `work` on every item, each on its own scoped thread, and returns once all are done.
+fn on_threads<T: Send>(items: impl IntoIterator<Item = T>, work: impl Fn(T) + Sync) {
+    let work = &work;
     thread::scope(|s| {
-        for &chunk in chunks {
-            s.spawn(move || {
-                let mut at = 0;
-                while at < chunk.len() {
-                    let tail = number(chunk, &mut at) as usize;
-                    let head = number(chunk, &mut at) as usize;
-                    visit(tail, head, number(chunk, &mut at));
-                }
-            });
+        for item in items {
+            s.spawn(move || work(item));
         }
     });
 }
 
 /// Builds the forward and the reverse [`Csr`] from the edge lines after the header, by a parallel
-/// counting sort.
+/// counting sort in three passes that share no counter between threads.
 ///
-/// The first pass counts every node's out-degree and in-degree. [`first_slots`] turns the counts
-/// into start offsets. The second pass scatters each edge into its node's next free slot, which
-/// an atomic `fetch_add` on the node's cursor hands out, so two threads never get the same slot.
-/// Edges land in whatever order the threads race to, and no distance depends on that order.
+/// The textbook parallel counting sort counts every node's degree with atomic adds, turns the
+/// counts into offsets, and drops each edge into its node's next free slot with another atomic
+/// add. Each of those adds hits a random cache line of a 14 MB array, and a `lock`ed add on x86
+/// also waits for every store before it, so the scatter runs at memory latency, one edge at a
+/// time per thread. In the profile they took 80% of the build's CPU time. Here every thread owns
+/// its counters and its slots:
+///
+/// 1. Each thread counts its chunk's edges per [`Blocks`] block, by tail and by head. At full
+///    scale that is 2 × 850 counters, which stay in L1.
+/// 2. A prefix sum in (block, chunk) order gives every chunk its own run of slots inside every
+///    block's range. Each thread parses its chunk again and appends every edge to its run
+///    ([`Blocks::append`]), with the edge's place in its block parked in spare bits. A thread
+///    writes to 2 × 850 runs, whose current cache lines fit in L2.
+/// 3. Each block, about 6,000 edges or 47 KB at full scale, is counting-sorted by place on one
+///    thread, which also writes the block's offsets ([`Blocks::sort`]).
+///
+/// For example, with 2,048 nodes per block the line `5000 7 9` lands in forward block 2 at place
+/// 904 (5000 = 2 · 2048 + 904), and in reverse block 0 at place 7.
 ///
 /// Every line is kept, as in the reference: of parallel edges only the lightest can ever improve
-/// a label, a duplicate changes nothing, and a self-loop never improves one (spec §3).
-fn build_graph(body: &[u8], n: usize, threads: usize) -> (Csr, Csr) {
+/// a label, a duplicate changes nothing, and a self-loop never improves one (spec §3). Each
+/// node's edges end up in an order set by the chunking, and no distance depends on it.
+fn build_graph(body: &[u8], n: usize, threads: usize) -> Result<[Csr; 2], Box<dyn Error>> {
     let chunks = line_chunks(body, threads);
-    // Node u's count and cursor live at index u + 1. The prefix sum then puts u's first slot
-    // there, and after the scatter it holds u's end, which is where u + 1 starts: the cursors
-    // have become the CSR offsets, with index 0 still 0. No shift pass is needed.
-    let (mut out_cursor, mut in_cursor) = (atomic_zeros(n + 1), atomic_zeros(n + 1));
-    for_each_edge(&chunks, &|tail, head, _| {
-        out_cursor[tail + 1].fetch_add(1, Relaxed);
-        in_cursor[head + 1].fetch_add(1, Relaxed);
+    let blocks = Blocks::new(n);
+    // Pass 1: counts[chunk][direction][block]. Direction 0 is keyed by the tail (the forward
+    // graph), direction 1 by the head (the reverse graph).
+    let mut counts = vec![[vec![0; blocks.len], vec![0; blocks.len]]; chunks.len()];
+    let work = chunks.iter().zip(&mut counts);
+    on_threads(work, |(chunk, [by_tail, by_head])| {
+        for_each_edge(chunk, |tail, head, _| {
+            by_tail[tail >> blocks.bits] += 1;
+            by_head[head >> blocks.bits] += 1;
+        });
     });
-    let out_slots = atomic_zeros(first_slots(&mut out_cursor));
-    let in_slots = atomic_zeros(first_slots(&mut in_cursor));
-    for_each_edge(&chunks, &|tail, head, weight| {
-        // Weight and neighbour share one u64, so relaxing an edge costs one load (spec §2: weights
-        // fit in 32 bits).
-        let slot = out_cursor[tail + 1].fetch_add(1, Relaxed) as usize;
-        out_slots[slot].store(weight << 32 | head as u64, Relaxed);
-        let slot = in_cursor[head + 1].fetch_add(1, Relaxed) as usize;
-        in_slots[slot].store(weight << 32 | tail as u64, Relaxed);
+    let in_block = |direction: usize, block: usize| counts.iter().map(move |c| c[direction][block]);
+    let m: usize = (0..blocks.len).flat_map(|block| in_block(0, block)).sum();
+    let edge_count = u32::try_from(m).map_err(|_| "over 2^32 - 1 edges")?;
+    // Zeroed allocations come from the kernel as untouched pages, so nothing zeroes 80 MB up
+    // front: each page is faulted in by the thread that first writes to it in pass 2.
+    let mut graphs = [(); 2].map(|()| Csr {
+        offsets: vec![0; n + 1],
+        edges: vec![0; m],
     });
-    let forward = Csr::new(out_cursor, out_slots);
-    (forward, Csr::new(in_cursor, in_slots))
+
+    // Pass 2: runs[chunk][direction][block] is the chunk's run of slots in that block.
+    let mut runs: Vec<[Vec<&mut [u64]>; 2]> = chunks.iter().map(|_| Default::default()).collect();
+    for (direction, graph) in graphs.iter_mut().enumerate() {
+        let lens = (0..blocks.len).flat_map(|block| in_block(direction, block));
+        for (i, run) in split_runs(&mut graph.edges, lens).into_iter().enumerate() {
+            runs[i % chunks.len()][direction].push(run);
+        }
+    }
+    let work = chunks.iter().zip(runs);
+    on_threads(work, |(chunk, [mut by_tail, mut by_head])| {
+        for_each_edge(chunk, |tail, head, weight| {
+            blocks.append(&mut by_tail, tail, head, weight);
+            blocks.append(&mut by_head, head, tail, weight);
+        });
+    });
+
+    // Pass 3: sort every block of both directions, split evenly over the threads.
+    let mut work = Vec::with_capacity(2 * blocks.len);
+    for (direction, graph) in graphs.iter_mut().enumerate() {
+        graph.offsets[n] = edge_count;
+        let lens = (0..blocks.len).map(|block| in_block(direction, block).sum());
+        let block_offsets = graph.offsets[..n].chunks_mut(1 << blocks.bits);
+        let block_runs = split_runs(&mut graph.edges, lens);
+        let mut first = 0;
+        for (run, offsets) in block_runs.into_iter().zip(block_offsets) {
+            let next = first + run.len() as u32;
+            work.push((run, offsets, first));
+            first = next;
+        }
+    }
+    let per_thread = work.len().div_ceil(threads);
+    on_threads(work.chunks_mut(per_thread), |share| {
+        for (run, offsets, first) in share {
+            blocks.sort(run, offsets, *first);
+        }
+    });
+    Ok(graphs)
 }
 
-/// `len` zeroed atomics. Atomics let the scatter threads share one array with no `unsafe`;
-/// `Relaxed` is enough, since the scope's join orders every write before the searches read.
+/// Cuts `slots` into consecutive runs of the given lengths.
+fn split_runs<T>(mut slots: &mut [T], lens: impl IntoIterator<Item = usize>) -> Vec<&mut [T]> {
+    let cut = |len| {
+        let (run, rest) = std::mem::take(&mut slots).split_at_mut(len);
+        slots = rest;
+        run
+    };
+    lens.into_iter().map(cut).collect()
+}
+
+/// Node ids cut into blocks of 2^`bits` consecutive ids, the unit of work of pass 3 in
+/// [`build_graph`].
+#[derive(Clone, Copy)]
+struct Blocks {
+    /// Bits of a node id: every id is below 2^`id_bits`.
+    id_bits: u32,
+    /// log2 of the nodes per block.
+    bits: u32,
+    /// The number of blocks, n / 2^`bits` rounded up.
+    len: usize,
+}
+
+impl Blocks {
+    /// Picks 2,048 nodes per block. That keeps a block's edges (about 6,000, or 47 KB, at full
+    /// scale) in L2 and its counters in L1, and it keeps the count of runs a thread writes to in
+    /// pass 2 small. A node's place in its block must also fit next to a node id in 32 bits
+    /// ([`Blocks::append`]), which only shrinks the blocks when n is over 2^21.
+    ///
+    /// shortcut: smaller blocks mean more counters and runs per chunk, n / 2^`bits` of each. That
+    /// is fine to about 2^24 nodes (the spec's full scale is 1,740,512); far beyond it, pass 2
+    /// would need wider edges that keep the whole key node.
+    fn new(n: usize) -> Self {
+        let id_bits = n.saturating_sub(1).bit_width();
+        let bits = (32 - id_bits).min(11);
+        let len = n.div_ceil(1 << bits);
+        Self { id_bits, bits, len }
+    }
+
+    /// Writes one edge into the first slot of its block's run in `runs` and moves that run's
+    /// start past it. The key node is the tail in the forward graph and the head in the reverse
+    /// one. The edge is packed as in the final [`Csr`], the weight in the high half and the other
+    /// end in the low bits, plus the key node's place in its block just above the other end.
+    ///
+    /// At full scale ids take 21 bits, so for `5000 7 9` the forward edge is
+    /// `9 << 32 | 904 << 21 | 7`: place 904 sits in bits 21..32, which pass 3 reads and clears.
+    fn append(self, runs: &mut [&mut [u64]], key: usize, other: usize, weight: u64) {
+        let run = &mut runs[key >> self.bits];
+        let (slot, rest) = std::mem::take(run)
+            .split_first_mut()
+            .expect("pass 1 counted it");
+        let place = key & ((1 << self.bits) - 1);
+        *slot = weight << 32 | (place << self.id_bits | other) as u64;
+        *run = rest;
+    }
+
+    /// Counting-sorts one block's packed edges by place, clears the places, and gives each of the
+    /// block's nodes its first slot in `offsets`. `first` is the slot of `run[0]` in the whole
+    /// edge array.
+    fn sort(self, run: &mut [u64], offsets: &mut [u32], first: u32) {
+        let place = |edge: u64| (edge >> self.id_bits) as usize & ((1 << self.bits) - 1);
+        // Degrees first, then an exclusive prefix sum turns them into each node's next slot.
+        let mut next = vec![0; offsets.len()];
+        for &edge in &*run {
+            next[place(edge)] += 1;
+        }
+        let mut at = 0;
+        for (offset, next) in offsets.iter_mut().zip(&mut next) {
+            *offset = first + at;
+            at += std::mem::replace(next, at);
+        }
+        // A copy to read from, since the loop overwrites `run` in sorted order.
+        let packed = run.to_vec();
+        for edge in packed {
+            let slot = &mut next[place(edge)];
+            run[*slot as usize] = edge & !(((1 << self.bits) - 1) << self.id_bits);
+            *slot += 1;
+        }
+    }
+}
+
+/// `len` zeroed atomics. Atomics let the query threads share one answer array with no `unsafe`;
+/// `Relaxed` is enough, since the scope's join orders every write before `main` reads.
 fn atomic_zeros(len: usize) -> Vec<AtomicU64> {
     (0..len).map(|_| AtomicU64::new(0)).collect()
-}
-
-/// Replaces each count with the sum of the counts before it (an exclusive prefix sum) and
-/// returns the total. Applied to degrees, this gives every node the first slot of its edges.
-fn first_slots(counts: &mut [AtomicU64]) -> usize {
-    let mut total = 0;
-    for count in counts {
-        total += std::mem::replace(count.get_mut(), total);
-    }
-    total as usize
 }
 
 /// A directed graph in compressed sparse row form: one flat array of edges grouped by node, and
 /// an array of where each group starts. A node's edges are one slice, with no pointer chasing.
 struct Csr {
-    /// Node u's edges are `edges[offsets[u]..offsets[u + 1]]`, so there are n + 1 entries.
-    offsets: Vec<u64>,
+    /// Node u's edges are `edges[offsets[u]..offsets[u + 1]]`, so there are n + 1 entries. They
+    /// are `u32`, half the size of `usize`, because [`build_graph`] checks that m fits.
+    offsets: Vec<u32>,
     /// `weight << 32 | other_end`, where `other_end` is the head in the forward graph and the
     /// tail in the reverse graph.
     edges: Vec<u64>,
 }
 
 impl Csr {
-    /// Unwraps the filled builder arrays into plain integers. `AtomicU64` and `u64` share a
-    /// layout, so std's in-place iteration reuses each buffer and nothing is reallocated.
-    fn new(offsets: Vec<AtomicU64>, slots: Vec<AtomicU64>) -> Self {
-        let offsets = offsets.into_iter().map(AtomicU64::into_inner).collect();
-        let edges = slots.into_iter().map(AtomicU64::into_inner).collect();
-        Self { offsets, edges }
-    }
-
     /// The packed edges of `node`.
     fn edges(&self, node: u32) -> &[u64] {
         let node = node as usize;
