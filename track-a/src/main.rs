@@ -57,8 +57,7 @@
 //! Every step's measurements are in `PERF.md`.
 
 use std::sync::{Barrier, Mutex, OnceLock, atomic::AtomicUsize, atomic::Ordering::Relaxed};
-use std::{cmp::Reverse, error::Error, fs::File, num::NonZeroUsize, ops::Range, os::fd::AsRawFd};
-use std::{io::Write, path::Path, ptr::null_mut, thread};
+use std::{fs::File, io::Write, ops::Range, os::fd::AsRawFd, path::Path, ptr::null_mut, thread};
 
 /// The number of hours a log can span.
 ///
@@ -99,7 +98,7 @@ unsafe extern "C" {
 ///
 /// The directories default to `/data` and `/out`, where the scoring harness mounts them; the
 /// local test scripts pass their own.
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A system that enables transparent huge pages for every process (`always`, as on our test
     // machine and, judging by its memory numbers, on the scoring box) backs anonymous memory in
     // 2 MB pages. A thread's 2 MB of records then usually straddles two of them, and that padding
@@ -124,7 +123,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// it, and every thread formats its hours straight into place. The page faults that allocate
 /// the pages then happen on all threads at once. Stores through a shared mapping land in the
 /// same page cache that `write` fills, so the file's bytes are identical.
-fn map_output(path: &Path, len: usize) -> Result<&'static mut [u8], Box<dyn Error>> {
+fn map_output(path: &Path, len: usize) -> Result<&'static mut [u8], Box<dyn std::error::Error>> {
     // `create` empties the file. Mapping it for writing needs it open for reading too.
     File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let file = File::options().read(true).write(true).open(path)?;
@@ -145,7 +144,7 @@ fn map_output(path: &Path, len: usize) -> Result<&'static mut [u8], Box<dyn Erro
 /// The zeros come from a reservation of anonymous memory that the file is then mapped over:
 /// they let [`parse`] read a whole [`LINE`] from the start of the last line too. Reading them
 /// maps the kernel's shared zero page, so they cost no memory either.
-fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
+fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn std::error::Error>> {
     let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let len = usize::try_from(file.metadata()?.len())?;
     let ptr = map(null_mut(), len + LINE, 1, 0x22, -1)?; // PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS
@@ -178,7 +177,7 @@ fn map(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32) -> std::io::Re
 /// rare errors a worker can meet end the run: failing to create the output file, or input
 /// that breaks a guarantee of the spec, which we otherwise rely on without checking.
 fn summarize(log: &[u8], out_path: &Path) {
-    let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    let threads = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let len = log.len() - LINE;
     // Chunk t starts at the first line that starts at or after byte `len * t / threads`, so
     // every line lands in exactly one chunk. With fewer lines than threads, some chunks are
@@ -224,7 +223,7 @@ fn summarize(log: &[u8], out_path: &Path) {
             // scheduling).
             let mut by_size: Vec<usize> = (0..HOURS).collect();
             let size = |h: &usize| runs[*h].iter().map(|run| run.0.len()).sum::<usize>();
-            by_size.sort_by_key(|h| Reverse(size(h)));
+            by_size.sort_by_key(|h| std::cmp::Reverse(size(h)));
             let names: Vec<&[u8]> = all.names.iter().map(|&(name, _)| name).collect();
             (names, order, runs, by_size)
         });
@@ -639,12 +638,12 @@ type Run<'a> = (&'a [u32], &'a [u32], &'a [u32]);
 /// We go through the runs twice:
 ///
 /// 1. **Count** the lines and errors of each endpoint (by global id).
-/// 2. **Place** each latency in one buffer, `latencies`, just below where its endpoint's
+/// 2. **Place** each latency in one buffer, `buffer`, just below where its endpoint's
 ///    latencies end. A running sum of the counts tells where that is. Together, the two steps
 ///    are a counting sort by endpoint.
 ///
-/// Then we take the endpoints in output `order`, and the three percentiles of each. `buffer` is
-/// the latencies' buffer, which a thread keeps from one hour to the next.
+/// Then we take the endpoints in output `order`, and the three percentiles of each. A thread
+/// keeps `buffer` from one hour to the next.
 ///
 /// Each run's records are freed right after the second pass, their last reader. Before, all
 /// 12 MB of records stayed until the hour pass ended, when the hours' lines and every
@@ -663,14 +662,13 @@ fn summarize_hour(runs: &[Run], order: &[usize], names: &[&[u8]], buffer: &mut V
     for e in 1..start.len() {
         start[e] += start[e - 1];
     }
-    let latencies = buffer;
-    latencies.resize(start[names.len()] as usize, 0);
+    buffer.resize(start[names.len()] as usize, 0);
     for &(records, large, ids) in runs {
         let mut large = large.iter();
         for &r in records {
             let e = ids[(r >> 20) as usize] as usize;
             start[e] -= 1;
-            latencies[start[e] as usize] = match r & LARGE {
+            buffer[start[e] as usize] = match r & LARGE {
                 LARGE => *large.next().expect("one large latency per LARGE record"),
                 small => small,
             };
@@ -679,7 +677,7 @@ fn summarize_hour(runs: &[Run], order: &[usize], names: &[&[u8]], buffer: &mut V
     }
     let (mut lines, mut len) = (Vec::with_capacity(order.len()), 0);
     for &e in order {
-        let group = &mut latencies[start[e] as usize..start[e + 1] as usize];
+        let group = &mut buffer[start[e] as usize..start[e + 1] as usize];
         if !group.is_empty() {
             let [p50, p95, p99] = percentiles(group);
             let line = [e as u32, group.len() as u32, p50, p95, p99, errors[e]];

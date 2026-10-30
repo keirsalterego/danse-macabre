@@ -28,6 +28,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 21 | Each small group loaded into the sorting network with one AVX2 masked load | run-c71602f005c5 | 0.0203 | 21.1 | 83.9 |
 | 22 | The hour label formatted once per hour into the line buffer, and each number of up to 7 digits written with one store; 5 fewer lines | run-c71602f005c5 | 0.0203 | 21.1 | 83.9 |
 | 23 | 5 fewer lines at the same speed: one `use` line, a recursive spawn tree, an hour as a tuple | run-6b577bd7fed9 | 0.0200 | 21.4 | 84.1 |
+| 24 | 2 fewer lines with the same machine code: one `use` line, and no alias for the hour buffer | | | | |
 
 ## Step 1: v1
 
@@ -293,6 +294,13 @@ same spawn tree (12 → 6 → 3 → 1); and an hour's result is a `(lines, len)`
 docs on its type alias instead of a two-field struct. `ab.py`, 40 interleaved runs, median / min:
 22.61 / 21.81 ms before, 22.53 / 21.58 ms after. No allocation changed. S 395 → 390. Gate: 307
 pass, 0 fail.
+
+## Step 24: 2 more lines
+
+The two remaining `use std::{…}` lines become one, and the three names used once (`Error`,
+`Reverse`, `NonZeroUsize`) are written as paths where they are used; `summarize_hour` resizes
+`buffer` itself instead of an alias, `latencies`. `objdump -d` of the binary is the same as step
+23's, so T and M cannot move. S 390 → 388. Gate: 307 pass, 0 fail.
 
 ## Experiments that did not stay
 
