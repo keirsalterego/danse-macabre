@@ -19,7 +19,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 12 | The BOM test reads one byte before it compares three, which takes a `bcmp` call off every record. A sentinel record after the mapped input replaces step 10's exact tail, and one thread replaces the quote pre-pass after a wrong guess | run-213d735f8f1d | 0.0368 | 12.2 | 74.3 |
 | 13 | 18 fewer lines in the region table, the exchange and the name set, at the same speed | run-5fd07fa31be9 | 0.0415 | 13.0 | 72.8 |
 | 14 | 11 fewer lines: one helper runs both thread groups, and the exchange wakes every worker | run-701b81269ca6 | 0.0368 | 12.4 | 74.3 |
-| 15 | The input padded with 32 zero bytes after the sentinel record, so the field parsers lose their end-of-input paths and a per-record `memcpy`; 11 fewer lines | | | | |
+| 15 | The input padded with 32 zero bytes after the sentinel record, so the field parsers lose their end-of-input paths and a per-record `memcpy`; 11 fewer lines | run-94c175e1147b | 0.0427 | 12.6 | 72.7 |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -494,6 +494,10 @@ S 545 → 534. Gate: 307 pass, 0 fail; the 402 random cases at 1, 3, 12, 37 and 
 the tiny-round build; the output hash is unchanged.
 
 ## Step 15: a padded input, and no `memcpy` per record
+
+The board's first run of this code, run-46d1884323c7, drew 54.9 ms while A, B and D ran at
+their usual times; the next run of the same code, run-94c175e1147b, took 42.7 ms: that is the
+row. Every worker waits at each round's barrier, so one interrupted thread delays them all.
 
 The sentinel record after the file is now followed by 32 zero bytes. Every position a parse
 reaches lies before those zeros, so the fixed-size reads of `number`, `text_field` and
