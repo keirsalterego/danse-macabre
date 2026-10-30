@@ -36,6 +36,7 @@
 //! Memory stays at a few arrays per thread: per query a count, an id sum and the first
 //! matches, and per kept term one window's documents. Numbers: PERF.md.
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
@@ -54,20 +55,74 @@ const SHOWN_IDS: usize = 10;
 /// The low bits of a [`Tally`] cell hold the sum of the ids matched in a chunk, which
 /// [`answer_all`] keeps below `2^SUM_BITS`; the high bits hold their count.
 const SUM_BITS: u32 = 40;
-/// A term is common when at least one sampled document in this many holds it: its bitset
-/// is then no bigger than a list of 32-bit ids.
+/// A term is common when at least one sampled document in this many holds it: as a list of
+/// 16-bit offsets ([`Window`]), it would then take at least half the memory of its bitset.
 const DENSE_SHARE: usize = 32;
 /// The queries on sets are evaluated every `64 * WINDOW` documents, on bitsets of `WINDOW`
-/// words ([`Window`]).
+/// words ([`Window`]). Its id lists hold 16-bit offsets, so it spans at most 2^16 documents.
 const WINDOW: usize = 64;
+const _: () = assert!(64 * WINDOW <= 1 << 16);
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const M_MMAP_THRESHOLD: i32 = -3;
+const MADV_HUGEPAGE: i32 = 14;
+
+/// The size of a huge page, and the smallest block that [`Allocator`] puts on huge pages.
+const HUGE: usize = 2 << 20;
+
+/// The system allocator, except that a block of at least [`HUGE`] bytes starts on a huge page
+/// boundary and asks for transparent huge pages. The pass reads the term table and the checks
+/// at random, and on 4 KiB pages most of those reads would first walk the page tables.
+struct Allocator;
+
+#[global_allocator]
+static ALLOCATOR: Allocator = Allocator;
+
+/// The layout [`Allocator`] gets from the system for a block of `layout`.
+fn huge(layout: Layout) -> Layout {
+    let align = if layout.size() < HUGE { 1 } else { HUGE };
+    layout.align_to(align).expect("a power of two")
+}
+
+// SAFETY: every block comes from `System` and goes back to it with the layout it came with.
+unsafe impl GlobalAlloc for Allocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller's contract; `huge` only raises the alignment.
+        let block = unsafe { System.alloc(huge(layout)) };
+        if layout.size() >= HUGE {
+            // SAFETY: advice changes no data, and fails harmlessly on a null block.
+            unsafe { madvise(block, layout.size(), MADV_HUGEPAGE) };
+        }
+        block
+    }
+
+    unsafe fn dealloc(&self, block: *mut u8, layout: Layout) {
+        // SAFETY: `alloc` got `block` from `System` with `huge(layout)`.
+        unsafe { System.dealloc(block, huge(layout)) }
+    }
+
+    unsafe fn realloc(&self, block: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        if layout.size().max(size) < HUGE {
+            // SAFETY: the caller's contract, and neither layout changes.
+            return unsafe { System.realloc(block, layout, size) };
+        }
+        // SAFETY: the caller's contract: `size` is nonzero and fits `layout.align()`.
+        let new = unsafe { self.alloc(Layout::from_size_align_unchecked(size, layout.align())) };
+        if !new.is_null() {
+            // SAFETY: both blocks are live and hold at least the smaller size.
+            unsafe { std::ptr::copy_nonoverlapping(block, new, layout.size().min(size)) };
+            // SAFETY: `block` was allocated with `layout`.
+            unsafe { self.dealloc(block, layout) };
+        }
+        new
+    }
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     // glibc raises its mmap threshold to the largest block freed so far, and blocks below it
@@ -371,7 +426,7 @@ impl Plan {
             })
             .collect();
         let cost = |t: u32| costs[t as usize];
-        // A bitset takes a bit per document and a list 32 bits per document holding the term.
+        // A bitset takes a bit per document and a list 16 bits per document holding the term.
         let common = |t: u32| hits[t as usize] as usize * DENSE_SHARE >= sampled.max(1);
         let mut flags = vec![0; terms.len()];
         // (trigger term, phrase) and (trigger term, check word) pairs, in query order.
@@ -780,8 +835,9 @@ struct Window {
     start: u32,
     /// `Store::Bits` rows: bit `i` of row `k` is set when document `start + i` holds term `k`.
     bits: Vec<[u64; WINDOW]>,
-    /// `Store::List` lists: the window's documents that contain the term, ascending.
-    lists: Vec<Vec<u32>>,
+    /// `Store::List` lists: the window's documents that contain the term, ascending, as
+    /// offsets from `start`, which take half the memory of ids.
+    lists: Vec<Vec<u16>>,
 }
 
 impl Window {
@@ -790,7 +846,7 @@ impl Window {
         let i = (doc - self.start) as usize;
         match store {
             Store::Bits(k) => self.bits[k as usize][i / 64] |= 1 << (i % 64),
-            Store::List(j) => self.lists[j as usize].push(doc),
+            Store::List(j) => self.lists[j as usize].push(i as u16),
             Store::None => unreachable!("Plan::new flags only stored terms"),
         }
     }
@@ -802,9 +858,8 @@ impl Window {
             Store::Bits(k) => &self.bits[k as usize],
             Store::List(j) => {
                 *scratch = [0; WINDOW];
-                for &doc in &self.lists[j as usize] {
-                    let i = (doc - self.start) as usize;
-                    scratch[i / 64] |= 1 << (i % 64);
+                for &i in &self.lists[j as usize] {
+                    scratch[usize::from(i / 64)] |= 1 << (i % 64);
                 }
                 scratch
             }

@@ -11,6 +11,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 4 | Queries parsed on every thread into flat arrays; the plan's per-term lists built with one counting sort | run-03f5349811b3 | 0.3798 | 70.7 | 62.1 |
 | 5 | Queries on sets evaluated every 4,096 documents inside the pass; glibc's mmap threshold fixed at 128 KiB | run-16bfddb1c5c1 | 0.3708 | 45.7 | 64.3 |
 | 6 | Per-document BOOL queries compiled to 64-bit truth tables with one packed tally each, prefetched at the trigger term; term keys folded through a mask table | run-a7a48ad2968d | 0.2838 | 43.1 | 67.2 |
+| 7 | Blocks of 2 MiB or more on transparent huge pages; a window's id lists hold 16-bit offsets | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -131,6 +132,30 @@ documents; a larger one stops with an error, and the spec's full scale has 250,0
 Tried and dropped: a parallel sampling pass (3 ms faster, inside the noise), and no cap on the
 first matches (5 ms faster, 2.7 MB more).
 
+## Step 7: huge pages
+
+At step 6 the pass spent 7.5% of its cycles walking page tables: 18.7 million dTLB load
+misses walked to completion, 541 M cycles with a walk under way. Each token probes the 4 MiB
+term table at a random slot, and a long token then reads its full key from a 2.4 MiB array.
+On 4 KiB pages those tables span more pages than the TLB holds. The kernel here has
+transparent huge pages set to `always`, but in the middle of a run only 2 MiB of the 18 MiB of
+large blocks sat on huge pages: the blocks did not start on 2 MiB boundaries, and without
+`MADV_HUGEPAGE` the kernel does not compact memory to find a huge page.
+
+- **A global allocator** that gives every block of 2 MiB or more a 2 MiB alignment and calls
+  `madvise(MADV_HUGEPAGE)` on it. Smaller blocks, and `realloc` between small sizes, still go
+  straight to glibc, which grows a large block with `mremap` instead of copying it. Walks
+  fell to 3.7 million and walk cycles to 142 M.
+- **16-bit window lists.** A window spans 4,096 documents, so each document in one of its id
+  lists ([`Window`]) fits in 16 bits as an offset from the window's first document. This
+  halves the lists of the queries on sets on every thread, and it takes back about 1.1 MB of
+  the memory the huge pages add.
+
+Locally, step 6 → 7, three interleaved rounds: cycles 7.07–7.23 → 6.89–7.01 G, task-clock
+3,059–3,131 → 2,958–3,014 ms, elapsed 0.2997–0.3045 → 0.2838–0.2843 s in the two quiet rounds.
+Alternating runs, 20 each: median wall 295.2 → 285.3 ms. memory.peak over eight runs each:
+41.1–44.2 → 40.2–45.1 MB (medians 41.9 and 43.3). S went from 837 to 871.
+
 ## Experiments that did not stay
 
 - **Transparent huge pages off on top of the fixed threshold** (`prctl(PR_SET_THP_DISABLE)`):
@@ -153,3 +178,18 @@ first matches (5 ms faster, 2.7 MB more).
 - **A term table sized for every term occurrence up front** instead of doubling: parse
   13.8–14.7 → 10.7–11.0 ms, but 8 MB of slots instead of 4, as the queries hold 152,904 term
   occurrences and only 75,747 distinct terms.
+- **Huge pages without the `realloc` path**, every resize a new block and a copy: median wall
+  288.9 ms against 295.5 for step 6 (285.3 with it). The parse and the plan grow their arrays
+  by copying. With `alloc_zeroed` also sent to glibc's `calloc` as well: 288.4 ms.
+- **Huge pages only for blocks of 4 MiB or more** (the term table and its keys): the same
+  cycles and memory as 2 MiB.
+- **No branch per token at the line end, on top of step 6.** A token that is no query term
+  resolved to an empty slot with a reserved id and no flags, and the trigger lists grew by
+  writing each entry and advancing by 0 or 1. Branch misses fell from 77.6 to 65.1 M, but
+  instructions rose from 10.07 to 10.57 G and cycles stayed at 7.19–7.20 G. Prefetching the
+  triggered checks after the token loop, or at first sight behind one branch, was 0.5–1%
+  slower than step 6.
+- **The full keys of long tokens prefetched** in a pass between hashing and probing, on the
+  step 5 code: cycles 8.40–8.44 → 9.09–9.12 G, as the extra pass stalls on the slot loads it
+  reads. On step 6, skipping the long-key comparison altogether (wrong answers, as an upper
+  bound) saved only 1.5–2.8% of cycles, too little for a prefetch scheme to chase.
