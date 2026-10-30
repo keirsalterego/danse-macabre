@@ -11,6 +11,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 4 | Heap entries ordered by one packed 128-bit key (542bc46) | run-05e531e8754c | 0.1565 | 125.2 | 68.6 |
 | 5 | Edges packed into 4 bytes and read through a 32-byte copy, and glibc's mmap threshold fixed at 64 KiB (680f4ad) | run-74c555d4ba4f | 0.1551 | 83.9 | 70.2 |
 | 6 | The build's arrays faulted in before pass 2, one write per 2 MB on half the threads | | | | |
+| 7 | Each search's binary heap replaced by a bucket queue: a ring of 4,096 one-unit buckets found through a bitmap, with a small heap for keys past the ring | | | | |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
@@ -168,6 +169,45 @@ so each huge page is faulted in by one thread, bar those that straddle two share
 - Peak memory unchanged: seed 1 82.2–83.8 → 83.3–85.4 MB, seed 2 79.8–84.1 → 79.4–85.3 MB.
 - S 352 → 359.
 
+## Step 7: a bucket queue instead of the binary heap
+
+A profile of the queries on step 5 put about 30% of each search step in the heap's sift-down
+after a pop (11 dependent levels) and about 25% in label lookups. Prefetching already hid most
+graph misses: loading edge rows was about 5% of query samples.
+
+Each `Search` now keeps its frontier in a `Queue`, a bucket queue in the style of Dial's
+algorithm:
+
+- A key in `cur..cur + 4096`, where `cur` is the last key popped, goes into bucket `key % 4096` of
+  a fixed ring. Keys only grow during a search and every edge weight is non-negative, so a pop
+  takes the lowest non-empty bucket at or after `cur`, which a 64-word bitmap finds.
+- Each bucket is a LIFO stack of `(node, key)` entries kept in one shared arena with a free list,
+  so the arena only grows to the most entries queued at once. A vector per bucket was slower than
+  the heap, from its cache misses.
+- A key at or past the end of the ring goes to a small binary heap, `far`. Weights go up to
+  2^32 - 1 (spec §2), and the near-2^32 edges in every seed take this path. The ring's size is a
+  constant, not something read from the input, so a graph with only huge weights stays correct
+  and pays one heap push per long edge.
+- The queue knows the next nodes it will pop, so each step prefetches the edge row of the node two
+  pops ahead and the offsets entry of the node three ahead. That replaces the guess at the heap's
+  children.
+- A stale pop (a node already settled at a smaller key) skips the label lookup that used to check
+  it: its relaxations can never improve a label, so it pushes nothing and leaves `best` alone.
+
+Balancing the two sides by queue length and the stopping rule are unchanged.
+
+Measured on P-cores, interleaved, medians:
+
+| Run | Queries before → after (ms) | Full run before → after (ms) |
+|---|---|---|
+| Seed 1, quiet machine, 11 runs (on step 5) | 119.75 → 93.11 | 164.69 → 136.48 |
+| Seed 1, busy machine, 11 runs (on step 5) | 124.08 → 102.08 | 174.55 → 147.86 |
+| Seed 2, busy machine, 7 runs (on step 5) | 129.06 → 106.14 | 175.10 → 151.98 |
+| Seed 3, busy machine, 7 runs (on step 5) | 144.63 → 113.68 | 196.23 → 169.70 |
+| Seed 1, 11 runs, on step 6 | | 160.02 → 133.06 |
+
+Peak memory is unchanged within noise: median 83.2 → 82.8 MB over 9 runs each. S 359 → 450.
+
 ## Tried and reverted (local, turbo off, no run ID)
 
 Each row's baseline ran in the same interleaved session as the experiment, so baselines differ
@@ -201,3 +241,11 @@ between rows.
 | A cheaper bounds check in `number` | Pass 1 fastest 9.39 ms, against 9.43 ms | No gain |
 | Pass 2's run lists sized up front | Runs set-up 1.28 → 1.10 ms | 0.18 ms is less than the lines cost |
 | A statically linked binary (`-C target-feature=+crt-static`) | Start-up 1.0 → 0.73–0.77 ms | Not adopted: untested in the Docker build, for about 0.25 ms |
+| Relabeling nodes in BFS order, computed during the run (on step 7) | Queries 93.8 → 84.8 ms, but the order took 80 ms and permuting the graph 52 ms. An ideal order from the generator's coordinates, which a submission cannot use, reached 83.3 ms | Even a 10× faster order would only about break even |
+| A locality-preserving hash for the label table (on step 7) | Queries 110.9 ms against 93.1 ms | Slower |
+| Labels as 32-bit distances with a fallback map (on step 7) | Queries 95.2 against 93.1 ms, 0.9 MB saved | Slower, for little memory |
+| A ring of 1,024 or 2,048 buckets instead of 4,096 | Queries 94.9 and 96.2 against 93.1 ms | More keys go to the far heap |
+| Linear-probing and epoch-packed label tables instead of `HashMap` | Lost clearly to hashbrown | Its control bytes make failed lookups cheap |
+| Exact pruning on `via + other_top >= best`, or checking the other side when a node is settled | Correct, no speedup | |
+| Prefetching the 4th or 5th node ahead, or pre-warming the label slots of the next node's neighbours | No gain | |
+| Balancing the two sides by pop count instead of queue length | Slower | |

@@ -43,9 +43,9 @@
 //! target with no in-edges empties the backward frontier after one step, where a forward search
 //! would first settle the whole graph.
 //!
-//! Each side ([`Search`]) keeps a binary heap of `(distance, node)` pairs with lazy deletion, and
-//! its tentative distances in a small hash map ([`Labels`]). A search therefore costs memory for
-//! the nodes it touches, not for all `n`.
+//! Each side ([`Search`]) keeps its frontier in a bucket queue ([`Queue`]) with lazy deletion,
+//! and its tentative distances in a small hash map ([`Labels`]). A search therefore costs memory
+//! for the nodes it touches, not for all `n`.
 //!
 //! ## Threads and output
 //!
@@ -77,7 +77,7 @@ const PROT_READ: i32 = 1;
 /// `mmap` flag: a private mapping. We never write to it, so it shares the page cache's pages.
 const MAP_PRIVATE: i32 = 2;
 
-/// The answer for an unreachable target, and the top of an empty heap. Real distances are below
+/// The answer for an unreachable target, and the top of an empty queue. Real distances are below
 /// 2^63 (spec §3), so they never collide with it, and it prints as `-1` once read as an `i64`.
 const UNREACHABLE: u64 = u64::MAX;
 
@@ -477,7 +477,7 @@ impl Csr {
 /// Answers every query on `threads` scoped threads and returns one slot per query, in input
 /// order.
 ///
-/// Each thread owns one [`Search`] per direction and reuses them across queries, so the heaps
+/// Each thread owns one [`Search`] per direction and reuses them across queries, so the queues
 /// and maps allocate only while they grow. Threads take the next unanswered query from a shared
 /// counter instead of a fixed share, because query cost varies by orders of magnitude (the target
 /// is drawn by Dijkstra rank, 2 to 131,071, spec §2).
@@ -507,7 +507,7 @@ fn answer(forward: &Csr, reverse: &Csr, queries: &[(u64, u64)], threads: usize) 
 /// improves the label of a node that the other side has labelled: the two labels join into a
 /// path through that node ([`Search::step`]).
 ///
-/// The search stops once the two heap tops sum to at least `best`, and `best` is then exact.
+/// The search stops once the two queue tops sum to at least `best`, and `best` is then exact.
 /// Suppose a shorter path P existed. Take the last node `a` on P whose distance from `s` is below
 /// the forward top: `a` is settled forward, so its edge to the next node `b` on P was relaxed.
 /// The rest of P from `b` is then shorter than the backward top, so `b` is settled backward. Both
@@ -516,22 +516,22 @@ fn answer(forward: &Csr, reverse: &Csr, queries: &[(u64, u64)], threads: usize) 
 /// improvement: updating it only when a node is settled by both sides misses paths through
 /// weight-0 edges.
 ///
-/// An empty heap's top is [`UNREACHABLE`], so the loop also ends when either side runs out of
+/// An empty queue's top is [`UNREACHABLE`], so the loop also ends when either side runs out of
 /// nodes. That side has settled everything it can reach, so `best` is the answer, `UNREACHABLE`
 /// included.
 fn distance(from_s: &mut Search, to_t: &mut Search, s: u32, t: u32) -> u64 {
     from_s.start(s);
     to_t.start(t);
     // A path may have zero edges, even on a node with no edges (spec §3). For s == t, best starts
-    // at 0 and the loop never runs, since no heap top is below 0. Starting from UNREACHABLE
+    // at 0 and the loop never runs, since no queue top is below 0. Starting from UNREACHABLE
     // instead would answer a round trip, or -1 on a node with no edges.
     let mut best = if s == t { 0 } else { UNREACHABLE };
-    // Saturating, because an empty heap's top is u64::MAX.
+    // Saturating, because an empty queue's top is u64::MAX.
     while from_s.top().saturating_add(to_t.top()) < best {
         // Advance the smaller frontier, not the one with the smaller top key: a source with no
         // in-edges leaves through edges near 2^32 (spec §2), and comparing keys would make the
         // other side settle the whole graph before the source side took a second step.
-        if from_s.heap.len() <= to_t.heap.len() {
+        if from_s.queue.len <= to_t.queue.len {
             from_s.step(&to_t.dist, &mut best);
         } else {
             to_t.step(&from_s.dist, &mut best);
@@ -545,91 +545,209 @@ fn distance(from_s: &mut Search, to_t: &mut Search, s: u32, t: u32) -> u64 {
 struct Search<'g> {
     /// The forward graph for the search from `s`, the reverse graph for the search from `t`.
     graph: &'g Csr,
-    /// One [`key`] per label, smallest distance first. A node whose label improves gets a new
-    /// entry and the old one stays behind (lazy deletion), because std's `BinaryHeap` has no
-    /// decrease-key.
-    heap: BinaryHeap<Reverse<u128>>,
+    /// One entry per label, smallest distance first. A node whose label improves gets a new
+    /// entry and the old one stays behind (lazy deletion).
+    queue: Queue,
     /// Tentative distance of every node this search has labelled.
     dist: Labels,
 }
 
 impl<'g> Search<'g> {
-    /// An idle search over `graph`, with an empty heap and no labels.
+    /// An idle search over `graph`, with an empty queue and no labels.
     fn new(graph: &'g Csr) -> Self {
-        let (heap, dist) = Default::default();
-        Self { graph, heap, dist }
+        let (queue, dist) = (Queue::new(), Labels::default());
+        Self { graph, queue, dist }
     }
 
     /// Resets the search to a single label, `node` at distance 0. Clearing keeps the capacity
-    /// the heap and the map grew to in earlier queries.
+    /// the queue and the map grew to in earlier queries.
     fn start(&mut self, node: u32) {
-        self.heap.clear();
-        self.heap.push(Reverse(key(0, node)));
+        self.queue.clear();
+        self.queue.push(0, node);
         self.dist.clear();
         self.dist.insert(node, 0);
     }
 
-    /// The smallest distance in the heap, or [`UNREACHABLE`] when it is empty. No unsettled node
+    /// The smallest distance in the queue, or [`UNREACHABLE`] when it is empty. No unsettled node
     /// is closer than this, which is what the stopping rule in [`distance`] relies on.
-    fn top(&self) -> u64 {
-        self.heap
-            .peek()
-            .map_or(UNREACHABLE, |&Reverse(top)| (top >> 32) as u64)
+    fn top(&mut self) -> u64 {
+        self.queue.top()
     }
 
-    /// Settles the closest unsettled node and relaxes its edges. Every label it improves on a
-    /// node that `other` has labelled joins the two searches into a path, which is offered to
-    /// `best`.
+    /// Settles the node on top of the queue, which [`Search::top`] found, and relaxes its edges.
+    /// Every label it improves on a node that `other` has labelled joins the two searches into a
+    /// path, which is offered to `best`.
     fn step(&mut self, other: &Labels, best: &mut u64) {
-        // An entry above its node's label is stale (lazy deletion): the node was settled at a
-        // shorter distance already, so the entry is dropped.
-        if let Some(Reverse(popped)) = self.heap.pop()
-            && let (d, node) = ((popped >> 32) as u64, popped as u32)
-            && d == self.dist[&node]
-        {
-            // Software pipelining, two steps deep. Settling a node takes two dependent trips to
-            // DRAM: its offsets entry, then its edges, both at random spots in big arrays. The
-            // node settled next is usually the one now on top of the heap, so its edges are
-            // fetched now, while the work on `node`'s edges below hides the wait. The node after
-            // it is usually one of the top's two children, so their offsets entries are fetched
-            // now too, and the next step finds the top's offsets in cache. The first prefetch
-            // cut the run by 28% on 12 threads, the second by 7% more; going a level deeper, to
-            // the grandchildren, measured no faster.
-            if let Some(&Reverse(top)) = self.heap.peek() {
-                self.graph.prefetch(top as u32);
+        // A stale entry, one above its node's label, is settled again with no check. The label's
+        // own entry came out first and relaxed the same edges from a shorter distance, so no label
+        // improves now: nothing is pushed and `best` stays. The check would cost a lookup a step.
+        let (d, node) = self.queue.pop();
+        // Software pipelining. Settling a node takes two dependent trips to DRAM: its offsets
+        // entry, then its edges, both at random spots in big arrays. The queue knows its next pops
+        // (a push below may still cut in), so this fetches the edges of the node two pops ahead
+        // and the offsets of the node three ahead. The previous step fetched the next node's
+        // edges. Of the depths tried, this one measured fastest.
+        let mut upcoming = self.queue.upcoming(d);
+        let ahead: [_; 3] = std::array::from_fn(|_| upcoming.next());
+        drop(upcoming); // it borrows the queue, which the loop below pushes to
+        if let [_, Some(second), third] = ahead {
+            self.graph.prefetch(second);
+            if let Some(third) = third {
+                prefetch(&self.graph.offsets[third as usize]);
             }
-            for &Reverse(after) in self.heap.as_slice().iter().skip(1).take(2) {
-                prefetch(&self.graph.offsets[after as u32 as usize]);
-            }
-            let unpack = self.graph.unpack(node);
-            let mut copy = [0; 8];
-            for &edge in self.graph.edges(node, &mut copy) {
-                let (next, weight) = unpack(edge);
-                let via = d + weight;
-                let label = self.dist.entry(next).or_insert(UNREACHABLE);
-                if via < *label {
-                    *label = via;
-                    self.heap.push(Reverse(key(via, next)));
-                    if let Some(&rest) = other.get(&next) {
-                        *best = (*best).min(via + rest);
-                    }
+        }
+        let unpack = self.graph.unpack(node);
+        let mut copy = [0; 8];
+        for &edge in self.graph.edges(node, &mut copy) {
+            let (next, weight) = unpack(edge);
+            let via = d + weight;
+            let label = self.dist.entry(next).or_insert(UNREACHABLE);
+            if via < *label {
+                *label = via;
+                self.queue.push(via, next);
+                if let Some(&rest) = other.get(&next) {
+                    *best = (*best).min(via + rest);
                 }
             }
         }
     }
 }
 
-/// A heap entry: `distance << 32 | node` in one `u128`, so that one integer comparison orders
-/// entries by distance, then by node.
+/// Buckets in a [`Queue`]'s ring, a multiple of 64. Road weights are mostly a few hundred and
+/// at most a few thousand (spec §2), so nearly every push lands in the ring. 1,024 and 2,048
+/// buckets measured 2 to 3 ms slower on seed 1.
+const RING: usize = 4096;
+
+/// A bucket queue (Dial, 1969) of `(distance, node)` entries. Dijkstra's keys are monotone: a
+/// step settles a node at the smallest key `cur` and pushes `cur + weight`, never less.
 ///
-/// The heap compares entries at every level it sifts through, up to 11 per pop at the heap sizes
-/// seen here (at most 2,719 entries on seed 1). A `(u64, u32)` tuple compares the distance, then
-/// on a tie the node, and that takes branches; a `u128` compares in a subtract-with-borrow, with
-/// no branch at all. Distances are below 2^63 (spec §3), so the key never overflows. For
-/// example, node 7 at distance 9 is `9 << 32 | 7` = 38,654,705,671. This cut the run by 5.5% on
-/// 12 threads. A 4-ary heap and a radix heap both measured slower than this binary heap.
-fn key(distance: u64, node: u32) -> u128 {
-    u128::from(distance) << 32 | u128::from(node)
+/// An entry with a key in `cur..cur + RING` goes into bucket `key % RING` of a fixed ring, one
+/// key per bucket, and the ring is scanned upwards from `cur`. A key beyond that goes into a
+/// binary heap, `far`. A weight can be anything below 2^32 (spec §2), so a ring that covered
+/// every key would need 2^32 buckets; this way a long edge costs one heap push instead.
+///
+/// Push and pop are O(1) plus a scan of the occupancy bits to the next full bucket, where a
+/// binary heap sifts through up to 11 levels, each a branch on the data. The queue also knows
+/// which nodes it pops next ([`Queue::upcoming`]), which [`Search::step`] prefetches. Against
+/// that heap on seed 1 (12 threads), the query phase fell from 120 to 93 ms.
+struct Queue {
+    /// The entry on top of each bucket's stack, or [`NIL`].
+    heads: Vec<u32>,
+    /// Bit `b % 64` of word `b / 64` is set when bucket `b` is not empty.
+    full: [u64; RING / 64],
+    /// Every bucket's stack entries, as `[node, next entry]`, in one array. Popped entries form a
+    /// free list from `free`, so the array only grows to the most entries queued at once.
+    links: Vec<[u32; 2]>,
+    free: u32,
+    /// The key [`Queue::top`] found last: no entry is below it.
+    cur: u64,
+    /// Entries pushed beyond the ring, as `key << 32 | node`: one compare orders them.
+    far: BinaryHeap<Reverse<u128>>,
+    /// Entries queued, stale ones included.
+    len: usize,
+}
+
+/// The end of a bucket's stack, and of the free list.
+const NIL: u32 = u32::MAX;
+
+impl Queue {
+    fn new() -> Self {
+        let (links, far) = Default::default();
+        Self {
+            heads: vec![NIL; RING],
+            full: [0; RING / 64],
+            links,
+            free: NIL,
+            cur: 0,
+            far,
+            len: 0,
+        }
+    }
+
+    /// Empties the queue, visiting only the full buckets. It keeps its capacity.
+    fn clear(&mut self) {
+        for (w, word) in self.full.iter_mut().enumerate() {
+            while *word != 0 {
+                self.heads[w * 64 + word.trailing_zeros() as usize] = NIL;
+                *word &= *word - 1;
+            }
+        }
+        self.links.clear();
+        self.far.clear();
+        (self.free, self.cur, self.len) = (NIL, 0, 0);
+    }
+
+    /// Queues `node` at distance `key`, which is at least `cur`.
+    fn push(&mut self, key: u64, node: u32) {
+        self.len += 1;
+        if key - self.cur >= RING as u64 {
+            return self
+                .far
+                .push(Reverse(u128::from(key) << 32 | u128::from(node)));
+        }
+        let b = key as usize % RING;
+        let entry = [node, self.heads[b]];
+        if let Some(&[_, next_free]) = self.links.get(self.free as usize) {
+            self.links[self.free as usize] = entry;
+            self.heads[b] = std::mem::replace(&mut self.free, next_free);
+        } else {
+            self.heads[b] = self.links.len() as u32;
+            self.links.push(entry);
+        }
+        self.full[b / 64] |= 1 << (b % 64);
+    }
+
+    /// The first key from `from` on whose bucket is full, scanning the ring once at most.
+    fn ahead(&self, from: u64) -> Option<u64> {
+        let p = from as usize % RING;
+        let (w, bit) = (p / 64, p % 64);
+        if self.full[w] >> bit != 0 {
+            return Some(from + u64::from((self.full[w] >> bit).trailing_zeros()));
+        }
+        (1..=RING / 64).find_map(|i| {
+            let word = self.full[(w + i) % (RING / 64)];
+            (word != 0).then(|| from + (i * 64 - bit) as u64 + u64::from(word.trailing_zeros()))
+        })
+    }
+
+    /// The ring's nodes from key `key` on, in the order [`Queue::pop`] returns them. Only a hint
+    /// for prefetching: it skips `far`, and when it runs past the ring it starts over.
+    fn upcoming(&self, mut key: u64) -> impl Iterator<Item = u32> + '_ {
+        let mut link = NIL;
+        std::iter::from_fn(move || {
+            if link == NIL {
+                key = self.ahead(key)?;
+                link = self.heads[key as usize % RING];
+                key += 1;
+            }
+            let [node, next] = self.links[link as usize];
+            link = next;
+            Some(node)
+        })
+    }
+
+    /// The smallest key queued, or [`UNREACHABLE`] when the queue is empty. It becomes `cur`.
+    fn top(&mut self) -> u64 {
+        let far = self.far.peek().map_or(UNREACHABLE, |r| (r.0 >> 32) as u64);
+        self.cur = self.ahead(self.cur).unwrap_or(UNREACHABLE).min(far);
+        self.cur
+    }
+
+    /// Removes an entry at `cur`, the key the last [`Queue::top`] found, and returns it.
+    fn pop(&mut self) -> (u64, u32) {
+        self.len -= 1;
+        let b = self.cur as usize % RING;
+        let head = self.heads[b];
+        let Some(&[node, next]) = self.links.get(head as usize) else {
+            return (self.cur, self.far.pop().expect("top found a key").0 as u32);
+        };
+        self.heads[b] = next;
+        if next == NIL {
+            self.full[b / 64] &= !(1 << (b % 64));
+        }
+        self.links[head as usize][1] = std::mem::replace(&mut self.free, head);
+        (self.cur, node)
+    }
 }
 
 /// Tentative distances of one search, keyed by node id.
