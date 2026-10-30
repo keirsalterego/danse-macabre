@@ -88,20 +88,13 @@ const LINE: usize = 256;
 
 // We declare `mmap` and friends ourselves instead of pulling in the `libc` crate: every
 // dependency costs points on the D axis, and the C library is already linked into every Rust
-// binary. The constants are the values from Linux's `<sys/mman.h>` and `<sys/prctl.h>`.
+// binary. The flag values are Linux's, from `<sys/mman.h>` and `<sys/prctl.h>`; a comment at
+// each call names them.
 unsafe extern "C" {
     fn prctl(option: i32, ...) -> i32;
     fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
 }
-const PROT_READ: i32 = 1;
-const PROT_WRITE: i32 = 2;
-const MAP_SHARED: i32 = 1;
-const MAP_PRIVATE: i32 = 2;
-const MAP_FIXED: i32 = 0x10;
-const MAP_ANONYMOUS: i32 = 0x20;
-const MADV_DONTNEED: i32 = 4;
-const PR_SET_THP_DISABLE: i32 = 41;
 
 /// Reads `<data_dir>/requests.log` and writes `<out_dir>/summary.txt`.
 ///
@@ -113,13 +106,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 2 MB pages. A thread's 2 MB of records then usually straddles two of them, and that padding
     // was 13 of the 50 MB peak. With plain 4 KB pages the records cost what they hold; the extra
     // page faults did not change the time measurably. The call is advice, so failure is ignored.
-    // SAFETY: PR_SET_THP_DISABLE only changes how the kernel backs our future memory.
-    unsafe { prctl(PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
-    let mut args = std::env::args().skip(1);
-    let data_dir = args.next().unwrap_or_else(|| "/data".into());
-    let out_dir = args.next().unwrap_or_else(|| "/out".into());
-    let log = map_file(&Path::new(&data_dir).join("requests.log"))?;
-    summarize(log, &Path::new(&out_dir).join("summary.txt"));
+    // SAFETY: PR_SET_THP_DISABLE (41) only changes how the kernel backs our future memory.
+    unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
+    let arg = |n, default: &str| std::env::args().nth(n).unwrap_or(default.into());
+    let log = map_file(&Path::new(&arg(1, "/data")).join("requests.log"))?;
+    summarize(log, &Path::new(&arg(2, "/out")).join("summary.txt"));
     // Exit without running destructors: freeing the interners and the hours' statistics would
     // only add to the timed wall clock, and the kernel reclaims the memory anyway. Every byte of
     // the output is already in the file's shared mapping, which the kernel keeps.
@@ -136,11 +127,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// same page cache that `write` fills, so the file's bytes are identical.
 fn map_output(path: &Path, len: usize) -> Result<&'static mut [u8], Box<dyn Error>> {
     // `create` empties the file. Mapping it for writing needs it open for reading too.
-    File::create(path)?;
+    File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let file = File::options().read(true).write(true).open(path)?;
     file.set_len(u64::try_from(len)?)?;
-    let fd = file.as_raw_fd();
-    let ptr = map(null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, fd)?;
+    let ptr = map(null_mut(), len, 3, 1, file.as_raw_fd())?; // PROT_READ | PROT_WRITE, MAP_SHARED
     // SAFETY: the mapping holds `len` writable bytes, nothing else refers to them, and it is
     // never unmapped. It stays valid after `file` is closed.
     Ok(unsafe { std::slice::from_raw_parts_mut(ptr, len) })
@@ -159,9 +149,8 @@ fn map_output(path: &Path, len: usize) -> Result<&'static mut [u8], Box<dyn Erro
 fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
     let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let len = usize::try_from(file.metadata()?.len())?;
-    let (fd, anonymous) = (file.as_raw_fd(), MAP_PRIVATE | MAP_ANONYMOUS);
-    let ptr = map(null_mut(), len + LINE, PROT_READ, anonymous, -1)?;
-    map(ptr, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd)?;
+    let ptr = map(null_mut(), len + LINE, 1, 0x22, -1)?; // PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS
+    map(ptr, len, 1, 0x12, file.as_raw_fd())?; // PROT_READ, MAP_PRIVATE | MAP_FIXED
     // SAFETY: the mappings hold `len + LINE` readable bytes and are never unmapped, so they
     // outlive every borrow. /data is mounted read-only, so the bytes cannot change under us.
     Ok(unsafe { std::slice::from_raw_parts(ptr, len + LINE) })
@@ -251,8 +240,7 @@ fn summarize(log: &[u8], out_path: &Path) {
         let queue = places.get_or_init(|| {
             let hours: Vec<&Hour> = hours.iter().map(|h| h.get().expect("summarized")).collect();
             let len = hours.iter().map(|hour| hour.len).sum();
-            let mut rest =
-                map_output(out_path, len).unwrap_or_else(|e| panic!("{}: {e}", out_path.display()));
+            let mut rest = map_output(out_path, len).unwrap_or_else(|e| panic!("{e}"));
             let mut place = |hour: &Hour| rest.split_off_mut(..hour.len).expect("lengths add up");
             let places = hours.into_iter().map(|hour| (hour, place(hour)));
             Mutex::new(places.enumerate().collect::<Vec<_>>())
@@ -303,16 +291,15 @@ fn fan_out<'s, F: Fn(usize) + Sync>(s: &'s thread::Scope<'s, '_>, ts: Range<usiz
 /// in use; if there is no whole page, the length is 0 and the call does nothing. The call is
 /// advice: if it fails, the exit does the work as before, so the result is ignored.
 fn release<T>(items: &[T]) {
-    let start = items.as_ptr().addr();
-    let first = start.next_multiple_of(4096);
-    let end = (start + size_of_val(items)) & !4095;
-    let first_page = items.as_ptr().cast::<u8>().with_addr(first);
+    let start = items.as_ptr().cast::<u8>();
+    let first = start.map_addr(|a| a.next_multiple_of(4096));
+    let end = (start.addr() + size_of_val(items)) & !4095;
     // SAFETY: the pages lie inside `items`. In the input's private read-only file mapping, a
     // later read (an endpoint name, say) just maps the same file data again. Records and
     // latencies read as zeros afterwards, which is why each is released only once nothing
     // reads it again: a run's records once its hour has been placed, a buffer after its last
     // hour.
-    unsafe { madvise(first_page, end.saturating_sub(first), MADV_DONTNEED) };
+    unsafe { madvise(first, end.saturating_sub(first.addr()), 4) }; // 4 is MADV_DONTNEED
 }
 
 /// One thread's share of the log after parsing.
@@ -789,7 +776,7 @@ fn numbers(&[_, count, p50, p95, p99, errors]: &[u32; 6]) -> [u64; 6] {
     [count, p50, p95, p99, errors, errors * 1_000_000 / count]
 }
 
-/// The number of decimal digits [`push_number`] writes for `value`.
+/// The number of decimal digits [`put_number`] writes for `value`.
 fn digits(value: u64) -> usize {
     value.checked_ilog10().map_or(1, |log| log as usize + 1)
 }
@@ -797,38 +784,44 @@ fn digits(value: u64) -> usize {
 /// Writes the formatted `lines` of hour index `hour` to `place`: `<hour> <endpoint>` and the
 /// six numbers.
 ///
-/// Each line is formatted in a small buffer and then copied into place, because
-/// [`push_number`] writes 8 bytes at a time and may write past a line's end. A whole hour's
-/// buffer per thread instead kept 1.6 MB more in memory while the output filled up.
+/// Each line is formatted in a small buffer on the stack and then copied into place, because
+/// [`put_number`] writes 8 bytes at a time and may write past a line's end. The buffer keeps
+/// the hour's label from line to line. A `Vec` instead cost a capacity check and a length
+/// update for every number, and a whole hour's buffer per thread kept 1.6 MB more in memory
+/// while the output filled up.
 fn format_hour(hour: usize, lines: &[[u32; 6]], names: &[&[u8]], mut place: &mut [u8]) {
-    let (label, mut text) = (hour_label(hour), Vec::with_capacity(256));
+    let mut text = [0; 256];
+    text[..21].copy_from_slice(hour_label(hour).as_bytes());
     for line in lines {
-        text.clear();
-        text.extend_from_slice(label.as_bytes());
-        text.extend_from_slice(names[line[0] as usize]);
+        let mut end = 21 + names[line[0] as usize].len();
+        text[21..end].copy_from_slice(names[line[0] as usize]);
         for value in numbers(line) {
-            push_number(&mut text, value);
+            end = put_number(&mut text, end, value);
         }
-        text.push(b'\n');
-        place.write_all(&text).expect("lengths add up"); // fails if `Hour::len` was short
+        text[end] = b'\n';
+        place.write_all(&text[..=end]).expect("lengths add up"); // fails if `Hour::len` was short
     }
 }
 
-/// Appends a space and then `value` in decimal.
+/// Writes a space and then `value` in decimal to `text[at..]`, and returns where they end.
 ///
 /// About 760,000 numbers go through here, so each one takes a fixed sequence of instructions:
-/// [`eight_ascii`] turns it into eight digits at once, one 8-byte append writes them, and we
-/// cut off the leading zeros, which we shifted to the end. The rare value of nine or ten digits
-/// writes its leading digits first, then the other eight.
-fn push_number(out: &mut Vec<u8>, value: u64) {
+/// [`eight_ascii`] turns it into eight digits at once, and one 8-byte store writes them after
+/// we shifted the leading zeros out to the end, where the next write lands on them. The
+/// leading zeros are the low bytes that hold `'0'`; the last digit counts even if it is one,
+/// so that 0 prints as `0`. The rare value of nine or ten digits writes its leading digits
+/// first, then the other eight.
+fn put_number(text: &mut [u8], at: usize, value: u64) -> usize {
     if value >= 100_000_000 {
-        push_number(out, value / 100_000_000);
-        return out.extend_from_slice(&eight_ascii(value % 100_000_000).to_le_bytes());
+        let at = put_number(text, at, value / 100_000_000);
+        text[at..at + 8].copy_from_slice(&eight_ascii(value % 100_000_000).to_le_bytes());
+        return at + 8;
     }
-    let n = digits(value);
-    out.push(b' ');
-    out.extend_from_slice(&(eight_ascii(value) >> (8 * (8 - n))).to_le_bytes());
-    out.truncate(out.len() - (8 - n));
+    let ascii = eight_ascii(value);
+    let zeros = ((ascii ^ 0x3030_3030_3030_3030) | 1 << 56).trailing_zeros() as usize / 8;
+    text[at] = b' ';
+    text[at + 1..at + 9].copy_from_slice(&(ascii >> (8 * zeros)).to_le_bytes());
+    at + 9 - zeros
 }
 
 /// Returns `value`, which must be below 10^8, as eight ASCII digits with leading zeros, the most

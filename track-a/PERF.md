@@ -24,6 +24,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 17 | The last thread to finish ends the process instead of joining the others; 15 fewer lines | run-3ba29a3569ef | 0.0209 | 21.1 | 83.5 |
 | 18 | The name table's padded copies aligned to cache lines, and its slot array a fixed-size box | run-01b9bf369035 | 0.0212 | 20.6 | 83.5 |
 | 19 | The name hash takes one multiply instead of three dependent ones, and the slot is the product's top bits | run-4d1c6d742295 | 0.0207 | 21.3 | 83.5 |
+| 20 | Each output line built in a stack buffer with digit counts from the SWAR conversion; 12 fewer lines | | | | |
 
 ## Step 1: v1
 
@@ -229,6 +230,25 @@ Local, turbo off: instructions 822.3 → 801.2 M; user cycles, 3 interleaved set
 443.5 → 430.3 M. `ab.py`, 31 interleaved runs, two rounds: medians 23.25 → 22.92 and 23.40 →
 22.93 ms, minimums 22.73 → 22.45 and 22.75 → 22.41 ms. memory.peak unchanged. S unchanged at
 412. Gate: 307 pass, 0 fail.
+
+## Step 20: a leaner formatter, and 12 fewer lines
+
+Each output line is built in a 256-byte stack buffer instead of a `Vec`, the hour label is
+written once per hour, and `put_number` writes at a cursor. The digit count comes from the
+SWAR conversion itself (one `tzcnt` over the '0' bytes) instead of a separate `digits()`. Phase
+stamps put the format phase at 1.96 → 1.72 ms. Line cuts outside the parse and the hour pass:
+the libc constants are inlined with a comment naming each flag, `main` reads its arguments
+through one closure, and the mapping helpers lose their single-use bindings.
+
+Local, turbo off, `ab.py` with 40 interleaved runs: median / min 22.84 / 22.16 → 22.70 / 22.06
+ms (formatter alone 22.64 / 22.22; an earlier pair 22.91 → 22.62). `perf stat -r 5`: instructions
+801 → 779 M, user cycles 429 → 425 M. memory.peak unchanged. S 412 → 400. Gate: 307 pass, 0
+fail; a missing input still reports its path and exits 1.
+
+Tried and dropped: faulting the output pages in ahead with `MADV_POPULATE_WRITE`, per hour
+(slower than plain faults in a 12-thread test, 1.15–1.26 against 1.04–1.07 ms) or during the hour
+pass (0.6 ms off the format phase, 1 ms onto the hour pass). A page fault on the output costs
+about 1.9 µs even without contention.
 
 ## Experiments that did not stay
 
