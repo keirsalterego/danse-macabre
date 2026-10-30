@@ -256,9 +256,8 @@ fn summarize(log: &[u8], out_path: &Path) {
             format_hour(index, lines, names, place);
         }
         release(&log[len * t / threads..len * (t + 1) / threads]);
-        if finished.fetch_add(1, Relaxed) + 1 == threads {
-            std::process::exit(0); // the output is complete; skip joining the others
-        }
+        // The output is complete once the last thread gets here: skip joining the others.
+        (finished.fetch_add(1, Relaxed) + 1 == threads).then(|| std::process::exit(0));
     };
     thread::scope(|s| fan_out(s, 0..threads, &work));
 }
@@ -288,15 +287,14 @@ fn fan_out<'s, F: Fn(usize) + Sync>(s: &'s thread::Scope<'s, '_>, ts: Range<usiz
 /// in use; if there is no whole page, the length is 0 and the call does nothing. The call is
 /// advice: if it fails, the exit does the work as before, so the result is ignored.
 fn release<T>(items: &[T]) {
-    let start = items.as_ptr().cast::<u8>();
-    let first = start.map_addr(|a| a.next_multiple_of(4096));
-    let end = (start.addr() + size_of_val(items)) & !4095;
+    let first = items.as_ptr().map_addr(|a| a.next_multiple_of(4096));
+    let end = (items.as_ptr().addr() + size_of_val(items)) & !4095;
     // SAFETY: the pages lie inside `items`. In the input's private read-only file mapping, a
     // later read (an endpoint name, say) just maps the same file data again. Records and
     // latencies read as zeros afterwards, which is why each is released only once nothing
     // reads it again: a run's records once its hour has been placed, a buffer after its last
     // hour.
-    unsafe { madvise(first, end.saturating_sub(first.addr()), 4) }; // 4 is MADV_DONTNEED
+    unsafe { madvise(first.cast(), end.saturating_sub(first.addr()), 4) }; // 4 is MADV_DONTNEED
 }
 
 /// One thread's share of the log after parsing.
@@ -359,9 +357,8 @@ fn parse(log: &[u8], lines: Range<usize>) -> (Interner<'_>, Chunk) {
     // A run lasts while the timestamp's bytes 5 to 12, `MM-DDTHH`, stay the same, so most lines
     // compare those 8 bytes and decode nothing. No line's bytes are all zero, so line 0 starts a
     // run.
-    let (mut count, mut current) = (0, 0);
+    let (mut count, mut current, mut i) = (0, 0, lines.start);
     assert!(lines.end + LINE <= log.len(), "map_file pads the log");
-    let mut i = lines.start;
     while i < lines.end {
         // SAFETY: i < lines.end, so the LINE bytes from i lie inside `log` (asserted above).
         let line: &[u8; LINE] = unsafe { &*log.as_ptr().add(i).cast() };
@@ -401,9 +398,8 @@ fn parse(log: &[u8], lines: Range<usize>) -> (Interner<'_>, Chunk) {
 /// another window; three reach byte 230, well past the LF of the longest line.
 fn line_end(line: &[u8; LINE]) -> usize {
     for at in [MIN_LINE - 1, MIN_LINE + 63, MIN_LINE + 127] {
-        let window = line[at..at + 64].try_into().expect("64-byte window");
         // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
-        let newlines = unsafe { equal_mask(window, &[b'\n'; 64]) };
+        let newlines = unsafe { equal_mask(line[at..].first_chunk().expect("64"), &[b'\n'; 64]) };
         if newlines != 0 {
             return at + newlines.trailing_zeros() as usize;
         }
@@ -556,7 +552,6 @@ impl<'a> Interner<'a> {
     /// first and `==` only for long names, cost 5% more instructions in the parse.
     #[inline(always)]
     fn intern(&mut self, name: &'a [u8], hash: u64, window: &[u8; 64]) -> u32 {
-        let mask = self.slots.len() - 1;
         // The top 13 bits, one of 8,192 slots: they are the ones that every hashed bit reaches.
         let mut slot = (hash >> 51) as usize;
         while let Some(id) = self.slots[slot].checked_sub(1) {
@@ -568,7 +563,7 @@ impl<'a> Interner<'a> {
             if found {
                 return id;
             }
-            slot = (slot + 1) & mask;
+            slot = (slot + 1) & (self.slots.len() - 1);
         }
         self.insert(slot, name, window)
     }

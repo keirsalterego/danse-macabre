@@ -29,6 +29,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 22 | The hour label formatted once per hour into the line buffer, and each number of up to 7 digits written with one store; 5 fewer lines | run-c71602f005c5 | 0.0203 | 21.1 | 83.9 |
 | 23 | 5 fewer lines at the same speed: one `use` line, a recursive spawn tree, an hour as a tuple | run-6b577bd7fed9 | 0.0200 | 21.4 | 84.1 |
 | 24 | 2 fewer lines with the same machine code: one `use` line, and no alias for the hour buffer | run-3d33fc387ebc | 0.0199 | 21.2 | 84.2 |
+| 25 | 6 fewer lines with the same machine code: five variables written where they are used, and the last thread's exit on one line | | | | |
 
 ## Step 1: v1
 
@@ -301,6 +302,14 @@ The two remaining `use std::{…}` lines become one, and the three names used on
 `Reverse`, `NonZeroUsize`) are written as paths where they are used; `summarize_hour` resizes
 `buffer` itself instead of an alias, `latencies`. `objdump -d` of the binary is the same as step
 23's, so T and M cannot move. S 390 → 388. Gate: 307 pass, 0 fail.
+
+## Step 25: 6 more lines
+
+`release` takes the page bounds straight from `items.as_ptr()`; `parse` declares its cursor `i`
+with `count` and `current`; `line_end` passes its 64-byte window to `equal_mask` as
+`first_chunk()`; `intern` computes the slot mask where it wraps; and the last thread's exit is one
+`bool::then`. The `.text` and `.rodata` sections are byte-identical to step 24's, so T and M
+cannot move. S 388 → 382. Gate: 307 pass, 0 fail.
 
 ## Experiments that did not stay
 
