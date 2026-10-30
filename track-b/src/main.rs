@@ -24,17 +24,17 @@
 //! 3. **One pass on every thread.** Each thread scans a chunk of whole lines ([`scan`]), and
 //!    [`walk`] finds the tokens 64 bytes at a time from AVX2 bit masks. At the end of each
 //!    document, every query its triggers point at is checked against that document alone: a
-//!    phrase window by window, a BOOL query by applying its operators to "does this document
-//!    contain the term" ([`run_checks`]). Set operations act on each document separately,
-//!    so this gives the same answer as combining whole sets (spec §3). For the queries on
-//!    sets, the pass records which documents hold their terms: a bitset per common term and
-//!    an id list per rare one ([`Chunk`]).
+//!    phrase at each position of its trigger term, a BOOL query by applying its operators to
+//!    "does this document contain the term" ([`run_checks`]). Set operations act on each
+//!    document separately, so this gives the same answer as combining whole sets (spec §3).
+//!    For the queries on sets, the pass records which documents of the current [`Window`]
+//!    hold their terms, a bitset per common term and an id list per rare one, and evaluates
+//!    the queries at the window's end.
 //! 4. **Merge.** Per query, the chunks' counts and id sums add up, and the smallest ids come
-//!    from the earliest chunks ([`Tally`]). The queries on sets combine bitsets 64 documents
-//!    per operation ([`on_sets`]).
+//!    from the earliest chunks ([`Tally`]).
 //!
-//! Memory stays at a few arrays per thread plus the sets: one bit per document for each
-//! common term and 32 bits per document for each rare one. Numbers: PERF.md.
+//! Memory stays at a few arrays per thread: per query a count, an id sum and the first
+//! matches, and per kept term one window's documents. Numbers: PERF.md.
 
 use std::error::Error;
 use std::fs::File;
@@ -54,14 +54,24 @@ const SHOWN_IDS: usize = 10;
 /// A term is common when at least one sampled document in this many holds it: its bitset
 /// is then no bigger than a list of 32-bit ids.
 const DENSE_SHARE: usize = 32;
+/// The queries on sets are evaluated every `64 * WINDOW` documents, on bitsets of `WINDOW`
+/// words ([`Window`]).
+const WINDOW: usize = 64;
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
+const M_MMAP_THRESHOLD: i32 = -3;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // glibc raises its mmap threshold to the largest block freed so far, and blocks below it
+    // then stay resident after they are freed. Fixed, every block of 128 KiB or more goes back
+    // to the kernel when freed, such as each thread's first matches once they are grouped.
+    // SAFETY: no other thread exists yet, and mallopt takes no pointers.
+    unsafe { mallopt(M_MMAP_THRESHOLD, 128 << 10) };
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
@@ -138,7 +148,7 @@ fn answer_all(query_text: &[u8], docs: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     Ok(thread::scope(|s| {
         let workers: Vec<_> = (0..threads)
             .map(|t| n * t / threads..n * (t + 1) / threads)
-            .map(|range| s.spawn(move || format_range(range, queries, plan, chunks)))
+            .map(|range| s.spawn(move || format_range(range, chunks)))
             .collect();
         (workers.into_iter())
             .map(|w| w.join().expect("a panic aborts the process"))
@@ -203,21 +213,20 @@ impl Queries {
 }
 
 /// One thread's share of `queries.txt`, parsed as in [`Queries`] but with each term still as
-/// its key and its text.
+/// its key.
 #[derive(Default)]
-struct Lines<'q> {
+struct Lines {
     phrase: Vec<bool>,
     /// Per query: how many terms it has.
     lens: Vec<u32>,
     ops: Vec<Op>,
     keys: Vec<Key>,
-    names: Vec<&'q [u8]>,
 }
 
 /// Parses `queries.txt` (grammar in spec §2.3). Every thread parses a share of the lines; then
 /// one thread gives each distinct term its id, in file order, loading the table slot of the
 /// term 16 ahead while it interns one, so that its cache misses overlap.
-fn parse_queries(text: &[u8], threads: usize) -> Result<(Queries, TermTable<'_>), String> {
+fn parse_queries(text: &[u8], threads: usize) -> Result<(Queries, TermTable), String> {
     let bounds = line_bounds(text, threads);
     let parts = thread::scope(|s| {
         let workers: Vec<_> = (bounds.windows(2))
@@ -235,18 +244,18 @@ fn parse_queries(text: &[u8], threads: usize) -> Result<(Queries, TermTable<'_>)
             queries.at.push(queries.at[queries.at.len() - 1] + len);
         }
         queries.ops.extend(part.ops);
-        for (i, (key, name)) in part.keys.iter().zip(part.names).enumerate() {
+        for (i, key) in part.keys.iter().enumerate() {
             if let Some(ahead) = part.keys.get(i + 16) {
                 table.prefetch(ahead);
             }
-            queries.terms.push(table.intern(*key, name));
+            queries.terms.push(table.intern(*key));
         }
     }
     Ok((queries, table))
 }
 
 /// Parses whole lines of `queries.txt`.
-fn parse_lines(text: &[u8]) -> Result<Lines<'_>, String> {
+fn parse_lines(text: &[u8]) -> Result<Lines, String> {
     let mut lines = Lines::default();
     for line in text.split_inclusive(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
@@ -261,18 +270,17 @@ fn parse_lines(text: &[u8]) -> Result<Lines<'_>, String> {
 }
 
 /// Appends the query on `line` to `lines`, or returns `None` if the line is not one.
-fn parse_line<'q>(line: &'q [u8], lines: &mut Lines<'q>) -> Option<()> {
+fn parse_line(line: &[u8], lines: &mut Lines) -> Option<()> {
     // Rejecting anything but `[a-z0-9]{1,32}` keeps a term from matching a token that differs
     // from it only in case, which the case-folding key would otherwise allow, and keeps every
     // term within one `Key`.
-    let mut push = |op, term: &'q [u8]| {
+    let mut push = |op, term: &[u8]| {
         let valid = (1..=MAX_TERM).contains(&term.len())
             && term
                 .iter()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
         lines.keys.push(key(term).filter(|_| valid)?);
         lines.ops.push(op);
-        lines.names.push(term);
         Some(())
     };
     let phrase = line
@@ -306,16 +314,16 @@ fn parse_line<'q>(line: &'q [u8], lines: &mut Lines<'q>) -> Option<()> {
 enum Store {
     /// Nothing is kept.
     None,
-    /// Row `k` of each chunk's bitsets, one bit per document.
+    /// Row `k` of the [`Window`]'s bitsets, one bit per document.
     Bits(u32),
-    /// List `j` of each chunk's id lists.
+    /// List `j` of the window's id lists.
     List(u32),
 }
 
 /// What the corpus pass needs to know about each query term.
-struct Plan<'q> {
+struct Plan {
     /// The query terms, each with the [`Slot`] flags that say what the pass does with it.
-    terms: TermTable<'q>,
+    terms: TermTable,
     /// Term `t` triggers the phrases `phrases[phrase_at[t]..phrase_at[t + 1]]`, each as (query
     /// index, position of the term in the phrase).
     phrase_at: Vec<u32>,
@@ -334,11 +342,11 @@ struct Plan<'q> {
     rows: usize,
     /// The number of `Store::List` lists.
     lists: usize,
-    /// Per query: evaluated on whole sets after the pass ([`on_sets`]) rather than per document.
-    on_sets: Vec<bool>,
+    /// The queries evaluated on sets ([`Window::flush`]) rather than per document, in file order.
+    sets: Vec<u32>,
 }
 
-impl<'q> Plan<'q> {
+impl Plan {
     /// Picks every query's triggers and every term's [`Store`].
     ///
     /// A phrase match holds each of its terms at a fixed offset from the window start, so
@@ -348,13 +356,17 @@ impl<'q> Plan<'q> {
     /// terms keep a bitset and the others an id list, whichever is smaller. A term absent
     /// from the corpus never fires and keeps an empty list, which leaves its queries at `0 0`
     /// with no special case.
-    fn new(queries: &Queries, mut terms: TermTable<'q>, docs: &[u8]) -> Self {
+    fn new(queries: &Queries, mut terms: TermTable, docs: &[u8]) -> Self {
         let (hits, sampled) = sample_hits(docs, &terms);
         // Fewer sample hits cost less. Among equals (often zero hits), longer terms tend to be
-        // rarer, so they cost a little less. Computed in one pass, as reading hits and names
-        // term by term costs two cache misses per call.
-        let costs: Vec<u64> = (hits.iter().zip(&terms.names))
-            .map(|(&hits, name)| u64::from(hits) * 64 + (MAX_TERM - name.len()) as u64)
+        // rarer, so they cost a little less; a key's length is its count of nonzero bytes.
+        // Computed in one pass, as reading hits and keys term by term costs two cache misses
+        // per call.
+        let costs: Vec<u64> = (hits.iter().zip(&terms.keys))
+            .map(|(&hits, key)| {
+                let len: u32 = key.iter().map(|word| 8 - word.leading_zeros() / 8).sum();
+                u64::from(hits) * 64 + u64::from(MAX_TERM as u32 - len)
+            })
             .collect();
         let cost = |t: u32| costs[t as usize];
         // A bitset takes a bit per document and a list 32 bits per document holding the term.
@@ -364,7 +376,7 @@ impl<'q> Plan<'q> {
         let (mut phrases, mut checks) = (Vec::new(), Vec::new());
         let mut store = vec![Store::None; terms.len()];
         let (mut rows, mut lists) = (0, 0);
-        let mut on_sets = vec![false; queries.len()];
+        let mut sets = Vec::new();
         let mut cover = Vec::new();
         for (i, &phrase) in queries.phrase.iter().enumerate() {
             let query = queries.terms(i);
@@ -392,7 +404,7 @@ impl<'q> Plan<'q> {
                 }
                 continue;
             }
-            on_sets[i] = true;
+            sets.push(i as u32);
             for &t in query {
                 if let Store::None = store[t as usize] {
                     store[t as usize] = if common(t) {
@@ -418,7 +430,7 @@ impl<'q> Plan<'q> {
             store,
             rows: rows as usize,
             lists: lists as usize,
-            on_sets,
+            sets,
         }
     }
 }
@@ -449,7 +461,7 @@ fn bool_cover(
     cover.dedup();
 }
 
-impl Plan<'_> {
+impl Plan {
     /// The phrases that term `t` triggers, as (query index, position of `t` in the phrase).
     fn phrases(&self, t: u32) -> &[(u32, u32)] {
         let t = t as usize;
@@ -661,8 +673,8 @@ fn classify(block: &[u8; 64]) -> (u64, u64) {
     (token, lf)
 }
 
-/// One chunk's answers to the queries evaluated per document: how many of its documents match,
-/// the sum of their ids, and the first `SHOWN_IDS` of them.
+/// One chunk's answers: how many of its documents match each query, the sum of their ids, and
+/// the first `SHOWN_IDS` of them.
 struct Tally {
     count: Vec<u32>,
     sum: Vec<u64>,
@@ -690,6 +702,19 @@ impl Tally {
         }
     }
 
+    /// Records the documents `base + i` for each bit `i` set in `word`, as [`Tally::add`] would
+    /// one by one. Their count is a popcount, and their id sum is `base` times the count plus
+    /// the sum of the set bits' positions ([`bit_index_sum`]).
+    fn add_word(&mut self, q: u32, base: u32, mut word: u64) {
+        while word != 0 && (self.count[q as usize] as usize) < SHOWN_IDS {
+            self.add(q, base + word.trailing_zeros());
+            word &= word - 1;
+        }
+        let (i, n) = (q as usize, word.count_ones());
+        self.count[i] += n;
+        self.sum[i] += u64::from(base) * u64::from(n) + bit_index_sum(word);
+    }
+
     /// Takes the first matches out, grouped by query and each in doc order: query `q`'s are
     /// `ids[at[q]..at[q + 1]]`. Each scanning thread groups its own, instead of one big sort
     /// after the pass.
@@ -700,36 +725,45 @@ impl Tally {
 
 /// What the corpus pass keeps from one chunk of whole lines.
 struct Chunk {
-    /// The chunk's document ids.
-    ids: Range<u32>,
     tally: Tally,
     /// Each query's first matches in the chunk, smallest first: query `q`'s are
     /// `shown[shown_at[q]..shown_at[q + 1]]`.
     shown_at: Vec<u32>,
     shown: Vec<u32>,
-    /// `Store::Bits` rows of `words()` words each: bit `i` of row `k` is set when document
-    /// `ids.start + i` contains term `k`.
-    bits: Vec<u64>,
-    /// `Store::List` lists: the ascending ids of the chunk's documents that contain the term.
+}
+
+/// The documents of one window of `64 * WINDOW` that contain the terms of the queries on sets
+/// ([`Store`]). Only one window is kept at a time, so these sets take the same memory however
+/// long the chunk is.
+struct Window {
+    /// The window's first document.
+    start: u32,
+    /// `Store::Bits` rows: bit `i` of row `k` is set when document `start + i` holds term `k`.
+    bits: Vec<[u64; WINDOW]>,
+    /// `Store::List` lists: the window's documents that contain the term, ascending.
     lists: Vec<Vec<u32>>,
 }
 
-impl Chunk {
-    fn words(&self) -> usize {
-        ((self.ids.end - self.ids.start) as usize).div_ceil(64)
+impl Window {
+    /// Records that `doc` contains a term kept as `store`.
+    fn add(&mut self, store: Store, doc: u32) {
+        let i = (doc - self.start) as usize;
+        match store {
+            Store::Bits(k) => self.bits[k as usize][i / 64] |= 1 << (i % 64),
+            Store::List(j) => self.lists[j as usize].push(doc),
+            Store::None => unreachable!("Plan::new flags only stored terms"),
+        }
     }
 
-    /// The chunk's documents that contain a term with this `store`, as bitset words. A list is
+    /// The window's documents that contain a term kept as `store`, as a bitset. A list is
     /// spread into `scratch` first.
-    fn row<'a>(&'a self, store: Store, scratch: &'a mut Vec<u64>) -> &'a [u64] {
-        let words = self.words();
+    fn row<'a>(&'a self, store: Store, scratch: &'a mut [u64; WINDOW]) -> &'a [u64; WINDOW] {
         match store {
-            Store::Bits(k) => &self.bits[k as usize * words..][..words],
+            Store::Bits(k) => &self.bits[k as usize],
             Store::List(j) => {
-                scratch.clear();
-                scratch.resize(words, 0);
+                *scratch = [0; WINDOW];
                 for &doc in &self.lists[j as usize] {
-                    let i = (doc - self.ids.start) as usize;
+                    let i = (doc - self.start) as usize;
                     scratch[i / 64] |= 1 << (i % 64);
                 }
                 scratch
@@ -737,27 +771,56 @@ impl Chunk {
             Store::None => unreachable!("every term of a query on sets has a store"),
         }
     }
+
+    /// Evaluates every query on sets over the window, strictly left to right (spec §3), adds
+    /// the matches to `tally`, and moves on to the next window.
+    ///
+    /// On bitsets, AND, OR and NOT are the word-wise `&`, `|` and `& !`, 64 documents per
+    /// operation.
+    fn flush(&mut self, queries: &Queries, plan: &Plan, tally: &mut Tally) {
+        let mut scratch = [0; WINDOW];
+        for &q in &plan.sets {
+            let mut acc = [0u64; WINDOW];
+            for (op, term) in queries.steps(q as usize) {
+                let row = self.row(plan.store[term as usize], &mut scratch);
+                let pairs = acc.iter_mut().zip(row);
+                match op {
+                    Op::And => pairs.for_each(|(a, &w)| *a &= w),
+                    Op::Or => pairs.for_each(|(a, &w)| *a |= w),
+                    Op::Not => pairs.for_each(|(a, &w)| *a &= !w),
+                }
+            }
+            for (i, &word) in acc.iter().enumerate() {
+                tally.add_word(q, self.start + 64 * i as u32, word);
+            }
+        }
+        self.bits.fill([0; WINDOW]);
+        self.lists.iter_mut().for_each(Vec::clear);
+        self.start += 64 * WINDOW as u32;
+    }
 }
 
 /// Runs the corpus pass over `text`, whole lines holding the documents `ids`.
 ///
 /// A token costs one probe of the term table, whose [`Slot`] says what to do with the term,
 /// and otherwise only touches the current document's state: which terms it contains (one bit
-/// each, small enough to stay in L1), and the bitset rows and lists of terms that keep them.
-/// At each line end, the phrases triggered in the document are checked window by window, and
-/// the per-document checks of the BOOL terms it contains are run ([`run_checks`]).
+/// each, small enough to stay in L1), and the [`Window`] of the terms that keep their
+/// documents. At each line end, the phrases triggered in the document are checked at each
+/// position of their trigger term, and the per-document checks of the BOOL terms it contains
+/// are run ([`run_checks`]).
 fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
-    let words = ((ids.end - ids.start) as usize).div_ceil(64);
-    let mut bits = vec![0u64; plan.rows * words];
-    let mut lists = vec![Vec::new(); plan.lists];
+    let mut sets = Window {
+        start: ids.start,
+        bits: vec![[0; WINDOW]; plan.rows],
+        lists: vec![Vec::new(); plan.lists],
+    };
     let mut tally = Tally::new(queries.len());
     // Bit `t` is set while the current doc contains term `t`.
     let mut seen = vec![0u64; plan.terms.len().div_ceil(64)];
-    // Per phrase, the last doc it matched, so no doc counts twice.
-    let mut decided = vec![u32::MAX; queries.len()];
     // The current doc's term id per token (MISS for the rest), the positions of its phrase
-    // triggers, and its distinct BOOL triggers.
+    // triggers, its distinct BOOL triggers, and the phrases it matched, so none counts twice.
     let (mut terms, mut phrase_at, mut bool_terms) = (Vec::new(), Vec::new(), Vec::new());
+    let mut found = Vec::new();
     // The current doc's tokens as (key, home slot), probed only at the line end: by then every
     // slot load is long under way ([`TermTable::prefetch`]), instead of each stalling in turn.
     let mut probes: Vec<Option<(Key, usize)>> = Vec::new();
@@ -777,14 +840,7 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
                 if seen[t] & bit == 0 {
                     seen[t] |= bit;
                     if slot.flags & Slot::STORED != 0 {
-                        match plan.store[slot.id as usize] {
-                            Store::Bits(k) => {
-                                let i = (doc - ids.start) as usize;
-                                bits[k as usize * words + i / 64] |= 1 << (i % 64);
-                            }
-                            Store::List(j) => lists[j as usize].push(doc),
-                            Store::None => unreachable!("Plan::new flags only stored terms"),
-                        }
+                        sets.add(plan.store[slot.id as usize], doc);
                     }
                     if slot.flags & Slot::BOOL != 0 {
                         bool_terms.push(slot.id);
@@ -798,11 +854,11 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
             for &at in &phrase_at {
                 for &(q, offset) in plan.phrases(terms[at]) {
                     let phrase = queries.terms(q as usize);
-                    // `terms` holds this doc only, so a window never spans two docs (spec §3).
+                    // `terms` holds this doc only, so a match never spans two docs (spec §3).
                     let start = at.checked_sub(offset as usize);
-                    let window = start.and_then(|s| terms.get(s..s + phrase.len()));
-                    if decided[q as usize] != doc && window == Some(phrase) {
-                        decided[q as usize] = doc;
+                    let span = start.and_then(|s| terms.get(s..s + phrase.len()));
+                    if span == Some(phrase) && !found.contains(&q) {
+                        found.push(q);
                         tally.add(q, doc);
                     }
                 }
@@ -817,44 +873,34 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
             terms.clear();
             phrase_at.clear();
             bool_terms.clear();
+            found.clear();
             doc += 1;
+            if doc - sets.start == 64 * WINDOW as u32 {
+                sets.flush(queries, plan, &mut tally);
+            }
         }
     });
+    sets.flush(queries, plan, &mut tally);
     let (shown_at, shown) = tally.take_first();
     Chunk {
-        ids,
         tally,
         shown_at,
         shown,
-        bits,
-        lists,
     }
 }
 
 /// Formats the answers to queries `range`, in order (spec §4).
-fn format_range(range: Range<usize>, queries: &Queries, plan: &Plan, chunks: &[Chunk]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let (mut acc, mut scratch, mut shown) = (Vec::new(), Vec::new(), Vec::new());
+fn format_range(range: Range<usize>, chunks: &[Chunk]) -> Vec<u8> {
+    let (mut out, mut shown) = (Vec::new(), Vec::<u32>::new());
     for q in range {
         shown.clear();
-        let (count, sum) = if plan.on_sets[q] {
-            on_sets(
-                queries,
-                q,
-                plan,
-                chunks,
-                (&mut acc, &mut scratch),
-                &mut shown,
-            )
-        } else {
-            // Chunks hold ascending ids, so the first chunks' first matches are the smallest.
-            for c in chunks {
-                let ids = &c.shown[c.shown_at[q] as usize..c.shown_at[q + 1] as usize];
-                shown.extend(ids.iter().take(SHOWN_IDS - shown.len()));
-            }
-            let count = chunks.iter().map(|c| u64::from(c.tally.count[q])).sum();
-            (count, chunks.iter().map(|c| c.tally.sum[q]).sum())
-        };
+        // Chunks hold ascending ids, so the first chunks' first matches are the smallest.
+        for c in chunks {
+            let ids = &c.shown[c.shown_at[q] as usize..c.shown_at[q + 1] as usize];
+            shown.extend(ids.iter().take(SHOWN_IDS - shown.len()));
+        }
+        let count: u64 = chunks.iter().map(|c| u64::from(c.tally.count[q])).sum();
+        let sum: u64 = chunks.iter().map(|c| c.tally.sum[q]).sum();
         write!(out, "{count} {sum}").expect("writing to a Vec cannot fail");
         for id in &shown {
             write!(out, " {id}").expect("writing to a Vec cannot fail");
@@ -862,48 +908,6 @@ fn format_range(range: Range<usize>, queries: &Queries, plan: &Plan, chunks: &[C
         out.push(b'\n');
     }
     out
-}
-
-/// Evaluates a BOOL query on whole sets, chunk by chunk and strictly left to right (spec §3).
-/// Returns the count and the id sum, and puts the first `SHOWN_IDS` ids in `shown`.
-///
-/// On bitsets, AND, OR and NOT are the word-wise `&`, `|` and `& !`, 64 documents per
-/// operation. The count is a popcount, and the id sum of a word at `base` is `base` times its
-/// popcount plus the sum of its set bits' positions ([`bit_index_sum`]).
-fn on_sets(
-    queries: &Queries,
-    q: usize,
-    plan: &Plan,
-    chunks: &[Chunk],
-    (acc, scratch): (&mut Vec<u64>, &mut Vec<u64>),
-    shown: &mut Vec<u32>,
-) -> (u64, u64) {
-    let (mut count, mut sum) = (0, 0);
-    for chunk in chunks {
-        acc.clear();
-        acc.resize(chunk.words(), 0);
-        for (op, term) in queries.steps(q) {
-            let pairs = acc
-                .iter_mut()
-                .zip(chunk.row(plan.store[term as usize], scratch));
-            match op {
-                Op::And => pairs.for_each(|(a, &w)| *a &= w),
-                Op::Or => pairs.for_each(|(a, &w)| *a |= w),
-                Op::Not => pairs.for_each(|(a, &w)| *a &= !w),
-            }
-        }
-        for (i, &word) in acc.iter().enumerate() {
-            let base = u64::from(chunk.ids.start) + 64 * i as u64;
-            count += u64::from(word.count_ones());
-            sum += base * u64::from(word.count_ones()) + bit_index_sum(word);
-            let mut rest = word;
-            while rest != 0 && shown.len() < SHOWN_IDS {
-                shown.push((base + u64::from(rest.trailing_zeros())) as u32);
-                rest &= rest - 1;
-            }
-        }
-    }
-    (count, sum)
 }
 
 /// The sum of the positions of the set bits in `word`. Mask `k` keeps the bits whose position
@@ -994,28 +998,25 @@ impl Slot {
 /// the rest of its key. So most tokens cost one memory access here, whether or not they are
 /// query terms. It doubles at half load, so it assumes nothing about how many distinct terms
 /// the queries use.
-struct TermTable<'q> {
+struct TermTable {
     /// The slot count is a power of two.
     slots: Vec<Slot>,
     /// Term id → its key.
     keys: Vec<Key>,
-    /// Term id → the term as written in `queries.txt`.
-    names: Vec<&'q [u8]>,
 }
 
-impl Default for TermTable<'_> {
+impl Default for TermTable {
     fn default() -> Self {
         Self {
             slots: vec![Slot::default(); 1024],
             keys: Vec::new(),
-            names: Vec::new(),
         }
     }
 }
 
-impl<'q> TermTable<'q> {
+impl TermTable {
     fn len(&self) -> usize {
-        self.names.len()
+        self.keys.len()
     }
 
     /// The slot of the query term whose key this is, if any, given `at = self.home(key)`.
@@ -1039,14 +1040,13 @@ impl<'q> TermTable<'q> {
         at
     }
 
-    fn intern(&mut self, key: Key, name: &'q [u8]) -> u32 {
+    fn intern(&mut self, key: Key) -> u32 {
         let at = self.position(&key, self.home(&key));
         if self.slots[at].head != 0 {
             return self.slots[at].id;
         }
         self.keys.push(key);
-        self.names.push(name);
-        if self.names.len() * 2 <= self.slots.len() {
+        if self.keys.len() * 2 <= self.slots.len() {
             self.place(self.keys.len() - 1, at);
         } else {
             // Rebuilt from the keys in id order, which reads them sequentially; each new slot
@@ -1060,7 +1060,7 @@ impl<'q> TermTable<'q> {
                 self.place(id, self.position(key, self.home(key)));
             }
         }
-        self.names.len() as u32 - 1
+        self.keys.len() as u32 - 1
     }
 
     /// Puts term `id` into the free slot `at`.

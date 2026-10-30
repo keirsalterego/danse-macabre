@@ -9,6 +9,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 2 | Term keys read with one masked 32-byte load; tokens found 64 bytes at a time from AVX2 masks | run-03e880c5be0a | 0.5555 | 182.1 | 55.5 |
 | 3 | Costly BOOL queries evaluated on per-chunk bitsets and id lists, the rest checked per document; one 16-byte prefetched probe per token; first matches grouped per thread | run-0ba4a60c4e07 | 0.4085 | 82.7 | 60.9 |
 | 4 | Queries parsed on every thread into flat arrays; the plan's per-term lists built with one counting sort | run-03f5349811b3 | 0.3798 | 70.7 | 62.1 |
+| 5 | Queries on sets evaluated every 4,096 documents inside the pass; glibc's mmap threshold fixed at 128 KiB | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -67,23 +68,35 @@ waited: 56–59 ms of a 0.43 s run.
 Locally, step 3 → 4: elapsed 0.4335–0.4380 → 0.3905–0.3929 s; cycles 9.97–10.05 → 9.84–9.87 G;
 memory.peak 79.2 → 69.2 MB. S went from 745 to 803.
 
+## Step 5: memory
+
+At step 4 the peak was 15 MB of tables and plan, plus about 4.3 MB on each of the 12 threads.
+The biggest share was the bitset rows and id lists of the queries on sets, which each thread
+kept for its whole chunk.
+
+- **Sets per window.** Each thread keeps those rows and lists for one window of 4,096 documents,
+  and evaluates the 1,772 queries on sets at the window's end. Their matches go to the same
+  per-query tally as the other queries, so the output phase treats every query alike. The
+  per-query "last matched document" array became a per-document list of matched phrases, and
+  the term names are gone: a term's cost reads its length from its key. Local: memory.peak
+  68.3 → 50.8 MB, cycles 9.91–9.97 → 9.85–9.91 G.
+- **A fixed mmap threshold.** glibc raises its mmap threshold to the largest mapped block freed
+  so far, and parsing and planning free blocks of up to a few MB, so smaller blocks then come
+  from per-thread arenas and stay resident after they are freed. With
+  `mallopt(M_MMAP_THRESHOLD, 128 KiB)`, every block of 128 KiB or more goes back to the kernel
+  when it is freed, such as each thread's first matches once they are grouped. In the first
+  measurement: 50.8–51.2 → 42.4–45.3 MB at the same speed.
+
+Locally, step 4 → 5, six interleaved rounds on a busy machine: cycles 9.74–9.89 → 9.73–9.89 G,
+elapsed 0.3926 → 0.3867 s in the quietest round; memory.peak 68.4–69.8 → 39.6–40.8 MB over five
+runs. S went from 803 to 790.
+
 ## Experiments that did not stay
 
-- **Queries on sets evaluated every 4,096 documents inside the pass** (after step 4; not
-  submitted, because B is not among our three best tracks): each thread kept bitset rows and id
-  lists for one window instead of its whole chunk, evaluated the 1,772 queries on sets at each
-  window's end, and added their matches to the same per-query tally as the other queries. The
-  same build replaced the per-query "last matched document" array with a per-document list of
-  matched phrases and dropped the term names. Local: memory.peak 68.3 → 50.8 MB, cycles
-  9.91–9.97 → 9.85–9.91 G, instructions 12.21 → 12.41 G, same output.
-- **A fixed glibc mmap threshold on top of that:** glibc raises its mmap threshold to the largest
-  mapped block freed so far, and parsing and planning free blocks of up to a few MB, so smaller
-  blocks then come from per-thread arenas and stay resident after they are freed.
-  `mallopt(M_MMAP_THRESHOLD, 128 KiB)` took memory.peak from 50.8–51.2 to 42.4–45.3 MB at the
-  same speed (0.383–0.385 s, 9.79–9.83 G cycles). With transparent huge pages also off it was
-  41.1–41.2 MB, but cycles rose to 9.91–9.97 G and elapsed to 0.392–0.397 s. Huge pages off alone
-  gave 49.8–50.8 MB, and `malloc_trim(0)` after planning 49.2–50.1 MB.
-
+- **Transparent huge pages off on top of the fixed threshold** (`prctl(PR_SET_THP_DISABLE)`):
+  41.1–41.2 MB against 42.4–45.3 in the same session, but cycles 9.79–9.83 → 9.91–9.97 G and
+  elapsed 0.383–0.385 → 0.392–0.397 s. Huge pages off without the fixed threshold gave
+  49.8–50.8 MB, and `malloc_trim(0)` after planning 49.2–50.1 MB.
 - **Every BOOL query checked per document, with no sets at all** (step 3 without the sets):
   1.29 s, 29.0 G cycles, 53.3 MB, against 0.63 s and 14.6 G for step 2. That meant about 100
   million evaluations, each chasing a query's heap-allocated terms and operators.
