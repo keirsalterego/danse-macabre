@@ -22,12 +22,13 @@
 //!
 //! # The pipeline
 //!
-//! 1. **The lookup becomes a direct-address table.** [`parse_regions`] turns `regions.csv` into a
-//!    flat array indexed by region id that holds a group number, one byte per id. Countries are
-//!    numbered in bytewise order, so the group number is already the output order and no sort is
-//!    needed at the end. Group 0 is `_UNMATCHED`, and it is also what every id missing from the
-//!    table reads as. The spec allows up to 26³ countries, more than a byte holds, so groups past
-//!    254 read as 255 and are found in a short sorted list instead (see [`Regions`]).
+//! 1. **The lookup becomes a direct-address table.** [`parse_regions`] parses `regions.csv` on
+//!    every thread into a flat array indexed by region id that holds a group number, one byte
+//!    per id. Countries are numbered in bytewise order, so the group number is already the output
+//!    order and no sort is needed at the end. Group 0 is `_UNMATCHED`, and it is also what every
+//!    id missing from the table reads as. The spec allows up to 26³ countries, more than a byte
+//!    holds, so groups past 254 read as 255 and are found in a hash map instead (see
+//!    [`Regions`]).
 //! 2. **The records are split even though fields contain newlines.** The file is cut into one
 //!    chunk per hardware thread, and a cut can land inside a quoted note, where an LF is data
 //!    and not a record end. [`guess_bounds`] takes the first LF after each cut that a digit or a
@@ -68,7 +69,7 @@
 //!
 //! The input is mapped and never copied (see [`map_file`]). What the program allocates is
 //! mostly the name sets, about 6.4 MB of entries (one 64-byte line for each of ~100k names) and
-//! 1.5 MB of slots at full scale, then about 1.2 MB of mailbox pages that the rounds touch and
+//! 0.8 MB of slots at full scale, then about 1.2 MB of mailbox pages that the rounds touch and
 //! the 1 MB array from region id to group. Every buffer of 64 KiB or more gets its own mapping,
 //! so a freed buffer returns its pages at once, and transparent huge pages are off (see
 //! [`main`]).
@@ -79,8 +80,8 @@
 //! CRLF or LF, a final record without a terminator, and unquoted text that is not empty. Its
 //! output never depends on the narrower generator guarantees of §2.2; the name pool of §2.2 and
 //! the sizes in §5 only set the name sets' starting sizes. It does rely on §2.3, where country
-//! codes are `[A-Z]{3}` and region ids ascend, so the last one is the largest (both checked
-//! while parsing), and on §3, where `id_sum` and `amount_sum` fit in 64 bits.
+//! codes are `[A-Z]{3}` (checked while parsing), and on §3, where `id_sum` and `amount_sum` fit
+//! in 64 bits.
 //! Records outside the §2.1 grammar are not validated.
 
 use std::collections::HashMap;
@@ -220,8 +221,8 @@ struct Regions {
     /// Region id → group, sized from the largest id in the file. Ids it lacks stay 0, which is
     /// `_UNMATCHED`. The groups past 254 read as 255 here and are looked up in `wide`.
     group_of: Vec<u8>,
-    /// The regions of groups past 254, as (id, group) in ascending id order.
-    wide: Vec<(usize, u16)>,
+    /// The groups past 254, by region id.
+    wide: HashMap<usize, u16>,
     /// Country codes in bytewise order: `codes[k]` is group k + 1.
     codes: Vec<[u8; 3]>,
 }
@@ -230,44 +231,41 @@ impl Regions {
     /// The group of the region with this id; ids past the table's largest are `_UNMATCHED`.
     fn group(&self, id: usize) -> usize {
         match self.group_of.get(id) {
-            Some(255) => {
-                let at = (self.wide.binary_search_by_key(&id, |&(id, _)| id)).expect("a wide id");
-                usize::from(self.wide[at].1)
-            }
+            Some(255) => usize::from(self.wide[&id]),
             Some(&group) => usize::from(group),
             None => 0,
         }
     }
 }
 
-/// Builds [`Regions`] from `regions.csv` in one pass over its rows.
+/// Builds [`Regions`] from `regions.csv`, with its rows parsed on every hardware thread.
 ///
-/// Region ids ascend (spec §2.3), so the last row's id sizes the array before the pass. The pass
-/// stores each region's country code and marks which countries occur. Numbering the countries
-/// afterwards, by walking the [`CODES`] table in index order, sorts them bytewise for free, and
-/// one walk over the array then swaps each code for its group, narrowed to a byte. Two passes
-/// that each split the rows at LF and then parsed them took three times as long.
+/// A row holds no quotes, so every LF ends one. Each thread takes the rows that start in one
+/// even share of the file and lists them as (id, country code). Numbering the countries that
+/// occur, by walking the [`CODES`] table in index order, then sorts them bytewise for free, and
+/// one walk over the rows writes each region's group, narrowed to a byte. The join cannot start
+/// before this ends, and on one thread it took 3.8 ms (PERF.md, step 11).
 fn parse_regions(csv: &[u8]) -> Result<Regions, String> {
     let body = (csv.strip_prefix(b"region_id,country\n"))
         .ok_or("regions.csv: the header is not `region_id,country`")?;
-    let last_row = (body[..body.len().saturating_sub(1)].iter())
-        .rposition(|&b| b == b'\n')
-        .map_or(0, |lf| lf + 1);
-    let max_id = if body.is_empty() {
-        0
-    } else {
-        region_row(body, last_row)?.0
+    let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    // The first row that starts at or after the `i`th of `threads` even cuts.
+    let cut = |i| match body.len() * i / threads {
+        0 => 0,
+        at => (body[at - 1..].iter().position(|&b| b == b'\n')).map_or(body.len(), |lf| at + lf),
     };
-    // Until the last walk, an entry holds its country's code + 1, so that 0 still means no
-    // region. That is at most 26³, which fits a `u16`.
-    let mut group_of = vec![0u16; max_id + 1];
-    let mut group_of_code = vec![0u16; CODES];
-    let mut at = 0;
-    while at < body.len() {
-        let (id, code, next) = region_row(body, at)?;
-        *(group_of.get_mut(id)).ok_or("regions.csv: ids do not ascend")? = code as u16 + 1;
+    let chunks = thread::scope(|s| {
+        let parsers: Vec<_> = (0..threads)
+            .map(|i| s.spawn(move || region_rows(body, cut(i)..cut(i + 1))))
+            .collect();
+        (parsers.into_iter())
+            .map(|p| p.join().expect("a panic aborts the process"))
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    let (mut group_of_code, mut max_id) = (vec![0u16; CODES], 0);
+    for &(id, code) in chunks.iter().flatten() {
         group_of_code[code] = 1;
-        at = next;
+        max_id = max_id.max(id);
     }
     let mut codes = Vec::new();
     for (code, group) in group_of_code.iter_mut().enumerate() {
@@ -277,17 +275,14 @@ fn parse_regions(csv: &[u8]) -> Result<Regions, String> {
             *group = codes.len() as u16;
         }
     }
-    let group_of_entry: Vec<u16> = [0].into_iter().chain(group_of_code).collect();
-    let mut wide = Vec::new();
-    let group_of = (group_of.iter().enumerate())
-        .map(|(id, &code)| match group_of_entry[usize::from(code)] {
-            group @ 0..255 => group as u8,
-            group => {
-                wide.push((id, group));
-                255
-            }
-        })
-        .collect();
+    let (mut group_of, mut wide) = (vec![0; max_id + 1], HashMap::new());
+    for &(id, code) in chunks.iter().flatten() {
+        let group = group_of_code[code];
+        group_of[id] = group.min(255) as u8;
+        if group >= 255 {
+            wide.insert(id, group);
+        }
+    }
     Ok(Regions {
         group_of,
         wide,
@@ -295,32 +290,42 @@ fn parse_regions(csv: &[u8]) -> Result<Regions, String> {
     })
 }
 
-/// Parses the row that starts at `body[start]`, `region_id,country` and an LF (spec §2.3), into
-/// the id, the country code as a base-26 number, and the start of the next row.
+/// Parses the rows that start in `rows`, each `region_id,country` and an LF (spec §2.3), into
+/// pairs of the id and the country code as a base-26 number.
 ///
-/// The digits run up to the comma, and the rest of the row has a fixed length, so the row's end
+/// The digits run up to the comma, and the rest of a row has a fixed length, so the row's end
 /// comes out of the parse with no search for the LF. This is the one place the program checks its
 /// input. A row that breaks spec §2.3 returns an error naming the row, because a bad code here
 /// would silently move every record of a region.
-fn region_row(body: &[u8], start: usize) -> Result<(usize, usize, usize), String> {
-    let mut at = start;
-    let mut id = 0;
-    while let Some(&digit @ b'0'..=b'9') = body.get(at) {
-        id = id * 10 + usize::from(digit - b'0');
-        at += 1;
+fn region_rows(body: &[u8], rows: Range<usize>) -> Result<Vec<(usize, usize)>, String> {
+    // Sized for the shortest row, `0,ABC` and its LF, so that the list never grows: lists that
+    // grew left their old copies resident in each thread's malloc arena, 1.5 MiB in all.
+    let mut list = Vec::with_capacity(rows.len() / 6);
+    let mut start = rows.start;
+    while start < rows.end {
+        let (mut at, mut id) = (start, 0);
+        while let Some(&digit @ b'0'..=b'9') = body.get(at) {
+            id = id * 10 + usize::from(digit - b'0');
+            at += 1;
+        }
+        if let Some(&[b',', a, b, c, b'\n']) = body.get(at..at + 5)
+            && at > start
+            && [a, b, c].iter().all(u8::is_ascii_uppercase)
+        {
+            list.push((
+                id,
+                ([a, b, c].iter()).fold(0, |n, &c| n * 26 + usize::from(c - b'A')),
+            ));
+            start = at + 5;
+        } else {
+            let row = body[start..].split(|&b| b == b'\n').next();
+            return Err(format!(
+                "regions.csv: bad row {:?}",
+                String::from_utf8_lossy(row.unwrap_or_default())
+            ));
+        }
     }
-    if let Some(&[b',', a, b, c, b'\n']) = body.get(at..at + 5)
-        && at > start
-        && [a, b, c].iter().all(u8::is_ascii_uppercase)
-    {
-        let code = ([a, b, c].iter()).fold(0, |n, &c| n * 26 + usize::from(c - b'A'));
-        return Ok((id, code, at + 5));
-    }
-    let row = body[start..].split(|&b| b == b'\n').next();
-    Err(format!(
-        "regions.csv: bad row {:?}",
-        String::from_utf8_lossy(row.unwrap_or_default())
-    ))
+    Ok(list)
 }
 
 /// Bytes of its chunk a worker parses per round before the workers swap names. Small rounds
@@ -780,9 +785,9 @@ impl Exchange {
     /// Writes letter `index` of the mailbox from `from` to `to`.
     fn post(&self, half: usize, from: usize, to: usize, index: usize, letter: [u64; 4]) {
         let at = (self.mailbox(half, from, to) * MAILBOX + index) * 4;
-        for (word, value) in self.letters[at..at + 4].iter().zip(letter) {
-            word.store(value, Relaxed);
-        }
+        (self.letters[at..at + 4].iter())
+            .zip(letter)
+            .for_each(|(w, v)| w.store(v, Relaxed));
     }
 
     /// Publishes how many letters `from` posted to each worker this round.
@@ -870,8 +875,7 @@ fn name_letter(data: &[u8], Range { start, end }: Range<usize>) -> [u64; 4] {
     }
     let words: [u64; 3] = std::array::from_fn(|i| {
         let keep = len.saturating_sub(8 * i).min(8);
-        let word = u64::from_le_bytes(bytes[8 * i..][..8].try_into().expect("8 bytes"));
-        word & ((1u128 << (8 * keep)) - 1) as u64
+        u64::from_le_bytes(bytes.as_chunks().0[i]) & ((1u128 << (8 * keep)) - 1) as u64
     });
     let mix = |h: u64, w: u64| (h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
     let h = words.iter().fold(len as u64, |h, &w| mix(h, w));
@@ -881,6 +885,11 @@ fn name_letter(data: &[u8], Range { start, end }: Range<usize>) -> [u64; 4] {
     }
     [words[0], words[1], words[2], hash | (len as u64) << 32]
 }
+
+/// The low 24 bits of a slot: its entry's index plus 1, so that 0 is an empty slot. The top 8
+/// bits are bits 20 to 27 of the name's hash, so a probe that passes a different name usually
+/// skips its entry without loading it.
+const ENTRY: u32 = (1 << 24) - 1;
 
 /// One cache line of a [`NameSet`] entry.
 #[derive(Clone, Copy)]
@@ -893,21 +902,21 @@ struct Line([u64; 8]);
 /// touches: no atomics and no cache line shared with another core. Each distinct name has one
 /// entry of whole cache lines: its four-word key from [`name_letter`], then a bitset with one bit
 /// per group. With up to 256 groups an entry is one line, so a record's compare and its bit land
-/// on the same line. Names longer than [`INLINE`] bytes are rare and are kept in a `HashMap`
-/// keyed by their bytes in the file, pointing at entries of the same kind.
+/// on the same line. A slot holds an entry's number and 8 more bits of the name's hash (see
+/// [`ENTRY`]), so an empty slot costs 4 bytes, and a probe loads an entry only when those bits
+/// match. Names longer than [`INLINE`] bytes are rare. Their keys say where they lie in the file,
+/// and two of them are compared there (see [`NameSet::holds`]).
 ///
 /// Names are keyed still escaped. Escaping is one to one (each `"` becomes `""`), so two raw
 /// names are equal exactly when their unescaped values are. The empty quoted name `""` and the
 /// empty unquoted name both arrive as an empty slice, so they are one name, as spec §3 asks.
 struct NameSet {
-    /// `entry + 1` for the entry of a short name, or 0 for an empty slot.
+    /// The entry of each name, with 8 bits of its hash on top (see [`ENTRY`]), or 0.
     slots: Vec<u32>,
     /// The entries, `stride` lines each.
     lines: Vec<Line>,
     /// Lines per entry: four key words, then one bit per group.
     stride: usize,
-    /// The entries of the names longer than [`INLINE`] bytes.
-    long: HashMap<&'static [u8], usize>,
 }
 
 impl NameSet {
@@ -915,57 +924,40 @@ impl NameSet {
     fn new(group_count: usize, names: usize) -> Self {
         let stride = (4 + group_count.div_ceil(64)).div_ceil(8);
         Self {
-            slots: vec![0; (2 * names).next_power_of_two().max(16)],
+            // The slots may fill to three quarters before they grow (see `insert`).
+            slots: vec![0; (4 * names / 3).next_power_of_two().max(16)],
             // Pages of the capacity that no entry reaches cost nothing, so this is generous.
             lines: Vec::with_capacity(2 * names * stride),
             stride,
-            long: HashMap::new(),
         }
-    }
-
-    /// Adds `group` to the groups of the short name with this key and returns `true` if it was
-    /// not there yet. The key holds the whole name, so equal keys are equal names.
-    fn mark(&mut self, key: [u64; 4], group: usize) -> bool {
-        let mask = self.slots.len() - 1;
-        let mut slot = key[3] as u32 as usize & mask;
-        let entry = loop {
-            match self.slots[slot] as usize {
-                0 => break self.insert(slot, key),
-                entry if self.lines[(entry - 1) * self.stride].0[..4] == key => break entry - 1,
-                _ => slot = (slot + 1) & mask,
-            }
-        };
-        self.set(entry, group)
     }
 
     /// Marks the names of `letters` and counts each name that is new for its group in
     /// `groups`. Kept out of line so that this loop gets the registers to itself.
     #[inline(never)]
-    fn read(&mut self, letters: &[AtomicU64], data: &'static [u8], groups: &mut [Group]) {
+    fn read(&mut self, letters: &[AtomicU64], data: &[u8], groups: &mut [Group]) {
         for letter in letters.as_chunks::<4>().0 {
             let letter: [u64; 4] = std::array::from_fn(|i| letter[i].load(Relaxed));
             let group = (letter[3] >> 48) as usize;
-            let new = if letter[3] >> 32 & 0xFFFF == LONG {
-                self.mark_long(&data[letter[0] as usize..letter[1] as usize], group)
-            } else {
-                self.mark([letter[0], letter[1], letter[2], letter[3] & KEY], group)
-            };
-            groups[group].distinct += u64::from(new);
+            let key = [letter[0], letter[1], letter[2], letter[3] & KEY];
+            groups[group].distinct += u64::from(self.mark(key, group, data));
         }
     }
 
-    /// [`NameSet::mark`] for a name longer than [`INLINE`] bytes.
-    fn mark_long(&mut self, name: &'static [u8], group: usize) -> bool {
-        let next = self.lines.len() / self.stride;
-        let entry = *self.long.entry(name).or_insert(next);
-        if entry == next {
-            self.add([0; 4]);
-        }
-        self.set(entry, group)
-    }
-
-    /// Sets `group`'s bit in `entry` and returns whether it was clear.
-    fn set(&mut self, entry: usize, group: usize) -> bool {
+    /// Adds `group` to the groups of the name with this key and returns `true` if it was not
+    /// there yet.
+    fn mark(&mut self, key: [u64; 4], group: usize, data: &[u8]) -> bool {
+        let mask = self.slots.len() - 1;
+        let mut slot = key[3] as u32 as usize & mask;
+        let tag = (key[3] as u32 >> 20) << 24;
+        let entry = loop {
+            let found = self.slots[slot];
+            match (found & ENTRY) as usize {
+                0 => break self.insert(slot, tag, key),
+                e if found & !ENTRY == tag && self.holds(e - 1, key, data) => break e - 1,
+                _ => slot = (slot + 1) & mask,
+            }
+        };
         let word = 4 + group / 64;
         let word = &mut self.lines[entry * self.stride + word / 8].0[word % 8];
         let bit = 1 << (group % 64);
@@ -974,39 +966,48 @@ impl NameSet {
         new
     }
 
-    /// Appends an entry with this key and no groups, and returns its index.
-    fn add(&mut self, key: [u64; 4]) -> usize {
-        let entry = self.lines.len() / self.stride;
-        self.lines.resize((entry + 1) * self.stride, Line([0; 8]));
-        self.lines[entry * self.stride].0[..4].copy_from_slice(&key);
-        entry
+    /// Whether `entry` is the name of `key`. A short name's key is the whole name, so equal keys
+    /// are equal names. A long name's key says where the name lies in `data`, so two long names
+    /// with the same hash are compared there.
+    fn holds(&self, entry: usize, key: [u64; 4], data: &[u8]) -> bool {
+        let held = self.key(entry);
+        let text = |key: &[u64]| &data[key[0] as usize..key[1] as usize];
+        held == key || held[3] == key[3] && key[3] >> 32 == LONG && text(held) == text(&key)
     }
 
-    /// Adds a short name's entry into the empty `slot` and returns its index. The slots grow
-    /// when the entries, long names' included, reach half their count; see [`NameSet::grow`].
-    fn insert(&mut self, slot: usize, key: [u64; 4]) -> usize {
-        let entry = self.add(key);
-        self.slots[slot] = u32::try_from(entry + 1).expect("under 2^32 names");
-        if 2 * (entry + 1) > self.slots.len() {
+    /// Appends an entry with this key and no groups, puts it in the empty `slot` with its `tag`,
+    /// and returns its index. The slots grow when the entries fill three quarters of them; see
+    /// [`NameSet::grow`].
+    fn insert(&mut self, slot: usize, tag: u32, key: [u64; 4]) -> usize {
+        let entry = self.lines.len() / self.stride;
+        assert!(entry < ENTRY as usize, "under 2^24 names per thread");
+        self.lines.resize((entry + 1) * self.stride, Line([0; 8]));
+        self.lines[entry * self.stride].0[..4].copy_from_slice(&key);
+        self.slots[slot] = tag | (entry + 1) as u32;
+        if 4 * (entry + 1) > 3 * self.slots.len() {
             self.grow();
         }
         entry
     }
 
-    /// Doubles the slots and places every entry again, so at least half the slots stay empty
-    /// and every probe ends at an empty slot.
+    /// Doubles the slots and places every entry again, tag and all, so at least a quarter of the
+    /// slots stay empty and every probe ends at an empty slot.
     fn grow(&mut self) {
         let mut slots = vec![0; 2 * self.slots.len()];
         let mask = slots.len() - 1;
-        for &entry in self.slots.iter().filter(|&&entry| entry != 0) {
-            let key = self.lines[(entry as usize - 1) * self.stride].0[3];
-            let mut slot = key as u32 as usize & mask;
+        for &found in self.slots.iter().filter(|&&found| found != 0) {
+            let mut slot = self.key((found & ENTRY) as usize - 1)[3] as u32 as usize & mask;
             while slots[slot] != 0 {
                 slot = (slot + 1) & mask;
             }
-            slots[slot] = entry;
+            slots[slot] = found;
         }
         self.slots = slots;
+    }
+
+    /// The key that `entry` starts with.
+    fn key(&self, entry: usize) -> &[u64] {
+        &self.lines[entry * self.stride].0[..4]
     }
 }
 

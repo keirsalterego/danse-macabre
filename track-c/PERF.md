@@ -13,8 +13,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 6 | Names and notes scanned 32 bytes at a time for their next quote | run-599ba20d6eb1 | 0.0920 | 15.5 | 64.2 |
 | 7 | Each name's hash slot loaded as soon as the name is scanned, so its cache miss overlaps the rest of the record | run-7b03d961ed16 | 0.0799 | 15.3 | 65.7 |
 | 8 | Numbers parsed from one 8-byte word each, and the number and text-field parsers inlined | run-c66327de718b | 0.0734 | 15.2 | 66.6 |
-| 9 | Each distinct name owned by one thread: names travel to their owner in rounds, and each owner marks them in a private table. Region table at one byte per id | | | | |
-| 10 | Each run's first record guessed instead of found by a quote pre-pass, with a check after the parse and an exact rerun when a guess is wrong. Each worker gives its input pages back after the last round | | | | |
+| 9 | Each distinct name owned by one thread: names travel to their owner in rounds, and each owner marks them in a private table. Region table at one byte per id | run-b8279a47babc | 0.0510 | 14.83 | 69.7 |
+| 10 | Each run's first record guessed instead of found by a quote pre-pass, with a check after the parse and an exact rerun when a guess is wrong. Each worker gives its input pages back after the last round | run-b480cbf26ce8 | 0.0418 | 14.8 | 71.7 |
+| 11 | Hash slots tagged with 8 bits of the name's hash, at half the size; `regions.csv` parsed on all threads; long names kept in the same table | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -390,6 +391,39 @@ Correctness checks:
   hostile ones, with 64-, 1,024- and 4,096-byte tails: 648,626 exact cuts gave the same output
   and ended where the next run starts, and 498,540 offsets forced as guesses never crashed, were
   accepted exactly when they were record starts, and then gave the same output.
+
+## Step 11: tagged hash slots, and regions parsed on all threads
+
+1. **Tagged slots.** Each u32 slot of a worker's name table holds its entry's index plus one in
+   the low 24 bits and 8 bits of the name's hash in the top 8. A probe that meets another name's
+   slot sees the tag differ and moves on without loading that name's entry line. With the tags
+   the table halves to 16k slots per worker, sized at 4/3 of the names it will hold and grown
+   at 3/4 load. Halving the slots without tags cost 3% of T; with them T fell 4.8%.
+2. **`regions.csv` parsed on all threads**, one even share of the rows each, into row lists
+   sized up front. The serial parse and the walk over the 1M-entry id array took 3.8 ms before
+   the join could start; the parallel parse takes about 2.5 ms. Without the sizing, glibc's
+   per-thread arenas gave 1.5 MiB of the saving back.
+3. **Fewer lines.** Names over 24 bytes go into the same tagged table. Their key is a pair of
+   file offsets, compared in the file only when the hashes match, so the separate `HashMap`
+   goes. Groups wider than 254 countries use a `HashMap` instead of a sorted list. Region ids no
+   longer need to ascend: the reference accepts them in any order, and step 10 stopped with an
+   error on them.
+
+On top of step 10, P-cores, wall time of interleaved runs (`ab.py`), median / min in ms:
+
+| | step 10 | step 11 |
+|---|---|---|
+| session 1, 41 runs each, load average 18 | 47.96 / 45.70 | 44.16 / 42.08 |
+| session 2, quieter | 46.44 / 45.60 | 43.17 / 42.58 |
+
+memory.peak in the container with the harness's flags, 8 runs each: median 13.84 MiB
+(13.35–14.01) for step 10 and 12.39 MiB (11.78–12.73) for step 11. S 630 → 622.
+
+Correctness checks: the gate (307 pass, 0 fail); the 402 random cases at the default thread
+count and at 1, 3, 12, 37 and 64 threads; tiny rounds (100-byte rounds, 3-letter mailboxes) at
+1, 2, 3, 12 and 64 threads; and against the reference, at the default count and at 64 threads,
+a region set with groups wider than 254 countries and one with shuffled ids. A bad region row
+still stops the join with its error.
 
 ## Experiments that did not stay
 
