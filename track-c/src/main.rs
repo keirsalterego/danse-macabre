@@ -233,6 +233,16 @@ fn release(bytes: &[u8]) {
     }
 }
 
+/// Runs `work(i)` for each `i` in `0..n`, each on a thread of its own, and returns the results
+/// in order of `i`.
+fn parallel<T: Send>(n: usize, work: &(impl Fn(usize) -> T + Sync)) -> Vec<T> {
+    thread::scope(|s| {
+        let threads: Vec<_> = (0..n).map(|i| s.spawn(move || work(i))).collect();
+        // A panic aborts the process, so `join` never returns an error.
+        threads.into_iter().map(|t| t.join().unwrap()).collect()
+    })
+}
+
 /// The lookup table from `regions.csv`, as a direct-address table: the region id is the index.
 ///
 /// Group 0 is `_UNMATCHED`, and country k in bytewise order is group k + 1. There are at most
@@ -274,14 +284,8 @@ fn parse_regions(csv: &[u8]) -> Result<Regions, String> {
         0 => 0,
         at => (body[at - 1..].iter().position(|&b| b == b'\n')).map_or(body.len(), |lf| at + lf),
     };
-    let chunks = thread::scope(|s| {
-        let parsers: Vec<_> = (0..threads)
-            .map(|i| s.spawn(move || region_rows(body, cut(i)..cut(i + 1))))
-            .collect();
-        (parsers.into_iter())
-            .map(|p| p.join().expect("a panic aborts the process"))
-            .collect::<Result<Vec<_>, _>>()
-    })?;
+    let chunks = parallel(threads, &|i| region_rows(body, cut(i)..cut(i + 1)));
+    let chunks = chunks.into_iter().collect::<Result<Vec<_>, _>>()?;
     let (mut group_of_code, mut max_id) = (vec![0u16; CODES], 0);
     for &(id, code) in chunks.iter().flatten() {
         group_of_code[code] = 1;
@@ -318,8 +322,7 @@ fn region_rows(body: &[u8], rows: Range<usize>) -> Result<Vec<(usize, usize)>, S
     while start < rows.end {
         let (mut at, mut id) = (start, 0);
         while let Some(&digit @ b'0'..=b'9') = body.get(at) {
-            id = id * 10 + usize::from(digit - b'0');
-            at += 1;
+            (id, at) = (id * 10 + usize::from(digit - b'0'), at + 1);
         }
         if let Some(&[b',', a, b, c, b'\n']) = body.get(at..at + 5)
             && at > start
@@ -363,14 +366,8 @@ fn join(records: &'static [u8], regions: &Regions) -> Result<Vec<u8>, String> {
     loop {
         // A worker registers with its exchange once, so every attempt needs a new one.
         let exchange = &Exchange::new(bounds.len() - 1);
-        let parts: Vec<(Vec<Group>, usize)> = thread::scope(|s| {
-            let work = |me, range| aggregate(me, records, range, regions, exchange);
-            let workers: Vec<_> = (bounds.windows(2).enumerate())
-                .map(|(me, w)| s.spawn(move || work(me, w[0]..w[1])))
-                .collect();
-            (workers.into_iter())
-                .map(|w| w.join().expect("a panic aborts the process"))
-                .collect()
+        let parts = parallel(bounds.len() - 1, &|me| {
+            aggregate(me, records, bounds[me]..bounds[me + 1], regions, exchange)
         });
         // A guess is right exactly when the run before it ends where it starts. The last run
         // ends one byte past the file when the last record has no line break.
@@ -549,7 +546,7 @@ fn aggregate(
             }
         }
         exchange.seal(half, me, &sent);
-        let all_done = exchange.wait(me, round, at >= range.end);
+        let all_done = exchange.wait(round, at >= range.end);
         for from in 0..exchange.threads {
             names.read(exchange.letters(half, from, me), data, &mut groups);
         }
@@ -720,9 +717,7 @@ impl Exchange {
     /// Writes letter `index` of the mailbox from `from` to `to`.
     fn post(&self, half: usize, from: usize, to: usize, index: usize, letter: [u64; 4]) {
         let at = (self.mailbox(half, from, to) * MAILBOX + index) * 4;
-        (self.letters[at..at + 4].iter())
-            .zip(letter)
-            .for_each(|(w, v)| w.store(v, Relaxed));
+        (self.letters[at..at + 4].iter().zip(letter)).for_each(|(w, v)| w.store(v, Relaxed));
     }
 
     /// Publishes how many letters `from` posted to each worker this round.
@@ -746,7 +741,8 @@ impl Exchange {
     /// The last worker to arrive resets the count and releases the others. Its `AcqRel` add
     /// sees every earlier arrival's writes, and its `Release` store passes them on to the
     /// `Acquire` loads of the waiters, so every letter posted before the barrier is visible after.
-    fn wait(&self, me: usize, round: usize, done: bool) -> bool {
+    /// It unparks every worker, itself too, which only makes its own next `park` return at once.
+    fn wait(&self, round: usize, done: bool) -> bool {
         let arrival = 1 + (u64::from(done) << 32);
         let arrived = self.arrived.fetch_add(arrival, AcqRel) + arrival;
         let next = 2 * (round as u64 + 1);
@@ -754,9 +750,7 @@ impl Exchange {
             self.arrived.store(0, Relaxed);
             let all_done = (arrived >> 32) as usize == self.threads;
             self.released.store(next + u64::from(all_done), Release);
-            (self.workers.iter().enumerate())
-                .filter(|&(worker, _)| worker != me)
-                .for_each(|(_, thread)| thread.get().expect("set before round 0").unpark());
+            (self.workers.iter()).for_each(|t| t.get().expect("set before round 0").unpark());
             return all_done;
         }
         let mut spins = 0;

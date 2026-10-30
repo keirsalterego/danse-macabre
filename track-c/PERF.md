@@ -18,6 +18,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 11 | Hash slots tagged with 8 bits of the name's hash, at half the size; `regions.csv` parsed on all threads; long names kept in the same table | run-cddb49a6dc40 | 0.0422 | 12.3 | 72.4 |
 | 12 | The BOM test reads one byte before it compares three, which takes a `bcmp` call off every record. A sentinel record after the mapped input replaces step 10's exact tail, and one thread replaces the quote pre-pass after a wrong guess | run-213d735f8f1d | 0.0368 | 12.2 | 74.3 |
 | 13 | 18 fewer lines in the region table, the exchange and the name set, at the same speed | run-5fd07fa31be9 | 0.0415 | 13.0 | 72.8 |
+| 14 | 11 fewer lines: one helper runs both thread groups, and the exchange wakes every worker | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -475,6 +476,21 @@ code were put back: each cost 0.15–0.3 ms. `ab.py`, 50 interleaved runs, media
 40.51 / 39.68 ms, step 13 40.77 / 39.62 ms. memory.peak, 6 runs: 11.68 MiB median, within the
 ±0.8 MiB of the per-CPU charge batching. S 563 → 545. Gate: 307 pass, 0 fail; the 402 random
 cases at 1, 3, 12, 37 and 64 threads and in the tiny-round build; the output hash is unchanged.
+
+## Step 14: 11 fewer lines
+
+A 6-line `parallel(n, &work)` helper replaces the two `thread::scope` spawn and join blocks, in
+the regions parse and the join. `Exchange::wait` now unparks every worker, itself included,
+which is harmless and drops its `me` parameter. The record loop is 585 instructions in both
+builds; the only difference in the hot code is the instruction order inside the hash of
+`wide[&id]`, which runs only for a region group of 255 or more, and 240 countries never get
+there. Dropped: removing the barrier leader's early return, which saved a line but changed the
+hot loop's register allocation.
+
+`ab.py` against step 13, median / min: full runs (60 each) 40.44 / 39.73 → 40.34 / 39.58 ms;
+regions only (100 each) 4.73 / 4.24 → 4.81 / 4.16 ms. memory.peak, 4 runs: 12.23 → 12.22 MiB.
+S 545 → 534. Gate: 307 pass, 0 fail; the 402 random cases at 1, 3, 12, 37 and 64 threads and in
+the tiny-round build; the output hash is unchanged.
 
 ## Experiments that did not stay
 
