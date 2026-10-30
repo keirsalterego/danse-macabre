@@ -64,12 +64,13 @@ const _: () = assert!(64 * WINDOW <= 1 << 16);
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
-    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
 }
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const M_MMAP_THRESHOLD: i32 = -3;
 const MADV_HUGEPAGE: i32 = 14;
+const MADV_DONTNEED: i32 = 4;
 
 fn main() -> Result<(), Box<dyn Error>> {
     // glibc raises its mmap threshold to the largest block freed so far, and blocks below it
@@ -939,6 +940,14 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
             sets.flush(queries, plan, &mut tally);
         }
     });
+    // The chunk's pages leave our page tables now, each thread its own, instead of one by one
+    // in the exit after the output is written.
+    let offset = text.as_ptr().addr() % 4096;
+    let start = text.as_ptr().wrapping_sub(offset);
+    // SAFETY: madvise only drops pages. Those of the docs mapping, private and never written,
+    // fault the same bytes back in if read again, as a neighbouring chunk's first or last page
+    // may be; outside a mapping, madvise fails and changes nothing.
+    unsafe { madvise(start, offset + text.len(), MADV_DONTNEED) };
     sets.flush(queries, plan, &mut tally);
     // The window's bitsets go back to the kernel before the first matches are grouped, when
     // memory peaks.

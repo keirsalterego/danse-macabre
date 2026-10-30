@@ -21,6 +21,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 14 | The per-document checks count a query's first matches in a byte per query, not in its cell | run-f56225b92327 | 0.2350 | 45.1 | 69.1 |
 | 15 | Memory at its peak: a thread frees its window before grouping its first matches, and the grouping keeps no second copy of the group starts | run-7458013fd46b | 0.2346 | 42.3 | 69.2 |
 | 16 | The query and check cells are written when allocated, so the pass's first store to a page no longer replaces the shared zero page and interrupts every core | | | | |
+| 17 | Each thread drops its chunk's pages of the corpus mapping when its pass ends, instead of the exit unmapping all of them on one core after the output is written | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -300,6 +301,23 @@ Not kept: the same writes as `black_box(&mut cells).fill(0)` after `vec!`, for t
 matches in chunk 0 only, an upper bound on skipping the other chunks' first matches once chunk 0
 holds ten for a query. Median 244.6 and 245.1 → 248.2 and 248.0 ms: chunk 0 still records and
 groups all of its own, so its thread, the one the others wait for, does no less.
+
+## Step 17: the corpus pages dropped in parallel
+
+The kernel tears down the process's mappings in the exit, after the output is written, on one
+core. For the corpus mapping that is 61,970 page table entries on seed 1 (254 MB), each a page
+cache page whose map count, reference count and cgroup statistics it updates. Each thread now
+drops its own chunk's pages with `madvise(MADV_DONTNEED)` as soon as its pass ends, so the
+twelve cores share that work, mostly while other threads still scan. The range is rounded out to
+whole pages: a neighbouring chunk that still reads a shared boundary page faults it back in from
+the page cache, with the same bytes, as the mapping is private and never written.
+
+Locally, against step 16, alternating runs, 16 each, three rounds: median 245.3, 242.8 and 243.5
+→ 241.7, 241.3 and 240.4 ms; min 242.9, 241.6 and 241.1 → 239.7, 236.9 and 238.5 ms. With the
+range rounded inward instead, to the chunk's own whole pages: 242.7 → 240.7 ms. Kernel cycles
+rise a little, 171–182 → 178–192 M in a noisy session (the same work, spread over cores, plus
+one TLB-flush interrupt per thread), but no longer at the end. memory.peak over seven
+interleaved runs: median 40.0 → 40.1 MiB. S 848 → 852. Gate: 507 pass, 0 fail.
 
 ## Experiments that did not stay
 
