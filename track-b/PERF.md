@@ -14,6 +14,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 7 | Blocks of 2 MiB or more on transparent huge pages; a window's id lists hold 16-bit offsets | run-91f41d207c31 | 0.2793 | 46.3 | 67.0 |
 | 8 | Term table sized once from the queries' term count, and its keys trimmed after the intern | run-533a441d6902 | 0.2705 | 45.1 | 67.5 |
 | 9 | Tokens that are no query term take the id of a bit that is never set, so clearing the seen bits takes no branch | run-d85affefdce5 | 0.2679 | 44.2 | 67.7 |
+| 10 | Only the term table on transparent huge pages, allocated alone at a 2 MiB boundary; the global allocator is gone | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -187,6 +188,21 @@ Locally, on step 7 (the scan is the same at step 8): branch misses 76.6 → 68.8
 interleaved rounds, cycles 7.07–7.10 → 6.81–6.84 G, task-clock 3,039–3,054 → 2,931–2,943 ms,
 elapsed 0.2858–0.2864 → 0.2781–0.2791 s in the two quiet rounds. Alternating runs, 20 each:
 median wall 286.0 → 277.3 ms (step 6: 297.9). S unchanged.
+
+## Step 10: huge pages for the term table only
+
+A huge page is resident as a whole, so step 7's allocator cost memory for every large block that
+only partly fills its last huge page: on the board, 43.1 → 46.3 MB, and still 44.2 MB at step 9.
+The term table is exactly two huge pages and the pass reads all of it, so it is the one block whose
+huge pages cost no memory. It is now allocated alone at a 2 MiB boundary and advised once, and the
+34-line global allocator goes, with step 8's trim of the keys, which only mattered on huge pages.
+Walk cycles: 427–517 M with no huge pages, 136 M at step 9, 246–257 M now.
+
+Locally, against step 9, three interleaved rounds: cycles 6.87–6.90 → 6.85–6.90 G, task-clock
+2,952–2,967 → 2,969–2,989 ms, elapsed 0.2755–0.2770 → 0.2770–0.2791 s. Alternating runs, 14 each,
+twice: median wall 275.6 and 276.9 → 276.8 and 278.7 ms (no huge pages at all: 282.5 and 282.2).
+memory.peak over six runs each: 39.4–42.8 → 39.3–41.8 MiB; this machine does not show the
+board's difference. S 871 → 849. Gate: 507 pass, 0 fail.
 
 ## Experiments that did not stay
 

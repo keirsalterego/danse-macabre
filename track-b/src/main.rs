@@ -36,7 +36,7 @@
 //! Memory stays at a few arrays per thread: per query a count, an id sum and the first
 //! matches, and per kept term one window's documents. Numbers: PERF.md.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::Layout;
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
@@ -70,57 +70,6 @@ const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const M_MMAP_THRESHOLD: i32 = -3;
 const MADV_HUGEPAGE: i32 = 14;
-
-/// The size of a huge page, and the smallest block that [`Allocator`] puts on huge pages.
-const HUGE: usize = 2 << 20;
-
-/// The system allocator, except that a block of at least [`HUGE`] bytes starts on a huge page
-/// boundary and asks for transparent huge pages. The pass reads the term table and the checks
-/// at random, and on 4 KiB pages most of those reads would first walk the page tables.
-struct Allocator;
-
-#[global_allocator]
-static ALLOCATOR: Allocator = Allocator;
-
-/// The layout [`Allocator`] gets from the system for a block of `layout`.
-fn huge(layout: Layout) -> Layout {
-    let align = if layout.size() < HUGE { 1 } else { HUGE };
-    layout.align_to(align).expect("a power of two")
-}
-
-// SAFETY: every block comes from `System` and goes back to it with the layout it came with.
-unsafe impl GlobalAlloc for Allocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: the caller's contract; `huge` only raises the alignment.
-        let block = unsafe { System.alloc(huge(layout)) };
-        if layout.size() >= HUGE {
-            // SAFETY: advice changes no data, and fails harmlessly on a null block.
-            unsafe { madvise(block, layout.size(), MADV_HUGEPAGE) };
-        }
-        block
-    }
-
-    unsafe fn dealloc(&self, block: *mut u8, layout: Layout) {
-        // SAFETY: `alloc` got `block` from `System` with `huge(layout)`.
-        unsafe { System.dealloc(block, huge(layout)) }
-    }
-
-    unsafe fn realloc(&self, block: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if layout.size().max(size) < HUGE {
-            // SAFETY: the caller's contract, and neither layout changes.
-            return unsafe { System.realloc(block, layout, size) };
-        }
-        // SAFETY: the caller's contract: `size` is nonzero and fits `layout.align()`.
-        let new = unsafe { self.alloc(Layout::from_size_align_unchecked(size, layout.align())) };
-        if !new.is_null() {
-            // SAFETY: both blocks are live and hold at least the smaller size.
-            unsafe { std::ptr::copy_nonoverlapping(block, new, layout.size().min(size)) };
-            // SAFETY: `block` was allocated with `layout`.
-            unsafe { self.dealloc(block, layout) };
-        }
-        new
-    }
-}
 
 fn main() -> Result<(), Box<dyn Error>> {
     // glibc raises its mmap threshold to the largest block freed so far, and blocks below it
@@ -312,8 +261,6 @@ fn parse_queries(text: &[u8], threads: usize) -> Result<(Queries, TermTable), St
             queries.terms.push(table.intern(*key));
         }
     }
-    // The keys grew by doubling; the spare capacity would sit in resident huge pages.
-    table.keys.shrink_to_fit();
     Ok((queries, table))
 }
 
@@ -1106,7 +1053,7 @@ fn key_hash(key: &Key) -> u64 {
 
 /// One slot of a [`TermTable`]: a term's first key word, its id and what the corpus pass does
 /// with it, 16 bytes that one load brings in.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Slot {
     /// `key[0]`, the term's first 8 bytes; 0 marks an empty slot, as a term's first byte is
     /// never zero.
@@ -1128,6 +1075,22 @@ impl Slot {
     const STORED: u32 = 8;
 }
 
+/// `len` empty slots on their own transparent huge pages, never freed. The pass reads the term
+/// table at random, and on 4 KiB pages most of those reads would first walk the page tables.
+fn huge_slots(len: usize) -> &'static mut [Slot] {
+    let layout = Layout::from_size_align(size_of::<Slot>() * len, 2 << 20).expect("fits");
+    // SAFETY: `len` is a power of two, so the size is nonzero.
+    let block = unsafe { std::alloc::alloc(layout) };
+    assert!(!block.is_null(), "out of memory");
+    // SAFETY: `block` holds `layout.size()` bytes, aligned for slots, and an all-zero slot is
+    // empty; the advice changes no data.
+    unsafe {
+        madvise(block, layout.size(), MADV_HUGEPAGE);
+        block.write_bytes(0, layout.size());
+        std::slice::from_raw_parts_mut(block.cast(), len)
+    }
+}
+
 /// Open-addressing map from query term to its [`Slot`]. A probe compares a slot's `head` with
 /// the token's first key word; only a term longer than 8 bytes, rare among tokens, then loads
 /// the rest of its key. So most tokens cost one memory access here, whether or not they are
@@ -1135,7 +1098,7 @@ impl Slot {
 /// the queries use.
 struct TermTable {
     /// The slot count is a power of two.
-    slots: Vec<Slot>,
+    slots: &'static mut [Slot],
     /// Term id → its key.
     keys: Vec<Key>,
 }
@@ -1145,7 +1108,7 @@ impl TermTable {
     /// doubles when more than half of `occurrences` are distinct terms.
     fn new(occurrences: usize) -> Self {
         Self {
-            slots: vec![Slot::default(); occurrences.next_power_of_two()],
+            slots: huge_slots(occurrences.next_power_of_two()),
             keys: Vec::new(),
         }
     }
@@ -1184,7 +1147,9 @@ impl TermTable {
         } else {
             // Rebuilt from the keys in id order, which reads them sequentially; each new slot
             // is prefetched 16 keys ahead.
-            self.slots = vec![Slot::default(); self.slots.len() * 2];
+            // shortcut: the old table is never freed, which costs memory only when more than
+            // half the term occurrences are distinct terms.
+            self.slots = huge_slots(self.slots.len() * 2);
             for id in 0..self.keys.len() {
                 if let Some(ahead) = self.keys.get(id + 16) {
                     self.prefetch(ahead);
