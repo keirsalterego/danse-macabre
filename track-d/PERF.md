@@ -13,7 +13,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 6 | The build's arrays faulted in before pass 2, one write per 2 MB on half the threads (3d3e358; measured together with step 7) | run-bb1fd514f3b2 | 0.1279 | 81.4 | 71.6 |
 | 7 | Each search's binary heap replaced by a bucket queue: a ring of 4,096 one-unit buckets found through a bitmap, with a small heap for keys past the ring (fc4ed14) | run-bb1fd514f3b2 | 0.1279 | 81.4 | 71.6 |
 | 8 | The query code shortened by 24 lines at the same speed: `answer` reuses `on_threads`, and the queue's helpers are folded together | run-966433fb4d85 | 0.1264 | 84.0 | 71.8 |
-| 9 | Each node's edge range kept in 2 bytes instead of a 4-byte offset, in groups of 4 nodes, and pass 3 run one direction at a time with its index faulted in first | | | | |
+| 9 | Each node's edge range kept in 2 bytes instead of a 4-byte offset, in groups of 4 nodes, and pass 3 run one direction at a time with its index faulted in first | run-ee72c614f94f | 0.1297 | 75.5 | 71.8 |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure

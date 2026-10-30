@@ -19,7 +19,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 12 | One mmap helper for input and output; 35 fewer code lines | run-ce9384368863 | 0.0269 | 25.1 | 79.4 |
 | 13 | Hour checked by comparing 8 timestamp bytes; exact 64-byte name compare without the hash; padded copies for the merge | run-b262ef9cc01a | 0.0258 | 25.2 | 79.9 |
 | 14 | Lean parse on a padded mapping, SWAR number output, names merged inside the parse, sorting networks for groups of up to 64, threads spawned as a tree, and a static-pie build | run-3c59aa35895d | 0.0220 | 24.5 | 81.3 |
-| 15 | 137 fewer code lines: a fixed-size name table, `OnceLock` hand-offs instead of a barrier leader, records written straight into each chunk | | | | |
+| 15 | 137 fewer code lines: a fixed-size name table, `OnceLock` hand-offs instead of a barrier leader, records written straight into each chunk | run-f13e9cd22a88 | 0.0215 | 24.4 | 82.5 |
 
 ## Step 1: v1
 
