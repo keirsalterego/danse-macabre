@@ -16,7 +16,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 9 | Tokens that are no query term take the id of a bit that is never set, so clearing the seen bits takes no branch | run-d85affefdce5 | 0.2679 | 44.2 | 67.7 |
 | 10 | Only the term table on transparent huge pages, allocated alone at a 2 MiB boundary; the global allocator is gone | run-b4d6bfbdd0e9 | 0.2698 | 43.9 | 67.7 |
 | 11 | A check's cell takes a match with a conditional move instead of a branch | run-6a27aa29cd80 | 0.2644 | 44.9 | 67.8 |
-| 12 | The corpus walk takes one callback per token and one per line end, so the per-token one is inlined | | | | |
+| 12 | The corpus walk takes one callback per token and one per line end, so the per-token one is inlined | run-68a53e20303e | 0.2450 | 43.8 | 68.8 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 

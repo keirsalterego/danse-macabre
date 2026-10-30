@@ -25,8 +25,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 18 | The name table's padded copies aligned to cache lines, and its slot array a fixed-size box | run-01b9bf369035 | 0.0212 | 20.6 | 83.5 |
 | 19 | The name hash takes one multiply instead of three dependent ones, and the slot is the product's top bits | run-4d1c6d742295 | 0.0207 | 21.3 | 83.5 |
 | 20 | Each output line built in a stack buffer with digit counts from the SWAR conversion; 12 fewer lines | run-1df3325795e7 | 0.0220 | 21.2 | 83.0 |
-| 21 | Each small group loaded into the sorting network with one AVX2 masked load | | | | |
-| 22 | The hour label formatted once per hour into the line buffer, and each number of up to 7 digits written with one store; 5 fewer lines | | | | |
+| 21 | Each small group loaded into the sorting network with one AVX2 masked load | run-c71602f005c5 | 0.0203 | 21.1 | 83.9 |
+| 22 | The hour label formatted once per hour into the line buffer, and each number of up to 7 digits written with one store; 5 fewer lines | run-c71602f005c5 | 0.0203 | 21.1 | 83.9 |
 
 ## Step 1: v1
 
@@ -270,6 +270,8 @@ user cycles 423.9 → 416.8 M, branch misses 1.25 → 1.12 M, instructions 779.1
 memory.peak unchanged. S unchanged at 400. Gate: 307 pass, 0 fail.
 
 ## Step 22: one store per number
+
+Steps 21 and 22 went to the board in one push, so both rows cite run-c71602f005c5.
 
 `hour_label` is folded into `format_hour`, which formats the label once per hour into the
 line's stack buffer. `put_number` writes the space and the digits of a value below 10^7 as one

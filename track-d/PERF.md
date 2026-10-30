@@ -16,7 +16,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 9 | Each node's edge range kept in 2 bytes instead of a 4-byte offset, in groups of 4 nodes, and pass 3 run one direction at a time with its index faulted in first | run-ee72c614f94f | 0.1297 | 75.5 | 71.8 |
 | 10 | Label distances aligned to 4 bytes, so a label table entry takes 12 bytes instead of 16 | run-37fab0938045 | 0.1280 | 69.4 | 72.3 |
 | 11 | Each queue's top kept between steps; a step recomputes only its own side's | run-37fab0938045 | 0.1280 | 69.4 | 72.3 |
-| 12 | Pass 2's runs kept as two slice iterators instead of their `zip`: 32 bytes a run instead of 48 | | | | |
+| 12 | Pass 2's runs kept as two slice iterators instead of their `zip`: 32 bytes a run instead of 48 | run-0581a96cbf3c | 0.1259 | 70.7 | 72.4 |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
