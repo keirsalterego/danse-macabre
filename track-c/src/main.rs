@@ -34,9 +34,8 @@
 //!    and not a record end. [`guess_bounds`] takes the first LF after each cut that a digit or a
 //!    BOM follows, which no generated note holds, so no pass over the file comes first. Each
 //!    thread reports where its run's last record ended, and the guesses are right exactly when
-//!    every run ends where the next one starts. Otherwise [`record_bounds`] finds the exact cuts
-//!    with a parallel pre-pass that takes the parity of each chunk's quotes, and the join runs
-//!    again.
+//!    every run ends where the next one starts. Otherwise the join runs again on one thread,
+//!    which parses the whole file from its first record and so needs no guess.
 //! 3. **Each thread walks its records field by field.** [`aggregate`] parses each record in
 //!    order and sums into its own [`Group`] per country. Names and notes are quoted, and
 //!    [`text_field`] jumps from quote to quote 32 bytes at a time with AVX2 compares. It measures
@@ -103,6 +102,11 @@ use std::thread::{self, Thread};
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 /// The first line of `records.csv`, after its optional BOM.
 const HEADER: &[u8] = b"id,name,note,region_id,amount";
+/// One more record, which [`map_file`] puts after the last byte of `records.csv`, on a line of
+/// its own. Its name and note are quoted and hold more than quotes, so a parse that starts
+/// inside a record stops within it at the latest (see [`guess_bounds`]), and no parse can run
+/// off the end of the input. No run covers it, so it never reaches the output.
+const SENTINEL: &[u8] = b"\n0,\"a\",\"a\",0,0.00\n";
 /// The number of possible country codes. Codes are `[A-Z]{3}` (spec §2.3), so a code read as a
 /// base-26 number indexes a table of 26³ entries, and that number sorts like the code's bytes.
 const CODES: usize = 26 * 26 * 26;
@@ -123,10 +127,16 @@ unsafe extern "C" {
 const MADV_DONTNEED: i32 = 4;
 /// `mallopt` parameter: the size from which `malloc` maps memory of its own.
 const M_MMAP_THRESHOLD: i32 = -3;
-/// `mmap` protection: the pages are readable and nothing else.
+/// `mmap` protection: the pages are readable.
 const PROT_READ: i32 = 1;
+/// `mmap` protection: the pages are writable.
+const PROT_WRITE: i32 = 2;
 /// `mmap` flag: a private mapping, so nothing we do could ever write back to the file.
 const MAP_PRIVATE: i32 = 2;
+/// `mmap` flag: map at exactly the address given, over whatever is mapped there.
+const MAP_FIXED: i32 = 0x10;
+/// `mmap` flag: memory that no file backs, all zeros.
+const MAP_ANONYMOUS: i32 = 0x20;
 /// `prctl` option: no transparent huge pages for this process (see [`main`]).
 const PR_SET_THP_DISABLE: i32 = 41;
 
@@ -153,8 +163,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
-    let regions = parse_regions(map_file(&Path::new(&data_dir).join("regions.csv"))?)?;
-    let records = map_file(&Path::new(&data_dir).join("records.csv"))?;
+    let regions = parse_regions(map_file(&Path::new(&data_dir).join("regions.csv"), b"")?)?;
+    let records = map_file(&Path::new(&data_dir).join("records.csv"), SENTINEL)?;
     let out = join(records, &regions)?;
     let out_path = Path::new(&out_dir).join("aggregates.txt");
     std::fs::write(&out_path, out).map_err(|e| format!("{}: {e}", out_path.display()))?;
@@ -163,35 +173,44 @@ fn main() -> Result<(), Box<dyn Error>> {
     std::process::exit(0)
 }
 
-/// Maps the whole file read-only and hands it out as one byte slice for the rest of the run.
+/// Maps the whole file, followed by the bytes of `pad`, and hands it out as one byte slice for
+/// the rest of the run.
 ///
 /// The page cache is pre-warmed, so the mapping copies nothing and charges almost nothing to our
 /// memory cgroup, where reading the file into the heap would charge all of it. Every name and
 /// note stays a range into this slice and is never copied out.
-fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
+///
+/// The file is mapped over the start of a reservation of anonymous memory, whose rest holds the
+/// pad. The mappings are writable so that the pad can be written, which copies at most the
+/// file's last page. They are private, so nothing is ever written back to the file.
+fn map_file(path: &Path, pad: &'static [u8]) -> Result<&'static [u8], Box<dyn Error>> {
     let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let len = usize::try_from(file.metadata()?.len())?;
     if len == 0 {
-        return Ok(&[]); // mmap rejects a zero length
+        return Ok(pad); // mmap rejects a zero length
     }
-    // SAFETY: a new read-only private mapping of an open fd; the kernel picks the address.
-    let ptr = unsafe {
-        mmap(
-            std::ptr::null_mut(),
-            len,
-            PROT_READ,
-            MAP_PRIVATE,
-            file.as_raw_fd(),
-            0,
-        )
-    };
+    let ptr = map(std::ptr::null_mut(), len + pad.len(), MAP_ANONYMOUS, -1)
+        .and_then(|ptr| map(ptr, len, MAP_FIXED, file.as_raw_fd()))
+        .map_err(|e| format!("mmap {}: {e}", path.display()))?;
+    // SAFETY: the mappings hold `len + pad.len()` writable bytes that nothing refers to yet, and
+    // they are never unmapped, so they outlive every borrow. /data is mounted read-only, so the
+    // file's bytes cannot change under us.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, len + pad.len()) };
+    bytes[len..].copy_from_slice(pad);
+    Ok(bytes)
+}
+
+/// Maps `len` readable and writable private bytes of the file `fd` from its start, or of
+/// anonymous memory with [`MAP_ANONYMOUS`] in `flags` and `fd` -1, and returns their address.
+/// They go to address `at` with [`MAP_FIXED`], and wherever the kernel picks for a null `at`.
+fn map(at: *mut u8, len: usize, flags: i32, fd: i32) -> std::io::Result<*mut u8> {
+    // SAFETY: a new mapping at an address the kernel picks overlaps no memory we already use, and
+    // the one fixed address we pass is our own fresh reservation, which nothing refers to yet.
+    let ptr = unsafe { mmap(at, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | flags, fd, 0) };
     if ptr.addr() == usize::MAX {
-        let err = std::io::Error::last_os_error();
-        return Err(format!("mmap {}: {err}", path.display()).into());
+        return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: the mapping holds `len` readable bytes and is never unmapped, so it outlives every
-    // borrow. /data is mounted read-only, so the bytes cannot change under us.
-    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+    Ok(ptr)
 }
 
 /// Gives the whole pages inside `bytes` back to the kernel with `madvise(MADV_DONTNEED)`.
@@ -207,7 +226,9 @@ fn release(bytes: &[u8]) {
     let start = bytes.as_ptr().addr();
     let (first, end) = (start.next_multiple_of(4096), (start + bytes.len()) & !4095);
     if first < end {
-        // SAFETY: the pages lie inside `bytes`, in a read-only file mapping that stays mapped.
+        // SAFETY: the pages lie inside `bytes`, in a file mapping that stays mapped. A run ends
+        // where the pad that `map_file` wrote starts, so they hold only bytes of the file, and
+        // a later read of them sees the same bytes.
         unsafe { madvise(bytes.as_ptr().with_addr(first), end - first, MADV_DONTNEED) };
     }
 }
@@ -338,22 +359,22 @@ const MAILBOX: usize = 256;
 /// Spins of a worker that waits at the barrier before it parks (see [`Exchange::wait`]).
 const SPINS: usize = 2000;
 
-/// Parses every record, joins it to its group and returns the output text.
+/// Parses every record, joins it to its group and returns the output text. `records` is the
+/// file followed by the [`SENTINEL`].
 ///
 /// This is a parallel map-reduce. Each thread aggregates one run of whole records in
 /// [`aggregate`], and the partial [`Group`]s are merged in thread order at the end. The runs
-/// come from [`guess_bounds`], or from [`record_bounds`] when a guess turns out wrong. Distinct
-/// names are split between the threads by hash, so each name has one owner that counts it, and
-/// the threads hand names to their owners through an [`Exchange`].
+/// come from [`guess_bounds`], and when a guess turns out wrong, one thread parses all the
+/// records instead. Distinct names are split between the threads by hash, so each name has one
+/// owner that counts it, and the threads hand names to their owners through an [`Exchange`].
 fn join(records: &'static [u8], regions: &Regions) -> Result<Vec<u8>, String> {
-    let body = body_start(records)?;
+    let len = records.len() - SENTINEL.len();
+    let body = body_start(&records[..len])?;
     let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
-    let mut guess = guess_bounds(records, body, threads);
+    let mut bounds = guess_bounds(&records[..len], body, threads);
     loop {
-        let guessed = guess.is_some();
-        let bounds = (guess.take()).unwrap_or_else(|| record_bounds(records, body, threads));
         // A worker registers with its exchange once, so every attempt needs a new one.
-        let exchange = &Exchange::new(threads);
+        let exchange = &Exchange::new(bounds.len() - 1);
         let parts: Vec<(Vec<Group>, usize)> = thread::scope(|s| {
             let work = |me, range| aggregate(me, records, range, regions, exchange);
             let workers: Vec<_> = (bounds.windows(2).enumerate())
@@ -363,16 +384,18 @@ fn join(records: &'static [u8], regions: &Regions) -> Result<Vec<u8>, String> {
                 .map(|w| w.join().expect("a panic aborts the process"))
                 .collect()
         });
-        // A guess is right exactly when the run before it ends where it starts. After a wrong
-        // one the join runs again on exact runs.
-        if guessed && !parts.iter().map(|p| p.1).eq(bounds[1..].iter().copied()) {
-            continue;
+        // A guess is right exactly when the run before it ends where it starts. The last run
+        // ends one byte past the file when the last record has no line break.
+        if (parts.iter().zip(&bounds[1..])).all(|(part, &next)| part.1.min(len) == next) {
+            let mut groups = vec![Group::EMPTY; regions.codes.len() + 1];
+            for (part, _) in &parts {
+                groups.iter_mut().zip(part).for_each(|(g, p)| g.merge(p));
+            }
+            return Ok(format_output(&groups, regions));
         }
-        let mut groups = vec![Group::default(); regions.codes.len() + 1];
-        for (part, _) in &parts {
-            groups.iter_mut().zip(part).for_each(|(g, p)| g.merge(p));
-        }
-        return Ok(format_output(&groups, regions));
+        // After a wrong guess, one thread parses everything from the first record, which is
+        // exact.
+        bounds = vec![body, len];
     }
 }
 
@@ -388,102 +411,30 @@ fn body_start(records: &[u8]) -> Result<usize, String> {
     Ok(records.len() - rest.len())
 }
 
-/// Guesses where `parts` runs of whole records after `body` start, with no pass over the file.
-/// Returns the starts and then the exact start of the file's last few records, which the last
-/// run's worker parses after its run (see [`aggregate`]), or `None` if no tail fits the rules
-/// below.
+/// Guesses where `parts` runs of whole records after `body` start, with no pass over the file,
+/// and returns the starts and then the end of the file.
 ///
-/// [`record_bounds`] reads all 200 MB once just to count quotes before any worker starts, and
-/// dropping that pass saved 4 to 5 ms (PERF.md, step 10). A guess reads a few bytes per cut
-/// instead: it takes the first LF that a digit or a BOM follows. A record starts that way, and an
-/// LF inside a generated note is followed by a word or a quote (§2.2), so on generated data no
-/// guess is wrong. Spec §2.1 lets any byte follow an LF in a note, though, so [`join`] checks every
-/// guess after the parse and reruns on exact runs.
+/// Splitting a CSV in parallel is hard, because an LF inside a quoted field looks exactly like a
+/// record end. The exact way is a pass that takes the parity of the quotes before each cut, but
+/// that pass reads all 200 MB before any worker starts, and dropping it saved 4 to 5 ms (PERF.md,
+/// step 10). A guess reads a few bytes per cut instead: it takes the first LF that a digit or a
+/// BOM follows. A record starts that way, and an LF inside a generated note is followed by a word
+/// or a quote (§2.2), so on generated data no guess is wrong. Spec §2.1 lets any byte follow an
+/// LF in a note, though, so [`join`] checks every guess after the parse.
 ///
 /// A wrong guess must cost only time, never a crash. The parse that starts at one reads past its
 /// run, but never past the first real record whose name and note are quoted and hold more than
 /// quotes. Such a field opens and closes with an odd run of quotes, and a quoted scan ends at the
 /// first odd run, so each scan of a misread record stops at that record's quotes, commas or dot.
-/// So the runs end at the start of the tail, which must hold such a record, and the tail itself
-/// is parsed from its exact start. That start comes from the parity of the quotes after it: a
-/// valid file holds an even number of quotes, so that parity is also the quote state where the
-/// count starts.
-fn guess_bounds(data: &[u8], body: usize, parts: usize) -> Option<Vec<usize>> {
-    // 4 KiB hold dozens of records, and counting their quotes takes a microsecond.
-    let from = data.len().saturating_sub(4 << 10).max(body);
-    let odd = data[from..].iter().fold(false, |odd, &b| odd ^ (b == b'"'));
-    let tail = next_record_start(data, from, odd);
-    // A quoted field that holds more than quotes opens and closes with an odd run of quotes.
-    let good = |f: Range<usize>| data[f.start - 1] == b'"' && data[f].iter().any(|&b| b != b'"');
-    let mut at = tail;
-    loop {
-        let comma = at + data[at..].iter().position(|&b| b == b',')?;
-        let (name, _, after_name) = text_field(data, comma + 1);
-        let (note, _, after_note) = text_field(data, after_name);
-        if good(name) && good(note) {
-            break;
-        }
-        at = next_record_start(data, after_note, false);
-    }
+/// The [`SENTINEL`] after the file is such a record.
+fn guess_bounds(file: &[u8], body: usize, parts: usize) -> Vec<usize> {
     // After an LF, a digit or a BOM, whose first byte is 0xEF. The first guess is `body` itself.
-    let start = |&k: &usize| data[k - 1] == b'\n' && matches!(data[k], b'0'..=b'9' | 0xEF);
+    let start = |&k: &usize| file[k - 1] == b'\n' && matches!(file[k], b'0'..=b'9' | 0xEF);
     let guess = |i| {
-        let cut = body + (tail - body) * i / parts;
-        (cut..tail).find(start).unwrap_or(tail)
+        let cut = body + (file.len() - body) * i / parts;
+        (cut..file.len()).find(start).unwrap_or(file.len())
     };
-    Some((0..parts).map(guess).chain([tail]).collect())
-}
-
-/// Cuts the records after `body` into `parts` runs of whole records, with a quote-parity
-/// pre-pass. It is exact on every valid file, and [`join`] falls back to it when a guess from
-/// [`guess_bounds`] is wrong.
-///
-/// Splitting a CSV in parallel is hard because an LF inside a quoted field looks exactly like a
-/// record end. The way out is that quotes come in pairs: unquoted fields hold none, and a quoted
-/// field adds its two delimiters plus two per `""`. So a position is inside quotes exactly when
-/// an odd number of quotes precede it. Each thread takes the parity of its chunk's quotes, and
-/// a prefix XOR over those parities gives the quote state at every cut. [`next_record_start`]
-/// then finds each cut's first record. The parity is an XOR of bytes, which the compiler
-/// vectorizes over all 32 byte lanes of an AVX2 register (`vpcmpeqb` on `ymm`).
-fn record_bounds(data: &[u8], body: usize, parts: usize) -> Vec<usize> {
-    let cuts: Vec<usize> = (0..=parts)
-        .map(|i| body + (data.len() - body) * i / parts)
-        .collect();
-    let odd_quotes: Vec<bool> = thread::scope(|s| {
-        let counters: Vec<_> = (cuts.windows(2))
-            .map(|w| &data[w[0]..w[1]])
-            .map(|chunk| s.spawn(move || chunk.iter().fold(0, |odd, &b| odd ^ u8::from(b == b'"'))))
-            .collect();
-        (counters.into_iter())
-            .map(|c| c.join().expect("a panic aborts the process") == 1)
-            .collect()
-    });
-    let mut bounds = vec![body];
-    let mut in_quotes = false;
-    for (&cut, &odd) in cuts[1..parts].iter().zip(&odd_quotes) {
-        in_quotes ^= odd;
-        bounds.push(next_record_start(data, cut, in_quotes));
-    }
-    bounds.push(data.len());
-    bounds
-}
-
-/// Returns the first record start at or after `at`, given `in_quotes`, the quote state at `at`.
-///
-/// A record starts right after an LF that is outside quotes (spec §2.1). A BOM, if any, is the
-/// record's first byte, so it stays with the record. The scan starts one byte early so that `at`
-/// itself counts when an LF precedes it, which keeps the bounds exact when a cut lands right on a
-/// record start.
-fn next_record_start(data: &[u8], at: usize, mut in_quotes: bool) -> usize {
-    in_quotes ^= data[at - 1] == b'"';
-    for (i, &b) in data[at - 1..].iter().enumerate() {
-        match b {
-            b'"' => in_quotes = !in_quotes,
-            b'\n' if !in_quotes => return at + i,
-            _ => {}
-        }
-    }
-    data.len()
+    (0..parts).map(guess).chain([file.len()]).collect()
 }
 
 /// The running aggregates of one output line.
@@ -507,23 +458,19 @@ struct Group {
     distinct: u64,
 }
 
-impl Default for Group {
-    /// An empty group: no records, with min and max at the extremes.
-    fn default() -> Self {
-        Self {
-            count: 0,
-            id_sum: 0,
-            amount_sum: 0,
-            amount_min: i64::MAX,
-            amount_max: i64::MIN,
-            name_bytes: 0,
-            note_bytes: 0,
-            distinct: 0,
-        }
-    }
-}
-
 impl Group {
+    /// An empty group: no records, with min and max at the extremes.
+    const EMPTY: Self = Self {
+        count: 0,
+        id_sum: 0,
+        amount_sum: 0,
+        amount_min: i64::MAX,
+        amount_max: i64::MIN,
+        name_bytes: 0,
+        note_bytes: 0,
+        distinct: 0,
+    };
+
     /// Adds `other`'s records to this group. [`aggregate`] also adds each single record this
     /// way, as a group of one, so there is one place that knows how fields combine.
     fn merge(&mut self, other: &Self) {
@@ -550,10 +497,8 @@ impl Group {
 /// for all workers, and then marks the names posted to it in its own [`NameSet`].
 ///
 /// Returns the groups and where the parse of `range` stopped, the first record start at or
-/// after `range.end`, by which [`join`] checks guessed runs. The last worker then parses on from
-/// `range.end` to the end of the file, because with runs from [`guess_bounds`] that is where
-/// the file's tail starts. After the last round the worker gives its run's pages back (see
-/// [`release`]).
+/// after `range.end`, by which [`join`] checks guessed runs. After the last round the worker
+/// gives its run's pages back (see [`release`]).
 fn aggregate(
     me: usize,
     data: &'static [u8],
@@ -562,22 +507,22 @@ fn aggregate(
     exchange: &Exchange,
 ) -> (Vec<Group>, usize) {
     let group_count = regions.codes.len() + 1;
-    let mut groups = vec![Group::default(); group_count];
+    let mut groups = vec![Group::EMPTY; group_count];
     // Full scale draws from 100,000 names (spec §2.2) in 202 MB (§5), about one per 2 KiB, and
     // a thread owns a share of them. The set grows when a file has more.
     let mut names = NameSet::new(group_count, data.len() / 2048 / exchange.threads);
     let mut sent = vec![0; exchange.threads];
     let mut at = range.start;
-    let (mut end, mut ended) = (range.end, None);
     (exchange.workers[me].set(thread::current())).expect("each worker registers once");
     for round in 0.. {
         let half = round % 2;
         sent.fill(0);
-        let round_end = end.min(at + ROUND_BYTES);
+        let round_end = range.end.min(at + ROUND_BYTES);
         while at < round_end {
             // A BOM at the start of a record is not data (§2.1). It sits in front of the id, so
-            // missing it would show up in `id_sum`.
-            if data[at..].starts_with(BOM) {
+            // missing it would show up in `id_sum`. The test of its first byte keeps the whole
+            // compare, a call to `bcmp`, off the path of every other record.
+            if data[at] == BOM[0] && data[at..].starts_with(BOM) {
                 at += BOM.len();
             }
             let (id, comma) = number(data, at, b',');
@@ -615,12 +560,8 @@ fn aggregate(
                 break;
             }
         }
-        // The last worker goes on from the exact start of the file's tail (see `guess_bounds`).
-        if at >= end && ended.is_none() && me + 1 == exchange.threads {
-            (ended, at, end) = (Some(at), end, data.len());
-        }
         exchange.seal(half, me, &sent);
-        let all_done = exchange.wait(me, round, at >= end);
+        let all_done = exchange.wait(me, round, at >= range.end);
         for from in 0..exchange.threads {
             names.read(exchange.letters(half, from, me), data, &mut groups);
         }
@@ -629,7 +570,7 @@ fn aggregate(
         }
     }
     release(&data[range]);
-    (groups, ended.unwrap_or(at))
+    (groups, at)
 }
 
 /// Parses the decimal digits from `at` up to the `stop` byte, and returns the value and the
@@ -640,7 +581,8 @@ fn aggregate(
 /// `stop` into a zero byte, which a zero-byte test finds. Shifting the digits to the top of the
 /// word turns the missing ones into leading zeros, and three multiplies then join neighbouring
 /// digits into pairs, pairs into fours and fours into the value. Longer fields, such as an id
-/// with leading zeros (§2.1 allows them), and the file's last 7 bytes take the loop over bytes.
+/// with leading zeros (§2.1 allows them), and the last 7 bytes of `data` take the loop over
+/// bytes.
 ///
 /// It is always inlined. At each of its three call sites `stop` is a constant, so the call and
 /// the multiply that copies `stop` into every byte disappear, 29 instructions per record.
@@ -680,8 +622,8 @@ fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
 ///
 /// Inside quotes only the quotes matter, so the scan jumps from one quote to the next with
 /// [`byte_mask`], 32 bytes per step. A name or a note usually ends within the first step, where
-/// a loop over bytes took one step and one branch per byte. The file's last 31 bytes, too few for
-/// a step, go one byte at a time.
+/// a loop over bytes took one step and one branch per byte. The last 31 bytes of `data`, too few
+/// for a step, go one byte at a time.
 ///
 /// It is always inlined. As a call it returned its four words through the stack, and the caller
 /// read two of them back with one 16-byte load, which waits until both 8-byte stores reach the
@@ -1027,16 +969,12 @@ fn zeroed(len: usize) -> Box<[AtomicU64]> {
 /// Group numbers already follow bytewise order (see [`Regions`]), so this is a walk, not a sort.
 fn format_output(groups: &[Group], regions: &Regions) -> Vec<u8> {
     let mut out = Vec::new();
-    for g in (1..groups.len()).chain([0]) {
-        let group = &groups[g];
+    // Group k + 1 is country k, and group 0, `_UNMATCHED`, goes last.
+    let keys = (regions.codes.iter().map(|code| &code[..])).chain([&b"_UNMATCHED"[..]]);
+    for (key, group) in keys.zip(groups[1..].iter().chain(&groups[..1])) {
         if group.count == 0 {
             continue; // a country without records prints nothing (§3)
         }
-        let key: &[u8] = if g == 0 {
-            b"_UNMATCHED"
-        } else {
-            &regions.codes[g - 1]
-        };
         out.extend_from_slice(key);
         writeln!(
             out,

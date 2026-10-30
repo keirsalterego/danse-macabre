@@ -16,6 +16,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 9 | Each distinct name owned by one thread: names travel to their owner in rounds, and each owner marks them in a private table. Region table at one byte per id | run-b8279a47babc | 0.0510 | 14.83 | 69.7 |
 | 10 | Each run's first record guessed instead of found by a quote pre-pass, with a check after the parse and an exact rerun when a guess is wrong. Each worker gives its input pages back after the last round | run-b480cbf26ce8 | 0.0418 | 14.8 | 71.7 |
 | 11 | Hash slots tagged with 8 bits of the name's hash, at half the size; `regions.csv` parsed on all threads; long names kept in the same table | run-cddb49a6dc40 | 0.0422 | 12.3 | 72.4 |
+| 12 | The BOM test reads one byte before it compares three, which takes a `bcmp` call off every record. A sentinel record after the mapped input replaces step 10's exact tail, and one thread replaces the quote pre-pass after a wrong guess | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -424,6 +425,45 @@ count and at 1, 3, 12, 37 and 64 threads; tiny rounds (100-byte rounds, 3-letter
 1, 2, 3, 12 and 64 threads; and against the reference, at the default count and at 64 threads,
 a region set with groups wider than 254 countries and one with shuffled ids. A bad region row
 still stops the join with its error.
+
+## Step 12: one `bcmp` call less per record, and 59 lines less
+
+1. **The BOM test.** `data[at..].starts_with(BOM)` compiled to a call to glibc's `bcmp` for
+   every record, after a `vzeroupper`, because LLVM left the 3-byte compare as a call. Testing
+   the first byte first leaves the call to the records that start with 0xEF.
+2. **A sentinel record instead of the exact tail.** `map_file` maps `records.csv` over a
+   reservation of anonymous memory and writes one more record after it, `0,"a","a",0,0.00` on a
+   line of its own. Its name and note are quoted, so a parse from a wrong guess stops within it
+   at the latest, as step 10 showed for any such record. Step 10's tail is then redundant: no
+   quote parity over the last 4 KiB, no search there for such a record, no jump of the last
+   worker into the tail, and no `next_record_start`. The last run ends at the end of the file.
+   The mapping is writable and private; writing the sentinel copies at most the file's last
+   page, and no run's pages hold it, so the release never drops it.
+3. **One thread instead of the pre-pass after a wrong guess.** Guesses go wrong only on files
+   outside §2.2, where speed is not scored, so the rerun parses the whole body on one worker
+   from its exact start, and `record_bounds` and its parallel quote count go.
+4. **Smaller cuts.** `Group::EMPTY` replaces the `Default` impl, and the output walk zips the
+   keys with the groups.
+
+On top of step 11, P-cores, wall time of interleaved runs (`ab.py`, 101 runs each), median / min
+in ms. "Lines only" is items 2 to 4 without item 1.
+
+| | step 11 | lines only | step 12 |
+|---|---|---|---|
+| session 1 | 43.17 / 41.87 | 43.36 / 41.91 | 40.47 / 39.71 |
+| session 2 | 43.09 / 41.83 | | 40.57 / 39.68 |
+
+memory.peak in the container with the harness's flags, 6 runs each: 12.7–13.3 MB for step 11
+and 12.5–13.5 MB for step 12. Page faults stay at 6,390. S 622 → 563: the pre-pass −23 lines,
+the tail −27 (−40 there, +13 for the mapping and its constants), `Group::EMPTY` −4, the output
+walk −5.
+
+Correctness checks: the gate (307 pass, 0 fail); full seeds 1 to 4 against the reference; the
+400 random and 400 hostile cases at the default thread count and at 1, 3, 12, 37 and 64 threads,
+where up to 397 of the hostile runs guessed wrong and all reran to the reference's output; and
+every byte offset of the body of 72 files (490,079 offsets), each forced as an exact cut and as
+a guess with the second run reading on into the sentinel: no crash or hang, and the 8,783
+offsets that are record starts tiled and gave the same output.
 
 ## Experiments that did not stay
 
