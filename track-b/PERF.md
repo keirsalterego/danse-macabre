@@ -9,7 +9,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 2 | Term keys read with one masked 32-byte load; tokens found 64 bytes at a time from AVX2 masks | run-03e880c5be0a | 0.5555 | 182.1 | 55.5 |
 | 3 | Costly BOOL queries evaluated on per-chunk bitsets and id lists, the rest checked per document; one 16-byte prefetched probe per token; first matches grouped per thread | run-0ba4a60c4e07 | 0.4085 | 82.7 | 60.9 |
 | 4 | Queries parsed on every thread into flat arrays; the plan's per-term lists built with one counting sort | run-03f5349811b3 | 0.3798 | 70.7 | 62.1 |
-| 5 | Queries on sets evaluated every 4,096 documents inside the pass; glibc's mmap threshold fixed at 128 KiB | | | | |
+| 5 | Queries on sets evaluated every 4,096 documents inside the pass; glibc's mmap threshold fixed at 128 KiB | run-16bfddb1c5c1 | 0.3708 | 45.7 | 64.3 |
+| 6 | Per-document BOOL queries compiled to 64-bit truth tables with one packed tally each, prefetched at the trigger term; term keys folded through a mask table | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -90,6 +91,45 @@ kept for its whole chunk.
 Locally, step 4 → 5, six interleaved rounds on a busy machine: cycles 9.74–9.89 → 9.73–9.89 G,
 elapsed 0.3926 → 0.3867 s in the quietest round; memory.peak 68.4–69.8 → 39.6–40.8 MB over five
 runs. S went from 803 to 790.
+
+## Step 6: checks without branches
+
+Where step 5's time went on seed 1, found by switching off one stage at a time:
+
+| Stage | ms |
+|---|---|
+| Start-up on one thread: query parse 15 (11 of it interning terms), plan 15 | 30 |
+| Tokenizer | 41 |
+| Each token's key: the u128 masking took about 77 instructions a token, and `key_in` was not inlined | 36 |
+| Hashing, prefetching and storing each token's lookup for the line end | 19 |
+| Term lookup at the line end (23 M branch misses) | 55 |
+| Per-token bookkeeping, seen bits and flags (31 M branch misses) | 65 |
+| Phrase checks | 7 |
+| Per-document BOOL checks and their tallies: 17.5 M checks at about 160 cycles and 3 branch misses each | 132 |
+
+Branch misses wasted 35% of all pipeline slots; waiting on memory, 5%. So the checks lost
+their branches first. Each change below is measured on top of the ones before it (medians,
+local, turbo off; step 5 ran 384–387 ms in the same sessions):
+
+1. **Truth tables.** Each per-document BOOL query has at most 6 distinct terms, so it compiles to
+   a 64-bit truth table: its AND, OR and NOT applied to six fixed bit masks. The skip for
+   documents already counted from an earlier cover term is folded into the table. A check is a
+   shift and a mask. 350.5 ms; branch misses 117 → 80 M.
+2. **One tally per check.** Each check keeps its count and id sum in one u64 next to its
+   neighbours, and the check and its tally are prefetched when the trigger term is first seen
+   in a document. 320 ms.
+3. **A mask table for the key fold.** A sliding table of 0xFF bytes replaces the u128 shifts,
+   `key_in` inlines, and 2.2 G instructions disappear. 288.5 ms, but memory rose 8–10 MB.
+4. **The memory back.** Each query keeps only its first ten matches, every per-query tally is
+   one u64 (`count << 40 | id sum`), and the check tallies are freed before the grouping.
+   296.4 and 296.9 ms over two rounds of 11 runs (min 289.6). memory.peak 44.9 MB against
+   44.6 MB for step 5 (8 interleaved samples each, noise ±2 MB).
+
+S 790 → 837. Gate: 507 pass, 0 fail. The packed sums limit the corpus to fewer than 2^20
+documents; a larger one stops with an error, and the spec's full scale has 250,000.
+
+Tried and dropped: a parallel sampling pass (3 ms faster, inside the noise), and no cap on the
+first matches (5 ms faster, 2.7 MB more).
 
 ## Experiments that did not stay
 

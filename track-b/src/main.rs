@@ -25,7 +25,7 @@
 //!    [`walk`] finds the tokens 64 bytes at a time from AVX2 bit masks. At the end of each
 //!    document, every query its triggers point at is checked against that document alone: a
 //!    phrase at each position of its trigger term, a BOOL query by applying its operators to
-//!    "does this document contain the term" ([`run_checks`]). Set operations act on each
+//!    "does this document contain the term" ([`Check`]). Set operations act on each
 //!    document separately, so this gives the same answer as combining whole sets (spec §3).
 //!    For the queries on sets, the pass records which documents of the current [`Window`]
 //!    hold their terms, a bitset per common term and an id list per rare one, and evaluates
@@ -51,6 +51,9 @@ const SAMPLE_DOCS: usize = 1000;
 const MISS: u32 = u32::MAX;
 /// An output line lists at most this many ids (spec §4).
 const SHOWN_IDS: usize = 10;
+/// The low bits of a [`Tally`] cell hold the sum of the ids matched in a chunk, which
+/// [`answer_all`] keeps below `2^SUM_BITS`; the high bits hold their count.
+const SUM_BITS: u32 = 40;
 /// A term is common when at least one sampled document in this many holds it: its bitset
 /// is then no bigger than a list of 32-bit ids.
 const DENSE_SHARE: usize = 32;
@@ -132,6 +135,15 @@ fn answer_all(query_text: &[u8], docs: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     let firsts = (bounds.iter())
         .map(|&at| id_at(docs, at))
         .collect::<Result<Vec<_>, _>>()?;
+    // A query's id sum over a chunk stays below the square of the document count.
+    // shortcut: 2^20 or more documents stop here; the spec's full scale has 250,000. Widen the
+    // cells to u128 if a corpus that large must run.
+    if firsts
+        .last()
+        .is_some_and(|&n| u64::from(n).pow(2) >> SUM_BITS != 0)
+    {
+        return Err("docs.txt: too many documents".into());
+    }
     let (queries, plan) = (&queries, &plan);
     let chunks: Vec<Chunk> = thread::scope(|s| {
         let scanners: Vec<_> = (0..threads)
@@ -173,11 +185,6 @@ enum Op {
     And,
     Or,
     Not,
-}
-
-impl Op {
-    /// Every operator, indexed by its `as u32` value.
-    const ALL: [Op; 3] = [Op::And, Op::Or, Op::Not];
 }
 
 /// The queries of `queries.txt` in file order, their terms in flat arrays. Duplicate lines stay
@@ -330,12 +337,7 @@ struct Plan {
     phrases: Vec<(u32, u32)>,
     /// Term `t` triggers the per-document checks `checks[check_at[t]..check_at[t + 1]]`.
     check_at: Vec<u32>,
-    /// Checks of BOOL queries evaluated per document, back to back, each laid out as
-    /// `q, n, s_1..s_n, m, op_1, t_1, .., op_m, t_m`. Query `q` matches a document that holds
-    /// none of the cover terms `s_1..s_n` (a document holding one was checked from that term)
-    /// and whose terms satisfy the operators, applied left to right starting from no match:
-    /// `op_1` is OR. A check sits in one flat array so that running it reads no other memory.
-    checks: Vec<u32>,
+    checks: Vec<Check>,
     /// Per term: how its documents are kept.
     store: Vec<Store>,
     /// The number of `Store::Bits` rows.
@@ -389,17 +391,12 @@ impl Plan {
                 continue;
             }
             bool_cover(queries.steps(i), cost, &mut cover);
-            if !cover.iter().any(|&t| common(t)) {
+            if !cover.iter().any(|&t| common(t))
+                && let Some(check) = Check::new(i as u32, queries.steps(i), terms.len() as u32)
+            {
                 for (k, &term) in cover.iter().enumerate() {
-                    let mut push = |word| checks.push((term, word));
-                    push(i as u32);
-                    push(k as u32);
-                    cover[..k].iter().for_each(|&t| push(t));
-                    push(query.len() as u32);
-                    for (op, t) in queries.steps(i) {
-                        push(op as u32);
-                        push(t);
-                    }
+                    // A document holding an earlier cover term was checked from that term.
+                    checks.push((term, check.unless(&cover[..k])));
                     flags[term as usize] |= Slot::BOOL;
                 }
                 continue;
@@ -468,10 +465,10 @@ impl Plan {
         &self.phrases[self.phrase_at[t] as usize..self.phrase_at[t + 1] as usize]
     }
 
-    /// The per-document checks that term `t` triggers, laid out as in [`Plan::checks`].
-    fn checks(&self, t: u32) -> &[u32] {
+    /// The indices of the per-document checks that term `t` triggers.
+    fn check_range(&self, t: u32) -> Range<usize> {
         let t = t as usize;
-        &self.checks[self.check_at[t] as usize..self.check_at[t + 1] as usize]
+        self.check_at[t] as usize..self.check_at[t + 1] as usize
     }
 }
 
@@ -493,31 +490,61 @@ fn group<T: Copy + Default>(keys: usize, items: &[(u32, T)]) -> (Vec<u32>, Vec<T
     (at, grouped)
 }
 
-/// Runs the per-document `checks` ([`Plan::checks`]) on a document that holds the terms for
-/// which `has` is true, and calls `matched` with every query that matches it.
-///
-/// On a single document the set operations become boolean ones, applied strictly left to
-/// right (spec §3): `AND` is `&&`, `OR` is `||` and `NOT` is `&& !`.
-fn run_checks(mut checks: &[u32], has: impl Fn(u32) -> bool, mut matched: impl FnMut(u32)) {
-    while let [q, skips, rest @ ..] = checks {
-        let (skip, rest) = rest.split_at(*skips as usize);
-        let [steps, rest @ ..] = rest else {
-            unreachable!("Plan::new writes whole checks")
-        };
-        let (steps, rest) = rest.split_at(2 * *steps as usize);
-        checks = rest;
-        if skip.iter().any(|&t| has(t)) {
-            continue;
+/// A BOOL query compiled for one document at a time: its result as a truth table over which
+/// of its distinct terms the document holds, so that checking it takes no branch.
+#[derive(Clone, Copy, Default)]
+struct Check {
+    /// Bit `x` is the query's result on a document that holds `terms[j]` exactly for the bits
+    /// `j` set in `x`.
+    table: u64,
+    q: u32,
+    /// The query's distinct terms, padded with a term id that no document holds.
+    terms: [u32; CHECK_TERMS],
+}
+
+/// The most distinct terms a [`Check`] takes; spec §2.3 allows 6 terms per BOOL query.
+const CHECK_TERMS: usize = 6;
+
+impl Check {
+    /// Compiles query `q`, or returns `None` when it has too many distinct terms. `pad` is a
+    /// term id that no document holds.
+    ///
+    /// On a single document the set operations become boolean ones, applied strictly left to
+    /// right (spec §3): `AND` is `&&`, `OR` is `||` and `NOT` is `&& !`.
+    ///
+    /// Bit `x` of `HAS[j]` is set when input `x` holds `terms[j]`, so applying the operators
+    /// to those masks evaluates the query on all 64 inputs at once.
+    fn new(q: u32, steps: impl Iterator<Item = (Op, u32)>, pad: u32) -> Option<Self> {
+        let (mut terms, mut n, mut table) = ([pad; CHECK_TERMS], 0, 0);
+        for (op, t) in steps {
+            let j = terms[..n].iter().position(|&u| u == t).unwrap_or(n);
+            if j == n {
+                *terms.get_mut(n)? = t;
+                n += 1;
+            }
+            table = match op {
+                Op::And => table & HAS[j],
+                Op::Or => table | HAS[j],
+                Op::Not => table & !HAS[j],
+            };
         }
-        let steps = steps.as_chunks::<2>().0.iter();
-        let result = steps.fold(false, |result, &[op, t]| match Op::ALL[op as usize] {
-            Op::And => result && has(t),
-            Op::Or => result || has(t),
-            Op::Not => result && !has(t),
-        });
-        if result {
-            matched(*q);
+        Some(Self { table, q, terms })
+    }
+
+    /// This check, matching only documents that hold none of `skip`.
+    fn unless(mut self, skip: &[u32]) -> Self {
+        for (j, t) in self.terms.iter().enumerate() {
+            if skip.contains(t) {
+                self.table &= !HAS[j];
+            }
         }
+        self
+    }
+
+    /// Whether a document matches, given `has(t)`: 1 when it holds term `t`, else 0.
+    fn matches(&self, has: impl Fn(u32) -> u64) -> bool {
+        let x = (self.terms.iter().enumerate()).fold(0, |x, (j, &t)| x | has(t) << j);
+        self.table >> x & 1 != 0
     }
 }
 
@@ -676,17 +703,19 @@ fn classify(block: &[u8; 64]) -> (u64, u64) {
 /// One chunk's answers: how many of its documents match each query, the sum of their ids, and
 /// the first `SHOWN_IDS` of them.
 struct Tally {
-    count: Vec<u32>,
-    sum: Vec<u64>,
+    /// Per query, a cell: its matches as `count << SUM_BITS | id sum`, one load for both.
+    queries: Vec<u64>,
+    /// Per check ([`Plan::checks`]), a cell as above, next to its neighbours in the check list.
+    checks: Vec<u64>,
     /// (query index, doc id) of each query's first matches in the chunk, in doc order.
     first: Vec<(u32, u32)>,
 }
 
 impl Tally {
-    fn new(queries: usize) -> Self {
+    fn new(queries: usize, checks: usize) -> Self {
         Self {
-            count: vec![0; queries],
-            sum: vec![0; queries],
+            queries: vec![0; queries],
+            checks: vec![0; checks],
             first: Vec::new(),
         }
     }
@@ -694,10 +723,22 @@ impl Tally {
     /// Records that `doc` matches query `q`. Docs arrive in id order, so the first matches a
     /// chunk records are its smallest ids.
     fn add(&mut self, q: u32, doc: u32) {
-        let i = q as usize;
-        self.count[i] += 1;
-        self.sum[i] += u64::from(doc);
-        if self.count[i] as usize <= SHOWN_IDS {
+        let cell = &mut self.queries[q as usize];
+        *cell += 1 << SUM_BITS | u64::from(doc);
+        if *cell >> SUM_BITS <= SHOWN_IDS as u64 {
+            self.first.push((q, doc));
+        }
+    }
+
+    /// Records that `doc` matches check `c` of query `q` when `hit`, without a branch on
+    /// `hit` in the common case: a check past its first matches only adds to its cell. Until
+    /// the pass ends, the query's own cell counts only its first matches so far.
+    fn add_check(&mut self, c: usize, q: u32, doc: u32, hit: bool) {
+        let cell = &mut self.checks[c];
+        *cell += u64::from(hit) * (1 << SUM_BITS | u64::from(doc));
+        let shown = &mut self.queries[q as usize];
+        if hit && *cell >> SUM_BITS <= SHOWN_IDS as u64 && *shown >> SUM_BITS < SHOWN_IDS as u64 {
+            *shown += 1 << SUM_BITS;
             self.first.push((q, doc));
         }
     }
@@ -706,20 +747,19 @@ impl Tally {
     /// one by one. Their count is a popcount, and their id sum is `base` times the count plus
     /// the sum of the set bits' positions ([`bit_index_sum`]).
     fn add_word(&mut self, q: u32, base: u32, mut word: u64) {
-        while word != 0 && (self.count[q as usize] as usize) < SHOWN_IDS {
+        while word != 0 && self.queries[q as usize] >> SUM_BITS < SHOWN_IDS as u64 {
             self.add(q, base + word.trailing_zeros());
             word &= word - 1;
         }
-        let (i, n) = (q as usize, word.count_ones());
-        self.count[i] += n;
-        self.sum[i] += u64::from(base) * u64::from(n) + bit_index_sum(word);
+        let n = u64::from(word.count_ones());
+        self.queries[q as usize] += n << SUM_BITS | (u64::from(base) * n + bit_index_sum(word));
     }
 
     /// Takes the first matches out, grouped by query and each in doc order: query `q`'s are
     /// `ids[at[q]..at[q + 1]]`. Each scanning thread groups its own, instead of one big sort
     /// after the pass.
     fn take_first(&mut self) -> (Vec<u32>, Vec<u32>) {
-        group(self.count.len(), &std::mem::take(&mut self.first))
+        group(self.queries.len(), &std::mem::take(&mut self.first))
     }
 }
 
@@ -807,18 +847,20 @@ impl Window {
 /// each, small enough to stay in L1), and the [`Window`] of the terms that keep their
 /// documents. At each line end, the phrases triggered in the document are checked at each
 /// position of their trigger term, and the per-document checks of the BOOL terms it contains
-/// are run ([`run_checks`]).
+/// are run ([`Check`]).
 fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
     let mut sets = Window {
         start: ids.start,
         bits: vec![[0; WINDOW]; plan.rows],
         lists: vec![Vec::new(); plan.lists],
     };
-    let mut tally = Tally::new(queries.len());
-    // Bit `t` is set while the current doc contains term `t`.
-    let mut seen = vec![0u64; plan.terms.len().div_ceil(64)];
+    let mut tally = Tally::new(queries.len(), plan.checks.len());
+    // Bit `t` is set while the current doc contains term `t`. One more bit, never set, pads
+    // the checks ([`Check`]).
+    let mut seen = vec![0u64; (plan.terms.len() + 1).div_ceil(64)];
     // The current doc's term id per token (MISS for the rest), the positions of its phrase
-    // triggers, its distinct BOOL triggers, and the phrases it matched, so none counts twice.
+    // triggers, the checks of its distinct BOOL triggers, and the phrases it matched, so none
+    // counts twice.
     let (mut terms, mut phrase_at, mut bool_terms) = (Vec::new(), Vec::new(), Vec::new());
     let mut found = Vec::new();
     // The current doc's tokens as (key, home slot), probed only at the line end: by then every
@@ -843,7 +885,11 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
                         sets.add(plan.store[slot.id as usize], doc);
                     }
                     if slot.flags & Slot::BOOL != 0 {
-                        bool_terms.push(slot.id);
+                        // Start loading its checks and their cells now, to use at the line end.
+                        let checks = plan.check_range(slot.id);
+                        prefetch(&plan.checks[checks.start]);
+                        prefetch(&tally.checks[checks.start]);
+                        bool_terms.push(checks);
                     }
                 }
                 if slot.flags & Slot::PHRASE != 0 {
@@ -863,16 +909,18 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
                     }
                 }
             }
-            let has = |t: u32| seen[t as usize / 64] & 1 << (t % 64) != 0;
-            for &term in &bool_terms {
-                run_checks(plan.checks(term), has, |q| tally.add(q, doc));
+            let has = |t: u32| seen[t as usize / 64] >> (t % 64) & 1;
+            for checks in bool_terms.drain(..) {
+                for c in checks {
+                    let check = &plan.checks[c];
+                    tally.add_check(c, check.q, doc, check.matches(has));
+                }
             }
             for &t in terms.iter().filter(|&&t| t != MISS) {
                 seen[t as usize / 64] &= !(1 << (t % 64));
             }
             terms.clear();
             phrase_at.clear();
-            bool_terms.clear();
             found.clear();
             doc += 1;
             if doc - sets.start == 64 * WINDOW as u32 {
@@ -881,6 +929,11 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
         }
     });
     sets.flush(queries, plan, &mut tally);
+    // The checks' cells hold their queries' whole counts and sums.
+    (plan.checks.iter()).for_each(|check| tally.queries[check.q as usize] = 0);
+    for (check, cell) in plan.checks.iter().zip(std::mem::take(&mut tally.checks)) {
+        tally.queries[check.q as usize] += cell;
+    }
     let (shown_at, shown) = tally.take_first();
     Chunk {
         tally,
@@ -899,8 +952,10 @@ fn format_range(range: Range<usize>, chunks: &[Chunk]) -> Vec<u8> {
             let ids = &c.shown[c.shown_at[q] as usize..c.shown_at[q + 1] as usize];
             shown.extend(ids.iter().take(SHOWN_IDS - shown.len()));
         }
-        let count: u64 = chunks.iter().map(|c| u64::from(c.tally.count[q])).sum();
-        let sum: u64 = chunks.iter().map(|c| c.tally.sum[q]).sum();
+        let count: u64 = chunks.iter().map(|c| c.tally.queries[q] >> SUM_BITS).sum();
+        let sum: u64 = (chunks.iter())
+            .map(|c| c.tally.queries[q] & ((1 << SUM_BITS) - 1))
+            .sum();
         write!(out, "{count} {sum}").expect("writing to a Vec cannot fail");
         for id in &shown {
             write!(out, " {id}").expect("writing to a Vec cannot fail");
@@ -910,20 +965,29 @@ fn format_range(range: Range<usize>, chunks: &[Chunk]) -> Vec<u8> {
     out
 }
 
-/// The sum of the positions of the set bits in `word`. Mask `k` keeps the bits whose position
-/// has bit `k` set, so each of its set bits adds `2^k` to the sum.
+/// Mask `k` keeps the bits whose position has bit `k` set.
+const HAS: [u64; 6] = [
+    0xAAAA_AAAA_AAAA_AAAA,
+    0xCCCC_CCCC_CCCC_CCCC,
+    0xF0F0_F0F0_F0F0_F0F0,
+    0xFF00_FF00_FF00_FF00,
+    0xFFFF_0000_FFFF_0000,
+    0xFFFF_FFFF_0000_0000,
+];
+
+/// The sum of the positions of the set bits in `word`: each set bit of mask `k` ([`HAS`])
+/// adds `2^k`.
 fn bit_index_sum(word: u64) -> u64 {
-    const MASKS: [u64; 6] = [
-        0xAAAA_AAAA_AAAA_AAAA,
-        0xCCCC_CCCC_CCCC_CCCC,
-        0xF0F0_F0F0_F0F0_F0F0,
-        0xFF00_FF00_FF00_FF00,
-        0xFFFF_0000_FFFF_0000,
-        0xFFFF_FFFF_0000_0000,
-    ];
-    (MASKS.iter().enumerate())
+    (HAS.iter().enumerate())
         .map(|(k, &mask)| u64::from((word & mask).count_ones()) << k)
         .sum()
+}
+
+/// Starts loading the cache line that holds `item` into L1.
+fn prefetch<T>(item: &T) {
+    use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+    // SAFETY: a prefetch never faults or changes memory.
+    unsafe { _mm_prefetch::<_MM_HINT_T0>(std::ptr::from_ref(item).cast()) };
 }
 
 /// A token's bytes, ASCII-lowercased and zero-padded to `MAX_TERM`, as little-endian words.
@@ -952,10 +1016,24 @@ fn key_in(chunk: &[u8], start: usize, end: usize) -> Option<Key> {
 
 /// Lowercases the first `len` bytes of `window`, all letters and digits, and zeroes the rest.
 fn fold(window: &[u8; MAX_TERM], len: usize) -> Key {
+    // `len` bytes of 0xFF, then zeros, are `ONES[MAX_TERM - len..]`.
+    const ONES: [u8; 2 * MAX_TERM] = {
+        let mut ones = [0; 2 * MAX_TERM];
+        let mut i = 0;
+        while i < MAX_TERM {
+            ones[i] = 0xFF;
+            i += 1;
+        }
+        ones
+    };
+    let mask: &[u8; MAX_TERM] = ONES[MAX_TERM - len..]
+        .first_chunk()
+        .expect("len <= MAX_TERM");
     std::array::from_fn(|i| {
-        let word = u64::from_le_bytes(*window[8 * i..].first_chunk().expect("8 of 32 bytes"));
-        let kept = len.saturating_sub(8 * i).min(8);
-        let word = word & ((1u128 << (8 * kept)) - 1) as u64;
+        let word = |bytes: &[u8; MAX_TERM]| {
+            u64::from_le_bytes(*bytes[8 * i..].first_chunk().expect("8 of 32 bytes"))
+        };
+        let word = word(window) & word(mask);
         // Copying each byte's bit 6 into its bit 5 lowercases a letter (A-Z have bit 6 set)
         // and leaves digits and the zero padding alone.
         word | (word >> 1 & 0x2020_2020_2020_2020)
@@ -1033,10 +1111,8 @@ impl TermTable {
     /// Returns [`TermTable::home`] and starts loading that slot into L1, so that the load
     /// overlaps other work until [`TermTable::find_from`] needs it.
     fn prefetch(&self, key: &Key) -> usize {
-        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
         let at = self.home(key);
-        // SAFETY: a prefetch never faults or changes memory, and this address is in `slots`.
-        unsafe { _mm_prefetch::<_MM_HINT_T0>(self.slots[at..].as_ptr().cast()) };
+        prefetch(&self.slots[at]);
         at
     }
 
