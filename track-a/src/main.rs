@@ -73,10 +73,12 @@ const MIN_LINE: usize = 40;
 // points on the D axis, and the C library is already linked into every Rust binary. The two
 // constants are the values from Linux's `<sys/mman.h>`.
 unsafe extern "C" {
+    fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
 }
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
+const MADV_DONTNEED: i32 = 4;
 
 /// Reads `<data_dir>/requests.log` and writes `<out_dir>/summary.txt`.
 ///
@@ -153,12 +155,40 @@ fn summarize(log: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     Ok(thread::scope(|s| {
         let workers: Vec<_> = (0..threads)
             .map(|t| HOURS * t / threads..HOURS * (t + 1) / threads)
-            .map(|hours| s.spawn(move || summarize_hours(hours, chunks, ranks, names)))
+            .enumerate()
+            .map(|(t, hours)| {
+                s.spawn(move || {
+                    let out = summarize_hours(hours, chunks, ranks, names);
+                    release(&log[log.len() * t / threads..log.len() * (t + 1) / threads]);
+                    out
+                })
+            })
             .collect();
         (workers.into_iter())
             .map(|w| w.join().expect("a panic aborts the process"))
             .collect()
     }))
+}
+
+/// Drops our page-table entries for `bytes` with `madvise(MADV_DONTNEED)`.
+///
+/// At exit the kernel unmaps every page we touched, on one thread and inside the timed window:
+/// for the 58,000 pages of the input that took 3.9 ms. Each worker instead releases its share of
+/// the input as soon as it is done, in parallel with the others. The file stays in the page
+/// cache, so a later read of these bytes (an endpoint name, say) just maps its page again. The
+/// call is advice: if it fails, the exit does the work as before, so the result is ignored.
+fn release(bytes: &[u8]) {
+    let start = bytes.as_ptr().map_addr(|addr| addr & !4095);
+    // SAFETY: the range lies inside our private, read-only file mapping (rounded down to its
+    // page, which is also mapped). Dropping such pages never changes their contents: the next
+    // access maps the same file data again, so every `&[u8]` into it stays valid.
+    unsafe {
+        madvise(
+            start,
+            bytes.len() + (bytes.as_ptr().addr() - start.addr()),
+            MADV_DONTNEED,
+        )
+    };
 }
 
 /// Splits `log` into `parts` chunks of whole lines and returns the `parts + 1` boundaries.
