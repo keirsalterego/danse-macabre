@@ -32,6 +32,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 25 | 6 fewer lines with the same machine code: five variables written where they are used, and the last thread's exit on one line | run-6223c163632a | 0.0200 | 20.9 | 84.2 |
 | 26 | 3 fewer lines with the same machine code: `digits` a closure in its one caller, and a group's length read where it is used | run-b3536f948213 | 0.0200 | 21.2 | 84.2 |
 | 27 | The sorting network's stages within one register take each lane's partner from the register itself, not from the stage's copy | | | | |
+| 28 | 3 fewer lines with the same machine code: the run pairs taken with `array_windows`, and two lint exceptions moved to `Cargo.toml` | | | | |
 
 ## Step 1: v1
 
@@ -334,6 +335,16 @@ percentiles and lines of an hour, timed per hour, 5 runs each: median 2.34 → 2
 That is about 0.06–0.1 ms per thread, under 0.5% of the run: user cycles 417.21 → 416.96 M over
 15 interleaved runs and `ab.py` (61 runs per round, two rounds: medians 22.37 → 22.36 and
 22.43 → 22.55 ms) are within noise. S unchanged at 379. Gate: 307 pass, 0 fail.
+
+## Step 28: 3 more lines
+
+The plan loop destructures each pair of runs from `array_windows()` instead of indexing a
+`windows(2)` slice, and the two lints the code breaks on purpose, `inline_always` for `intern`
+and `wildcard_imports` for the AVX2 intrinsics, are allowed in `Cargo.toml` with their reasons
+instead of `#[expect]` on the items. `.text` and `.rodata` are byte-identical to step 27's, so T
+and M cannot move. S 379 → 376. Gate: 307 pass, 0 fail.
+
+Steps 27 and 28 went to the board in one push, so both rows cite the same run.
 
 ## Experiments that did not stay
 

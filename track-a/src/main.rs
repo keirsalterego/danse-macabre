@@ -212,8 +212,7 @@ fn summarize(log: &[u8], out_path: &Path) {
             order.sort_unstable_by_key(|&id| (&all.padded[id].0, all.names[id].0));
             let mut runs: Vec<Vec<Run>> = vec![Vec::new(); HOURS];
             for (chunk, ids) in chunks.iter().map(|c| c.get().expect("parsed")) {
-                for run in chunk.runs.windows(2) {
-                    let ((hour, start, first), (_, end, _)) = (run[0], run[1]);
+                for &[(hour, start, first), (_, end, _)] in chunk.runs.array_windows() {
                     runs[hour].push((&chunk.records[start..end], &chunk.large[first..], ids));
                 }
             }
@@ -540,8 +539,8 @@ impl Default for Interner<'_> {
 }
 
 // `intern` runs once per line. As a call, with its register saves and bounds checks, it cost
-// 9% of all instructions, so it is forced inline; `insert` stays out of line.
-#[expect(clippy::inline_always, reason = "measured: about 1 ms of wall time")]
+// 9% of all instructions (about 1 ms of wall time), so it is forced inline (`inline_always` is
+// allowed in `Cargo.toml`); `insert` stays out of line.
 impl<'a> Interner<'a> {
     /// Returns `name`'s id, assigning the next free one if the name is new.
     ///
@@ -729,8 +728,7 @@ fn percentiles(group: &mut [u32]) -> [u32; 3] {
 /// first and move the wanted positions up by their number.
 #[target_feature(enable = "avx2")]
 fn sort_network<const R: usize>(group: &[u32], at: [usize; 3]) -> [u32; 3] {
-    #[expect(clippy::wildcard_imports, reason = "the twelve AVX2 intrinsics below")]
-    use std::arch::x86_64::*;
+    use std::arch::x86_64::*; // the twelve AVX2 intrinsics below
     let (lanes, splat) = (_mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7), _mm256_set1_epi32);
     let mut v: [__m256i; R] = std::array::from_fn(|r| {
         // A masked load: lanes past the group's end read nothing and hold 0. Reading lane by
