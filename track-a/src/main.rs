@@ -62,8 +62,8 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::{Barrier, Mutex, OnceLock};
 use std::thread;
 
 /// The number of hours a log can span.
@@ -193,9 +193,12 @@ fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
 
 /// Runs the whole pipeline over `log` and writes the output to `out_path`.
 ///
-/// All three parallel phases use [`std::thread::scope`], so the threads can borrow `log` and
-/// each other's results without reference counting. A worker that panics aborts the whole
-/// process (`panic = "abort"` in `Cargo.toml`), so a `join` never actually returns an error.
+/// The parallel phases run in two [`std::thread::scope`]s, one for the parse and one for the
+/// hour pass and the formatting, so the threads can borrow `log` and each other's results
+/// without reference counting. A worker that panics aborts the whole process (`panic = "abort"`
+/// in `Cargo.toml`), so a `join` never actually returns an error. The one error the second scope
+/// can meet, failing to create the output file, ends the process with a message, because the
+/// other threads would otherwise wait at the barrier forever.
 fn summarize(log: &[u8], out_path: &Path) -> Result<(), Box<dyn Error>> {
     let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
     let bounds = line_bounds(log, threads);
@@ -220,41 +223,53 @@ fn summarize(log: &[u8], out_path: &Path) -> Result<(), Box<dyn Error>> {
     let mut by_size: Vec<usize> = (0..HOURS).collect();
     by_size.sort_by_key(|&h| Reverse(runs[h].iter().map(|run| run.0.len()).sum::<usize>()));
     let taken = AtomicUsize::new(0);
-    let (runs, names, by_size, taken) = (&runs, &names, &by_size, &taken);
-    let mut hours: Vec<Hour> = thread::scope(|s| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                s.spawn(move || {
-                    let queue = std::iter::from_fn(|| by_size.get(taken.fetch_add(1, Relaxed)));
-                    summarize_hours(queue.copied(), runs, names)
-                })
-            })
-            .collect();
-        (workers.into_iter())
-            .flat_map(|w| w.join().expect("a panic aborts the process"))
-            .collect()
-    });
-    hours.sort_unstable_by_key(|hour| hour.index);
-    let len = hours.iter().map(|hour| hour.len).sum();
-    let mut rest = map_output(out_path, len).map_err(|e| format!("{}: {e}", out_path.display()))?;
-    let mut places = Vec::with_capacity(hours.len());
-    for hour in &hours {
-        let (place, after) = rest.split_at_mut(hour.len);
-        places.push((hour, place));
-        rest = after;
-    }
-    // Every hour has its place in the file now, so the threads format in parallel, taking the
-    // next hour from a shared queue until none is left. Each first frees one chunk's records:
-    // no hour needs them any more. Releasing the input waits until the end, because freeing
-    // pages interrupts every other thread to flush its TLB, which cost 3 ms in the hour pass.
-    let queue = Mutex::new(places.into_iter());
-    let queue = &queue;
+    let (hours, sorted, places) = (Mutex::new(Vec::new()), OnceLock::new(), OnceLock::new());
+    let barrier = Barrier::new(threads);
+    // The same threads summarize the hours and then format them. Between the two phases they
+    // wait at a barrier while one of them sorts the hours and maps the output file, which saves
+    // spawning a second team: the last of twelve new threads started about 1 ms after the first.
+    let shared = (
+        &runs, &names, &by_size, &taken, &hours, &sorted, &places, &barrier,
+    );
     thread::scope(|s| {
         for (t, chunk) in chunks.iter().enumerate() {
             s.spawn(move || {
+                let (runs, names, by_size, taken, hours, sorted, places, barrier) = shared;
+                let queue = std::iter::from_fn(|| by_size.get(taken.fetch_add(1, Relaxed)));
+                let done = summarize_hours(queue.copied(), runs, names);
+                hours
+                    .lock()
+                    .expect("a panic aborts the process")
+                    .extend(done);
+                if barrier.wait().is_leader() {
+                    let hours = sorted.get_or_init(|| {
+                        let mut hours = std::mem::take(&mut *hours.lock().expect("no panic"));
+                        hours.sort_unstable_by_key(|hour: &Hour| hour.index);
+                        hours
+                    });
+                    let len = hours.iter().map(|hour| hour.len).sum();
+                    let mut rest = map_output(out_path, len).unwrap_or_else(|e| {
+                        eprintln!("Error: {}: {e}", out_path.display());
+                        std::process::exit(1)
+                    });
+                    let mut split = Vec::with_capacity(hours.len());
+                    for hour in hours {
+                        let (place, after) = rest.split_at_mut(hour.len);
+                        split.push((hour, place));
+                        rest = after;
+                    }
+                    let _ = places.set(Mutex::new(split.into_iter()));
+                }
+                barrier.wait();
+                // Every hour has its place in the file now, so the threads format in parallel,
+                // taking the next hour from a shared queue until none is left. Each first frees
+                // one chunk's records: no hour needs them any more. Releasing the input waits
+                // until the end, because freeing pages interrupts every other thread to flush its
+                // TLB, which cost 3 ms in the hour pass.
                 release(&chunk.records);
                 release(&chunk.large);
                 let mut text = Vec::new();
+                let queue = places.get().expect("the leader mapped the output");
                 let next = || queue.lock().expect("a panic aborts the process").next();
                 for (hour, place) in std::iter::from_fn(next) {
                     text.clear();
