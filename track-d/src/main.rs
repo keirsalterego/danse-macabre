@@ -294,7 +294,7 @@ fn build_graph(body: &[u8], n: usize, threads: usize) -> Result<[Csr; 2], Box<dy
         let lens = || (0..blocks).flat_map(|block| in_block(direction, block));
         let edge_runs = split_runs(&mut graph.edges, lens()).into_iter();
         for (i, (edges, places)) in edge_runs.zip(split_runs(places, lens())).enumerate() {
-            runs[i % chunks.len()][direction].push(edges.iter_mut().zip(places));
+            runs[i % chunks.len()][direction].push((edges.iter_mut(), places.iter_mut()));
         }
     }
     // The weight field's largest value marks a heavy edge, so it holds 0..mark.
@@ -358,15 +358,18 @@ fn split_runs<T>(mut slots: &mut [T], lens: impl IntoIterator<Item = usize>) -> 
 /// runs a thread writes to in pass 2 small. A node's place in its block fits in a `u16`.
 const BLOCK: usize = 2048;
 
-/// A chunk's run of slots in one block during pass 2: edge slots, each zipped with its place slot.
-type Run<'a> = std::iter::Zip<std::slice::IterMut<'a, u32>, std::slice::IterMut<'a, u16>>;
+/// A chunk's run of slots in one block during pass 2: its free edge slots and its free place
+/// slots. Two iterators take 32 bytes against 48 for their `zip`, so a thread's 2 × 850 runs, which
+/// pass 2 reads at random, take 54 KB instead of 82 KB.
+type Run<'a> = (std::slice::IterMut<'a, u32>, std::slice::IterMut<'a, u16>);
 
 /// Writes `edge` into the next slot of its block's run in `runs`, and the key node's place in its
 /// block into the matching place slot. The key node is the tail in the forward graph and the head
 /// in the reverse one.
 fn append(runs: &mut [Run], key: usize, edge: u32) {
-    let (slot, place) = runs[key / BLOCK].next().expect("pass 1 counted it");
-    (*slot, *place) = (edge, (key % BLOCK) as u16);
+    let (edges, places) = &mut runs[key / BLOCK];
+    *edges.next().expect("pass 1 counted it") = edge;
+    *places.next().expect("pass 1 counted it") = (key % BLOCK) as u16;
 }
 
 /// Counting-sorts one block's edges by place and writes the block's groups of [`Csr::rows`] to

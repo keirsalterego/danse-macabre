@@ -16,6 +16,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 9 | Each node's edge range kept in 2 bytes instead of a 4-byte offset, in groups of 4 nodes, and pass 3 run one direction at a time with its index faulted in first | run-ee72c614f94f | 0.1297 | 75.5 | 71.8 |
 | 10 | Label distances aligned to 4 bytes, so a label table entry takes 12 bytes instead of 16 | run-37fab0938045 | 0.1280 | 69.4 | 72.3 |
 | 11 | Each queue's top kept between steps; a step recomputes only its own side's | run-37fab0938045 | 0.1280 | 69.4 | 72.3 |
+| 12 | Pass 2's runs kept as two slice iterators instead of their `zip`: 32 bytes a run instead of 48 | | | | |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
@@ -319,6 +320,34 @@ queries use 53% of the CPU and their cost can't be predicted, so no cheap reorde
 Label and queue resets cost about 0.5 ms of wall time, and the 20 duplicate queries of a seed
 about 0.7 ms, which would take about 10 lines to remove.
 
+## Step 12: pass 2's runs as two iterators
+
+A phase split of step 11's build on seed 1, medians of 25 runs: pass 1 9.5 ms, faulting the
+arrays in 3.3, the runs set-up 1.4, pass 2 12.9, the heavy edges 0.4, pass 3 3.3 and 3.5. The
+queries took 91.3 ms. Pass 1 is bound by instruction throughput, about 91 instructions per line.
+Pass 2 parses the same text again and makes 4 scattered stores per line; a faster parse did not
+shorten it (see the AVX2 row below).
+
+Pass 2 appends every edge to one run in each direction, picked by its block, so a thread reads
+and writes its 2 × 850 runs at random. A run was a `zip` of the edge-slot and place-slot
+iterators, which keeps an index and two lengths besides the two iterators: 48 bytes. The two
+iterators alone take 32, so a thread's runs take 54 KB instead of 82 KB, and `append` advances
+each iterator itself.
+
+Phase marks, 25 rounds each on seeds 1 and 2, medians: runs set-up 1.36 → 1.14 and
+1.35 → 1.13 ms, pass 2 12.90 → 12.63 and 12.93 → 12.43 ms. `ab.py` against step 11, 41
+alternating runs per binary and session, medians: seed 1 133.04 → 131.35, 132.56 → 130.69 and
+133.92 → 131.67 ms, seed 2 133.50 → 131.97, 133.83 → 132.26 and 139.53 → 137.15 ms, seed 3
+139.91 → 137.89 ms. About 1.2 ms of that is code placement. With every function aligned to 64
+bytes in both builds (`-C llvm-args=-align-all-functions=6`, for this control only), the gain was
+0.2, 0.6, 0.8 and 1.3 ms in four sessions, which matches the phase marks.
+
+Peak memory, medians: seed 1 70.3 → 70.35 MB (10 runs each), seed 3 69.6 → 69.5 and seed 4
+67.7 → 67.9 (5 runs each). Seed 2 rose from 67.6 to 68.25 MB over 10 runs. Its build maximum
+stayed at 67.4–68.0 MB, but its query phase ended about 1 MB higher in anonymous memory in three
+traced runs. The query code is unchanged, so this is most likely where the heap's pieces landed.
+S 447 → 448. Gate: 509 pass, 0 fail.
+
 ## Tried and reverted (local, turbo off, no run ID)
 
 Each row's baseline ran in the same interleaved session as the experiment, so baselines differ
@@ -363,3 +392,8 @@ between rows.
 | Balancing the two sides by pop count instead of queue length | Slower | |
 | Label maps emptied after each query once they pass 14,336 entries, or 28,672 (on step 7, with step 9's pass 3 change) | Peak 72.0–72.7 MB against 80.9–82.6, but elapsed median 148.6 against 134.7 ms, task-clock 1.55–1.57 against 1.41–1.42 s | 10% slower: the next big search regrows its map from empty, rehashing at every doubling into freshly mapped pages |
 | Step 9's pass 3 change without faulting the offsets in first (on step 7) | Peak 80.9–85.2 MB against 80.6–83.7, elapsed median 137.2 against 134.1 ms | More threads first-touched each fresh huge page |
+| Pass 1 parsed with AVX2: one 32-byte compare finds a line's three separators (on step 11, phase marks) | Pass 1 fastest 9.4–9.5 → 7.6–7.8 ms, pass 2 unchanged, S +24 | 1.3% of T for 5% more lines, a small loss on the score |
+| A write prefetch of a run's next slots in pass 2, three placements (on step 11, phase marks) | Pass 2 fastest 15.1–15.2 ms against 12.8 ms | Slower |
+| `sort`'s counters in a stack array of `BLOCK + 1` instead of a `Vec` per block (on step 11) | Medians 133.30 and 133.63 ms against 133.31 and 133.57 ms (seeds 1 and 2) | No change |
+| Each pass 2 thread drops its chunk's pages of graph.txt from the page tables (`madvise(MADV_DONTNEED)`) when it is done, so that the exit has none to unmap (on step 12) | Medians 131.11, 132.27, 131.01 and 131.92 ms against 131.35, 131.97, 130.69 and 132.26 ms (seeds 1, 2, 1, 2) | A tie, for 4 lines. Unmapping them at the exit takes about 1.7 ms on one thread, and the calls cost about as much, likely in the TLB flushes they send to the other threads |
+| The same `madvise` on all of graph.txt from a 13th thread during the queries (on step 12) | Medians 132.09, 155.11, 133.53 and 133.61 ms against 131.67, 154.59, 132.94 and 132.81 ms | 0.4–0.8 ms slower, likely from the CPU time it takes from the 12 query threads and the TLB flushes it sends them |
