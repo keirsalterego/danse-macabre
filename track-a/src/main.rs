@@ -21,19 +21,20 @@
 //!
 //! 1. **Map and split.** We `mmap` the log instead of reading it ([`map_file`]) and cut it into
 //!    one chunk per thread at line breaks ([`line_bounds`]).
-//! 2. **Parse once.** Each thread turns every line of its chunk into one 8-byte record: endpoint
-//!    id, hour, error bit and latency ([`parse`]). Endpoint names become small integer ids
-//!    through a per-thread hash table ([`Interner`]). The thread then sorts its records by hour,
-//!    in place ([`sort_by_hour`]).
+//! 2. **Parse once.** Each thread turns every line of its chunk into a 6-byte record: endpoint
+//!    id, error bit and latency ([`parse`]). Endpoint names become small integer ids through a
+//!    per-thread hash table ([`Interner`]). The hour is not stored per line: the records stay in
+//!    file order, where lines come in long runs of one hour, and the thread notes where each run
+//!    starts ([`Chunk`]).
 //! 3. **Merge.** We collect every thread's endpoint names, drop duplicates and sort them bytewise
 //!    ([`rank_endpoints`]). An endpoint's position in that list, its *rank*, is also its position
 //!    within an hour of the output, so the output never needs sorting.
 //! 4. **Summarize by hour.** Threads take hours one at a time, largest first
-//!    ([`summarize_hours`]). For one hour a thread counts the lines per endpoint, uses the counts
-//!    to place each latency next to the others of its endpoint (a counting sort), and picks the
-//!    three percentiles out of every run with a selection algorithm, which is linear, instead of
-//!    a full sort. What it keeps is six numbers per output line, and the hour's exact length
-//!    once formatted.
+//!    ([`summarize_hours`]). For one hour a thread goes through that hour's runs in every chunk.
+//!    It counts the lines per endpoint, uses the counts to place each latency next to the others
+//!    of its endpoint (a counting sort), and picks the three percentiles out of each endpoint's
+//!    latencies with a selection algorithm, which is linear, instead of a full sort. What it
+//!    keeps is six numbers per output line, and the hour's exact length once formatted.
 //! 5. **Write in place.** With every hour's length known, we give the output file its final size
 //!    and map it into memory ([`map_output`]). Each thread then frees one chunk's records and
 //!    formats its run of hours straight into place in the file ([`format_hour`]).
@@ -41,7 +42,7 @@
 //! ## Why it is fast
 //!
 //! - **One pass over the input.** The log is 239 MB, ten times the L3 cache, so every pass over
-//!   it streams from main memory. We parse it once and keep 25 MB of compact records instead.
+//!   it streams from main memory. We parse it once and keep 19 MB of compact records instead.
 //! - **No byte-by-byte scanning.** One AVX2 compare finds a line's end ([`line_end`]). The
 //!   latency, the status and the end of the endpoint are then read backwards from it at known
 //!   offsets, and the latency's digits convert in a single SWAR step ([`latency`]).
@@ -57,6 +58,7 @@ use std::cmp::Reverse;
 use std::error::Error;
 use std::fs::File;
 use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Mutex;
@@ -125,7 +127,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// same page cache that `write` fills, so the file's bytes are identical.
 fn map_output(path: &Path, len: usize) -> Result<&'static mut [u8], Box<dyn Error>> {
     // Mapping a file for writing needs it open for reading too.
-    let file = File::options().read(true).write(true).create(true).truncate(true).open(path)?;
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
     if len == 0 {
         return Ok(&mut []); // mmap rejects a zero length
     }
@@ -134,7 +141,14 @@ fn map_output(path: &Path, len: usize) -> Result<&'static mut [u8], Box<dyn Erro
     // `len`; the kernel picks the address.
     let ptr = unsafe {
         let prot = PROT_READ | PROT_WRITE;
-        mmap(std::ptr::null_mut(), len, prot, MAP_SHARED, file.as_raw_fd(), 0)
+        mmap(
+            std::ptr::null_mut(),
+            len,
+            prot,
+            MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
     };
     if ptr.addr() == usize::MAX {
         return Err(format!("mmap: {}", std::io::Error::last_os_error()).into());
@@ -193,19 +207,26 @@ fn summarize(log: &[u8], out_path: &Path) -> Result<(), Box<dyn Error>> {
             .collect::<Result<Vec<_>, _>>()
     })?;
     let (names, ranks) = rank_endpoints(&chunks);
+    let mut runs: Vec<Vec<Run>> = vec![Vec::new(); HOURS];
+    for (chunk, rank) in chunks.iter().zip(&ranks) {
+        for (hour, lines) in &chunk.runs {
+            let records = (&chunk.ids[lines.clone()], &chunk.latencies[lines.clone()]);
+            runs[*hour].push((records.0, records.1, rank));
+        }
+    }
     // Night hours carry about half the traffic of day hours, so fixed blocks of hours would
     // leave some workers idle while others finish. Workers instead take one hour at a time from
     // a shared counter, largest first (longest-processing-time-first scheduling).
     let mut by_size: Vec<usize> = (0..HOURS).collect();
-    by_size.sort_by_key(|&h| Reverse(chunks.iter().map(|c| c.hour(h).len()).sum::<usize>()));
+    by_size.sort_by_key(|&h| Reverse(runs[h].iter().map(|run| run.0.len()).sum::<usize>()));
     let taken = AtomicUsize::new(0);
-    let (chunks, ranks, names, by_size, taken) = (&chunks, &ranks, &names, &by_size, &taken);
+    let (runs, names, by_size, taken) = (&runs, &names, &by_size, &taken);
     let mut hours: Vec<Hour> = thread::scope(|s| {
         let workers: Vec<_> = (0..threads)
             .map(|_| {
                 s.spawn(move || {
                     let queue = std::iter::from_fn(|| by_size.get(taken.fetch_add(1, Relaxed)));
-                    summarize_hours(queue.copied(), chunks, ranks, names)
+                    summarize_hours(queue.copied(), runs, names)
                 })
             })
             .collect();
@@ -231,7 +252,8 @@ fn summarize(log: &[u8], out_path: &Path) -> Result<(), Box<dyn Error>> {
     thread::scope(|s| {
         for (t, chunk) in chunks.iter().enumerate() {
             s.spawn(move || {
-                release(&chunk.records);
+                release(&chunk.latencies);
+                release(&chunk.ids);
                 let mut text = Vec::new();
                 let next = || queue.lock().expect("a panic aborts the process").next();
                 for (hour, place) in std::iter::from_fn(next) {
@@ -257,7 +279,10 @@ fn summarize(log: &[u8], out_path: &Path) -> Result<(), Box<dyn Error>> {
 /// ignored.
 fn release<T>(items: &[T]) {
     let start = items.as_ptr().addr();
-    let (first, end) = (start.next_multiple_of(4096), (start + size_of_val(items)) & !4095);
+    let (first, end) = (
+        start.next_multiple_of(4096),
+        (start + size_of_val(items)) & !4095,
+    );
     if first < end {
         let first = items.as_ptr().cast::<u8>().with_addr(first);
         // SAFETY: the pages lie inside `items`. In the input's private read-only file mapping, a
@@ -286,34 +311,32 @@ fn line_bounds(log: &[u8], parts: usize) -> Vec<usize> {
 
 /// One thread's share of the log after parsing.
 ///
-/// Every line becomes a single `u64` record, packed like this:
+/// Every line becomes a 6-byte record, split over two arrays so that the counting pass of
+/// [`summarize_hours`] reads only the 2-byte half. For line `i` of the chunk:
 ///
-/// | bits    | field                                       |
-/// |---------|---------------------------------------------|
-/// | 63 – 40 | the endpoint's id in this chunk (24 bits)   |
-/// | 39 – 33 | the hour index, `0..72` (7 bits)            |
-/// | 32      | 1 if the status is 500–599                  |
-/// | 31 – 0  | the latency in microseconds                 |
+/// - `latencies[i]` is its latency in microseconds;
+/// - `ids[i]` is its endpoint's id in this chunk, shifted left by one, with the low bit set if
+///   its status is 500–599.
 ///
-/// Eight bytes per line keep all 3.1 million records at 25 MB. The ids are local to the chunk:
+/// The hour is not stored per line. Shards upload their lines in time order, so consecutive
+/// lines of the log almost always share an hour: seed 1's 3.1 million lines form just 1,054 runs
+/// of one hour each. The chunk keeps one entry per run instead, and the records stay in file
+/// order without any sorting. Correctness does not depend on long runs, since the spec promises
+/// no bound on the disorder: a log whose hour changed on every line would simply have one run
+/// per line.
+///
+/// Six bytes per line keep all 3.1 million records at 19 MB. The ids are local to the chunk:
 /// [`rank_endpoints`] later maps them to global ranks.
 struct Chunk<'a> {
     /// Local endpoint id → (name, hash). Names borrow the mapped file, so none are copied.
     names: Vec<(&'a [u8], u64)>,
-    /// One record per line, sorted by hour.
-    records: Vec<u64>,
-    /// `records[hour_start[h]..hour_start[h + 1]]` are hour `h`'s lines.
-    hour_start: [usize; HOURS + 1],
+    latencies: Vec<u32>,
+    ids: Vec<u16>,
+    /// The runs in file order: each one's hour and its lines' indices.
+    runs: Vec<(usize, Range<usize>)>,
 }
 
-impl Chunk<'_> {
-    /// The records of one hour.
-    fn hour(&self, hour: usize) -> &[u64] {
-        &self.records[self.hour_start[hour]..self.hour_start[hour + 1]]
-    }
-}
-
-/// Parses one chunk of whole lines into records, then sorts them by hour.
+/// Parses one chunk of whole lines into records.
 ///
 /// The spec guarantees well-formed input (§2), so we locate fields by fixed offsets and single
 /// byte checks instead of validating them. No field is scanned byte by byte. Once [`line_end`]
@@ -330,8 +353,10 @@ impl Chunk<'_> {
 /// Here `space` is the last space of the line, which [`latency`] finds.
 fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
     let mut endpoints = Interner::default();
-    let mut records = Vec::with_capacity(chunk.len() / MIN_LINE + 1);
-    let mut per_hour = [0; HOURS];
+    let mut latencies = Vec::with_capacity(chunk.len() / MIN_LINE + 1);
+    let mut ids = Vec::with_capacity(chunk.len() / MIN_LINE + 1);
+    // The hour and first line of every run. No hour equals `usize::MAX`, so line 0 starts one.
+    let (mut starts, mut current) = (Vec::new(), usize::MAX);
     let mut i = 0;
     while i < chunk.len() {
         let line = &chunk[i..];
@@ -346,21 +371,36 @@ fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
         // `space` precedes the latency; before it sit the 3-digit status and its own space.
         let (latency_us, space) = latency(line, lf);
         let name = &line[start..space - 4];
-        let id = endpoints.intern(name, hash(name), line.get(start..).and_then(|w| w.first_chunk()));
+        let id = endpoints.intern(
+            name,
+            hash(name),
+            line.get(start..).and_then(|w| w.first_chunk()),
+        );
         // Errors are exactly 500..=599, so the status's first digit decides.
-        let error = u64::from(line[space - 3] == b'5');
-        per_hour[hour] += 1;
-        records
-            .push(u64::from(id) << 40 | (hour as u64) << 33 | error << 32 | u64::from(latency_us));
+        let error = u32::from(line[space - 3] == b'5');
+        if hour != current {
+            starts.push((hour, ids.len()));
+            current = hour;
+        }
+        latencies.push(latency_us);
+        ids.push((id << 1 | error) as u16);
     }
-    if endpoints.names.len() > 1 << 24 {
-        return Err("over 2^24 distinct endpoints in one chunk: ids overflow the record".into());
+    // The spec gives every seed 1,842 endpoints (§2), far below the 2^15 that fit beside the
+    // error bit. Past that, the ids above were cut short, so we stop instead.
+    if endpoints.names.len() > 1 << 15 {
+        return Err("over 32,768 distinct endpoints in one chunk: ids overflow 15 bits".into());
     }
-    let hour_start = sort_by_hour(&mut records, &per_hour);
+    let ends = starts
+        .iter()
+        .skip(1)
+        .map(|&(_, start)| start)
+        .chain([ids.len()]);
+    let runs = (starts.iter().zip(ends)).map(|(&(hour, start), end)| (hour, start..end));
     Ok(Chunk {
         names: endpoints.names,
-        records,
-        hour_start,
+        latencies,
+        ids,
+        runs: runs.collect(),
     })
 }
 
@@ -613,31 +653,6 @@ fn same_name(window: &[u8; 64], known: &[u8; 64], len: usize) -> bool {
     !unsafe { equal_mask(window, known) } & wanted == 0
 }
 
-/// Sorts `records` by hour in place and returns where each hour starts.
-///
-/// This is an American flag sort: a counting sort that permutes in place instead of copying into
-/// a second buffer, so it needs no extra memory. The counts from parsing give each hour its
-/// region of the array. Then we walk the regions in order, and every record that sits in the
-/// wrong region is swapped straight into the next free place of its own. Each swap puts at least
-/// one record where it belongs, so the whole sort is linear. It takes about 1.6 ms per thread.
-fn sort_by_hour(records: &mut [u64], per_hour: &[usize; HOURS]) -> [usize; HOURS + 1] {
-    let mut start = [0; HOURS + 1];
-    for h in 0..HOURS {
-        start[h + 1] = start[h] + per_hour[h];
-    }
-    let mut next = start;
-    for h in 0..HOURS {
-        while next[h] < start[h + 1] {
-            let to = (records[next[h]] >> 33) as usize & 127;
-            if to != h {
-                records.swap(next[h], next[to]);
-            }
-            next[to] += 1;
-        }
-    }
-    start
-}
-
 /// Assigns every endpoint its global rank: its position in the bytewise sort of all names.
 ///
 /// Each chunk has its own ids, so we first merge the chunks' names through one more
@@ -680,9 +695,13 @@ struct Hour {
     len: usize,
 }
 
-/// Computes the output lines of each hour in `hours`.
+/// One run of lines from one hour: their endpoint ids and latencies (see [`Chunk`]), and the
+/// table from their chunk's endpoint ids to ranks.
+type Run<'a> = (&'a [u16], &'a [u32], &'a [u32]);
+
+/// Computes the output lines of each hour in `hours`, from `runs[hour]`.
 ///
-/// For each hour we gather that hour's records from every chunk, in chunk order, and then:
+/// For each hour we go through that hour's runs from every chunk, and then:
 ///
 /// 1. **Count** the lines and errors of each endpoint (by rank).
 /// 2. **Place** each latency in one buffer at its endpoint's next free position. The prefix sum
@@ -693,8 +712,7 @@ struct Hour {
 /// Endpoints are visited in rank order, so the lines come out already in output order.
 fn summarize_hours(
     hours: impl Iterator<Item = usize>,
-    chunks: &[Chunk],
-    ranks: &[Vec<u32>],
+    runs: &[Vec<Run>],
     names: &[&[u8]],
 ) -> Vec<Hour> {
     let mut done = Vec::new();
@@ -708,11 +726,11 @@ fn summarize_hours(
         let mut len = 0;
         start.fill(0);
         errors.fill(0);
-        for (chunk, rank) in chunks.iter().zip(ranks) {
-            for &r in chunk.hour(hour) {
-                let e = rank[(r >> 40) as usize] as usize;
+        for &(ids, _, rank) in &runs[hour] {
+            for &id in ids {
+                let e = rank[usize::from(id >> 1)] as usize;
                 start[e + 1] += 1;
-                errors[e] += (r >> 32) as u32 & 1;
+                errors[e] += u32::from(id & 1);
             }
         }
         for e in 0..names.len() {
@@ -720,10 +738,10 @@ fn summarize_hours(
         }
         next.copy_from_slice(&start[..names.len()]);
         latencies.resize(start[names.len()] as usize, 0);
-        for (chunk, rank) in chunks.iter().zip(ranks) {
-            for &r in chunk.hour(hour) {
-                let e = rank[(r >> 40) as usize] as usize;
-                latencies[next[e] as usize] = r as u32;
+        for &(ids, run_latencies, rank) in &runs[hour] {
+            for (&id, &latency) in ids.iter().zip(run_latencies) {
+                let e = rank[usize::from(id >> 1)] as usize;
+                latencies[next[e] as usize] = latency;
                 next[e] += 1;
             }
         }
@@ -765,7 +783,14 @@ fn summarize_hours(
 /// count, p50, p95, p99, the error count and the errors per million requests, rounded down.
 fn numbers(&[_, count, p50, p95, p99, errors]: &[u32; 6]) -> [u64; 6] {
     let (count, errors) = (u64::from(count), u64::from(errors));
-    [count, p50.into(), p95.into(), p99.into(), errors, errors * 1_000_000 / count]
+    [
+        count,
+        p50.into(),
+        p95.into(),
+        p99.into(),
+        errors,
+        errors * 1_000_000 / count,
+    ]
 }
 
 /// The number of decimal digits [`push_number`] writes for `value`.
