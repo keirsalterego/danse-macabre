@@ -83,6 +83,7 @@
 //! in 64 bits.
 //! Records outside the §2.1 grammar are not validated.
 
+use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -506,47 +507,62 @@ fn aggregate(
     for round in 0.. {
         let half = round % 2;
         sent.fill(0);
-        let round_end = range.end.min(at + ROUND_BYTES);
+        let mut round_end = range.end.min(at + ROUND_BYTES);
         while at < round_end {
-            // A BOM at the start of a record is not data (§2.1). It sits in front of the id, so
-            // missing it would show up in `id_sum`. The test of its first byte keeps the whole
-            // compare, a call to `bcmp`, off the path of every other record.
-            if data[at] == BOM[0] && data[at..].starts_with(BOM) {
-                at += BOM.len();
+            // The records of a batch are parsed and posted first, and added to their groups
+            // after, so that the prefetch of each record's byte in the region table, which
+            // misses the L2 cache about half the time, has the rest of the batch to arrive.
+            let mut batch = [(0, 0, 0, 0, 0, 0); 4];
+            let mut parsed = 0;
+            while parsed < batch.len() && at < round_end {
+                // A BOM at the start of a record is not data (§2.1). It sits in front of the id,
+                // so missing it would show up in `id_sum`. The test of its first byte keeps the
+                // whole compare, a call to `bcmp`, off the path of every other record.
+                if data[at] == BOM[0] && data[at..].starts_with(BOM) {
+                    at += BOM.len();
+                }
+                let (id, comma) = number(data, at, b',');
+                let (name, name_bytes, after_name) = text_field(data, comma + 1);
+                let letter = name_letter(data, name);
+                let (_, note_bytes, after_note) = text_field(data, after_name);
+                let (region_id, comma) = number(data, after_note, b',');
+                let byte = regions.by_id.as_ptr().wrapping_add(region_id as usize);
+                // SAFETY: a prefetch reads nothing the program sees, and never faults.
+                unsafe { _mm_prefetch::<_MM_HINT_T0>(byte.cast()) };
+                // The sign applies to the whole value, so -0.75 is -75 cents, not -0 * 100 + 75.
+                let negative = data[comma + 1] == b'-';
+                let (whole, dot) = number(data, comma + 1 + usize::from(negative), b'.');
+                let fraction =
+                    u64::from(data[dot + 1] - b'0') * 10 + u64::from(data[dot + 2] - b'0');
+                let cents = (whole * 100 + fraction).cast_signed();
+                let cents = if negative { -cents } else { cents };
+                // Past the CR if any, then the LF. Only the last record may end at end of file
+                // instead (§2.1), which leaves `at` past the end and stops the loop.
+                at = dot + 4 + usize::from(data.get(dot + 3) == Some(&b'\r'));
+                let to = exchange.owner(letter[3] as u32);
+                let word = exchange.post(half, me, to, sent[to], letter);
+                sent[to] += 1;
+                // A full mailbox ends the round.
+                round_end = if sent[to] == MAILBOX { at } else { round_end };
+                batch[parsed] = (region_id as usize, word, id, cents, name_bytes, note_bytes);
+                parsed += 1;
             }
-            let (id, comma) = number(data, at, b',');
-            let (name, name_bytes, after_name) = text_field(data, comma + 1);
-            let mut letter = name_letter(data, name);
-            let (_, note_bytes, after_note) = text_field(data, after_name);
-            let (region_id, comma) = number(data, after_note, b',');
-            // The sign applies to the whole value, so -0.75 is -75 cents, not -0 * 100 + 75.
-            let negative = data[comma + 1] == b'-';
-            let (whole, dot) = number(data, comma + 1 + usize::from(negative), b'.');
-            let fraction = u64::from(data[dot + 1] - b'0') * 10 + u64::from(data[dot + 2] - b'0');
-            let cents = (whole * 100 + fraction).cast_signed();
-            let cents = if negative { -cents } else { cents };
-            // Past the CR if any, then the LF. Only the last record may end at end of file instead
-            // (§2.1), which leaves `at` past the end and stops the loop.
-            at = dot + 4 + usize::from(data.get(dot + 3) == Some(&b'\r'));
-            // Records also reference ids past the table's largest (§2.2), so the lookup is
-            // bounds-checked; those ids are unmatched like the holes inside the table.
-            let group = regions.group(region_id as usize);
-            letter[3] |= (group as u64) << 48;
-            let to = exchange.owner(letter[3] as u32);
-            exchange.post(half, me, to, sent[to], letter);
-            sent[to] += 1;
-            groups[group].merge(&Group {
-                count: 1,
-                id_sum: id,
-                amount_sum: cents,
-                amount_min: cents,
-                amount_max: cents,
-                name_bytes,
-                note_bytes,
-                distinct: 0,
-            });
-            if sent[to] == MAILBOX {
-                break;
+            for &(region_id, word, id, cents, name_bytes, note_bytes) in &batch[..parsed] {
+                // Records also reference ids past the table's largest (§2.2), so the lookup is
+                // bounds-checked; those ids are unmatched like the holes inside the table.
+                let group = regions.group(region_id);
+                let word = &exchange.letters[word];
+                word.store(word.load(Relaxed) | (group as u64) << 48, Relaxed);
+                groups[group].merge(&Group {
+                    count: 1,
+                    id_sum: id,
+                    amount_sum: cents,
+                    amount_min: cents,
+                    amount_max: cents,
+                    name_bytes,
+                    note_bytes,
+                    distinct: 0,
+                });
             }
         }
         exchange.seal(half, me, &sent);
@@ -714,10 +730,12 @@ impl Exchange {
         (half * self.threads + from) * self.threads + to
     }
 
-    /// Writes letter `index` of the mailbox from `from` to `to`.
-    fn post(&self, half: usize, from: usize, to: usize, index: usize, letter: [u64; 4]) {
+    /// Writes letter `index` of the mailbox from `from` to `to`, and returns where its last
+    /// word lies in `letters`, which [`aggregate`] completes later with the name's group.
+    fn post(&self, half: usize, from: usize, to: usize, index: usize, letter: [u64; 4]) -> usize {
         let at = (self.mailbox(half, from, to) * MAILBOX + index) * 4;
         (self.letters[at..at + 4].iter().zip(letter)).for_each(|(w, v)| w.store(v, Relaxed));
+        at + 3
     }
 
     /// Publishes how many letters `from` posted to each worker this round.

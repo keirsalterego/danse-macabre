@@ -20,6 +20,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 13 | 18 fewer lines in the region table, the exchange and the name set, at the same speed | run-5fd07fa31be9 | 0.0415 | 13.0 | 72.8 |
 | 14 | 11 fewer lines: one helper runs both thread groups, and the exchange wakes every worker | run-701b81269ca6 | 0.0368 | 12.4 | 74.3 |
 | 15 | The input padded with 32 zero bytes after the sentinel record, so the field parsers lose their end-of-input paths and a per-record `memcpy`; 11 fewer lines | run-94c175e1147b | 0.0427 | 12.6 | 72.7 |
+| 16 | Records parsed four at a time: each one's byte in the region table prefetched as soon as its region id is parsed, and the four groups looked up after the fourth record | | | | |
+| 17 | A static-pie build, which skips the dynamic loader | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -514,6 +516,52 @@ Local, on top of step 13 (P-cores, a loaded machine, 151 interleaved runs, media
 step 14, S 534 → 523, and 522 after inlining the single-use `KEY` constant, which leaves the machine code
 identical. Gate: 307 pass, 0 fail; full seeds 1–7; the 400 random and 400 hostile
 cases at 1, 3, 12, 37 and 64 threads; the forced-cut test on 490,079 offsets of 72 files.
+
+## Step 16: the region lookup prefetched, four records at a time
+
+At step 15 the byte load in `Regions::group` was the parse loop's one load that missed L2: 40% of
+all L2 misses and 6.5% of all cycle samples (P-cores, `perf record`). The table is 1 MB, which
+does not stay in a core's 1.25 MB L2 next to the input and the name sets, so the load goes to L3
+(per run, 4.3 M loads hit L3 and 54 K missed it). With the lookup replaced by `id & 127`, a wrong
+output, the median wall time fell 4.9%, the most that hiding the load could give.
+
+The worker now parses and posts four records, and prefetches each one's byte in the table as
+soon as its region id is parsed. Only after the fourth does it look up the four groups, OR each
+group into the last word of its letter, which no one reads before the barrier, and add each
+record to its group. A prefetch retires without waiting for its line, so it does not hold up
+the reorder buffer the way the load did.
+
+On top of step 15, P-cores, wall time of interleaved runs (`ab.py`, 151 runs each), median /
+min: 41.09 / 40.07 → 39.85 / 38.96 ms. `perf stat -r 10`, three interleaved rounds: cycles
+0.953–0.958 → 0.919–0.920 G (−3.7%), task-clock 425–427 → 411–412 ms, instructions 1.550 →
+1.655 G, page faults 6,390 in both. In 101-run sessions, batches of 3 and 4 measured −2.8%, 2
+−1.2%, 6 −1.8% and 16 −1.9%, and the batch of 4 without the prefetch +1.3%. S 522 → 534.
+
+Variants that did not stay, against step 15 in the same sessions:
+- The prefetch alone, with the lookup where it was: flat (41.05 against 41.07 ms).
+- Each record's lookup one record late instead of in batches: −0.8% to −1.1%. The record carried
+  past the next parse spilled to the stack, 20 more instructions per record.
+- The batch as a `Vec` in the record loop: +1.9%.
+- A non-temporal prefetch of the input 1 KiB ahead, to keep it out of L2: +2.2%.
+- Rounds of 32 KiB: +3.5%. Rounds of 128 KiB with 512-letter mailboxes: flat, with more memory.
+- A rank table for the regions on top of this step: one word per 32 ids with their presence
+  bits and the count of the regions before them, and one group byte per region, 450 KB in all.
+  It saved 134 page faults, about 0.5 MB, but cost +6.0% wall time and +12% task-clock: the
+  second load depends on the first, and the prefetch covers only the first.
+
+Correctness checks: the gate (307 pass, 0 fail); full seeds 1 to 7; the 400 random and 400
+hostile cases at the default thread count and at 1, 3, 12, 37 and 64 threads; the same cases on
+a build with 100-byte rounds and 3-letter mailboxes, which ends most rounds with a full mailbox
+and a partial batch, at 1, 2, 3, 12 and 64 threads; and the forced-cut test on 490,079 offsets
+of 72 files.
+
+## Step 17: a static-pie build
+
+`-C target-feature=+crt-static` in `.cargo/config.toml` (free on S) links the binary as a
+static PIE, so the process starts without the dynamic loader, as track A has done since its
+step 14. `ab.py`, 40 interleaved runs on top of step 16, median / min / mean: 40.14 / 38.97 /
+42.65 ms dynamic, 39.70 / 38.86 / 40.73 ms static. Gate: 307 pass, 0 fail; the image built
+offline and run with the harness's sandbox flags gives seed 1's hash.
 
 ## Experiments that did not stay
 
