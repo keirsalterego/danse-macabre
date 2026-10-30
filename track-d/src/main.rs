@@ -362,6 +362,19 @@ struct Csr {
 }
 
 impl Csr {
+    /// Starts loading the first cache line of `node`'s edges into L1, without waiting for it.
+    /// At full scale a node has 2.9 edges on average, 23 bytes, so one 64-byte line usually
+    /// holds them all: prefetching the last line as well measured no faster. The offsets entry
+    /// read here can miss too, but nothing waits for it.
+    fn prefetch(&self, node: u32) {
+        if let Some(edge) = self.edges.get(self.offsets[node as usize] as usize) {
+            let line = std::ptr::from_ref(edge).cast();
+            // SAFETY: a prefetch is a hint that never faults and changes no state, and `line`
+            // comes from a reference, so it points into live memory anyway.
+            unsafe { std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(line) };
+        }
+    }
+
     /// The packed edges of `node`.
     fn edges(&self, node: u32) -> &[u64] {
         let node = node as usize;
@@ -479,6 +492,13 @@ impl<'g> Search<'g> {
         if let Some(Reverse((d, node))) = self.heap.pop()
             && d == self.dist[&node]
         {
+            // Software pipelining. The node settled next is usually the one now on top of the
+            // heap, and its edges sit at a random spot in a 40 MB array, a trip to DRAM. Starting
+            // that load now overlaps it with the work on `node`'s edges below, where it would
+            // otherwise stall the next step. This one prefetch cut the run by 28% (12 threads).
+            if let Some(&Reverse((_, top))) = self.heap.peek() {
+                self.graph.prefetch(top);
+            }
             for &edge in self.graph.edges(node) {
                 let (next, via) = (edge as u32, d + (edge >> 32));
                 let label = self.dist.entry(next).or_insert(UNREACHABLE);
