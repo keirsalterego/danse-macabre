@@ -28,10 +28,11 @@
 //! 3. **Merge.** We collect every thread's endpoint names, drop duplicates and sort them bytewise
 //!    ([`rank_endpoints`]). An endpoint's position in that list, its *rank*, is also its position
 //!    within an hour of the output, so the output never needs sorting.
-//! 4. **Summarize by hour.** Each thread takes a range of hours ([`summarize_hours`]). For one
-//!    hour it counts the lines per endpoint, uses the counts to place each latency next to the
-//!    others of its endpoint (a counting sort), and picks the three percentiles out of every run
-//!    with a selection algorithm, which is linear, instead of a full sort.
+//! 4. **Summarize by hour.** Threads take hours one at a time, largest first
+//!    ([`summarize_hours`]). For one hour a thread counts the lines per endpoint, uses the counts
+//!    to place each latency next to the others of its endpoint (a counting sort), and picks the
+//!    three percentiles out of every run with a selection algorithm, which is linear, instead of
+//!    a full sort.
 //!
 //! ## Why it is fast
 //!
@@ -46,13 +47,14 @@
 //!
 //! Every step's measurements are in `PERF.md`.
 
+use std::cmp::Reverse;
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
 use std::num::NonZeroUsize;
-use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 /// The number of hours a log can span.
@@ -151,23 +153,30 @@ fn summarize(log: &[u8]) -> Result<Vec<Vec<u8>>, String> {
             .collect::<Result<Vec<_>, _>>()
     })?;
     let (names, ranks) = rank_endpoints(&chunks);
-    let (chunks, ranks, names) = (&chunks, &ranks, &names);
-    Ok(thread::scope(|s| {
+    // Night hours carry about half the traffic of day hours, so fixed blocks of hours would
+    // leave some workers idle while others finish. Workers instead take one hour at a time from
+    // a shared counter, largest first (longest-processing-time-first scheduling).
+    let mut by_size: Vec<usize> = (0..HOURS).collect();
+    by_size.sort_by_key(|&h| Reverse(chunks.iter().map(|c| c.hour(h).len()).sum::<usize>()));
+    let taken = AtomicUsize::new(0);
+    let (chunks, ranks, names, by_size, taken) = (&chunks, &ranks, &names, &by_size, &taken);
+    let mut hours: Vec<(usize, Vec<u8>)> = thread::scope(|s| {
         let workers: Vec<_> = (0..threads)
-            .map(|t| HOURS * t / threads..HOURS * (t + 1) / threads)
-            .enumerate()
-            .map(|(t, hours)| {
+            .map(|t| {
                 s.spawn(move || {
-                    let out = summarize_hours(hours, chunks, ranks, names);
+                    let queue = std::iter::from_fn(|| by_size.get(taken.fetch_add(1, Relaxed)));
+                    let out = summarize_hours(queue.copied(), chunks, ranks, names);
                     release(&log[log.len() * t / threads..log.len() * (t + 1) / threads]);
                     out
                 })
             })
             .collect();
         (workers.into_iter())
-            .map(|w| w.join().expect("a panic aborts the process"))
+            .flat_map(|w| w.join().expect("a panic aborts the process"))
             .collect()
-    }))
+    });
+    hours.sort_unstable_by_key(|&(hour, _)| hour);
+    Ok(hours.into_iter().map(|(_, out)| out).collect())
 }
 
 /// Drops our page-table entries for `bytes` with `madvise(MADV_DONTNEED)`.
@@ -542,7 +551,7 @@ fn rank_endpoints<'a>(chunks: &[Chunk<'a>]) -> (Vec<&'a [u8]>, Vec<Vec<u32>>) {
     (names, ranks)
 }
 
-/// Computes and formats the output lines for a range of hours.
+/// Computes and formats the output lines of each hour in `hours`, one buffer per hour.
 ///
 /// For each hour we gather that hour's records from every chunk, in chunk order, and then:
 ///
@@ -554,18 +563,19 @@ fn rank_endpoints<'a>(chunks: &[Chunk<'a>]) -> (Vec<&'a [u8]>, Vec<Vec<u32>>) {
 ///
 /// Endpoints are visited in rank order, so the lines come out already in output order.
 fn summarize_hours(
-    hours: Range<usize>,
+    hours: impl Iterator<Item = usize>,
     chunks: &[Chunk],
     ranks: &[Vec<u32>],
     names: &[&[u8]],
-) -> Vec<u8> {
-    let mut out = Vec::new();
+) -> Vec<(usize, Vec<u8>)> {
+    let mut done = Vec::new();
     // After the counting pass, endpoint e's latencies go to latencies[start[e]..start[e + 1]].
     let mut start = vec![0u32; names.len() + 1];
     let mut next = vec![0u32; names.len()];
     let mut errors = vec![0u32; names.len()];
     let mut latencies = Vec::new();
     for hour in hours {
+        let mut out = Vec::new();
         start.fill(0);
         errors.fill(0);
         for (chunk, rank) in chunks.iter().zip(ranks) {
@@ -623,8 +633,9 @@ fn summarize_hours(
             }
             out.push(b'\n');
         }
+        done.push((hour, out));
     }
-    out
+    done
 }
 
 /// Appends a space and then `value` in decimal.
