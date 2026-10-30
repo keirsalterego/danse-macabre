@@ -758,12 +758,14 @@ fn summarize_hours(
             let index = |p: usize| (p * n).div_ceil(100) - 1;
             // `select_nth_unstable(k)` puts the k-th smallest value at index k, everything
             // smaller before it and everything larger after it, in linear time. Selecting the
-            // highest rank first leaves every lower rank inside the prefix before it, so each
-            // later selection works on a shorter slice. The prefixes are inclusive because the
-            // ranks coincide for small groups (at n = 1 all three are index 0).
-            let p99 = *group.select_nth_unstable(index(99)).1;
-            let p95 = *group[..=index(99)].select_nth_unstable(index(95)).1;
-            let p50 = *group[..=index(95)].select_nth_unstable(index(50)).1;
+            // median first leaves both higher ranks in the upper half, and p95 then leaves p99
+            // in the top 5%, so the three selections cover about 1.55 n values instead of the
+            // 2.94 n of going from p99 down. The suffixes start at the rank already found
+            // because the ranks coincide for small groups (at n = 1 all three are index 0).
+            let (i50, i95, i99) = (index(50), index(95), index(99));
+            let p50 = *group.select_nth_unstable(i50).1;
+            let p95 = *group[i50..].select_nth_unstable(i95 - i50).1;
+            let p99 = *group[i95..].select_nth_unstable(i99 - i95).1;
             let line = [e as u32, n as u32, p50, p95, p99, errors[e]];
             // The label, a space, the name, six numbers that each follow a space, and the LF.
             let numbers = numbers(&line).map(|value| 1 + digits(value));
