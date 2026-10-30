@@ -18,6 +18,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 11 | A check's cell takes a match with a conditional move instead of a branch | run-6a27aa29cd80 | 0.2644 | 44.9 | 67.8 |
 | 12 | The corpus walk takes one callback per token and one per line end, so the per-token one is inlined | run-68a53e20303e | 0.2450 | 43.8 | 68.8 |
 | 13 | A token's hash multiplies the XOR of its key words once, instead of once per word | run-4a44efe39605 | 0.2403 | 43.4 | 69.0 |
+| 14 | The per-document checks count a query's first matches in a byte per query, not in its cell | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -244,6 +245,22 @@ bits of the product.
 Locally, against step 12, three interleaved rounds: instructions 8.86 → 8.64 G, cycles
 6.18–6.19 → 6.01–6.04 G, task-clock 2,677–2,681 → 2,609–2,623 ms. Alternating runs, 16 each,
 twice: median wall 253.0 and 255.4 → 247.4 and 249.0 ms. S 846 → 844. Gate: 507 pass, 0 fail.
+
+## Step 14: the first-match counts in bytes
+
+A check's first ten matches in a chunk also go to its query's list of first matches, up to ten per
+query, and the query's own cell counted them. That cell is one of 50,000 u64s per thread, 400 KB,
+read at random on 7 M early hits, and mostly from L3. The count now sits in a byte per query
+([`Tally`]), 50 KB per thread, which stays in cache. The query's cell is no longer touched during
+the pass, so it no longer needs zeroing before the checks' cells are added in.
+
+Locally, against step 13, three interleaved rounds: cycles 6.05–6.15 → 5.94–6.00 G, task-clock
+2,623–2,669 → 2,582–2,607 ms. Alternating runs, 16 each, twice: median wall 247.9 and 247.3 →
+245.4 and 244.8 ms. memory.peak over four runs: 40.2–44.1 → 41.7–42.5 MiB (the bytes add 0.6 MB
+over 12 threads). S 844 → 845. Gate: 507 pass, 0 fail.
+
+Not kept: each check pushing its first ten matches with no per-query count (format already takes
+ten per query) gave the same time, 6 M more branch misses, and 4 MB more memory.
 
 ## Experiments that did not stay
 

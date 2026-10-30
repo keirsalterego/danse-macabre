@@ -707,6 +707,9 @@ struct Tally {
     queries: Vec<u64>,
     /// Per check ([`Plan::checks`]), a cell as above, next to its neighbours in the check list.
     checks: Vec<u64>,
+    /// Per query, how many first matches its checks recorded: a byte, which stays in cache where
+    /// the query's cell would not.
+    shown: Vec<u8>,
     /// (query index, doc id) of each query's first matches in the chunk, in doc order.
     first: Vec<(u32, u32)>,
 }
@@ -716,6 +719,7 @@ impl Tally {
         Self {
             queries: vec![0; queries],
             checks: vec![0; checks],
+            shown: vec![0; queries],
             first: Vec::new(),
         }
     }
@@ -731,16 +735,15 @@ impl Tally {
     }
 
     /// Records that `doc` matches check `c` of query `q` when `hit`, without a branch on
-    /// `hit` in the common case: a check past its first matches only adds to its cell. Until
-    /// the pass ends, the query's own cell counts only its first matches so far.
+    /// `hit` in the common case: a check past its first matches only adds to its cell.
     fn add_check(&mut self, c: usize, q: u32, doc: u32, hit: bool) {
         let cell = &mut self.checks[c];
         // A conditional move: `hit` follows no pattern, and the compiler makes a product with
         // it a branch.
         *cell += std::hint::select_unpredictable(hit, 1 << SUM_BITS | u64::from(doc), 0);
-        let shown = &mut self.queries[q as usize];
-        if hit && *cell >> SUM_BITS <= SHOWN_IDS as u64 && *shown >> SUM_BITS < SHOWN_IDS as u64 {
-            *shown += 1 << SUM_BITS;
+        let shown = &mut self.shown[q as usize];
+        if hit && *cell >> SUM_BITS <= SHOWN_IDS as u64 && usize::from(*shown) < SHOWN_IDS {
+            *shown += 1;
             self.first.push((q, doc));
         }
     }
@@ -931,7 +934,6 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
     });
     sets.flush(queries, plan, &mut tally);
     // The checks' cells hold their queries' whole counts and sums.
-    (plan.checks.iter()).for_each(|check| tally.queries[check.q as usize] = 0);
     for (check, cell) in plan.checks.iter().zip(std::mem::take(&mut tally.checks)) {
         tally.queries[check.q as usize] += cell;
     }
