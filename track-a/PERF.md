@@ -31,8 +31,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 24 | 2 fewer lines with the same machine code: one `use` line, and no alias for the hour buffer | run-3d33fc387ebc | 0.0199 | 21.2 | 84.2 |
 | 25 | 6 fewer lines with the same machine code: five variables written where they are used, and the last thread's exit on one line | run-6223c163632a | 0.0200 | 20.9 | 84.2 |
 | 26 | 3 fewer lines with the same machine code: `digits` a closure in its one caller, and a group's length read where it is used | run-b3536f948213 | 0.0200 | 21.2 | 84.2 |
-| 27 | The sorting network's stages within one register take each lane's partner from the register itself, not from the stage's copy | | | | |
-| 28 | 3 fewer lines with the same machine code: the run pairs taken with `array_windows`, and two lint exceptions moved to `Cargo.toml` | | | | |
+| 27 | The sorting network's stages within one register take each lane's partner from the register itself, not from the stage's copy | run-ccf7ded5ed1d | 0.0199 | 21.0 | 84.3 |
+| 28 | 3 fewer lines with the same machine code: the run pairs taken with `array_windows`, and two lint exceptions moved to `Cargo.toml` | run-ccf7ded5ed1d | 0.0199 | 21.0 | 84.3 |
+| 29 | 1 fewer line with the same machine code: the network's compare-exchange blends its minimum and maximum in one expression | | | | |
 
 ## Step 1: v1
 
@@ -345,6 +346,12 @@ instead of `#[expect]` on the items. `.text` and `.rodata` are byte-identical to
 and M cannot move. S 379 → 376. Gate: 307 pass, 0 fail.
 
 Steps 27 and 28 went to the board in one push, so both rows cite the same run.
+
+## Step 29: 1 more line
+
+With the partner named `p` (step 27), the minimum and maximum fit inside the `blendv` call, so
+the `(low, high)` binding goes. `.text` and `.rodata` are byte-identical to step 28's. S 376 → 375.
+Gate: 307 pass, 0 fail.
 
 ## Experiments that did not stay
 
