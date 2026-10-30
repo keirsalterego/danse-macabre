@@ -1,17 +1,50 @@
-//! Track A: per-(hour, endpoint) request counts, exact latency percentiles and error rates.
+//! # Track A: Ingest
 //!
-//! Pipeline, on every hardware thread:
-//! 1. mmap `requests.log` and cut it into one chunk per thread at line breaks.
-//! 2. Parse each chunk once. Endpoints are interned per thread, and each line becomes one 8-byte
-//!    record (endpoint id, hour, error bit, latency). The chunk's records are then sorted by hour
-//!    in place.
-//! 3. Merge the per-thread endpoint names and sort them bytewise: rank order is output order.
-//! 4. Each thread takes a range of hours. Per hour it counts lines per endpoint, places the
-//!    latencies endpoint by endpoint in one buffer that fits in L2, and selects the three
-//!    nearest ranks with `select_nth_unstable` (exact, no full sort).
+//! This program reads an access log of about 3.1 million lines and writes, for every hour and
+//! endpoint that saw traffic, the request count, the exact 50th, 95th and 99th latency
+//! percentiles, and the error rate. An input line looks like this:
 //!
-//! The input is parsed once, not twice: at 239 MB it is ten times the L3, so a second pass would
-//! stream it from DRAM again. The records cost 25 MB of memory instead. Numbers: PERF.md.
+//! ```text
+//! 2026-10-30T18:07:12.345678Z GET /v2/orders/{id} 200 1234
+//! ```
+//!
+//! and an output line like this (count, p50, p95, p99, errors, errors per million):
+//!
+//! ```text
+//! 2026-10-30T18:00:00Z /v2/orders/{id} 3 5678 9012 9012 0 0
+//! ```
+//!
+//! ## The pipeline
+//!
+//! The work runs in two parallel phases with a short serial merge between them. Each parallel
+//! phase uses every hardware thread (12 on the scoring box).
+//!
+//! 1. **Map and split.** We `mmap` the log instead of reading it ([`map_file`]) and cut it into
+//!    one chunk per thread at line breaks ([`line_bounds`]).
+//! 2. **Parse once.** Each thread turns every line of its chunk into one 8-byte record: endpoint
+//!    id, hour, error bit and latency ([`parse`]). Endpoint names become small integer ids
+//!    through a per-thread hash table ([`Interner`]). The thread then sorts its records by hour,
+//!    in place ([`sort_by_hour`]).
+//! 3. **Merge.** We collect every thread's endpoint names, drop duplicates and sort them bytewise
+//!    ([`rank_endpoints`]). An endpoint's position in that list, its *rank*, is also its position
+//!    within an hour of the output, so the output never needs sorting.
+//! 4. **Summarize by hour.** Each thread takes a range of hours ([`summarize_hours`]). For one
+//!    hour it counts the lines per endpoint, uses the counts to place each latency next to the
+//!    others of its endpoint (a counting sort), and picks the three percentiles out of every run
+//!    with a selection algorithm, which is linear, instead of a full sort.
+//!
+//! ## Why it is fast
+//!
+//! - **One pass over the input.** The log is 239 MB, ten times the L3 cache, so every pass over
+//!   it streams from main memory. We parse it once and keep 25 MB of compact records instead.
+//! - **No byte-by-byte scanning.** One AVX2 compare finds a line's end ([`line_end`]). The
+//!   latency, the status and the end of the endpoint are then read backwards from it at known
+//!   offsets, and the latency's digits convert in a single SWAR step ([`latency`]).
+//! - **Working sets that fit in cache.** One hour holds about 43,000 lines, so its latency
+//!   buffer (170 KB) stays in the core's L2 cache during the counting sort and the selection.
+//! - **No teardown.** We exit right after the write, without running destructors.
+//!
+//! Every step's measurements are in `PERF.md`.
 
 use std::error::Error;
 use std::fs::File;
@@ -22,19 +55,33 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::thread;
 
-/// Every timestamp lies in the same 72 hours, 2026-10-30T18:00Z to 2026-11-02T17:59:59.999999Z,
-/// for every seed and scale (spec §2, field `ts`).
+/// The number of hours a log can span.
+///
+/// The spec guarantees that every timestamp lies in the same 72 hours, from
+/// `2026-10-30T18:00:00.000000Z` to `2026-11-02T17:59:59.999999Z`, for every seed and scale
+/// (§2, field `ts`). That lets us use the hour as a dense index `0..72` instead of hashing it.
 const HOURS: usize = 72;
-/// The shortest possible line: a 27-byte timestamp, a 3-byte method, a 1-byte endpoint, a 3-digit
-/// status, a 1-digit latency, four spaces and the LF.
+
+/// The length of the shortest possible line, LF included.
+///
+/// A 27-byte timestamp, a 3-byte method, a 1-byte endpoint, a 3-digit status, a 1-digit latency,
+/// four spaces and the LF add up to 40. Two things rely on it: [`parse`] sizes its record buffer
+/// for the worst case of all-minimal lines, and [`line_end`] starts looking for the LF at byte 39.
 const MIN_LINE: usize = 40;
 
+// We declare `mmap` ourselves instead of pulling in the `libc` crate: every dependency costs
+// points on the D axis, and the C library is already linked into every Rust binary. The two
+// constants are the values from Linux's `<sys/mman.h>`.
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
 }
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 
+/// Reads `<data_dir>/requests.log` and writes `<out_dir>/summary.txt`.
+///
+/// The directories default to `/data` and `/out`, where the scoring harness mounts them; the
+/// local test scripts pass their own.
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
@@ -46,13 +93,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     for part in &parts {
         out.write_all(part)?;
     }
-    // Exit without running destructors: freeing the record and output buffers would only add to
-    // the timed wall. `File` keeps no user-space buffer, so every byte is already written.
+    // Exit without running destructors: freeing tens of megabytes of records and output buffers
+    // would only add to the timed wall clock, and the kernel reclaims the memory anyway. `File`
+    // keeps no user-space buffer, so every byte has already reached the kernel.
     std::process::exit(0)
 }
 
-/// Maps the whole file read-only. The page cache is pre-warmed, so this copies nothing and
-/// charges almost nothing to our memory cgroup, unlike reading it into the heap.
+/// Maps the whole file into our address space, read-only.
+///
+/// Reading the file with `read` would copy all 239 MB into heap memory that counts toward our
+/// memory score. A private read-only mapping instead shares the pages the kernel already holds
+/// in its page cache (the harness pre-warms it), so the file costs neither a copy nor memory.
+/// Pages are mapped lazily as the parser first touches them.
 fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
     let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let len = usize::try_from(file.metadata()?.len())?;
@@ -79,7 +131,12 @@ fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
     Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
-/// Returns the output in pieces, one per thread, to be written in order.
+/// Runs the whole pipeline over `log` and returns the output in pieces, one per thread, to be
+/// written in order.
+///
+/// Both parallel phases use [`std::thread::scope`], so the threads can borrow `log` and each
+/// other's results without reference counting. A worker that panics aborts the whole process
+/// (`panic = "abort"` in `Cargo.toml`), so a `join` never actually returns an error.
 fn summarize(log: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
     let bounds = line_bounds(log, threads);
@@ -104,7 +161,11 @@ fn summarize(log: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     }))
 }
 
-/// Splits `log` at `parts - 1` line starts, so every line lands in exactly one chunk.
+/// Splits `log` into `parts` chunks of whole lines and returns the `parts + 1` boundaries.
+///
+/// Each boundary starts at an even share of the bytes and moves forward to just past the next
+/// LF, so every line lands in exactly one chunk. The boundaries never decrease, and with fewer
+/// lines than parts some chunks are simply empty.
 fn line_bounds(log: &[u8], parts: usize) -> Vec<usize> {
     let mut bounds = vec![0];
     for i in 1..parts {
@@ -117,25 +178,49 @@ fn line_bounds(log: &[u8], parts: usize) -> Vec<usize> {
 }
 
 /// One thread's share of the log after parsing.
+///
+/// Every line becomes a single `u64` record, packed like this:
+///
+/// | bits    | field                                       |
+/// |---------|---------------------------------------------|
+/// | 63 – 40 | the endpoint's id in this chunk (24 bits)   |
+/// | 39 – 33 | the hour index, `0..72` (7 bits)            |
+/// | 32      | 1 if the status is 500–599                  |
+/// | 31 – 0  | the latency in microseconds                 |
+///
+/// Eight bytes per line keep all 3.1 million records at 25 MB. The ids are local to the chunk:
+/// [`rank_endpoints`] later maps them to global ranks.
 struct Chunk<'a> {
-    /// Local endpoint id → (name, hash). Names borrow the mapped file.
+    /// Local endpoint id → (name, hash). Names borrow the mapped file, so none are copied.
     names: Vec<(&'a [u8], u64)>,
-    /// One per line: `id << 40 | hour << 33 | error << 32 | latency_us`, sorted by hour.
+    /// One record per line, sorted by hour.
     records: Vec<u64>,
-    /// `records[hour_start[h]..hour_start[h + 1]]` are hour h's lines.
+    /// `records[hour_start[h]..hour_start[h + 1]]` are hour `h`'s lines.
     hour_start: [usize; HOURS + 1],
 }
 
 impl Chunk<'_> {
+    /// The records of one hour.
     fn hour(&self, hour: usize) -> &[u64] {
         &self.records[self.hour_start[hour]..self.hour_start[hour + 1]]
     }
 }
 
-/// Parses one chunk of whole lines. The spec guarantees well-formed input (§2), so fields are
-/// found by fixed offsets and single-byte checks rather than validated. No field is scanned
-/// byte by byte: one AVX2 window finds the line end, and the latency, status and endpoint end
-/// are read backwards from it.
+/// Parses one chunk of whole lines into records, then sorts them by hour.
+///
+/// The spec guarantees well-formed input (§2), so we locate fields by fixed offsets and single
+/// byte checks instead of validating them. No field is scanned byte by byte. Once [`line_end`]
+/// has found the LF, everything else sits at a known offset from either end of the line:
+///
+/// | field     | position                                                         |
+/// |-----------|------------------------------------------------------------------|
+/// | timestamp | bytes `0..27`: month at 5, day at 8, hour at 11                  |
+/// | method    | 3 to 7 bytes from byte 28                                        |
+/// | endpoint  | from the byte after the method's space up to `space - 4`         |
+/// | status    | the three bytes `space - 3 .. space`                             |
+/// | latency   | the digits between `space` and the LF                            |
+///
+/// Here `space` is the last space of the line, which [`latency`] finds.
 fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
     let mut endpoints = Interner::default();
     let mut records = Vec::with_capacity(chunk.len() / MIN_LINE + 1);
@@ -172,8 +257,13 @@ fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
     })
 }
 
-/// Index of the LF that ends `line`. No line is shorter than `MIN_LINE`, so the search starts
-/// at that line's last byte, and the first 64-byte window holds the LF for ~90% of lines.
+/// Returns the index of the LF that ends the first line of `line`.
+///
+/// No line is shorter than [`MIN_LINE`], so the search starts at byte 39 rather than 0. From
+/// there one 64-byte window, checked with two AVX2 compares in [`newline_mask`], holds the LF of
+/// about 90% of lines, which makes the branch after it easy to predict. Longer lines take
+/// another window, and the last line of a chunk, with fewer than 64 bytes left, falls back to a
+/// plain byte search.
 fn line_end(line: &[u8]) -> usize {
     let mut at = MIN_LINE - 1;
     while at + 64 <= line.len() {
@@ -189,7 +279,11 @@ fn line_end(line: &[u8]) -> usize {
     at + tail.expect("every line ends in LF (spec §2)")
 }
 
-/// Bit i is set where `block[i]` is an LF: two 32-byte AVX2 compares.
+/// Returns a mask with bit `i` set wherever `block[i]` is an LF.
+///
+/// AVX2 compares 32 bytes at once: `_mm256_cmpeq_epi8` turns every matching byte into `0xFF`,
+/// and `_mm256_movemask_epi8` gathers the top bit of each byte into a 32-bit integer. Two of
+/// those cover the 64-byte block, and `trailing_zeros` on the result gives the first match.
 #[target_feature(enable = "avx2")]
 fn newline_mask(block: &[u8; 64]) -> u64 {
     use std::arch::x86_64::{
@@ -209,7 +303,12 @@ fn newline_mask(block: &[u8; 64]) -> u64 {
     u64::from(low) | (u64::from(high) << 32)
 }
 
-/// Hour index 0..72 from the timestamp's fixed offsets: month at 5, day at 8, hour at 11.
+/// Returns the hour index `0..72` of a line's timestamp, or `None` outside the span.
+///
+/// The timestamp is fixed-width, so we read the month, day and hour digits straight from their
+/// offsets instead of parsing a date. The span starts at 18:00 on October 30, so the days 10-30,
+/// 10-31, 11-01 and 11-02 become 0 to 3, and the index is `day × 24 + hour − 18`. For example
+/// `2026-11-01T00:...` is index 30.
 fn hour_index(line: &[u8]) -> Option<usize> {
     let two = |i: usize| usize::from(line[i] - b'0') * 10 + usize::from(line[i + 1] - b'0');
     let day = match &line[5..7] {
@@ -221,9 +320,13 @@ fn hour_index(line: &[u8]) -> Option<usize> {
     (hour < HOURS).then_some(hour)
 }
 
-/// The latency that ends at `lf`, and the index of the space before it. Up to 7 digits (99.9%
-/// of lines) take one branch-free step: find the last space in the 8 bytes before the LF, zero
-/// every byte up to it, and convert the remaining digit lanes all at once.
+/// Returns the latency that ends at `lf`, and the index of the space before it.
+///
+/// Latencies of up to 7 digits (99.9% of lines) take one step without a loop. We load the 8
+/// bytes before the LF as one integer, find the last space in it with [`spaces`], zero every
+/// byte up to and including that space, and convert the remaining digits with
+/// [`eight_digits`]. For a line ending in `200 1234`, the word holds exactly those 8 bytes, the
+/// last space is byte 3, and the digit lanes left are `0 0 0 0 1 2 3 4`.
 fn latency(line: &[u8], lf: usize) -> (u32, usize) {
     let w = word(line, lf - 8);
     let found = spaces(w);
@@ -240,9 +343,14 @@ fn latency(line: &[u8], lf: usize) -> (u32, usize) {
     (eight_digits(digits), lf - 8 + last_space)
 }
 
-/// Converts eight digit lanes (values 0..=9, most significant in the lowest byte; leading lanes
-/// zeroed) to their value: pairs, then the halves of the number, in three multiplies instead of
-/// eight (Lemire, "Fast numeric string to int", 2018).
+/// Converts eight decimal digits, one per byte, into their value.
+///
+/// Each byte holds a digit value `0..=9`, the most significant digit in the lowest byte; unused
+/// leading lanes are zero. This is SWAR (SIMD within a register): instead of eight
+/// multiply-adds, we combine neighbouring digits into pairs (`d0·10 + d1`), then pairs into the
+/// final number, using three multiplies on the whole word. For the lanes `0 0 0 0 1 2 3 4` the
+/// pairs are `00 00 12 34`, and the result is `12·100 + 34 = 1234`. The method is from Daniel
+/// Lemire, "Fast numeric string to int" (2018).
 fn eight_digits(lanes: u64) -> u32 {
     let pairs = lanes * 10 + (lanes >> 8);
     let high = (pairs & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32));
@@ -250,21 +358,34 @@ fn eight_digits(lanes: u64) -> u32 {
     ((high + low) >> 32) as u32
 }
 
-/// Reads the 8 bytes at `at` as one little-endian word.
+/// Reads the 8 bytes at `at` as one little-endian integer, so that byte `at` becomes the lowest
+/// byte of the result.
 fn word(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(*bytes[at..].first_chunk().expect("8 bytes at `at`"))
 }
 
-/// Sets bit 7 of exactly the bytes of `w` that are spaces. No borrow crosses bytes, so the
-/// highest set bit is as trustworthy as the lowest.
+/// Returns a mask with bit 7 of every byte set where that byte of `w` is a space.
+///
+/// XOR with `0x20` turns spaces into zero bytes, so the task becomes "which bytes are zero".
+/// For one byte `x`, `(x & 0x7F) + 0x7F` sets bit 7 exactly when the low seven bits are not all
+/// zero, and OR-ing `x` itself also catches bytes whose bit 7 was already set. So bit 7 ends up
+/// clear only for zero bytes, and the final NOT and mask report those. The addition never
+/// carries out of a byte, so every byte's answer is exact. The shorter, better-known zero-byte
+/// test from "Bit Twiddling Hacks" can flag false matches above a real one, and [`latency`]
+/// needs the *last* space, so it uses this exact form.
 fn spaces(w: u64) -> u64 {
     let x = w ^ 0x2020_2020_2020_2020;
     !(((x & 0x7F7F_7F7F_7F7F_7F7F) + 0x7F7F_7F7F_7F7F_7F7F) | x) & 0x8080_8080_8080_8080
 }
 
-/// Hashes an endpoint from its length and three 8-byte windows (first, middle, last), with no
-/// loop. Every window lies inside the name, so equal names hash equal; different names that
-/// share all three windows only cost an extra probe, since the interner compares bytes.
+/// Hashes an endpoint name for the [`Interner`].
+///
+/// Hashing every byte would need a loop whose length varies from line to line. Instead we mix
+/// the length with three 8-byte windows: the first, the middle and the last. That is a fixed
+/// amount of work, and it covers every byte of names up to 24 bytes long. Each window lies
+/// inside the name, so equal names always hash equal. Two different names that agree on all
+/// three windows would only share a probe sequence: the interner still compares the bytes.
+/// The mixing step is the multiply-rotate used by rustc's `FxHasher`.
 fn hash(name: &[u8]) -> u64 {
     let mix = |hash: u64, w: u64| (hash.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
     let n = name.len();
@@ -277,11 +398,17 @@ fn hash(name: &[u8]) -> u64 {
     mix(first_and_middle, word(name, n - 8))
 }
 
-/// Open-addressing map from endpoint bytes to dense ids. It doubles at half load, so it assumes
-/// nothing about how many distinct endpoints a seed has.
+/// A hash table that gives every distinct endpoint name a dense id: 0, 1, 2, and so on.
+///
+/// It uses open addressing with linear probing. A name's hash picks a slot, and on a collision
+/// we try the next slot until we find the name or an empty slot. The table doubles whenever it
+/// gets half full, which keeps probe sequences short and means it assumes nothing about how many
+/// distinct endpoints a seed has.
 struct Interner<'a> {
-    /// Id + 1 per slot; 0 marks an empty slot.
+    /// The table. A slot holds `id + 1`, so that 0 can mark an empty slot.
     slots: Vec<u32>,
+    /// Id → (name, hash). Keeping the hash lets a probe reject most non-matching slots without
+    /// comparing bytes, and lets the table grow without hashing anything again.
     names: Vec<(&'a [u8], u64)>,
 }
 
@@ -295,6 +422,7 @@ impl Default for Interner<'_> {
 }
 
 impl<'a> Interner<'a> {
+    /// Returns `name`'s id, assigning the next free one if the name is new.
     fn intern(&mut self, name: &'a [u8], hash: u64) -> u32 {
         let slot = self.slot(name, hash);
         if self.slots[slot] != 0 {
@@ -314,7 +442,7 @@ impl<'a> Interner<'a> {
         self.names.len() as u32 - 1
     }
 
-    /// The slot holding `name`, or the empty slot where it belongs (linear probing).
+    /// Returns the slot that holds `name`, or the empty slot where it belongs.
     fn slot(&self, name: &[u8], hash: u64) -> usize {
         let mask = self.slots.len() - 1;
         let mut slot = (hash >> 32) as usize & mask;
@@ -329,8 +457,13 @@ impl<'a> Interner<'a> {
     }
 }
 
-/// In-place counting sort by hour (American flag sort): each record moves at most once, and a
-/// chunk's records never leave that thread's own buffer.
+/// Sorts `records` by hour in place and returns where each hour starts.
+///
+/// This is an American flag sort: a counting sort that permutes in place instead of copying into
+/// a second buffer, so it needs no extra memory. The counts from parsing give each hour its
+/// region of the array. Then we walk the regions in order, and every record that sits in the
+/// wrong region is swapped straight into the next free place of its own. Each swap puts at least
+/// one record where it belongs, so the whole sort is linear. It takes about 1.6 ms per thread.
 fn sort_by_hour(records: &mut [u64], per_hour: &[usize; HOURS]) -> [usize; HOURS + 1] {
     let mut start = [0; HOURS + 1];
     for h in 0..HOURS {
@@ -349,9 +482,13 @@ fn sort_by_hour(records: &mut [u64], per_hour: &[usize; HOURS]) -> [usize; HOURS
     start
 }
 
-/// Global ranks: the union of every chunk's names, sorted bytewise, so rank order is output
-/// order (a proper prefix sorts first, as the spec asks). Returns the sorted names and, per
-/// chunk, local id → rank.
+/// Assigns every endpoint its global rank: its position in the bytewise sort of all names.
+///
+/// Each chunk has its own ids, so we first merge the chunks' names through one more
+/// [`Interner`], which drops duplicates in a single pass instead of sorting about 22,000
+/// names. Only the 1,842 distinct names are then sorted. Rust's slice ordering is bytewise and
+/// puts a proper prefix first, which is exactly the order the spec asks for (§4). Returns the
+/// sorted names and, for each chunk, a table from its local ids to ranks.
 fn rank_endpoints<'a>(chunks: &[Chunk<'a>]) -> (Vec<&'a [u8]>, Vec<Vec<u32>>) {
     let mut all = Interner::default();
     let global: Vec<Vec<u32>> = (chunks.iter())
@@ -375,7 +512,17 @@ fn rank_endpoints<'a>(chunks: &[Chunk<'a>]) -> (Vec<&'a [u8]>, Vec<Vec<u32>>) {
     (names, ranks)
 }
 
-/// Formats the output lines of `hours`, which arrive already in output order.
+/// Computes and formats the output lines for a range of hours.
+///
+/// For each hour we gather that hour's records from every chunk, in chunk order, and then:
+///
+/// 1. **Count** the lines and errors of each endpoint (by rank).
+/// 2. **Place** each latency in one buffer at its endpoint's next free position. The prefix sum
+///    of the counts tells each endpoint where its run starts. Together, steps 1 and 2 are a
+///    counting sort by endpoint.
+/// 3. **Select** the three percentiles from each endpoint's run.
+///
+/// Endpoints are visited in rank order, so the lines come out already in output order.
 fn summarize_hours(
     hours: Range<usize>,
     chunks: &[Chunk],
@@ -417,10 +564,15 @@ fn summarize_hours(
                 continue;
             }
             let n = group.len();
-            // Nearest rank, 1-indexed: ceil(p·n / 100), the spec's (p·n + 99) / 100 (§4).
+            // The spec's nearest-rank percentile (§4) is the value at 1-indexed rank
+            // ceil(p·n / 100), which it writes as (p·n + 99) / 100. We subtract 1 for a 0-based
+            // index.
             let index = |p: usize| (p * n).div_ceil(100) - 1;
-            // Select the highest rank first: each lower rank then lies in the prefix it leaves.
-            // The prefixes are inclusive because ranks coincide for small n (all three at n = 1).
+            // `select_nth_unstable(k)` puts the k-th smallest value at index k, everything
+            // smaller before it and everything larger after it, in linear time. Selecting the
+            // highest rank first leaves every lower rank inside the prefix before it, so each
+            // later selection works on a shorter slice. The prefixes are inclusive because the
+            // ranks coincide for small groups (at n = 1 all three are index 0).
             let p99 = *group.select_nth_unstable(index(99)).1;
             let p95 = *group[..=index(99)].select_nth_unstable(index(95)).1;
             let p50 = *group[..=index(95)].select_nth_unstable(index(50)).1;
@@ -445,8 +597,11 @@ fn summarize_hours(
     out
 }
 
-/// Appends a space and `value` in decimal. 760k numbers go through here, and `write!`'s
-/// formatting machinery cost more than the digits themselves.
+/// Appends a space and then `value` in decimal.
+///
+/// About 760,000 numbers go through here. `write!` runs each one through Rust's general
+/// formatting machinery, which costs more than producing the digits, so we write them directly:
+/// least significant first, into a small buffer from the back.
 fn push_number(out: &mut Vec<u8>, mut value: u64) {
     let mut digits = [0; 20];
     let mut at = digits.len();
@@ -462,7 +617,8 @@ fn push_number(out: &mut Vec<u8>, mut value: u64) {
     out.extend_from_slice(&digits[at..]);
 }
 
-/// `YYYY-MM-DDTHH:00:00Z` for hour index `hour` of the span that starts 2026-10-30T18:00Z.
+/// Returns the output label `YYYY-MM-DDTHH:00:00Z` of hour index `hour`, the inverse of
+/// [`hour_index`].
 fn hour_label(hour: usize) -> String {
     let (day, hh) = ((hour + 18) / 24, (hour + 18) % 24);
     let (month, dd) = if day < 2 {
