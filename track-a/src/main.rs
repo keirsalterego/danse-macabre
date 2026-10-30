@@ -16,7 +16,7 @@
 //!
 //! ## The pipeline
 //!
-//! The work runs in two parallel phases with a short serial merge between them. Each parallel
+//! The work runs in three parallel phases with short serial steps between them. Each parallel
 //! phase uses every hardware thread (12 on the scoring box).
 //!
 //! 1. **Map and split.** We `mmap` the log instead of reading it ([`map_file`]) and cut it into
@@ -32,7 +32,11 @@
 //!    ([`summarize_hours`]). For one hour a thread counts the lines per endpoint, uses the counts
 //!    to place each latency next to the others of its endpoint (a counting sort), and picks the
 //!    three percentiles out of every run with a selection algorithm, which is linear, instead of
-//!    a full sort.
+//!    a full sort. What it keeps is six numbers per output line, and the hour's exact length
+//!    once formatted.
+//! 5. **Write in place.** With every hour's length known, we give the output file its final size
+//!    and map it into memory ([`map_output`]). Each thread then frees one chunk's records and
+//!    formats its run of hours straight into place in the file ([`format_hour`]).
 //!
 //! ## Why it is fast
 //!
@@ -43,14 +47,15 @@
 //!   offsets, and the latency's digits convert in a single SWAR step ([`latency`]).
 //! - **Working sets that fit in cache.** One hour holds about 43,000 lines, so its latency
 //!   buffer (170 KB) stays in the core's L2 cache during the counting sort and the selection.
-//! - **No teardown.** We exit right after the write, without running destructors.
+//! - **No teardown.** We exit right after the write, without running destructors, and the threads
+//!   hand their records and their share of the input mapping back to the kernel themselves, in
+//!   parallel ([`release`]), instead of leaving it all to the exit.
 //!
 //! Every step's measurements are in `PERF.md`.
 
 use std::cmp::Reverse;
 use std::error::Error;
 use std::fs::File;
-use std::io::Write;
 use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -72,13 +77,15 @@ const HOURS: usize = 72;
 const MIN_LINE: usize = 40;
 
 // We declare `mmap` ourselves instead of pulling in the `libc` crate: every dependency costs
-// points on the D axis, and the C library is already linked into every Rust binary. The two
+// points on the D axis, and the C library is already linked into every Rust binary. The
 // constants are the values from Linux's `<sys/mman.h>`.
 unsafe extern "C" {
     fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
 }
 const PROT_READ: i32 = 1;
+const PROT_WRITE: i32 = 2;
+const MAP_SHARED: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const MADV_DONTNEED: i32 = 4;
 
@@ -91,16 +98,40 @@ fn main() -> Result<(), Box<dyn Error>> {
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
     let log = map_file(&Path::new(&data_dir).join("requests.log"))?;
-    let parts = summarize(log)?;
-    let out_path = Path::new(&out_dir).join("summary.txt");
-    let mut out = File::create(&out_path).map_err(|e| format!("{}: {e}", out_path.display()))?;
-    for part in &parts {
-        out.write_all(part)?;
-    }
-    // Exit without running destructors: freeing tens of megabytes of records and output buffers
-    // would only add to the timed wall clock, and the kernel reclaims the memory anyway. `File`
-    // keeps no user-space buffer, so every byte has already reached the kernel.
+    summarize(log, &Path::new(&out_dir).join("summary.txt"))?;
+    // Exit without running destructors: freeing the interners and the hours' statistics would
+    // only add to the timed wall clock, and the kernel reclaims the memory anyway. Every byte of
+    // the output is already in the file's shared mapping, which the kernel keeps.
     std::process::exit(0)
+}
+
+/// Creates the file at `path` with `len` zero bytes and maps it shared and writable.
+///
+/// A single `write` of the 10 MB output took 3.9 ms, all on one thread: the kernel allocates a
+/// page-cache page for every 4 KB and copies into it. Several threads calling `write` on one
+/// file would queue on its inode lock. Instead we set the file's final size up front and map
+/// it, and every thread formats its hours straight into place. The page faults that allocate
+/// the pages then happen on all threads at once. Stores through a shared mapping land in the
+/// same page cache that `write` fills, so the file's bytes are identical.
+fn map_output(path: &Path, len: usize) -> Result<&'static mut [u8], Box<dyn Error>> {
+    // Mapping a file for writing needs it open for reading too.
+    let file = File::options().read(true).write(true).create(true).truncate(true).open(path)?;
+    if len == 0 {
+        return Ok(&mut []); // mmap rejects a zero length
+    }
+    file.set_len(u64::try_from(len)?)?;
+    // SAFETY: a new shared read-write mapping of a file we just opened read-write and sized to
+    // `len`; the kernel picks the address.
+    let ptr = unsafe {
+        let prot = PROT_READ | PROT_WRITE;
+        mmap(std::ptr::null_mut(), len, prot, MAP_SHARED, file.as_raw_fd(), 0)
+    };
+    if ptr.addr() == usize::MAX {
+        return Err(format!("mmap: {}", std::io::Error::last_os_error()).into());
+    }
+    // SAFETY: the mapping holds `len` writable bytes, nothing else refers to them, and it is
+    // never unmapped. It stays valid after `file` is closed.
+    Ok(unsafe { std::slice::from_raw_parts_mut(ptr, len) })
 }
 
 /// Maps the whole file into our address space, read-only.
@@ -135,13 +166,12 @@ fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
     Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
-/// Runs the whole pipeline over `log` and returns the output in pieces, one per thread, to be
-/// written in order.
+/// Runs the whole pipeline over `log` and writes the output to `out_path`.
 ///
-/// Both parallel phases use [`std::thread::scope`], so the threads can borrow `log` and each
-/// other's results without reference counting. A worker that panics aborts the whole process
-/// (`panic = "abort"` in `Cargo.toml`), so a `join` never actually returns an error.
-fn summarize(log: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+/// All three parallel phases use [`std::thread::scope`], so the threads can borrow `log` and
+/// each other's results without reference counting. A worker that panics aborts the whole
+/// process (`panic = "abort"` in `Cargo.toml`), so a `join` never actually returns an error.
+fn summarize(log: &[u8], out_path: &Path) -> Result<(), Box<dyn Error>> {
     let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
     let bounds = line_bounds(log, threads);
     let chunks = thread::scope(|s| {
@@ -160,14 +190,12 @@ fn summarize(log: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     by_size.sort_by_key(|&h| Reverse(chunks.iter().map(|c| c.hour(h).len()).sum::<usize>()));
     let taken = AtomicUsize::new(0);
     let (chunks, ranks, names, by_size, taken) = (&chunks, &ranks, &names, &by_size, &taken);
-    let mut hours: Vec<(usize, Vec<u8>)> = thread::scope(|s| {
+    let mut hours: Vec<Hour> = thread::scope(|s| {
         let workers: Vec<_> = (0..threads)
-            .map(|t| {
+            .map(|_| {
                 s.spawn(move || {
                     let queue = std::iter::from_fn(|| by_size.get(taken.fetch_add(1, Relaxed)));
-                    let out = summarize_hours(queue.copied(), chunks, ranks, names);
-                    release(&log[log.len() * t / threads..log.len() * (t + 1) / threads]);
-                    out
+                    summarize_hours(queue.copied(), chunks, ranks, names)
                 })
             })
             .collect();
@@ -175,29 +203,57 @@ fn summarize(log: &[u8]) -> Result<Vec<Vec<u8>>, String> {
             .flat_map(|w| w.join().expect("a panic aborts the process"))
             .collect()
     });
-    hours.sort_unstable_by_key(|&(hour, _)| hour);
-    Ok(hours.into_iter().map(|(_, out)| out).collect())
+    hours.sort_unstable_by_key(|hour| hour.index);
+    let len = hours.iter().map(|hour| hour.len).sum();
+    let mut rest = map_output(out_path, len).map_err(|e| format!("{}: {e}", out_path.display()))?;
+    let mut places = Vec::with_capacity(hours.len());
+    for hour in &hours {
+        let (place, after) = rest.split_at_mut(hour.len);
+        places.push((hour, place));
+        rest = after;
+    }
+    // Every hour has its place in the file now, so the threads format in parallel. Each takes
+    // an equal run of hours, and first frees one chunk's records: no hour needs them any more.
+    thread::scope(|s| {
+        let mut places = &mut places[..];
+        for (t, chunk) in chunks.iter().enumerate() {
+            let (mine, others) = places.split_at_mut(places.len() / (threads - t));
+            places = others;
+            s.spawn(move || {
+                release(&chunk.records);
+                let mut text = Vec::new();
+                for (hour, place) in mine {
+                    text.clear();
+                    format_hour(hour, names, &mut text);
+                    place.copy_from_slice(&text); // panics if `Hour::len` was wrong
+                }
+                release(&log[log.len() * t / threads..log.len() * (t + 1) / threads]);
+            });
+        }
+    });
+    Ok(())
 }
 
-/// Drops our page-table entries for `bytes` with `madvise(MADV_DONTNEED)`.
+/// Gives the memory pages that lie entirely inside `items` back to the kernel, with
+/// `madvise(MADV_DONTNEED)`.
 ///
-/// At exit the kernel unmaps every page we touched, on one thread and inside the timed window:
-/// for the 58,000 pages of the input that took 3.9 ms. Each worker instead releases its share of
-/// the input as soon as it is done, in parallel with the others. The file stays in the page
-/// cache, so a later read of these bytes (an endpoint name, say) just maps its page again. The
-/// call is advice: if it fails, the exit does the work as before, so the result is ignored.
-fn release(bytes: &[u8]) {
-    let start = bytes.as_ptr().map_addr(|addr| addr & !4095);
-    // SAFETY: the range lies inside our private, read-only file mapping (rounded down to its
-    // page, which is also mapped). Dropping such pages never changes their contents: the next
-    // access maps the same file data again, so every `&[u8]` into it stays valid.
-    unsafe {
-        madvise(
-            start,
-            bytes.len() + (bytes.as_ptr().addr() - start.addr()),
-            MADV_DONTNEED,
-        )
-    };
+/// At exit the kernel frees every page we touched, on one thread and inside the timed window:
+/// for the 58,000 pages of the input alone that took 3.9 ms. So each thread frees its share of
+/// the input and of the records itself, in parallel with the others, once nothing reads them.
+/// A page that only partly belongs to `items` stays mapped, since its other part may still be
+/// in use. The call is advice: if it fails, the exit does the work as before, so the result is
+/// ignored.
+fn release<T>(items: &[T]) {
+    let start = items.as_ptr().addr();
+    let (first, end) = (start.next_multiple_of(4096), (start + size_of_val(items)) & !4095);
+    if first < end {
+        let first = items.as_ptr().cast::<u8>().with_addr(first);
+        // SAFETY: the pages lie inside `items`. In the input's private read-only file mapping, a
+        // later read (an endpoint name, say) just maps the same file data again. Records read as
+        // zeros afterwards, which is why a chunk's records are released only after every hour
+        // has been summarized and nothing reads them again.
+        unsafe { madvise(first, end - first.addr(), MADV_DONTNEED) };
+    }
 }
 
 /// Splits `log` into `parts` chunks of whole lines and returns the `parts + 1` boundaries.
@@ -590,7 +646,19 @@ fn rank_endpoints<'a>(chunks: &[Chunk<'a>]) -> (Vec<&'a [u8]>, Vec<Vec<u32>>) {
     (names, ranks)
 }
 
-/// Computes and formats the output lines of each hour in `hours`, one buffer per hour.
+/// One hour of output, ready to format: [`summarize_hours`] fills it, [`format_hour`] writes it.
+struct Hour {
+    /// The hour index, `0..72`.
+    index: usize,
+    /// One entry per output line, in output order: the endpoint's rank, then the request count,
+    /// the p50, p95 and p99 latencies and the error count.
+    lines: Vec<[u32; 6]>,
+    /// The exact length of the formatted hour, in bytes, so that its place in the output file
+    /// is known before any hour is formatted.
+    len: usize,
+}
+
+/// Computes the output lines of each hour in `hours`.
 ///
 /// For each hour we gather that hour's records from every chunk, in chunk order, and then:
 ///
@@ -606,7 +674,7 @@ fn summarize_hours(
     chunks: &[Chunk],
     ranks: &[Vec<u32>],
     names: &[&[u8]],
-) -> Vec<(usize, Vec<u8>)> {
+) -> Vec<Hour> {
     let mut done = Vec::new();
     // After the counting pass, endpoint e's latencies go to latencies[start[e]..start[e + 1]].
     let mut start = vec![0u32; names.len() + 1];
@@ -614,7 +682,8 @@ fn summarize_hours(
     let mut errors = vec![0u32; names.len()];
     let mut latencies = Vec::new();
     for hour in hours {
-        let mut out = Vec::new();
+        let mut lines = Vec::new();
+        let mut len = 0;
         start.fill(0);
         errors.fill(0);
         for (chunk, rank) in chunks.iter().zip(ranks) {
@@ -636,7 +705,7 @@ fn summarize_hours(
                 next[e] += 1;
             }
         }
-        let label = hour_label(hour);
+        let label = hour_label(hour).len();
         for (e, name) in names.iter().enumerate() {
             let group = &mut latencies[start[e] as usize..start[e + 1] as usize];
             if group.is_empty() {
@@ -655,26 +724,45 @@ fn summarize_hours(
             let p99 = *group.select_nth_unstable(index(99)).1;
             let p95 = *group[..=index(99)].select_nth_unstable(index(95)).1;
             let p50 = *group[..=index(95)].select_nth_unstable(index(50)).1;
-            let errors = u64::from(errors[e]);
-            let error_ppm = errors * 1_000_000 / n as u64;
-            out.extend_from_slice(label.as_bytes());
-            out.push(b' ');
-            out.extend_from_slice(name);
-            for value in [
-                n as u64,
-                p50.into(),
-                p95.into(),
-                p99.into(),
-                errors,
-                error_ppm,
-            ] {
-                push_number(&mut out, value);
-            }
-            out.push(b'\n');
+            let line = [e as u32, n as u32, p50, p95, p99, errors[e]];
+            // The label, a space, the name, six numbers that each follow a space, and the LF.
+            let numbers = numbers(&line).map(|value| 1 + digits(value));
+            len += label + 1 + name.len() + numbers.iter().sum::<usize>() + 1;
+            lines.push(line);
         }
-        done.push((hour, out));
+        done.push(Hour {
+            index: hour,
+            lines,
+            len,
+        });
     }
     done
+}
+
+/// The six numbers an output line prints after the endpoint's name (spec §4): the request
+/// count, p50, p95, p99, the error count and the errors per million requests, rounded down.
+fn numbers(&[_, count, p50, p95, p99, errors]: &[u32; 6]) -> [u64; 6] {
+    let (count, errors) = (u64::from(count), u64::from(errors));
+    [count, p50.into(), p95.into(), p99.into(), errors, errors * 1_000_000 / count]
+}
+
+/// The number of decimal digits [`push_number`] writes for `value`.
+fn digits(value: u64) -> usize {
+    value.checked_ilog10().map_or(1, |log| log as usize + 1)
+}
+
+/// Appends the formatted lines of `hour` to `out`: `<hour> <endpoint>` and the six numbers.
+fn format_hour(hour: &Hour, names: &[&[u8]], out: &mut Vec<u8>) {
+    let label = hour_label(hour.index);
+    for line in &hour.lines {
+        out.extend_from_slice(label.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(names[line[0] as usize]);
+        for value in numbers(line) {
+            push_number(out, value);
+        }
+        out.push(b'\n');
+    }
 }
 
 /// Appends a space and then `value` in decimal.
