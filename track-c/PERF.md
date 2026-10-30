@@ -26,6 +26,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 19 | 5 fewer lines with the same machine code: three pairs of variables set in one statement each, the regions header skipped in one line, and the cast lint exceptions in `Cargo.toml` | run-ad4d88cb83d7 | 0.0370 | 12.4 | 76.0 |
 | 20 | 2 fewer lines with the same machine code: a worker's position, run end and groups set in one statement, and so are a quoted field's start and end | | | | |
 | 21 | 3 fewer lines with the same machine code: one `unsafe` statement per `mmap` call, and the digit loop's two updates in one assignment | | | | |
+| 22 | 1 fewer line with the same machine code: the name set's probe names the hash once and takes the slot and the tag from it | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -617,6 +618,13 @@ two `mmap` calls as two statements, each with its own safety comment and its fla
 it, instead of one `unsafe` block, and the byte loop of `number` updates the value and the
 position in one assignment. Dropped because the machine code changed: `merge` setting the min
 and the max in one assignment. S 316 → 313. Gate: 307 pass, 0 fail; clippy reports no warnings.
+
+## Step 22: 1 fewer line, the same machine code
+
+`NameSet::read` names the letter's 32-bit hash once and takes the first slot and the tag from
+it, where it cast `key[3]` twice, so its three declarations before the probe become two.
+`.text` and `.rodata` are byte-identical to step 21's binary. S 313 → 312. Gate: 307 pass,
+0 fail; clippy reports no warnings.
 
 ## Experiments that did not stay
 

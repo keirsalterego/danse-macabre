@@ -581,9 +581,8 @@ impl NameSet {
             let group = (letter[3] >> 48) as usize;
             // The key is the letter without its group: the hash and the length, 48 bits.
             let key = [letter[0], letter[1], letter[2], letter[3] & ((1 << 48) - 1)];
-            let mask = self.slots.len() - 1;
-            let mut slot = key[3] as u32 as usize & mask;
-            let tag = (key[3] as u32 >> 20) << 24;
+            let (mask, hash) = (self.slots.len() - 1, key[3] as u32);
+            let (mut slot, tag) = (hash as usize & mask, (hash >> 20) << 24);
             let entry = loop {
                 let found = self.slots[slot];
                 match (found & ENTRY) as usize {
