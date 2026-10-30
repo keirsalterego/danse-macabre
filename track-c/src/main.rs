@@ -49,6 +49,13 @@
 //!    gives the same result in any order. [`NameTable::distinct_per_group`] counts each
 //!    country's bits, and [`format_output`] writes the lines.
 //!
+//! # Memory
+//!
+//! The input is mapped and never copied (see [`map_file`]). What the program allocates is
+//! mostly the name table, 4 MB of slots and about 5 MB of arena in use at full scale, and the
+//! 2 MB array from region id to group. Transparent huge pages are off, because twelve threads
+//! faulting on the same fresh 2 MB region at once more than doubled the peak (see [`main`]).
+//!
 //! # What the code relies on
 //!
 //! The parser implements the grammar of spec §2.1 as written: a BOM at the start of any record,
@@ -81,19 +88,33 @@ const HEADER: &[u8] = b"id,name,note,region_id,amount";
 const CODES: usize = 26 * 26 * 26;
 
 unsafe extern "C" {
-    /// libc's `mmap(2)`. The standard library already links libc, so declaring the one function
+    /// libc's `mmap(2)`. The standard library already links libc, so declaring the functions
     /// we need costs no dependency.
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    /// libc's `prctl(2)`, used once, with [`PR_SET_THP_DISABLE`]. Like the C prototype it is
+    /// variadic, and libc reads each extra argument as an `unsigned long`.
+    fn prctl(option: i32, ...) -> i32;
 }
 /// `mmap` protection: the pages are readable and nothing else.
 const PROT_READ: i32 = 1;
 /// `mmap` flag: a private mapping, so nothing we do could ever write back to the file.
 const MAP_PRIVATE: i32 = 2;
+/// `prctl` option: no transparent huge pages for this process (see [`main`]).
+const PR_SET_THP_DISABLE: i32 = 41;
 
 /// Reads `<data_dir>/regions.csv` and `<data_dir>/records.csv` and writes
 /// `<out_dir>/aggregates.txt`. The directories come from the first two arguments and default to
 /// `/data` and `/out`, where the harness mounts them.
 fn main() -> Result<(), Box<dyn Error>> {
+    // Transparent huge pages cost memory here and buy little speed. The name table's arena
+    // grows at one front that every thread writes. When the front reaches a fresh 2 MB region,
+    // each thread that faults on it before the first fault finishes allocates and zeroes a
+    // 2 MB page of its own, and memory.peak counts them all until the losers free theirs. On
+    // 12 cores that added 22 MiB to a 15 MiB peak, while 4 KB pages cost 2% more CPU time and
+    // under 1% more wall time. If the call fails, only that saving is lost, so its result is
+    // not checked.
+    // SAFETY: the call takes plain integers and only changes this process's page-size policy.
+    unsafe { prctl(PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out_dir = args.next().unwrap_or_else(|| "/out".into());
