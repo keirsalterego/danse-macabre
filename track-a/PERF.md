@@ -17,7 +17,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 10 | 4-byte records; latencies over 19 bits on a side list | run-00fdd1e29f86 | 0.0276 | 25.0 | 79.0 |
 | 11 | One team of threads summarizes and formats the hours, with a barrier between | run-23647f6bde01 | 0.0280 | 25.3 | 78.8 |
 | 12 | One mmap helper for input and output; 35 fewer code lines | run-ce9384368863 | 0.0269 | 25.1 | 79.4 |
-| 13 | Hour checked by comparing 8 timestamp bytes; exact 64-byte name compare without the hash; padded copies for the merge | | | | |
+| 13 | Hour checked by comparing 8 timestamp bytes; exact 64-byte name compare without the hash; padded copies for the merge | run-b262ef9cc01a | 0.0258 | 25.2 | 79.9 |
 
 ## Step 1: v1
 
@@ -111,7 +111,8 @@ out of the per-line work shortens the parse. Three changes, all in the parse and
   now compares the chunks' padded copies, which are then freed.
 
 Local, turbo off, 30 alternating runs: median 30.29 → 29.60 ms (hour check) → 28.74 ms (both);
-instructions 1,159 → 974 million; peak memory and code lines unchanged.
+instructions 1,159 → 974 million; peak memory and code lines unchanged. A second board run of the
+same code, run-b1fa893c8a06, measured 25.2 ms.
 
 ## Experiments that did not stay
 

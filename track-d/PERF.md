@@ -9,6 +9,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 2 | Counting sort with no atomics (482dcb3), then a prefetch of the next node's edges (c13e637), two steps deep (599190a) | run-97e259c08579 | 0.1889 | 128.2 | 66.7 |
 | 3 | Numbers parsed eight bytes at a time (85568b4) | run-49af01c44df1 | 0.1665 | 125.8 | 68.0 |
 | 4 | Heap entries ordered by one packed 128-bit key (542bc46) | run-05e531e8754c | 0.1565 | 125.2 | 68.6 |
+| 5 | Edges packed into 4 bytes and read through a 32-byte copy, and glibc's mmap threshold fixed at 64 KiB | | | | |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
@@ -90,6 +91,43 @@ branches. A `u128` compares with one subtract-with-borrow and no branch.
 - Seed 2: 171 → 161 ms. Seed 3: 180 → 165 ms.
 - Peak memory unchanged. S 317 → 323.
 
+## Step 5: 4-byte edges and a fixed mmap threshold
+
+Where step 4's peak went, from `memory.stat` sampled through a seed 1 run: 123.6 of its 127.2 MB
+were anonymous memory, and the peak came near the end of the queries. Of that:
+
+- the two CSRs, 2 × (7 MB of offsets + 40 MB of edges) = 94 MB;
+- the label maps, about 22 MB: of the 24 searches' maps, 17 had grown to 57,344 entries (1.1 MB)
+  and 7 to 28,672;
+- 5–10 MB of free heap space, left behind by label maps that grew;
+- the heaps, about 1 MB.
+
+The build's own buffers were already small (the edge arrays come zeroed from the kernel, and pass 2
+parked the places in spare bits), so this step cuts the CSRs and the free space:
+
+1. An edge is one `u32`: the other end in the low 21 bits at full scale, the weight in the 11 bits
+   above it. A weight that doesn't fit (3,496 of the 5M on seed 1, among them the heavy edges near
+   2^32) sets the field to all ones and goes into a small map. The CSRs take 54 MB instead of 94 MB.
+   With no spare bits left, pass 2 writes each edge's place in its block to a `u16` array, which is
+   freed after pass 3.
+2. Read in place, a 4-byte row is a run of loads by one instruction, 4 bytes apart, and on the
+   i7-13620H that sets off the hardware prefetchers: on seed 1 they brought 113M lines into L2
+   instead of 55M, and the run took 5% longer. The same records in 8-byte slots did not set them off
+   (55M). So each row of up to 8 edges is first copied to the stack with one 32-byte load.
+3. Freeing the 10 MB place arrays raised glibc's mmap threshold to 10 MB. The label maps then came
+   from the heap, where each map a search outgrew stayed behind as free space. A
+   `mallopt(M_MMAP_THRESHOLD, 64 KiB)` at the start fixes the threshold, so an outgrown map is
+   unmapped.
+
+- P-cores: elapsed 158–162 → 164–167 ms, task-clock 1.75–1.78 → 1.80–1.82 s, cycles 3.82–3.88 →
+  3.97–4.01 G, instructions 5.27 → 5.50 G.
+- Peak memory: 126.6–129.2 → 81.7–81.9 MB.
+- Seed 2: 159 → 164–166 ms, peak 123.0–123.5 → 81.7–84.2 MB. Seed 3: 164 → 170–171 ms, peak
+  123.5–125.5 → 80.1–83.6 MB.
+- Knockouts in the same session: without the row copy, 172–177 ms, task-clock 1.90–1.95 s, peak
+  81.0–82.3 MB; without the fixed threshold, 164–165 ms, task-clock 1.78–1.79 s, peak 90.6–95.6 MB.
+- S 323 → 352.
+
 ## Tried and reverted (local, turbo off, no run ID)
 
 Each row's baseline ran in the same interleaved session as the experiment, so baselines differ
@@ -108,3 +146,8 @@ between rows.
 | 4-ary heap, child picked by a loop | 202–205 ms, task-clock 2.24 s, 6.71 G instructions, against 166–168 ms, 1.83–1.84 s, 5.69 G | 18% more instructions. The heap tops out at 43 KB and stays in cache, so fewer levels save no misses |
 | 4-ary heap, child picked without branches | 212–213 ms, task-clock 1.96–1.98 s, against 201–205 ms and 1.86–1.88 s (two rounds, on a busy machine) | The same: std's binary heap is already cheap per level on a heap this small |
 | Radix heap, with each bucket's minimum kept on push | 203–208 ms, task-clock 2.25–2.31 s, cycles 4.92–5.07 G, against 170–171 ms, 1.85–1.87 s, 4.04–4.05 G | It can't name the node after next, so step 2c's prefetch is lost, and bucket bookkeeping costs more than a 43 KB binary heap |
+| Labels as `u32` distances, with the rare longer ones in a second map (on step 4) | 163–170 ms, task-clock 1.81 s, 5.65 G instructions, peak 114–116 MB, against 156–158 ms, 1.73 s, 5.27 G, 125–128 MB | 7% more instructions and 28 more lines to save 11 MB |
+| Step 5's rows read in place, but with an NTA hint on the row prefetch, in reverse order, or even edges then odd ones from one load instruction | cycles 4.14–4.35 G, 98–129M L2 prefetches, against 4.07 G and 113M read in place (counters, one `perf stat -r 3` each) | The extra prefetches stayed |
+| Step 5's rows read as 8-byte pairs, or even and odd edges from two load instructions | 55–60M L2 prefetches, but 5.85–5.93 G instructions and cycles 4.07–4.12 G, against 5.45 G and 4.07 G read in place (same session) | The extra instructions ate the gain |
+| Step 5's row copied by a `memcpy` of its exact length | cycles 3.97 G, 5.71 G instructions, against 3.91 G and 5.50 G for the 32-byte copy (same session) | A library call per row |
+| A 16-byte copy for rows of up to 4 edges | 89M L2 prefetches, cycles 3.99 G, against 55M and 3.91 G for the 32-byte copy (same session) | Rows of 5 to 8 edges still set the prefetchers off |

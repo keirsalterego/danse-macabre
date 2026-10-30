@@ -8,7 +8,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 1 | Rust v1: queries read first; one parallel pass keeps postings for query terms only and checks phrase windows at each phrase's trigger term | run-af10ba01e8f3 | 0.711 | 180.0 | 53.6 |
 | 2 | Term keys read with one masked 32-byte load; tokens found 64 bytes at a time from AVX2 masks | run-03e880c5be0a | 0.5555 | 182.1 | 55.5 |
 | 3 | Costly BOOL queries evaluated on per-chunk bitsets and id lists, the rest checked per document; one 16-byte prefetched probe per token; first matches grouped per thread | run-0ba4a60c4e07 | 0.4085 | 82.7 | 60.9 |
-| 4 | Queries parsed on every thread into flat arrays; the plan's per-term lists built with one counting sort | | | | |
+| 4 | Queries parsed on every thread into flat arrays; the plan's per-term lists built with one counting sort | run-03f5349811b3 | 0.3798 | 70.7 | 62.1 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -68,6 +68,21 @@ Locally, step 3 → 4: elapsed 0.4335–0.4380 → 0.3905–0.3929 s; cycles 9.9
 memory.peak 79.2 → 69.2 MB. S went from 745 to 803.
 
 ## Experiments that did not stay
+
+- **Queries on sets evaluated every 4,096 documents inside the pass** (after step 4; not
+  submitted, because B is not among our three best tracks): each thread kept bitset rows and id
+  lists for one window instead of its whole chunk, evaluated the 1,772 queries on sets at each
+  window's end, and added their matches to the same per-query tally as the other queries. The
+  same build replaced the per-query "last matched document" array with a per-document list of
+  matched phrases and dropped the term names. Local: memory.peak 68.3 → 50.8 MB, cycles
+  9.91–9.97 → 9.85–9.91 G, instructions 12.21 → 12.41 G, same output.
+- **A fixed glibc mmap threshold on top of that:** glibc raises its mmap threshold to the largest
+  mapped block freed so far, and parsing and planning free blocks of up to a few MB, so smaller
+  blocks then come from per-thread arenas and stay resident after they are freed.
+  `mallopt(M_MMAP_THRESHOLD, 128 KiB)` took memory.peak from 50.8–51.2 to 42.4–45.3 MB at the
+  same speed (0.383–0.385 s, 9.79–9.83 G cycles). With transparent huge pages also off it was
+  41.1–41.2 MB, but cycles rose to 9.91–9.97 G and elapsed to 0.392–0.397 s. Huge pages off alone
+  gave 49.8–50.8 MB, and `malloc_trim(0)` after planning 49.2–50.1 MB.
 
 - **Every BOOL query checked per document, with no sets at all** (step 3 without the sets):
   1.29 s, 29.0 G cycles, 53.3 MB, against 0.63 s and 14.6 G for step 2. That meant about 100
