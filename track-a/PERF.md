@@ -26,6 +26,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 19 | The name hash takes one multiply instead of three dependent ones, and the slot is the product's top bits | run-4d1c6d742295 | 0.0207 | 21.3 | 83.5 |
 | 20 | Each output line built in a stack buffer with digit counts from the SWAR conversion; 12 fewer lines | | | | |
 | 21 | Each small group loaded into the sorting network with one AVX2 masked load | | | | |
+| 22 | The hour label formatted once per hour into the line buffer, and each number of up to 7 digits written with one store; 5 fewer lines | | | | |
 
 ## Step 1: v1
 
@@ -264,6 +265,20 @@ Local, turbo off, `ab.py` with 31 interleaved runs, two rounds: medians 22.81 �
 22.98 → 22.68 ms, minimums 22.24 → 22.00 and 22.24 → 21.98 ms. `perf stat`, 7 interleaved runs:
 user cycles 423.9 → 416.8 M, branch misses 1.25 → 1.12 M, instructions 779.1 → 773.9 M.
 memory.peak unchanged. S unchanged at 400. Gate: 307 pass, 0 fail.
+
+## Step 22: one store per number
+
+`hour_label` is folded into `format_hour`, which formats the label once per hour into the
+line's stack buffer. `put_number` writes the space and the digits of a value below 10^7 as one
+8-byte store; values of 8 to 10 digits write their leading digits first, then the other seven.
+Full seeds 1–4 have percentiles of 8, 9 and 10 digits, so the gate covers that path. Instructions
+779.1 → 779.2 M: the change is lines, not time. `ab.py`, 40 interleaved runs, median / min:
+22.74 / 21.86 ms before, 22.77 / 21.94 ms after. memory.peak unchanged. S 400 → 395. Gate: 307
+pass, 0 fail.
+
+Tried and dropped: releasing each thread's share of the input right after its merge, to overlap
+the wait at the first barrier: +3.9 ms, because the TLB-shootdown interrupts hit the threads
+still parsing.
 
 ## Experiments that did not stay
 

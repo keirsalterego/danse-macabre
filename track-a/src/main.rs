@@ -783,17 +783,18 @@ fn digits(value: u64) -> usize {
     value.checked_ilog10().map_or(1, |log| log as usize + 1)
 }
 
-/// Writes the formatted `lines` of hour index `hour` to `place`: `<hour> <endpoint>` and the
+/// Writes the formatted `lines` of hour index `hour` to `place`: the hour's label
+/// `YYYY-MM-DDTHH:00:00Z` (the inverse of [`hour_index`]) and a space, the endpoint, and the
 /// six numbers.
 ///
 /// Each line is formatted in a small buffer on the stack and then copied into place, because
 /// [`put_number`] writes 8 bytes at a time and may write past a line's end. The buffer keeps
-/// the hour's label from line to line. A `Vec` instead cost a capacity check and a length
-/// update for every number, and a whole hour's buffer per thread kept 1.6 MB more in memory
-/// while the output filled up.
+/// the label from line to line. A `Vec` instead cost a capacity check and a length update for
+/// every number, and a whole hour's buffer per thread kept 1.6 MB more in memory while the
+/// output filled up.
 fn format_hour(hour: usize, lines: &[[u32; 6]], names: &[&[u8]], mut place: &mut [u8]) {
-    let mut text = [0; 256];
-    text[..21].copy_from_slice(hour_label(hour).as_bytes());
+    let (mut text, day, hh) = ([0; 256], (hour + 18) / 24, (hour + 18) % 24);
+    text[..21].copy_from_slice(format!("2026-{}T{hh:02}:00:00Z ", DAYS[day]).as_bytes());
     for line in lines {
         let mut end = 21 + names[line[0] as usize].len();
         text[21..end].copy_from_slice(names[line[0] as usize]);
@@ -808,21 +809,20 @@ fn format_hour(hour: usize, lines: &[[u32; 6]], names: &[&[u8]], mut place: &mut
 /// Writes a space and then `value` in decimal to `text[at..]`, and returns where they end.
 ///
 /// About 760,000 numbers go through here, so each one takes a fixed sequence of instructions:
-/// [`eight_ascii`] turns it into eight digits at once, and one 8-byte store writes them after
-/// we shifted the leading zeros out to the end, where the next write lands on them. The
-/// leading zeros are the low bytes that hold `'0'`; the last digit counts even if it is one,
-/// so that 0 prints as `0`. The rare value of nine or ten digits writes its leading digits
-/// first, then the other eight.
+/// [`eight_ascii`] turns it into eight digits at once, we shift the leading zeros out to the
+/// end, where the next write lands on them, and one 8-byte store writes the space and up to
+/// seven digits. The leading zeros are the low bytes that hold `'0'`; the last digit counts
+/// even if it is one, so that 0 prints as `0`. The rare value of eight to ten digits writes its
+/// leading digits first, then the other seven.
 fn put_number(text: &mut [u8], at: usize, value: u64) -> usize {
-    if value >= 100_000_000 {
-        let at = put_number(text, at, value / 100_000_000);
-        text[at..at + 8].copy_from_slice(&eight_ascii(value % 100_000_000).to_le_bytes());
-        return at + 8;
+    if value >= 10_000_000 {
+        let at = put_number(text, at, value / 10_000_000);
+        text[at..at + 8].copy_from_slice(&(eight_ascii(value % 10_000_000) >> 8).to_le_bytes());
+        return at + 7;
     }
     let ascii = eight_ascii(value);
     let zeros = ((ascii ^ 0x3030_3030_3030_3030) | 1 << 56).trailing_zeros() as usize / 8;
-    text[at] = b' ';
-    text[at + 1..at + 9].copy_from_slice(&(ascii >> (8 * zeros)).to_le_bytes());
+    text[at..at + 8].copy_from_slice(&((ascii >> (8 * zeros)) << 8 | 0x20).to_le_bytes());
     at + 9 - zeros
 }
 
@@ -839,11 +839,4 @@ fn eight_ascii(value: u64) -> u64 {
     let x = hundreds | (x - hundreds * 100) << 16;
     let tens = ((x * 103) >> 10) & 0x000F_000F_000F_000F;
     (tens | (x - tens * 10) << 8) | 0x3030_3030_3030_3030
-}
-
-/// Returns the output label `YYYY-MM-DDTHH:00:00Z` of hour index `hour` and the space after it,
-/// the inverse of [`hour_index`].
-fn hour_label(hour: usize) -> String {
-    let (day, hh) = ((hour + 18) / 24, (hour + 18) % 24);
-    format!("2026-{}T{hh:02}:00:00Z ", DAYS[day])
 }
