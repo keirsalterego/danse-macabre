@@ -12,7 +12,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 5 | Edges packed into 4 bytes and read through a 32-byte copy, and glibc's mmap threshold fixed at 64 KiB (680f4ad) | run-74c555d4ba4f | 0.1551 | 83.9 | 70.2 |
 | 6 | The build's arrays faulted in before pass 2, one write per 2 MB on half the threads (3d3e358; measured together with step 7) | run-bb1fd514f3b2 | 0.1279 | 81.4 | 71.6 |
 | 7 | Each search's binary heap replaced by a bucket queue: a ring of 4,096 one-unit buckets found through a bitmap, with a small heap for keys past the ring (fc4ed14) | run-bb1fd514f3b2 | 0.1279 | 81.4 | 71.6 |
-| 8 | The query code shortened by 24 lines at the same speed: `answer` reuses `on_threads`, and the queue's helpers are folded together | | | | |
+| 8 | The query code shortened by 24 lines at the same speed: `answer` reuses `on_threads`, and the queue's helpers are folded together | run-966433fb4d85 | 0.1264 | 84.0 | 71.8 |
+| 9 | Each node's edge range kept in 2 bytes instead of a 4-byte offset, in groups of 4 nodes, and pass 3 run one direction at a time with its index faulted in first | | | | |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
@@ -223,6 +224,63 @@ S 450 → 426. Interleaved full runs, medians (fc4ed14 → step 8): seed 1 133.1
 133.77 → 133.52 and 135.11 → 135.41 ms (11 runs each), seed 2 139.92 → 137.68 ms and seed 3
 141.70 → 140.94 ms (9 runs each). Peak memory median 83.7 → 82.9 MB (7 runs each).
 
+## Step 9: a 2-byte row index, and pass 3 one direction at a time
+
+Round 8 looked at peak memory, 81–84 MB on the board. A time series of the run's cgroup memory on
+seed 1 put the peak near the end of the queries, at 82–83 MB:
+
+- the two CSRs, 53.9 MB: 2 × 20 MB of edges and 2 × 7 MB of offsets;
+- the label maps, 22.3–22.8 MB: each of the 24 keeps the size of the largest search it has run,
+  and by the end 17 have 65,536 buckets (1.11 MB) and 7 have 32,768;
+- queues, glibc's arenas, kernel memory and the cgroup's per-CPU charge stock, about 5 MB.
+
+The build peaked at the end of pass 3, at about 78 MB: 40 MB of edges, 20 MB of places and the
+14 MB of offsets that pass 3 writes for the first time. Those writes come from 12 threads at once,
+and with shares of about 580 KB, 3 or 4 threads fault on each fresh huge page, so the race step 6
+describes for pass 2 added spikes of 13 to 25 MB there.
+
+Two changes:
+
+- Pass 3 sorts one direction at a time, so the forward places are freed before the reverse index
+  is written, and it faults each direction's index in first, one write per 2 MB, as step 6 does
+  for the other arrays.
+- `Csr::offsets`, a `u32` per node, became `Csr::rows`, a `u64` per group of 4 nodes: the slot of
+  the group's first edge in the high half, and in each byte of the low half where one node's edges
+  end, counted from that slot. That is 2 bytes a node instead of 4, 7 MB less at full scale. A
+  group with 255 edges or more keeps its nodes' rows in a small map instead, and its last byte,
+  255, sends lookups there. No seed has one (the most edges in a group on seed 1 is 22), but any
+  graph stays correct. `sort` counts each node's degree one slot up, so the counting sort leaves
+  an offsets array for the block, and each group is a window of 5 of it.
+
+Peak memory, `memory.peak` in MB, 5 runs each, alternating:
+
+| Seed | Step 8 | Pass 3 change alone | Step 9 |
+|---|---|---|---|
+| 1 | 81.3–82.9, median 82.3 | 80.7–82.7, median 81.5 | 74.8–76.9, median 74.9 |
+| 2 | 80.0–84.2, median 84.0 | 78.2–79.7, median 78.7 | 70.5–72.3, median 71.7 |
+
+The peak stays near the end of the queries (74–77 MB at 123–125 ms in three time series), and
+the build now tops out at 67–68 MB.
+
+Time, on a busy machine (load 17–22 from other work on CPUs 12–15):
+
+- `ab.py`, alternating full runs, medians, step 8 → step 9: seed 1 151.9 → 151.4 ms (21 runs) and
+  142.8 → 144.7 ms (41 runs); seed 2 161.1 → 155.7 and 143.1 → 141.8 ms; seed 3 141.9 → 144.2
+  and 152.1 → 151.0 ms.
+- `perf stat -r 5` on P-cores, 4 rounds: seed 1 elapsed medians 137.2 → 137.3 ms, cycles
+  3.26–3.28 → 3.31–3.33 G, instructions 4.75 → 5.04 G; seed 2 144.3 → 141.6 ms, cycles 3.37–3.45 →
+  3.44–3.48 G. Decoding the groups costs 6% more instructions, which the cache misses around
+  them hide.
+
+Correctness: the gate passes, 509 of 509. No seed has a wide group, so 200 generated graphs check
+them against step 8: 60 random graphs with hub nodes, and 140 with one group of 4 hubs whose every
+edge leads to or from a node of its own, so each answer says which hub owns the edge. They cover
+groups of 254 and 255 edges, empty nodes, the first and last group of a block, and a last group cut
+short by n. All 200 outputs are byte-identical to step 8's, and with the wide rows emptied, 54 of
+the 60 random graphs changed.
+
+S 426 → 443.
+
 ## Tried and reverted (local, turbo off, no run ID)
 
 Each row's baseline ran in the same interleaved session as the experiment, so baselines differ
@@ -265,3 +323,5 @@ between rows.
 | Exact pruning on `via + other_top >= best`, or checking the other side when a node is settled | Correct, no speedup | |
 | Prefetching the 4th or 5th node ahead, or pre-warming the label slots of the next node's neighbours | No gain | |
 | Balancing the two sides by pop count instead of queue length | Slower | |
+| Label maps emptied after each query once they pass 14,336 entries, or 28,672 (on step 7, with step 9's pass 3 change) | Peak 72.0–72.7 MB against 80.9–82.6, but elapsed median 148.6 against 134.7 ms, task-clock 1.55–1.57 against 1.41–1.42 s | 10% slower: the next big search regrows its map from empty, rehashing at every doubling into freshly mapped pages |
+| Step 9's pass 3 change without faulting the offsets in first (on step 7) | Peak 80.9–85.2 MB against 80.6–83.7, elapsed median 137.2 against 134.1 ms | More threads first-touched each fresh huge page |

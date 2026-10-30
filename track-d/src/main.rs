@@ -16,9 +16,9 @@
 //! ## The graph: two CSR arrays
 //!
 //! A [`Csr`] (compressed sparse row) stores every edge in one array, grouped by node, next to an
-//! offsets array that says where each node's group starts, so a node's edges are one contiguous
-//! slice. There are two of them: `forward` groups the edges by tail for the search from `s`, and
-//! `reverse` groups them by head for the search from `t`.
+//! index of where each node's group starts and ends ([`Csr::rows`]), so a node's edges are one
+//! contiguous slice. There are two of them: `forward` groups the edges by tail for the search
+//! from `s`, and `reverse` groups them by head for the search from `t`.
 //!
 //! An edge is one `u32`: the neighbour in the low bits, as many as a node id needs (21 at full
 //! scale), and the weight in the bits above it (11 at full scale, so up to 2,046). Road weights
@@ -241,7 +241,7 @@ fn on_threads<T: Send>(items: impl IntoIterator<Item = T>, work: impl Fn(T) + Sy
 ///    places. A thread writes to 2 × 850 runs of each, whose current cache lines fit in L2. Heavy
 ///    weights ([`Csr::heavy`]) also go to a list of the thread's own.
 /// 3. Each block, about 6,000 edges or 23 KB at full scale, is counting-sorted by place on one
-///    thread, which also writes the block's offsets ([`sort`]).
+///    thread, which also writes the block's part of [`Csr::rows`] ([`sort`]).
 ///
 /// For example, the line `5000 7 9` lands in forward block 2 at place 904 (5000 = 2 · 2048 +
 /// 904), and in reverse block 0 at place 7. At full scale its forward edge is `9 << 21 | 7`.
@@ -264,10 +264,11 @@ fn build_graph(body: &[u8], n: usize, threads: usize) -> Result<[Csr; 2], Box<dy
     });
     let in_block = |direction: usize, block: usize| counts.iter().map(move |c| c[direction][block]);
     let m: usize = (0..blocks).flat_map(|block| in_block(0, block)).sum();
-    let edge_count = u32::try_from(m).map_err(|_| "over 2^32 - 1 edges")?;
+    u32::try_from(m).map_err(|_| "over 2^32 - 1 edges")?;
     let id_bits = n.bit_width();
     let mut graphs = [(); 2].map(|()| Csr {
-        offsets: vec![0; n + 1],
+        rows: vec![0; n.div_ceil(4)],
+        wide: HashMap::new(),
         edges: vec![0; m],
         id_bits,
         heavy: HashMap::new(),
@@ -317,26 +318,28 @@ fn build_graph(body: &[u8], n: usize, threads: usize) -> Result<[Csr; 2], Box<dy
         }
     }
 
-    // Pass 3: sort every block of both directions, split evenly over the threads.
-    let mut work = Vec::with_capacity(2 * blocks);
-    for (direction, (graph, places)) in graphs.iter_mut().zip(&mut places).enumerate() {
-        graph.offsets[n] = edge_count;
+    // Pass 3: sort every block, split evenly over the threads, one direction at a time, so the
+    // first direction's places are freed before the second direction's rows take memory. The
+    // rows are faulted in first, one write per 2 MB, for the same reason as the arrays above:
+    // 12 threads writing to new pages at once raised the peak by up to 20 MB on seed 1.
+    for (direction, (graph, mut places)) in graphs.iter_mut().zip(places).enumerate() {
+        on_threads(graph.rows.chunks_mut(1 << 18), |rows| rows[0] = 0);
         let lens = || (0..blocks).map(|block| in_block(direction, block).sum());
         let block_runs = split_runs(&mut graph.edges, lens()).into_iter();
-        let block_places = block_runs.zip(split_runs(places, lens()));
-        let mut first = 0;
-        for ((run, places), offsets) in block_places.zip(graph.offsets[..n].chunks_mut(BLOCK)) {
+        let block_places = block_runs.zip(split_runs(&mut places, lens()));
+        let (mut work, mut first) = (Vec::with_capacity(blocks), 0);
+        for ((run, places), rows) in block_places.zip(graph.rows.chunks_mut(BLOCK / 4)) {
             let next = first + run.len() as u32;
-            work.push((run, places, offsets, first));
+            work.push((run, places, rows, first, Vec::new()));
             first = next;
         }
+        on_threads(work.chunks_mut(blocks.div_ceil(threads)), |share| {
+            for (run, places, rows, first, wide) in share {
+                sort(run, places, rows, *first, wide);
+            }
+        });
+        graph.wide = work.into_iter().flat_map(|work| work.4).collect();
     }
-    let per_thread = work.len().div_ceil(threads);
-    on_threads(work.chunks_mut(per_thread), |share| {
-        for (run, places, offsets, first) in share {
-            sort(run, places, offsets, *first);
-        }
-    });
     Ok(graphs)
 }
 
@@ -366,27 +369,41 @@ fn append(runs: &mut [Run], key: usize, edge: u32) {
     (*slot, *place) = (edge, (key % BLOCK) as u16);
 }
 
-/// Counting-sorts one block's edges by place and gives each of the block's nodes its first slot
-/// in `offsets`. `first` is the slot of `run[0]` in the whole edge array.
-fn sort(run: &mut [u32], places: &[u16], offsets: &mut [u32], first: u32) {
-    // Degrees first, then an exclusive prefix sum turns them into each node's next slot.
-    let mut next = vec![0; offsets.len()];
+/// Counting-sorts one block's edges by place and writes the block's groups of [`Csr::rows`] to
+/// `rows`, and the rows of its wide groups to `wide`. `first` is the slot of `run[0]` in the whole
+/// edge array.
+fn sort(run: &mut [u32], places: &[u16], rows: &mut [u64], first: u32, wide: &mut Wide) {
+    // Degrees first, then an exclusive prefix sum turns them into each node's next slot. Node k
+    // counts in `next[k + 1]`, one place up, so that the loop below leaves `next[k]` where node
+    // k's edges start.
+    let mut next = vec![0; 4 * rows.len() + 1];
     for &place in places {
-        next[usize::from(place)] += 1;
+        next[usize::from(place) + 1] += 1;
     }
     let mut at = 0;
-    for (offset, next) in offsets.iter_mut().zip(&mut next) {
-        *offset = first + at;
+    for next in &mut next {
         at += std::mem::replace(next, at);
     }
     // A copy to read from, since the loop overwrites `run` in sorted order.
     let packed = run.to_vec();
     for (edge, &place) in packed.into_iter().zip(places) {
-        let slot = &mut next[usize::from(place)];
+        let slot = &mut next[usize::from(place) + 1];
         run[*slot as usize] = edge;
         *slot += 1;
     }
+    // Node k's edges are now `run[next[k]..next[k + 1]]`, so a group of 4 is a window of 5.
+    for (row, ends) in rows.iter_mut().zip(next.array_windows::<5>().step_by(4)) {
+        let bytes = [1, 2, 3, 4].map(|i| (ends[i] - ends[0]).min(255) as u8);
+        *row = u64::from(first + ends[0]) << 32 | u64::from(u32::from_le_bytes(bytes));
+        if bytes[3] == 255 {
+            let slot = |i: usize| (first + ends[i]) as usize;
+            wide.extend((0..4).map(|i| ((*row, i as u32), (slot(i), slot(i + 1)))));
+        }
+    }
 }
+
+/// The rows of the wide groups of one block, as [`sort`] finds them, for [`Csr::wide`].
+type Wide = Vec<((u64, u32), (usize, usize))>;
 
 /// Asks the CPU to start loading the cache line that holds `item` into L1, and returns without
 /// waiting for it.
@@ -398,11 +415,19 @@ fn prefetch<T>(item: &T) {
 }
 
 /// A directed graph in compressed sparse row form: one flat array of edges grouped by node, and
-/// an array of where each group starts. A node's edges are one slice, with no pointer chasing.
+/// an index of where each group starts and ends. A node's edges are one slice, with no pointer
+/// chasing.
 struct Csr {
-    /// Node u's edges are `edges[offsets[u]..offsets[u + 1]]`, so there are n + 1 entries. They
-    /// are `u32`, half the size of `usize`, because [`build_graph`] checks that m fits.
-    offsets: Vec<u32>,
+    /// Where each node's edges are, 2 bytes a node in groups of 4: half of a `u32` offset per
+    /// node, and 3.5 MB less per direction at full scale. The high half of `rows[u / 4]` is the
+    /// slot of the group's first edge, a `u32` because [`build_graph`] checks that m fits, and
+    /// byte `u % 4` of the low half is the end of node u's edges, counted from that slot. A group
+    /// of 255 edges or more is wide: its last byte is 255 and its rows are in `wide`
+    /// ([`Csr::row`]).
+    rows: Vec<u64>,
+    /// The start and end slot of each node in a wide group, by the group's `rows` entry and the
+    /// node's place in the group.
+    wide: HashMap<(u64, u32), (usize, usize)>,
     /// `weight << id_bits | other_end`, where `other_end` is the head in the forward graph and
     /// the tail in the reverse graph. A weight field of all ones marks a heavy edge.
     edges: Vec<u32>,
@@ -415,12 +440,25 @@ struct Csr {
 }
 
 impl Csr {
+    /// The start and end slot of `node`'s edges in `edges`, from its group in `rows`.
+    fn row(&self, node: u32) -> (usize, usize) {
+        let group = self.rows[node as usize / 4];
+        if group as u32 >> 24 == 255 {
+            // Lays the rare lookup and its hashing out of the search loop's way.
+            std::hint::cold_path();
+            return self.wide[&(group, node % 4)];
+        }
+        // Byte i of `group << 8` is where node i - 1's edges end, which is where node i's start.
+        let at = |i: u32| (group >> 32) as usize + (group << 8 >> (8 * i) & 0xFF) as usize;
+        (at(node % 4), at(node % 4 + 1))
+    }
+
     /// Starts loading the first cache line of `node`'s edges into L1, without waiting for it.
     /// At full scale a node has 2.9 edges on average, 12 bytes, so one 64-byte line usually
     /// holds them all (prefetching the last line as well measured no faster even with 8-byte
-    /// edges). The offsets entry read here can miss too, but nothing waits for it.
+    /// edges). The group read here can miss too, but nothing waits for it.
     fn prefetch(&self, node: u32) {
-        if let Some(edge) = self.edges.get(self.offsets[node as usize] as usize) {
+        if let Some(edge) = self.edges.get(self.row(node).0) {
             prefetch(edge);
         }
     }
@@ -435,8 +473,7 @@ impl Csr {
     /// neither does the copy. The 32 bytes may reach into the next rows; the slice stops at the
     /// end of this one.
     fn edges<'a>(&'a self, node: u32, copy: &'a mut [u32; 8]) -> &'a [u32] {
-        let node = node as usize;
-        let (start, end) = (self.offsets[node] as usize, self.offsets[node + 1] as usize);
+        let (start, end) = self.row(node);
         if let Some(window) = self.edges.get(start..start + 8)
             && end - start <= 8
         {
@@ -568,15 +605,15 @@ impl<'g> Search<'g> {
         // own entry came out first and relaxed the same edges from a shorter distance, so no label
         // improves now: nothing is pushed and `best` stays. The check would cost a lookup a step.
         let (d, node) = self.queue.pop();
-        // Software pipelining. Settling a node takes two dependent trips to DRAM: its offsets
-        // entry, then its edges, both at random spots in big arrays. The queue knows its next pops
-        // (a push below may still cut in), so this fetches the edges of the node two pops ahead
-        // and the offsets of the node three ahead. The previous step fetched the next node's
+        // Software pipelining. Settling a node takes two dependent trips to DRAM: its group in
+        // `rows`, then its edges, both at random spots in big arrays. The queue knows its next
+        // pops (a push below may still cut in), so this fetches the edges of the node two pops
+        // ahead and the group of the node three ahead. The previous step fetched the next node's
         // edges. Of the depths tried, this one measured fastest.
         if let [_, Some(second), third] = self.queue.upcoming(d) {
             self.graph.prefetch(second);
             if let Some(third) = third {
-                prefetch(&self.graph.offsets[third as usize]);
+                prefetch(&self.graph.rows[third as usize / 4]);
             }
         }
         let unpack = self.graph.unpack(node);
