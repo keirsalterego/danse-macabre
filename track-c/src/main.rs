@@ -37,7 +37,8 @@
 //!    order and sums into its own [`Group`] per country, so the hot loop shares nothing but the
 //!    name table. Names and notes are quoted, and [`text_field`] jumps from quote to quote 32
 //!    bytes at a time with AVX2 compares. It measures a field as its raw length minus one per
-//!    `""` pair, so no field is ever unescaped.
+//!    `""` pair, so no field is ever unescaped. [`number`] reads each number from one 8-byte
+//!    word, with no loop over its digits.
 //! 4. **Distinct names go through one shared interner.** All threads intern names in one
 //!    lock-free [`NameTable`]. Each distinct name's raw, still escaped bytes are copied once into
 //!    an arena entry that also holds a bitset with one bit per country, so a record's compare
@@ -407,8 +408,8 @@ impl Group {
 /// record's name in `names`. Returns `None` when the name table is full.
 ///
 /// This is the hot loop. The fields come in a fixed order, so the state is simply the position in
-/// the record. The numbers parse as they are scanned, and [`text_field`] skips names and notes
-/// while counting their escapes. The name table is probed in two steps, [`NameTable::probe`]
+/// the record. [`number`] parses each number from one word, and [`text_field`] skips names and
+/// notes while counting their escapes. The name table is probed in two steps, [`NameTable::probe`]
 /// right after the name and [`NameTable::mark`] at the end of the record.
 fn aggregate(
     data: &[u8],
@@ -461,7 +462,34 @@ fn aggregate(
 
 /// Parses the decimal digits from `at` up to the `stop` byte, and returns the value and the
 /// position of `stop`. The field's end and its value come out of the same pass.
+///
+/// A field whose `stop` lies within 8 bytes is parsed from one 8-byte word, with no loop and no
+/// branch on its length (SWAR: SIMD within a register). XOR with `stop` in every byte turns each
+/// `stop` into a zero byte, which a zero-byte test finds. Shifting the digits to the top of the
+/// word turns the missing ones into leading zeros, and three multiplies then join neighbouring
+/// digits into pairs, pairs into fours and fours into the value. Longer fields, such as an id
+/// with leading zeros (§2.1 allows them), and the file's last 7 bytes take the loop over bytes.
+///
+/// It is always inlined. At each of its three call sites `stop` is a constant, so the call and
+/// the multiply that copies `stop` into every byte disappear, 29 instructions per record.
+#[inline(always)]
 fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
+    const ONES: u64 = u64::from_le_bytes([1; 8]);
+    if let Some(&chunk) = data[at..].first_chunk() {
+        let word = u64::from_le_bytes(chunk);
+        let x = word ^ (ONES * u64::from(stop));
+        // The lowest set bit marks the first zero byte of `x`, so the first `stop`. Bits above
+        // it can be false, which is why only the lowest one is used.
+        let stops = x.wrapping_sub(ONES) & !x & (ONES << 7);
+        if stops != 0 {
+            let len = stops.trailing_zeros() as usize / 8;
+            // In two steps, because a 0-digit field would need a shift by 64.
+            let digits = ((word & (ONES * 0x0F)) << (56 - 8 * len)) << 8;
+            let pairs = (digits.wrapping_mul(10 << 8 | 1) >> 8) & 0x00FF_00FF_00FF_00FF;
+            let fours = (pairs.wrapping_mul(100 << 16 | 1) >> 16) & 0x0000_FFFF_0000_FFFF;
+            return (fours.wrapping_mul(10000 << 32 | 1) >> 32, at + len);
+        }
+    }
     let mut value = 0;
     while data[at] != stop {
         value = value * 10 + u64::from(data[at] - b'0');
@@ -482,6 +510,11 @@ fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
 /// [`byte_mask`], 32 bytes per step. A name or a note usually ends within the first step, where
 /// a loop over bytes took one step and one branch per byte. The file's last 31 bytes, too few for
 /// a step, go one byte at a time.
+///
+/// It is always inlined. As a call it returned its four words through the stack, and the caller
+/// read two of them back with one 16-byte load, which waits until both 8-byte stores reach the
+/// cache because store forwarding cannot merge them.
+#[inline(always)]
 fn text_field(data: &[u8], at: usize) -> (Range<usize>, u64, usize) {
     if data[at] != b'"' {
         // The generator writes unquoted text only empty (§2.2), but §2.1 allows any bytes but

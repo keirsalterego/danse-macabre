@@ -10,8 +10,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 3 | Transparent huge pages off | run-fbfe0ea92fbf | 0.1190 | 15.47 | 61.5 |
 | 4 | Distinct names counted by the workers, from the atomic OR's return value | run-e05eb5fa2929 | 0.1101 | 15.58 | 62.4 |
 | 5 | `regions.csv` parsed in one pass, each row's end found by the parse itself | run-e703239bd822 | 0.1016 | 15.31 | 63.2 |
-| 6 | Names and notes scanned 32 bytes at a time for their next quote | | | | |
-| 7 | Each name's hash slot loaded as soon as the name is scanned, so its cache miss overlaps the rest of the record | | | | |
+| 6 | Names and notes scanned 32 bytes at a time for their next quote | run-599ba20d6eb1 | 0.0920 | 15.5 | 64.2 |
+| 7 | Each name's hash slot loaded as soon as the name is scanned, so its cache miss overlaps the rest of the record | run-7b03d961ed16 | 0.0799 | 15.3 | 65.7 |
+| 8 | Numbers parsed from one 8-byte word each, and the number and text-field parsers inlined | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -158,7 +159,8 @@ P-cores, `perf stat -r 10`, three interleaved rounds:
 | cycles:u (G) | 2.58 / 2.55 / 2.54 | 2.27 / 2.22 / 2.17 |
 | elapsed (ms) | 110.6 / 105.6 / 108.9 | 94.7 / 95.2 / 93.1 |
 
-S 416 → 426, and memory.peak is unchanged, 14.7–15.0 MiB.
+S 416 → 426, and memory.peak is unchanged, 14.7–15.0 MiB. On the board this code measured
+92.0 ms in run-599ba20d6eb1, at commit 2f88e04, which carries the same track C code.
 
 ## Step 7: each name's slot loaded as soon as the name is scanned
 
@@ -184,7 +186,53 @@ P-cores, `perf stat -r 10`, three interleaved rounds:
 | elapsed (ms) | 97.8 / 99.2 / 99.7 | 89.6 / 91.1 / 87.4 |
 
 Instructions barely move, 2.035 → 2.046 G. S 426 → 432, and memory.peak in the container with
-the harness's flags is unchanged, 14.8–15.0 MiB.
+the harness's flags is unchanged, 14.8–15.0 MiB. On the board this code measured 79.9 ms in
+run-7b03d961ed16, at commit ce4de64, which carries the same track C code. The board skipped
+b9cb846 itself when a newer push replaced it in its queue.
+
+## Step 8: numbers parsed from one word, and the field parsers inlined
+
+A line-level profile of step 7 (P-cores, `perf record`) still puts most of the worker loop in the
+name table. On the parsing side, the loops over number digits held about 10% of the samples, and
+3.1% sat right after a 16-byte load that read back part of `text_field`'s result from the
+stack. Branch misses ran at 2.7 per record, 9.06 M in all. Three changes followed, each measured
+on top of the one before (P-cores, three interleaved rounds):
+
+1. `number` parses a field whose stop byte lies within 8 bytes from one little-endian word. XOR
+   with the stop byte in every byte makes each stop a zero byte, and the zero-byte test finds
+   the first one. Shifting the digits to the top of the word turns the missing ones into leading
+   zeros, and three multiplies join digits into pairs, pairs into fours and fours into the
+   value. There is no loop and no branch on the field's length. Longer fields, which §2.1 allows
+   with leading zeros, and the file's last 7 bytes keep the byte loop. Measured with
+   `perf stat -r 10`: task-clock 916 / 899 / 911 → 859 / 864 / 871 ms, cycles:u
+   2.01 / 1.97 / 2.00 → 1.87 / 1.89 / 1.91 G, instructions 2.046 → 1.872 G, and branch misses
+   9.06 → 5.03 M.
+2. `text_field` is always inlined. As a call it returned four words through the stack, and the
+   caller read two of them back with one 16-byte load. Store forwarding cannot merge two 8-byte
+   stores into one load, so that load waited until both stores reached the cache. Measured with
+   `perf stat -r 10`: task-clock 876 / 883 / 868 → 841 / 840 / 842 ms, cycles:u
+   1.92 / 1.94 / 1.90 → 1.84 / 1.83 / 1.84 G, and instructions 1.872 → 1.769 G.
+3. `number` is always inlined too. At each call site `stop` is a constant, so the call and the
+   multiply that copies `stop` into every byte disappear, 29 instructions per record. Measured
+   with `perf stat -r 30`: task-clock 844 / 839 / 845 → 824 / 812 / 824 ms, elapsed
+   80.7 / 79.6 / 81.5 → 78.6 / 78.3 / 82.3 ms, and instructions 1.769 → 1.673 G.
+
+A plain `#[inline]` left `text_field` a call, so both use `#[inline(always)]`. `number` was
+checked against the byte loop on 200,040 fields: every length from 0 to 20 digits, both stops,
+random bytes after the stop, and 20-digit values that wrap.
+
+Step 7 → step 8 on P-cores, three interleaved rounds:
+
+| | step 7 | step 8 |
+|---|---|---|
+| task-clock, `perf stat -r 30` (ms) | 901 / 911 / 907 | 830 / 824 / 828 |
+| elapsed, `perf stat -r 30` (ms) | 87.5 / 89.0 / 87.8 | 78.8 / 78.5 / 79.4 |
+| cycles:u, `perf stat -r 10` (G) | 2.05 / 1.98 / 2.03 | 1.82 / 1.81 / 1.80 |
+| instructions:u (G) | 2.046 | 1.673 |
+| branch misses (M) | 9.06 | 5.10 |
+
+S 432 → 447: 13 lines for the word parse and 2 for the attributes. memory.peak in the container
+with the harness's flags is unchanged, 14.7–14.8 MiB against 14.8–15.2 MiB for step 7.
 
 ## Experiments that did not stay
 
