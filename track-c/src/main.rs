@@ -45,9 +45,12 @@
 //!    and the quoted empty name `""` and the unquoted one are both the empty slice. Twelve
 //!    per-thread tables would each hold most of the ~100k names, so a single shared table keeps
 //!    one copy instead of twelve.
-//! 5. **Merge, count and print.** The per-thread [`Group`]s hold only integers, so merging them
-//!    gives the same result in any order. [`NameTable::distinct_per_group`] counts each
-//!    country's bits, and [`format_output`] writes the lines.
+//!
+//!    The atomic OR that sets a bit returns the word it replaced, so exactly one record sees each
+//!    name's bit for a country go from 0 to 1, and its thread counts that name as new for the
+//!    country. The counts need no pass over the table afterwards.
+//! 5. **Merge and print.** The per-thread [`Group`]s hold only integers, so merging them gives
+//!    the same result in any order, and [`format_output`] writes the lines.
 //!
 //! # Memory
 //!
@@ -254,7 +257,7 @@ fn join(records: &'static [u8], regions: &Regions) -> Result<Vec<u8>, String> {
             for part in &parts {
                 groups.iter_mut().zip(part).for_each(|(g, p)| g.merge(p));
             }
-            return Ok(format_output(&groups, &names.distinct_per_group(), regions));
+            return Ok(format_output(&groups, regions));
         }
         slot_count *= 4;
     }
@@ -338,6 +341,10 @@ struct Group {
     amount_max: i64,
     name_bytes: u64,
     note_bytes: u64,
+    /// Names that one of these records added to the country's set of names. Across all threads
+    /// each name is added to a country exactly once (see [`NameTable::mark`]), so the merged sum
+    /// is the country's number of distinct names.
+    distinct: u64,
 }
 
 impl Default for Group {
@@ -351,6 +358,7 @@ impl Default for Group {
             amount_max: i64::MIN,
             name_bytes: 0,
             note_bytes: 0,
+            distinct: 0,
         }
     }
 }
@@ -366,6 +374,7 @@ impl Group {
         self.amount_max = self.amount_max.max(other.amount_max);
         self.name_bytes += other.name_bytes;
         self.note_bytes += other.note_bytes;
+        self.distinct += other.distinct;
     }
 }
 
@@ -405,6 +414,7 @@ fn aggregate(
         // Records also reference ids past the table's largest (§2.2), so the lookup is
         // bounds-checked; those ids are unmatched like the holes inside the table.
         let group = (regions.group_of.get(region_id as usize)).map_or(0, |&g| usize::from(g));
+        let new_name = names.mark(&data[name], group)?;
         groups[group].merge(&Group {
             count: 1,
             id_sum: id,
@@ -413,8 +423,8 @@ fn aggregate(
             amount_max: cents,
             name_bytes,
             note_bytes,
+            distinct: u64::from(new_name),
         });
-        names.mark(&data[name], group)?;
     }
     Some(groups)
 }
@@ -473,8 +483,9 @@ fn text_field(data: &[u8], at: usize) -> (Range<usize>, u64, usize) {
 /// It is a string interner built as an insert-only, lock-free hash table with open addressing
 /// and linear probing. The first time any thread sees a name, it writes the name into one
 /// entry of a shared arena: its length, a bitset with one bit per group, and a copy of its bytes.
-/// A record then sets its group's bit with an atomic OR. A set union does not depend on which
-/// thread got there first, so the counts are deterministic.
+/// A record then sets its group's bit with an atomic OR, which also says whether the bit was
+/// already set. Which thread sets a bit first changes from run to run, but each bit is set first
+/// exactly once, so the counts are deterministic.
 ///
 /// The entry keeps everything a record needs side by side, so a record touches two places in
 /// the table: its slot and its entry, where the compare and the OR hit the same cache line. The
@@ -521,11 +532,15 @@ impl NameTable {
         }
     }
 
-    /// Adds `group` to the groups of `name`. Returns `None` when the table is full.
-    fn mark(&self, name: &[u8], group: usize) -> Option<()> {
+    /// Adds `group` to the groups of `name` and returns `true` if this call is the one that added
+    /// it. Returns `None` when the table is full.
+    ///
+    /// The OR is one atomic read-modify-write, so of all the calls for one name and group, in
+    /// any threads, exactly one sees the bit clear.
+    fn mark(&self, name: &[u8], group: usize) -> Option<bool> {
         let entry = self.intern(name)?;
-        self.arena[entry + 1 + group / 64].fetch_or(1 << (group % 64), Relaxed);
-        Some(())
+        let bit = 1 << (group % 64);
+        Some(self.arena[entry + 1 + group / 64].fetch_or(bit, Relaxed) & bit == 0)
     }
 
     /// Returns the offset of `name`'s entry, inserting the name if it is new.
@@ -542,8 +557,8 @@ impl NameTable {
             let mut seen = self.slots[slot].load(Acquire);
             if seen == 0 {
                 let entry = self.insert(name)?;
-                // A thread that loses the race leaves its entry unpublished: the entry's group
-                // bits stay 0, so it counts for nothing.
+                // A thread that loses the race leaves its entry unpublished. No record ever
+                // marks it, so it counts for nothing.
                 let new = hash & !LOW | (entry as u64 + 1);
                 match self.slots[slot].compare_exchange(0, new, Release, Acquire) {
                     Ok(_) => return Some(entry),
@@ -585,28 +600,6 @@ impl NameTable {
         self.arena[entry].load(Relaxed) == name.len() as u64
             && words(name).zip(text).all(|(w, a)| a.load(Relaxed) == w)
     }
-
-    /// Per group, the number of names whose bit for that group is set, found by walking the
-    /// arena entry by entry. It runs after every thread has joined, so relaxed loads see every
-    /// bit, and every entry in the arena is complete.
-    fn distinct_per_group(&self) -> Vec<u64> {
-        let mut distinct = vec![0; self.words * 64];
-        let (mut entry, used) = (0, self.arena_used.load(Relaxed));
-        while entry < used {
-            let len = self.arena[entry].load(Relaxed) as usize;
-            let bitset = &self.arena[entry + 1..entry + 1 + self.words];
-            for (w, word) in bitset.iter().enumerate() {
-                let mut bits = word.load(Relaxed);
-                // Visit only the set bits: take the lowest, then clear it.
-                while bits != 0 {
-                    distinct[w * 64 + bits.trailing_zeros() as usize] += 1;
-                    bits &= bits - 1;
-                }
-            }
-            entry += 1 + self.words + len.div_ceil(8);
-        }
-        distinct
-    }
 }
 
 /// Allocates `len` atomics that are all 0.
@@ -645,7 +638,7 @@ fn hash(name: &[u8]) -> u64 {
 /// `_UNMATCHED`, which sorts after every capital letter because `_` is 0x5F (spec §4).
 ///
 /// Group numbers already follow bytewise order (see [`Regions`]), so this is a walk, not a sort.
-fn format_output(groups: &[Group], distinct: &[u64], regions: &Regions) -> Vec<u8> {
+fn format_output(groups: &[Group], regions: &Regions) -> Vec<u8> {
     let mut out = Vec::new();
     for g in (1..groups.len()).chain([0]) {
         let group = &groups[g];
@@ -666,7 +659,7 @@ fn format_output(groups: &[Group], distinct: &[u64], regions: &Regions) -> Vec<u
             Cents(group.amount_sum),
             Cents(group.amount_min),
             Cents(group.amount_max),
-            distinct[g],
+            group.distinct,
             group.name_bytes,
             group.note_bytes
         )

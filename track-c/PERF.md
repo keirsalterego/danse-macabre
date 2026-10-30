@@ -8,6 +8,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 1 | Rust v1: a quote-parity pre-pass splits the file for 12 threads, each runs a byte state machine, and one lock-free name table keeps a country bitset per name | run-7bddfb5dd3ec | 0.1204 | 39.3 | 57.4 |
 | 2 | Each distinct name copied into one arena entry next to its country bitset | | 0.1191 | | |
 | 3 | Transparent huge pages off | | | | |
+| 4 | Distinct names counted by the workers, from the atomic OR's return value | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -69,6 +70,26 @@ What remains, from the same instrumented copy with THP off: 4.0 MiB of hash slot
 arena in use (of 18 MiB reserved) and 1.9 MiB of region array, 11.4 MiB of anonymous memory in
 all. In the container the highest sample was 11.5 MiB anon plus 1.1 MiB of kernel memory, 0.6 MiB
 of it page tables for the 200 MB input mapping.
+
+## Step 4: distinct names counted by the workers
+
+The distinct-name counts used to come from a walk over every arena entry after the workers had
+joined, 9 ms on one thread. Now the atomic OR that sets a name's country bit returns the word it
+replaced, so the one record that sees the bit go from 0 to 1, in whichever thread, counts the name
+for its country. Each bit flips exactly once, so the per-thread counts always sum to the same
+totals, and the walk is gone.
+
+P-cores, `perf stat -r 10`, three interleaved rounds:
+
+| | step 3 | step 4 |
+|---|---|---|
+| task-clock (ms) | 1200 / 1198 / 1198 | 1139 / 1147 / 1169 |
+| elapsed (ms) | 123.9 / 124.0 / 124.0 | 111.5 / 113.1 / 114.2 |
+
+S 415 → 402, and memory.peak is unchanged at 14.8–15.4 MiB. Because the old value is now used,
+the OR compiles to a `lock cmpxchg` loop instead of `lock or`. LLVM can emit `lock bts` for this
+pattern, but only if the optimizer has not already rewritten the bit test, which it had here. The
+loop did not show in task-clock.
 
 ## Experiments that did not stay
 
