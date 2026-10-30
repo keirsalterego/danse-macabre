@@ -532,17 +532,29 @@ impl Default for Interner<'_> {
     }
 }
 
+// `intern` and `slot` run once per line. As calls, with their register saves and bounds checks,
+// they cost 9% of all instructions, so they are forced inline; `insert` stays out of line.
+#[expect(clippy::inline_always, reason = "measured: about 1 ms of wall time")]
 impl<'a> Interner<'a> {
     /// Returns `name`'s id, assigning the next free one if the name is new.
     ///
     /// `window` is the 128 bytes that start with `name` when the input has that many left. Every
     /// line but the last one or two of a chunk has them, and with them a probe compares names
     /// without a call to `memcmp` (see [`same_name`]).
+    #[inline(always)]
     fn intern(&mut self, name: &'a [u8], hash: u64, window: Option<&[u8; 128]>) -> u32 {
         let slot = self.slot(name, hash, window);
-        if self.slots[slot] != 0 {
-            return self.slots[slot] - 1;
+        match self.slots[slot].checked_sub(1) {
+            Some(id) => id,
+            None => self.insert(slot, name, hash),
         }
+    }
+
+    /// Gives `name`, which belongs in the empty `slot`, the next id. New names are rare (one
+    /// per distinct endpoint per chunk), so this stays out of line, away from the hot loop.
+    #[cold]
+    #[inline(never)]
+    fn insert(&mut self, slot: usize, name: &'a [u8], hash: u64) -> u32 {
         let mut padded = [0; 128];
         let kept = name.len().min(128);
         padded[..kept].copy_from_slice(&name[..kept]);
@@ -562,18 +574,20 @@ impl<'a> Interner<'a> {
     }
 
     /// Returns the slot that holds `name`, or the empty slot where it belongs.
+    #[inline(always)]
     fn slot(&self, name: &[u8], hash: u64, window: Option<&[u8; 128]>) -> usize {
         let mask = self.slots.len() - 1;
         let mut slot = (hash >> 32) as usize & mask;
         while let Some(id) = self.slots[slot].checked_sub(1) {
             let (known, known_hash) = self.names[id as usize];
-            let same = match window {
-                Some(window) if name.len() <= 128 => {
-                    same_name(window, &self.padded[id as usize], name.len())
+            if known_hash == hash
+                && match window {
+                    Some(window) if name.len() <= 128 => {
+                        same_name(window, &self.padded[id as usize], name.len())
+                    }
+                    _ => known == name,
                 }
-                _ => known == name,
-            };
-            if known_hash == hash && same {
+            {
                 break;
             }
             slot = (slot + 1) & mask;
