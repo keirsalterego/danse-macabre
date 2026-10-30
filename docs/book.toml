@@ -1,0 +1,15 @@
+# The submission's docs site, built with mdBook and served at keirsalterego.github.io/danse-macabre.
+# Copied in from the speed-demon skill at kickoff; replace danse-macabre with the repo name then.
+[book]
+title = "Speed Demon 2026: keirsalterego"
+src = "src"
+
+[output.html]
+site-url = "/danse-macabre/"
+git-repository-url = "https://github.com/keirsalterego/danse-macabre"
+# Draws the ```mermaid figures from each track's README (GitHub draws the same source).
+additional-js = ["mermaid-init.js"]
+
+[output.html.playground]
+# The snippets need target-cpu and /data, so the Rust playground can't run them.
+runnable = false

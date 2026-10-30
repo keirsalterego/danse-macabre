@@ -1,0 +1,33 @@
+# Builds the mdBook in docs/ and publishes it to GitHub Pages.
+# Manual trigger only: the repo stays private until the freeze, and the freeze pins the
+# speed-demon branch, so the site goes up afterwards from the frozen commit without a push.
+name: docs
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install mdBook 0.5.4
+        run: curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-unknown-linux-gnu.tar.gz | tar -xz
+      - run: ./mdbook build docs
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/book
+      - id: deployment
+        uses: actions/deploy-pages@v5

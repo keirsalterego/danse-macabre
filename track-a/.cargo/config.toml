@@ -1,0 +1,4 @@
+# alderlake = Raptor Lake's feature set (AVX2, BMI2, PCLMULQDQ). Never `native`: the board builds
+# on a different host (Depot, AVX-512) and `native` reroutes builds to the box's E-cores.
+[build]
+rustflags = ["-C", "target-cpu=alderlake"]
