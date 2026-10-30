@@ -22,6 +22,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 15 | 137 fewer code lines: a fixed-size name table, `OnceLock` hand-offs instead of a barrier leader, records written straight into each chunk | run-f13e9cd22a88 | 0.0215 | 24.4 | 82.5 |
 | 16 | Records freed run by run once their hour is placed, buffers freed after the hour pass, name tables allocated once, output formatted line by line straight into place | run-1ea5237a6e04 | 0.0212 | 21.5 | 83.1 |
 | 17 | The last thread to finish ends the process instead of joining the others; 15 fewer lines | run-3ba29a3569ef | 0.0209 | 21.1 | 83.5 |
+| 18 | The name table's padded copies aligned to cache lines, and its slot array a fixed-size box | | | | |
 
 ## Step 1: v1
 
@@ -199,6 +200,19 @@ no special case.
 Local, turbo off, `ab.py` with 50 interleaved runs in a quiet window: median 23.81 → 23.35 ms.
 memory.peak 19.4–20.2 → 19.8–20.4 MB, the same within noise. S 425 → 410. Gate: 307 pass, 0
 fail.
+
+## Step 18: name copies on whole cache lines
+
+The name table keeps a 64-byte padded copy of each name for the exact compare. malloc put that
+array at 16 mod 64 on every thread, so each copy straddled two cache lines and every probe
+loaded both, one of them as a split load. A `#[repr(align(64))]` wrapper puts each copy on one
+line: L1 misses 9.6 → 8.1 M. The slots became a `Box<[u32; 8192]>`, so the mask is a constant
+and the probe has no bounds check: user instructions 829.4 → 822.3 M.
+
+Local, turbo off, `ab.py` with 31 interleaved runs, two rounds: medians 23.52 → 23.09 and
+23.56 → 23.07 ms, minimums 23.16 → 22.64 and 22.98 → 22.72 ms. User cycles, 4 interleaved sets
+of 5 runs: 448.6 → 441.5 M. memory.peak 18.95–19.88 → 18.53–19.90 MB. S 410 → 412. Gate: 307
+pass, 0 fail.
 
 ## Experiments that did not stay
 
