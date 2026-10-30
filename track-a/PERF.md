@@ -21,6 +21,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 14 | Lean parse on a padded mapping, SWAR number output, names merged inside the parse, sorting networks for groups of up to 64, threads spawned as a tree, and a static-pie build | run-3c59aa35895d | 0.0220 | 24.5 | 81.3 |
 | 15 | 137 fewer code lines: a fixed-size name table, `OnceLock` hand-offs instead of a barrier leader, records written straight into each chunk | run-f13e9cd22a88 | 0.0215 | 24.4 | 82.5 |
 | 16 | Records freed run by run once their hour is placed, buffers freed after the hour pass, name tables allocated once, output formatted line by line straight into place | run-1ea5237a6e04 | 0.0212 | 21.5 | 83.1 |
+| 17 | The last thread to finish ends the process instead of joining the others; 15 fewer lines | | | | |
 
 ## Step 1: v1
 
@@ -185,6 +186,19 @@ plus 3 MB of lines). Local, turbo off: memory.peak 22.3–23.1 → 19.9–20.4 M
 
 Tried and dropped: formatting whole hours during the hour pass and copying them out afterwards
 (0.5 MB less, but +8% T).
+
+## Step 17: the last thread ends the process
+
+Once the output is complete, nothing is left to do but exit, so the last thread to finish calls
+`process::exit(0)` itself instead of the main thread joining every worker. That saves about
+0.35 ms of thread exits and joins. Line cuts at the same time: a timestamp outside the 72 hours
+fails an `expect`, like the other spec guarantees, instead of returning a `Result`; chunk starts
+come from a 4-line closure; and the mmap helper maps at least one byte, so an empty input needs
+no special case.
+
+Local, turbo off, `ab.py` with 50 interleaved runs in a quiet window: median 23.81 → 23.35 ms.
+memory.peak 19.4–20.2 → 19.8–20.4 MB, the same within noise. S 425 → 410. Gate: 307 pass, 0
+fail.
 
 ## Experiments that did not stay
 

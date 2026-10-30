@@ -20,7 +20,7 @@
 //! phases with short serial steps between them ([`summarize`]).
 //!
 //! 1. **Map and split.** We `mmap` the log instead of reading it ([`map_file`]) and cut it into
-//!    one chunk per thread at line breaks ([`line_bounds`]).
+//!    one chunk per thread at line breaks ([`summarize`]).
 //! 2. **Parse once.** Each thread turns every line of its chunk into a 4-byte record: endpoint
 //!    id, error bit and latency, with the rare latency too large for its 19 bits kept on a side
 //!    list ([`parse`]). Endpoint names become small integer ids through a per-thread hash table
@@ -138,9 +138,6 @@ fn map_output(path: &Path, len: usize) -> Result<&'static mut [u8], Box<dyn Erro
     // `create` empties the file. Mapping it for writing needs it open for reading too.
     File::create(path)?;
     let file = File::options().read(true).write(true).open(path)?;
-    if len == 0 {
-        return Ok(&mut []); // mmap rejects a zero length
-    }
     file.set_len(u64::try_from(len)?)?;
     let fd = file.as_raw_fd();
     let ptr = map(null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, fd)?;
@@ -164,9 +161,7 @@ fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
     let len = usize::try_from(file.metadata()?.len())?;
     let (fd, anonymous) = (file.as_raw_fd(), MAP_PRIVATE | MAP_ANONYMOUS);
     let ptr = map(null_mut(), len + LINE, PROT_READ, anonymous, -1)?;
-    if len > 0 {
-        map(ptr, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd)?;
-    }
+    map(ptr, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd)?;
     // SAFETY: the mappings hold `len + LINE` readable bytes and are never unmapped, so they
     // outlive every borrow. /data is mounted read-only, so the bytes cannot change under us.
     Ok(unsafe { std::slice::from_raw_parts(ptr, len + LINE) })
@@ -177,9 +172,10 @@ fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
 fn map(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32) -> std::io::Result<*mut u8> {
     // SAFETY: a new mapping at an address the kernel picks overlaps no memory we already use, and
     // the one fixed address we pass is our own fresh reservation, which nothing refers to yet.
-    let ptr = unsafe { mmap(addr, len, prot, flags, fd, 0) };
-    // On failure `mmap` returns `MAP_FAILED`, the address -1.
-    (ptr.addr() != usize::MAX).then_some(ptr).ok_or_else(std::io::Error::last_os_error)
+    // `mmap` rejects a zero length. An empty file or output maps one byte, which nothing reads.
+    let ptr = unsafe { mmap(addr, len.max(1), prot, flags, fd, 0) };
+    let ok = ptr.addr() != usize::MAX; // on failure `mmap` returns `MAP_FAILED`, the address -1
+    ok.then_some(ptr).ok_or_else(std::io::Error::last_os_error)
 }
 
 /// Runs the whole pipeline over `log` and writes the output to `out_path`.
@@ -189,16 +185,19 @@ fn map(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32) -> std::io::Re
 /// they wait at a barrier, and the first one past it does the short serial step while the
 /// others wait for its result in a [`OnceLock`]: ranking the endpoints, and later mapping the
 /// output file. Spawning a second team cost the time until its last thread started, about
-/// 0.25 ms. A worker that panics aborts the whole process (`panic = "abort"` in `Cargo.toml`).
-/// The errors a worker can meet, a malformed input or failing to create the output file, end
-/// the process with a message, because the other threads would otherwise wait forever.
+/// 0.25 ms. A worker that panics aborts the whole process (`panic = "abort"` in `Cargo.toml`)
+/// with its message, so the others never wait forever for it at a barrier. That is how the
+/// rare errors a worker can meet end the run: failing to create the output file, or input
+/// that breaks a guarantee of the spec, which we otherwise rely on without checking.
 fn summarize(log: &[u8], out_path: &Path) {
     let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
     let len = log.len() - LINE;
-    let bounds = line_bounds(&log[..len], threads);
-    let fail = |e: &dyn std::fmt::Display| -> ! {
-        eprintln!("Error: {e}");
-        std::process::exit(1)
+    // Chunk t starts at the first line that starts at or after byte `len * t / threads`, so
+    // every line lands in exactly one chunk. With fewer lines than threads, some chunks are
+    // simply empty.
+    let start = |t: usize| {
+        let newline = log[..len * t / threads].iter().rposition(|&b| b == b'\n');
+        newline.map_or(0, |p| p + 1)
     };
     // Each thread's chunk, with the table from its endpoint ids to ids in `all`, the merge of
     // every chunk's names; then each hour's output lines.
@@ -206,9 +205,9 @@ fn summarize(log: &[u8], out_path: &Path) {
     let hours: Vec<OnceLock<Hour>> = (0..HOURS).map(|_| OnceLock::new()).collect();
     let all = Mutex::new(Interner::default());
     let (plan, places, barrier) = (OnceLock::new(), OnceLock::new(), Barrier::new(threads));
-    let taken = AtomicUsize::new(0);
+    let (taken, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let work = |t: usize| {
-        let (endpoints, chunk) = parse(log, bounds[t]..bounds[t + 1]).unwrap_or_else(|e| fail(&e));
+        let (endpoints, chunk) = parse(log, start(t)..start(t + 1));
         // Each thread merges its names as soon as it is done, while others may still parse, and
         // then frees its table: only `all` needs the names from now on.
         let ids = all.lock().expect("panics abort").merge(&endpoints);
@@ -252,8 +251,8 @@ fn summarize(log: &[u8], out_path: &Path) {
         let queue = places.get_or_init(|| {
             let hours: Vec<&Hour> = hours.iter().map(|h| h.get().expect("summarized")).collect();
             let len = hours.iter().map(|hour| hour.len).sum();
-            let mut rest = map_output(out_path, len)
-                .unwrap_or_else(|e| fail(&format_args!("{}: {e}", out_path.display())));
+            let mut rest =
+                map_output(out_path, len).unwrap_or_else(|e| panic!("{}: {e}", out_path.display()));
             let mut place = |hour: &Hour| rest.split_off_mut(..hour.len).expect("lengths add up");
             let places = hours.into_iter().map(|hour| (hour, place(hour)));
             Mutex::new(places.enumerate().collect::<Vec<_>>())
@@ -271,6 +270,9 @@ fn summarize(log: &[u8], out_path: &Path) {
             format_hour(index, &hour.lines, names, place);
         }
         release(&log[len * t / threads..len * (t + 1) / threads]);
+        if finished.fetch_add(1, Relaxed) + 1 == threads {
+            std::process::exit(0); // the output is complete; skip joining the others
+        }
     };
     thread::scope(|s| fan_out(s, 0..threads, &work));
 }
@@ -311,20 +313,6 @@ fn release<T>(items: &[T]) {
     // reads it again: a run's records once its hour has been placed, a buffer after its last
     // hour.
     unsafe { madvise(first_page, end.saturating_sub(first), MADV_DONTNEED) };
-}
-
-/// Splits `log` into `parts` chunks of whole lines and returns the `parts + 1` boundaries.
-///
-/// Each boundary starts at an even share of the bytes and moves forward to just past the next
-/// LF, so every line lands in exactly one chunk. The boundaries never decrease, and with fewer
-/// lines than parts some chunks are simply empty.
-fn line_bounds(log: &[u8], parts: usize) -> Vec<usize> {
-    let mut bounds: Vec<usize> = (0..=parts).map(|i| log.len() * i / parts).collect();
-    for at in &mut bounds[1..parts] {
-        let newline = log[*at..].iter().position(|&b| b == b'\n');
-        *at = newline.map_or(log.len(), |p| *at + p + 1);
-    }
-    bounds
 }
 
 /// One thread's share of the log after parsing.
@@ -379,7 +367,7 @@ const LARGE: u32 = (1 << 19) - 1;
 /// | latency   | the digits between `space` and the LF                            |
 ///
 /// Here `space` is the last space of the line, which [`latency`] finds.
-fn parse(log: &[u8], lines: Range<usize>) -> Result<(Interner<'_>, Chunk), String> {
+fn parse(log: &[u8], lines: Range<usize>) -> (Interner<'_>, Chunk) {
     let (mut endpoints, mut chunk) = (Interner::default(), Chunk::default());
     // Every line takes at least MIN_LINE bytes. The records start out zero, which costs nothing
     // until a page is written, and the unused tail is cut off at the end.
@@ -396,10 +384,7 @@ fn parse(log: &[u8], lines: Range<usize>) -> Result<(Interner<'_>, Chunk), Strin
         let lf = line_end(line);
         i += lf + 1;
         if word(line, 5) != current {
-            let hour = hour_index(line).ok_or_else(|| {
-                let ts = String::from_utf8_lossy(&line[..27]);
-                format!("timestamp {ts} is outside the spec's 72-hour span")
-            })?;
+            let hour = hour_index(line).expect("timestamps lie in the 72 hours (§2)");
             chunk.runs.push((hour, count, chunk.large.len()));
             current = word(line, 5);
         }
@@ -421,7 +406,7 @@ fn parse(log: &[u8], lines: Range<usize>) -> Result<(Interner<'_>, Chunk), Strin
     }
     chunk.records.truncate(count);
     chunk.runs.push((HOURS, count, chunk.large.len()));
-    Ok((endpoints, chunk))
+    (endpoints, chunk)
 }
 
 /// Returns the index of the LF that ends the first line of `line`.
