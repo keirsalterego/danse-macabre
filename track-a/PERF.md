@@ -18,6 +18,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 11 | One team of threads summarizes and formats the hours, with a barrier between | run-23647f6bde01 | 0.0280 | 25.3 | 78.8 |
 | 12 | One mmap helper for input and output; 35 fewer code lines | run-ce9384368863 | 0.0269 | 25.1 | 79.4 |
 | 13 | Hour checked by comparing 8 timestamp bytes; exact 64-byte name compare without the hash; padded copies for the merge | run-b262ef9cc01a | 0.0258 | 25.2 | 79.9 |
+| 14 | Lean parse on a padded mapping, SWAR number output, names merged inside the parse, sorting networks for groups of up to 64, threads spawned as a tree, and a static-pie build | | | | |
 
 ## Step 1: v1
 
@@ -113,6 +114,29 @@ out of the per-line work shortens the parse. Three changes, all in the parse and
 Local, turbo off, 30 alternating runs: median 30.29 → 29.60 ms (hour check) → 28.74 ms (both);
 instructions 1,159 → 974 million; peak memory and code lines unchanged. A second board run of the
 same code, run-b1fa893c8a06, measured 25.2 ms.
+
+## Step 14: fewer instructions everywhere, and a faster start
+
+A phase split of step 13 (instrumented build, 27.7 ms locally): start-up 0.65 ms, parse 14.4 ms
+of wall time (13.6 per thread, plus 0.7 until the last thread starts), serial name merge 1.0, hour
+pass 6.3 (count 0.7, scatter 1.2, selection 3.6), formatting 3.05, releasing the input 0.65, and
+joining plus exit 1.0. Five changes, each measured on top of the ones before (medians of 30
+interleaved runs, local, turbo off, against step 13 in the same session):
+
+| Change | Step 14 so far | Step 13 |
+|---|---|---|
+| The log is mapped with 256 zero bytes after it, so each line is read as a fixed-size array with no bounds checks; bit tricks skip the method and convert the latency's digits | 27.91 ms | 28.59 ms |
+| Numbers written by a SWAR conversion and fixed 8-byte stores | 27.23 ms | 28.58 ms |
+| Each thread merges its endpoint names right after its own parse, so the serial merge disappears | 26.69 ms | 28.65 ms |
+| Groups of up to 64 latencies sorted by an AVX2 sorting network, which has no branches; the selection it replaces was mostly mispredicted branches. Hour pass 6.3 → 4.7 ms | 25.63 ms | 28.65 ms |
+| Threads spawned as a tree, so the last of twelve starts after four spawns instead of eleven, and a static-pie build that skips the dynamic loader | 23.94 ms | 29.18 ms |
+
+`perf stat`, 5 runs: instructions 989 → 817 M, cycles 530 → 446 M, branch misses 2.46 → 1.28 M.
+Peak memory is unchanged (24.2–24.9 MB against 23.9–25.1 MB). S 490 → 561. The static build was
+checked with an offline `docker build` of the track: its output for full seed 1 matches.
+
+Tried and dropped: an LSD radix sort instead of the scatter and selection (no gain: the count
+pass doubled and it added page faults).
 
 ## Experiments that did not stay
 

@@ -74,6 +74,14 @@ const HOURS: usize = 72;
 /// for the worst case of all-minimal lines, and [`line_end`] starts looking for the LF at byte 39.
 const MIN_LINE: usize = 40;
 
+/// How many bytes from a line's start [`parse`] may read: every line fits, with room to spare.
+///
+/// The longest line is 177 bytes: a 27-byte timestamp, a 7-byte method, a 125-byte endpoint, a
+/// 3-digit status, a 10-digit latency, four spaces and the LF. The parse views each line as
+/// a fixed array of this size, so its reads at offsets computed from the line need no checks
+/// of their own; [`map_file`] makes sure the array exists even for the last line.
+const LINE: usize = 256;
+
 // We declare `mmap` and friends ourselves instead of pulling in the `libc` crate: every
 // dependency costs points on the D axis, and the C library is already linked into every Rust
 // binary. The constants are the values from Linux's `<sys/mman.h>` and `<sys/prctl.h>`.
@@ -86,6 +94,8 @@ const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
 const MAP_SHARED: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
+const MAP_FIXED: i32 = 0x10;
+const MAP_ANONYMOUS: i32 = 0x20;
 const MADV_DONTNEED: i32 = 4;
 const PR_SET_THP_DISABLE: i32 = 41;
 
@@ -128,36 +138,54 @@ fn map_output(path: &Path, len: usize) -> Result<&'static mut [u8], Box<dyn Erro
         return Ok(&mut []); // mmap rejects a zero length
     }
     file.set_len(u64::try_from(len)?)?;
-    let ptr = map(&file, len, PROT_READ | PROT_WRITE, MAP_SHARED)?;
+    let ptr = map(
+        std::ptr::null_mut(),
+        len,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED,
+        file.as_raw_fd(),
+    )?;
     // SAFETY: the mapping holds `len` writable bytes, nothing else refers to them, and it is
     // never unmapped. It stays valid after `file` is closed.
     Ok(unsafe { std::slice::from_raw_parts_mut(ptr, len) })
 }
 
-/// Maps the whole file into our address space, read-only.
+/// Maps the whole file into our address space, read-only, followed by [`LINE`] zero bytes.
 ///
 /// Reading the file with `read` would copy all 239 MB into heap memory that counts toward our
 /// memory score. A private read-only mapping instead shares the pages the kernel already holds
 /// in its page cache (the harness pre-warms it), so the file costs neither a copy nor memory.
 /// Pages are mapped lazily as the parser first touches them.
+///
+/// The zeros come from a reservation of anonymous memory that the file is then mapped over:
+/// they let [`parse`] read a whole [`LINE`] from the start of the last line too. Reading them
+/// maps the kernel's shared zero page, so they cost no memory either.
 fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
     let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let len = usize::try_from(file.metadata()?.len())?;
-    if len == 0 {
-        return Ok(&[]); // mmap rejects a zero length
-    }
-    let ptr = map(&file, len, PROT_READ, MAP_PRIVATE)
+    let anonymous = MAP_PRIVATE | MAP_ANONYMOUS;
+    let ptr = map(std::ptr::null_mut(), len + LINE, PROT_READ, anonymous, -1)?;
+    if len > 0 {
+        map(
+            ptr,
+            len,
+            PROT_READ,
+            MAP_PRIVATE | MAP_FIXED,
+            file.as_raw_fd(),
+        )
         .map_err(|e| format!("mmap {}: {e}", path.display()))?;
-    // SAFETY: the mapping holds `len` readable bytes and is never unmapped, so it outlives every
-    // borrow. /data is mounted read-only, so the bytes cannot change under us.
-    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+    // SAFETY: the mappings hold `len + LINE` readable bytes and are never unmapped, so they
+    // outlive every borrow. /data is mounted read-only, so the bytes cannot change under us.
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len + LINE) })
 }
 
-/// Maps `len` bytes of `file` from its start with `mmap(2)` and returns the address, which the
-/// kernel picks.
-fn map(file: &File, len: usize, prot: i32, flags: i32) -> std::io::Result<*mut u8> {
-    // SAFETY: a new mapping at an address the kernel picks overlaps no memory we already use.
-    let ptr = unsafe { mmap(std::ptr::null_mut(), len, prot, flags, file.as_raw_fd(), 0) };
+/// Maps `len` bytes of the file `fd` (or of anonymous memory, for `fd` -1) from its start with
+/// `mmap(2)` at `addr`, or wherever the kernel picks for a null `addr`, and returns the address.
+fn map(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32) -> std::io::Result<*mut u8> {
+    // SAFETY: a new mapping at an address the kernel picks overlaps no memory we already use, and
+    // the one fixed address we pass is our own fresh reservation, which nothing refers to yet.
+    let ptr = unsafe { mmap(addr, len, prot, flags, fd, 0) };
     if ptr.addr() == usize::MAX {
         return Err(std::io::Error::last_os_error());
     }
@@ -166,94 +194,129 @@ fn map(file: &File, len: usize, prot: i32, flags: i32) -> std::io::Result<*mut u
 
 /// Runs the whole pipeline over `log` and writes the output to `out_path`.
 ///
-/// The parallel phases run in two [`std::thread::scope`]s, one for the parse and one for the
-/// hour pass and the formatting, so the threads can borrow `log` and each other's results
-/// without reference counting. A worker that panics aborts the whole process (`panic = "abort"`
-/// in `Cargo.toml`), so a `join` never actually returns an error. The one error the second scope
-/// can meet, failing to create the output file, ends the process with a message, because the
-/// other threads would otherwise wait at the barrier forever.
+/// One team of threads runs every parallel phase, in one [`std::thread::scope`], so the threads
+/// can borrow `log` and each other's results without reference counting. Between the phases
+/// they wait at a barrier while one of them does the short serial step: ranking the endpoints,
+/// and later sorting the hours and mapping the output file. Spawning a second team cost the
+/// time until its last thread started, about 0.25 ms. A worker that panics aborts the whole
+/// process (`panic = "abort"` in `Cargo.toml`). The errors a worker can meet, a malformed input
+/// or failing to create the output file, end the process with a message, because the other
+/// threads would otherwise wait at the barrier forever.
 fn summarize(log: &[u8], out_path: &Path) -> Result<(), Box<dyn Error>> {
     let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
-    let bounds = line_bounds(log, threads);
-    let mut chunks = thread::scope(|s| {
-        let parsers: Vec<_> = (bounds.windows(2))
-            .map(|w| s.spawn(move || parse(&log[w[0]..w[1]])))
-            .collect();
-        (parsers.into_iter())
-            .map(|p| p.join().expect("a panic aborts the process"))
-            .collect::<Result<Vec<_>, _>>()
-    })?;
-    let (names, ranks) = rank_endpoints(&mut chunks);
-    let mut runs: Vec<Vec<Run>> = vec![Vec::new(); HOURS];
-    for (chunk, rank) in chunks.iter().zip(&ranks) {
-        for (hour, lines, first) in &chunk.runs {
-            runs[*hour].push((&chunk.records[lines.clone()], &chunk.large[*first..], rank));
-        }
-    }
-    // Night hours carry about half the traffic of day hours, so fixed blocks of hours would
-    // leave some workers idle while others finish. Workers instead take one hour at a time from
-    // a shared counter, largest first (longest-processing-time-first scheduling).
-    let mut by_size: Vec<usize> = (0..HOURS).collect();
-    by_size.sort_by_key(|&h| Reverse(runs[h].iter().map(|run| run.0.len()).sum::<usize>()));
+    let len = log.len() - LINE;
+    let bounds = line_bounds(&log[..len], threads);
+    let fail = |e: &dyn std::fmt::Display| -> ! {
+        eprintln!("Error: {e}");
+        std::process::exit(1)
+    };
+    // Each thread's chunk and the ids its names got in `all`, which merges every chunk's names.
+    let chunks: Vec<OnceLock<(Chunk, Vec<u32>)>> = (0..threads).map(|_| OnceLock::new()).collect();
+    let all = Mutex::new(Interner::default());
+    let (ranked, planned) = (OnceLock::new(), OnceLock::new());
     let taken = AtomicUsize::new(0);
     let (hours, sorted, places) = (Mutex::new(Vec::new()), OnceLock::new(), OnceLock::new());
     let barrier = Barrier::new(threads);
-    // The same threads summarize the hours and then format them. Between the two phases they
-    // wait at a barrier while one of them sorts the hours and maps the output file, which saves
-    // spawning a second team: the last of twelve new threads started about 1 ms after the first.
     let shared = (
-        &runs, &names, &by_size, &taken, &hours, &sorted, &places, &barrier,
+        &bounds, &chunks, &all, &ranked, &planned, &taken, &hours, &sorted, &places, &barrier,
     );
-    thread::scope(|s| {
-        for (t, chunk) in chunks.iter().enumerate() {
-            s.spawn(move || {
-                let (runs, names, by_size, taken, hours, sorted, places, barrier) = shared;
-                let queue = std::iter::from_fn(|| by_size.get(taken.fetch_add(1, Relaxed)));
-                let done = summarize_hours(queue.copied(), runs, names);
-                hours
-                    .lock()
-                    .expect("a panic aborts the process")
-                    .extend(done);
-                if barrier.wait().is_leader() {
-                    let hours = sorted.get_or_init(|| {
-                        let mut hours = std::mem::take(&mut *hours.lock().expect("no panic"));
-                        hours.sort_unstable_by_key(|hour: &Hour| hour.index);
-                        hours
-                    });
-                    let len = hours.iter().map(|hour| hour.len).sum();
-                    let mut rest = map_output(out_path, len).unwrap_or_else(|e| {
-                        eprintln!("Error: {}: {e}", out_path.display());
-                        std::process::exit(1)
-                    });
-                    let mut split = Vec::with_capacity(hours.len());
-                    for hour in hours {
-                        let (place, after) = rest.split_at_mut(hour.len);
-                        split.push((hour, place));
-                        rest = after;
-                    }
-                    let _ = places.set(Mutex::new(split.into_iter()));
+    let work = move |t: usize| {
+        let (bounds, chunks, all, ranked, planned, taken, hours, sorted, places, barrier) = shared;
+        let mut chunk = parse(log, bounds[t]..bounds[t + 1]).unwrap_or_else(|e| fail(&e));
+        // Each thread merges its names as soon as it is done, while others may still
+        // parse, and frees its padded copies: only `all` needs them from now on.
+        let ids = {
+            let mut all = all.lock().expect("a panic aborts the process");
+            (chunk.names.iter().zip(&chunk.padded))
+                .map(|(&(name, hash), padded)| all.intern(name, hash, padded))
+                .collect()
+        };
+        chunk.padded = Vec::new();
+        let _ = chunks[t].set((chunk, ids));
+        if barrier.wait().is_leader() {
+            let chunks: Vec<_> = chunks.iter().map(|c| c.get().expect("parsed")).collect();
+            let ids: Vec<_> = chunks.iter().map(|c| &c.1).collect();
+            let all = all.lock().expect("a panic aborts the process");
+            let (_, ranks) = ranked.get_or_init(|| rank_endpoints(&all, &ids));
+            let mut runs: Vec<Vec<Run>> = vec![Vec::new(); HOURS];
+            for ((chunk, _), rank) in chunks.iter().zip(ranks) {
+                for (hour, lines, first) in &chunk.runs {
+                    let records = &chunk.records[lines.clone()];
+                    runs[*hour].push((records, &chunk.large[*first..], rank));
                 }
-                barrier.wait();
-                // Every hour has its place in the file now, so the threads format in parallel,
-                // taking the next hour from a shared queue until none is left. Each first frees
-                // one chunk's records: no hour needs them any more. Releasing the input waits
-                // until the end, because freeing pages interrupts every other thread to flush its
-                // TLB, which cost 3 ms in the hour pass.
-                release(&chunk.records);
-                release(&chunk.large);
-                let mut text = Vec::new();
-                let queue = places.get().expect("the leader mapped the output");
-                let next = || queue.lock().expect("a panic aborts the process").next();
-                for (hour, place) in std::iter::from_fn(next) {
-                    text.clear();
-                    format_hour(hour, names, &mut text);
-                    place.copy_from_slice(&text); // panics if `Hour::len` was wrong
-                }
-                release(&log[log.len() * t / threads..log.len() * (t + 1) / threads]);
-            });
+            }
+            // Night hours carry about half the traffic of day hours, so fixed blocks of
+            // hours would leave some workers idle while others finish. Workers instead
+            // take one hour at a time from a shared counter, largest first
+            // (longest-processing-time-first scheduling).
+            let mut by_size: Vec<usize> = (0..HOURS).collect();
+            let size = |h: &usize| runs[*h].iter().map(|run| run.0.len()).sum::<usize>();
+            by_size.sort_by_key(|h| Reverse(size(h)));
+            let _ = planned.set((runs, by_size));
         }
-    });
+        barrier.wait();
+        let ((names, _), (runs, by_size)) = (
+            ranked.get().expect("ranked"),
+            planned.get().expect("planned"),
+        );
+        let queue = std::iter::from_fn(|| by_size.get(taken.fetch_add(1, Relaxed)));
+        let done = summarize_hours(queue.copied(), runs, names);
+        hours
+            .lock()
+            .expect("a panic aborts the process")
+            .extend(done);
+        if barrier.wait().is_leader() {
+            let hours = sorted.get_or_init(|| {
+                let mut hours = std::mem::take(&mut *hours.lock().expect("no panic"));
+                hours.sort_unstable_by_key(|hour: &Hour| hour.index);
+                hours
+            });
+            let len = hours.iter().map(|hour| hour.len).sum();
+            let mut rest = map_output(out_path, len)
+                .unwrap_or_else(|e| fail(&format_args!("{}: {e}", out_path.display())));
+            let mut split = Vec::with_capacity(hours.len());
+            for hour in hours {
+                let (place, after) = rest.split_at_mut(hour.len);
+                split.push((hour, place));
+                rest = after;
+            }
+            let _ = places.set(Mutex::new(split.into_iter()));
+        }
+        barrier.wait();
+        // Every hour has its place in the file now, so the threads format in parallel,
+        // taking the next hour from a shared queue until none is left. Each first frees
+        // its chunk's records: no hour needs them any more. Releasing the input waits
+        // until the end, because freeing pages interrupts every other thread to flush its
+        // TLB, which cost 3 ms in the hour pass.
+        let (chunk, _) = chunks[t].get().expect("parsed");
+        release(&chunk.records);
+        release(&chunk.large);
+        let mut text = Vec::new();
+        let queue = places.get().expect("the leader mapped the output");
+        let next = || queue.lock().expect("a panic aborts the process").next();
+        for (hour, place) in std::iter::from_fn(next) {
+            format_hour(hour, names, &mut text);
+            place.copy_from_slice(&text); // panics if `Hour::len` was wrong
+        }
+        release(&log[len * t / threads..len * (t + 1) / threads]);
+    };
+    thread::scope(|s| fan_out(s, 0..threads, &work));
     Ok(())
+}
+
+/// Runs `work(t)` for every `t` in `ts`, each on its own thread, the first on this one.
+///
+/// Each thread hands the upper half of its numbers to a new thread until it keeps just one, so
+/// the last of twelve threads starts after four spawns instead of eleven. A spawn took about
+/// 50 µs, and every thread parses an equal share, so the last to start was the last to finish.
+fn fan_out<'s, F: Fn(usize) + Sync>(s: &'s thread::Scope<'s, '_>, ts: Range<usize>, work: &'s F) {
+    let mut ts = ts;
+    while ts.len() > 1 {
+        let upper = ts.start + ts.len() / 2..ts.end;
+        ts.end = upper.start;
+        s.spawn(move || fan_out(s, upper, work));
+    }
+    work(ts.start);
 }
 
 /// Gives the memory pages that lie entirely inside `items` back to the kernel, with
@@ -351,16 +414,21 @@ const LARGE: u32 = (1 << 19) - 1;
 /// | latency   | the digits between `space` and the LF                            |
 ///
 /// Here `space` is the last space of the line, which [`latency`] finds.
-fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
+fn parse(log: &[u8], lines: Range<usize>) -> Result<Chunk<'_>, String> {
     let mut endpoints = Interner::default();
-    let (mut records, mut large) = (Vec::with_capacity(chunk.len() / MIN_LINE + 1), Vec::new());
+    // Every line takes at least MIN_LINE bytes. The records start out zero, which costs nothing
+    // until a page is written, and the unused tail is cut off at the end.
+    let (mut records, mut large) = (vec![0; lines.len() / MIN_LINE + 1], Vec::new());
+    let mut count = 0;
     // The hour, first line and first large latency of every run. A run lasts while the
     // timestamp's bytes 5 to 12, `MM-DDTHH`, stay the same, so most lines compare those 8 bytes
     // and decode nothing. No line's bytes are all zero, so line 0 starts a run.
     let (mut starts, mut current) = (Vec::new(), 0);
-    let mut i = 0;
-    while i < chunk.len() {
-        let line = &chunk[i..];
+    assert!(lines.end + LINE <= log.len(), "map_file pads the log");
+    let mut i = lines.start;
+    while i < lines.end {
+        // SAFETY: i < lines.end, so the LINE bytes from i lie inside `log` (asserted above).
+        let line: &[u8; LINE] = unsafe { &*log.as_ptr().add(i).cast() };
         let lf = line_end(line);
         i += lf + 1;
         if word(line, 5) != current {
@@ -368,34 +436,33 @@ fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
                 let ts = String::from_utf8_lossy(&line[..27]);
                 format!("timestamp {ts} is outside the spec's 72-hour span")
             })?;
-            starts.push((hour, records.len(), large.len()));
+            starts.push((hour, count, large.len()));
             current = word(line, 5);
         }
         // The method is 3 to 7 bytes at offset 28, so the space after it is in the word at 31.
-        let start = 32 + spaces(word(line, 31)).trailing_zeros() as usize / 8;
+        // It is the first byte there without bit 6 (0x40), which every capital letter has.
+        let start = 32 + (!word(line, 31) & 0x4040_4040_4040_4040).trailing_zeros() as usize / 8;
         // `space` precedes the latency; before it sit the 3-digit status and its own space.
         let (latency_us, space) = latency(line, lf);
         let name = &line[start..space - 4];
-        let window = line.get(start..).and_then(|w| w.first_chunk());
-        let id = endpoints.intern(name, hash(name), window);
+        let window = line[start..start + 64].try_into().expect("start <= 40");
+        let id = endpoints.intern(name, hash(name, word(line, start)), window);
         // Errors are exactly 500..=599, so the status's first digit decides.
         let error = u32::from(line[space - 3] == b'5');
         let small = latency_us.min(LARGE);
         if small == LARGE {
             large.push(latency_us);
         }
-        records.push(id << 20 | error << 19 | small);
+        records[count] = id << 20 | error << 19 | small;
+        count += 1;
     }
+    records.truncate(count);
     // The spec gives every seed 1,842 endpoints (§2), well below the 4,096 that 12 bits hold.
     // Past that, the ids above were cut short, so we stop instead.
     if endpoints.names.len() > 1 << 12 {
         return Err("over 4,096 distinct endpoints in one chunk: ids overflow 12 bits".into());
     }
-    let ends = starts
-        .iter()
-        .skip(1)
-        .map(|run| run.1)
-        .chain([records.len()]);
+    let ends = starts.iter().skip(1).map(|run| run.1).chain([count]);
     let runs =
         (starts.iter().zip(ends)).map(|(&(hour, start, first), end)| (hour, start..end, first));
     Ok(Chunk {
@@ -412,21 +479,17 @@ fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
 /// No line is shorter than [`MIN_LINE`], so the search starts at byte 39 rather than 0. From
 /// there one 64-byte window, checked with two AVX2 compares in [`equal_mask`], holds the LF of
 /// about 90% of lines, which makes the branch after it easy to predict. Longer lines take
-/// another window, and the last line of a chunk, with fewer than 64 bytes left, falls back to a
-/// plain byte search.
-fn line_end(line: &[u8]) -> usize {
-    let mut at = MIN_LINE - 1;
-    while at + 64 <= line.len() {
+/// another window; three reach byte 230, well past the LF of the longest line.
+fn line_end(line: &[u8; LINE]) -> usize {
+    for at in [MIN_LINE - 1, MIN_LINE + 63, MIN_LINE + 127] {
         let window = line[at..at + 64].try_into().expect("64-byte window");
         // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
         let newlines = unsafe { equal_mask(window, &[b'\n'; 64]) };
         if newlines != 0 {
             return at + newlines.trailing_zeros() as usize;
         }
-        at += 64;
     }
-    let tail = line[at..].iter().position(|&b| b == b'\n');
-    at + tail.expect("every line ends in LF (spec §2)")
+    panic!("a line is at most 177 bytes long (spec §2)")
 }
 
 /// Returns a mask with bit `i` set wherever `a[i] == b[i]`.
@@ -474,13 +537,15 @@ fn hour_index(line: &[u8]) -> Option<usize> {
 /// Returns the latency that ends at `lf`, and the index of the space before it.
 ///
 /// Latencies of up to 7 digits (99.9% of lines) take one step without a loop. We load the 8
-/// bytes before the LF as one integer, find the last space in it with [`spaces`], zero every
-/// byte up to and including that space, and convert the remaining digits with
-/// [`eight_digits`]. For a line ending in `200 1234`, the word holds exactly those 8 bytes, the
-/// last space is byte 3, and the digit lanes left are `0 0 0 0 1 2 3 4`.
+/// bytes before the LF as one integer and find the last space in it: digits (`0x30` to `0x39`)
+/// have bit 4 set and a space (`0x20`) does not, so it is the highest byte without bit 4. Other
+/// bytes without it can only sit further down, in the endpoint. We then keep the low half of
+/// every byte above that space, which is its digit, and convert them with [`eight_digits`].
+/// For a line ending in `200 1234`, the word holds exactly those 8 bytes, the last space is
+/// byte 3, and the digit lanes left are `0 0 0 0 1 2 3 4`.
 fn latency(line: &[u8], lf: usize) -> (u32, usize) {
     let w = word(line, lf - 8);
-    let found = spaces(w);
+    let found = !w & 0x1010_1010_1010_1010;
     if found == 0 {
         // 8 to 10 digits: rare enough for a plain loop.
         let space = line[..lf].iter().rposition(|&b| b == b' ');
@@ -489,8 +554,7 @@ fn latency(line: &[u8], lf: usize) -> (u32, usize) {
         return (digits.fold(0, |v, &d| v * 10 + u32::from(d - b'0')), space);
     }
     let last_space = 7 - found.leading_zeros() as usize / 8;
-    let digit_lanes = u64::MAX << (8 * (last_space + 1));
-    let digits = (w & digit_lanes) - (0x3030_3030_3030_3030 & digit_lanes);
+    let digits = w & 0x0F0F_0F0F_0F0F_0F0F & u64::MAX << (8 * (last_space + 1));
     (eight_digits(digits), lf - 8 + last_space)
 }
 
@@ -515,20 +579,6 @@ fn word(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(*bytes[at..].first_chunk().expect("8 bytes at `at`"))
 }
 
-/// Returns a mask with bit 7 of every byte set where that byte of `w` is a space.
-///
-/// XOR with `0x20` turns spaces into zero bytes, so the task becomes "which bytes are zero".
-/// For one byte `x`, `(x & 0x7F) + 0x7F` sets bit 7 exactly when the low seven bits are not all
-/// zero, and OR-ing `x` itself also catches bytes whose bit 7 was already set. So bit 7 ends up
-/// clear only for zero bytes, and the final NOT and mask report those. The addition never
-/// carries out of a byte, so every byte's answer is exact. The shorter, better-known zero-byte
-/// test from "Bit Twiddling Hacks" can flag false matches above a real one, and [`latency`]
-/// needs the *last* space, so it uses this exact form.
-fn spaces(w: u64) -> u64 {
-    let x = w ^ 0x2020_2020_2020_2020;
-    !(((x & 0x7F7F_7F7F_7F7F_7F7F) + 0x7F7F_7F7F_7F7F_7F7F) | x) & 0x8080_8080_8080_8080
-}
-
 /// Hashes an endpoint name for the [`Interner`].
 ///
 /// Hashing every byte would need a loop whose length varies from line to line. Instead we mix
@@ -537,13 +587,11 @@ fn spaces(w: u64) -> u64 {
 /// inside the name, so equal names always hash equal. Two different names that agree on all
 /// three windows would only share a probe sequence: the interner still compares the bytes.
 /// The mixing step is the multiply-rotate used by rustc's `FxHasher`.
-fn hash(name: &[u8]) -> u64 {
+fn hash(name: &[u8], first: u64) -> u64 {
     let mix = |hash: u64, w: u64| (hash.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
     let n = name.len();
     if n < 8 {
-        let mut short = [0; 8];
-        short[..n].copy_from_slice(name);
-        return mix(n as u64, u64::from_le_bytes(short));
+        return mix(n as u64, first & u64::MAX >> (64 - 8 * n));
     }
     let first_and_middle = mix(mix(n as u64, word(name, 0)), word(name, n / 2 - 4));
     mix(first_and_middle, word(name, n - 8))
@@ -583,17 +631,16 @@ impl Default for Interner<'_> {
 impl<'a> Interner<'a> {
     /// Returns `name`'s id, assigning the next free one if the name is new.
     ///
-    /// `window` is the 64 bytes that start with `name` and the space after it, when the input has
-    /// that many left. Every line but the last one of a chunk has them, and with them a probe
-    /// compares a name of up to 63 bytes without a call to `memcmp` (see [`same_name`]). That
-    /// covers 1,791 of the 1,842 endpoints of seed 1 and 94% of its lines; longer names compare
-    /// with `==`.
+    /// `window` is 64 bytes that start with `name` and the space after it: the line itself, or a
+    /// padded copy. With them a probe compares a name of up to 63 bytes without a call to
+    /// `memcmp` (see [`same_name`]). That covers 1,791 of the 1,842 endpoints of seed 1 and 94%
+    /// of its lines; longer names compare with `==`.
     #[inline(always)]
-    fn intern(&mut self, name: &'a [u8], hash: u64, window: Option<&[u8; 64]>) -> u32 {
+    fn intern(&mut self, name: &'a [u8], hash: u64, window: &[u8; 64]) -> u32 {
         let slot = self.slot(name, hash, window);
         match self.slots[slot].checked_sub(1) {
             Some(id) => id,
-            None => self.insert(slot, name, hash),
+            None => self.insert(slot, name, hash, window),
         }
     }
 
@@ -601,12 +648,10 @@ impl<'a> Interner<'a> {
     /// per distinct endpoint per chunk), so this stays out of line, away from the hot loop.
     #[cold]
     #[inline(never)]
-    fn insert(&mut self, slot: usize, name: &'a [u8], hash: u64) -> u32 {
+    fn insert(&mut self, slot: usize, name: &'a [u8], hash: u64, window: &[u8; 64]) -> u32 {
         // The name, then the space if there is room for it, then zeros.
-        let mut padded = [b' '; 64];
-        let kept = name.len().min(64);
-        padded[..kept].copy_from_slice(&name[..kept]);
-        padded[kept.min(63) + 1..].fill(0);
+        let mut padded = *window;
+        padded[name.len().min(63) + 1..].fill(0);
         self.padded.push(padded);
         self.names.push((name, hash));
         self.slots[slot] = self.names.len() as u32;
@@ -614,8 +659,9 @@ impl<'a> Interner<'a> {
             let grown = vec![0; self.slots.len() * 2];
             let old = std::mem::replace(&mut self.slots, grown);
             for id in old.into_iter().filter(|&id| id != 0) {
-                let (name, hash) = self.names[id as usize - 1];
-                let slot = self.slot(name, hash, None);
+                let ((name, hash), window) =
+                    (self.names[id as usize - 1], self.padded[id as usize - 1]);
+                let slot = self.slot(name, hash, &window);
                 self.slots[slot] = id;
             }
         }
@@ -624,15 +670,14 @@ impl<'a> Interner<'a> {
 
     /// Returns the slot that holds `name`, or the empty slot where it belongs.
     #[inline(always)]
-    fn slot(&self, name: &[u8], hash: u64, window: Option<&[u8; 64]>) -> usize {
+    fn slot(&self, name: &[u8], hash: u64, window: &[u8; 64]) -> usize {
         let mask = self.slots.len() - 1;
         let mut slot = (hash >> 32) as usize & mask;
         while let Some(id) = self.slots[slot].checked_sub(1) {
-            let found = match window {
-                Some(window) if name.len() < 64 => {
-                    same_name(window, &self.padded[id as usize], name.len())
-                }
-                _ => self.names[id as usize].0 == name,
+            let found = if name.len() < 64 {
+                same_name(window, &self.padded[id as usize], name.len())
+            } else {
+                self.names[id as usize].0 == name
             };
             if found {
                 break;
@@ -661,34 +706,23 @@ fn same_name(window: &[u8; 64], known: &[u8; 64], len: usize) -> bool {
 
 /// Assigns every endpoint its global rank: its position in the bytewise sort of all names.
 ///
-/// Each chunk has its own ids, so we first merge the chunks' names through one more
-/// [`Interner`], which drops duplicates in a single pass instead of sorting about 22,000
-/// names. Only the 1,842 distinct names are then sorted. Rust's slice ordering is bytewise and
-/// puts a proper prefix first, which is exactly the order the spec asks for (§4). Returns the
-/// sorted names and, for each chunk, a table from its local ids to ranks.
-///
-/// The merge compares the chunks' padded copies, which then go: each name's bytes in the input
-/// lie in a different place, and reading them there took most of a millisecond, one cache miss
-/// after another, while every other thread waited.
-fn rank_endpoints<'a>(chunks: &mut [Chunk<'a>]) -> (Vec<&'a [u8]>, Vec<Vec<u32>>) {
-    let mut all = Interner::default();
-    let global: Vec<Vec<u32>> = (chunks.iter_mut())
-        .map(|c| {
-            let padded = std::mem::take(&mut c.padded);
-            (c.names.iter().zip(&padded))
-                .map(|(&(name, hash), padded)| all.intern(name, hash, Some(padded)))
-                .collect()
-        })
-        .collect();
+/// `all` holds every distinct name once, in the order the threads merged them in after their
+/// parse, and `ids` maps each chunk's own ids to ids in `all`. Only the 1,842 distinct names are
+/// sorted. A name's padded copy sorts like the name itself, because the space after it and the
+/// zero padding are smaller than any byte a name can hold (§2): a proper prefix sorts first,
+/// which is exactly the order the spec asks for (§4). Only names that agree on 64 bytes compare
+/// in full. Returns the sorted names and, for each chunk, a table from its own ids to ranks.
+fn rank_endpoints<'a>(all: &Interner<'a>, ids: &[&Vec<u32>]) -> (Vec<&'a [u8]>, Vec<Vec<u32>>) {
     let mut order: Vec<u32> = (0..all.names.len() as u32).collect();
-    order.sort_unstable_by_key(|&id| all.names[id as usize].0);
+    let key = |id: &u32| (&all.padded[*id as usize], all.names[*id as usize].0);
+    order.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
     let mut rank = vec![0; order.len()];
     for (r, &id) in order.iter().enumerate() {
         rank[id as usize] = r as u32;
     }
     let names = order.iter().map(|&id| all.names[id as usize].0).collect();
-    let ranks = (global.into_iter())
-        .map(|ids| ids.into_iter().map(|id| rank[id as usize]).collect())
+    let ranks = (ids.iter())
+        .map(|ids| ids.iter().map(|&id| rank[id as usize]).collect())
         .collect();
     (names, ranks)
 }
@@ -777,9 +811,18 @@ fn summarize_hours(
             // 2.94 n of going from p99 down. The suffixes start at the rank already found
             // because the ranks coincide for small groups (at n = 1 all three are index 0).
             let (i50, i95, i99) = (index(50), index(95), index(99));
-            let p50 = *group.select_nth_unstable(i50).1;
-            let p95 = *group[i50..].select_nth_unstable(i95 - i50).1;
-            let p99 = *group[i95..].select_nth_unstable(i99 - i95).1;
+            // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
+            let [p50, p95, p99] = match n {
+                ..=8 => unsafe { sort_network::<1>(group, [i50, i95, i99]) },
+                ..=16 => unsafe { sort_network::<2>(group, [i50, i95, i99]) },
+                ..=32 => unsafe { sort_network::<4>(group, [i50, i95, i99]) },
+                ..=64 => unsafe { sort_network::<8>(group, [i50, i95, i99]) },
+                _ => {
+                    let p50 = *group.select_nth_unstable(i50).1;
+                    let p95 = *group[i50..].select_nth_unstable(i95 - i50).1;
+                    [p50, p95, *group[i95..].select_nth_unstable(i99 - i95).1]
+                }
+            };
             let line = [e as u32, n as u32, p50, p95, p99, errors[e]];
             // The label, a space, the name, six numbers that each follow a space, and the LF.
             let numbers = numbers(&line).map(|value| 1 + digits(value));
@@ -793,6 +836,50 @@ fn summarize_hours(
         });
     }
     done
+}
+
+/// Returns the values at the sorted positions `at` of `group`, which holds at most 8·R values,
+/// after sorting them in R AVX2 registers.
+///
+/// Selecting from a group of 4 to 15 values cost about 170 ns, most of it in mispredicted
+/// branches, and 80% of the groups are that small. A sorting network compares fixed pairs of
+/// positions whatever the values are, so it has no branches at all. This one is bitonic: to
+/// merge sorted runs of `k / 2` into runs of `k`, it pairs each position `i` with `i ^ m`, first
+/// for `m = k - 1` (its mirror in the run of `k`), then for `m = k / 4, …, 1`, and the lower
+/// position of each pair keeps the smaller value. One permute lines up every lane with its
+/// partner, which sits in register `r ^ m / 8`. Positions past the group hold `u32::MAX`, so
+/// they sort last.
+#[target_feature(enable = "avx2")]
+fn sort_network<const R: usize>(group: &[u32], at: [usize; 3]) -> [u32; 3] {
+    use std::arch::x86_64::{__m256i, _mm256_add_epi32, _mm256_and_si256, _mm256_blendv_epi8};
+    use std::arch::x86_64::{_mm256_cmpeq_epi32, _mm256_max_epu32, _mm256_min_epu32};
+    use std::arch::x86_64::{_mm256_permutevar8x32_epi32, _mm256_set1_epi32 as splat};
+    use std::arch::x86_64::{_mm256_setr_epi32, _mm256_xor_si256};
+    let value = |i| group.get(i).copied().unwrap_or(u32::MAX);
+    let values: [[u32; 8]; R] = std::array::from_fn(|r| std::array::from_fn(|l| value(8 * r + l)));
+    // SAFETY: both types are R·32 bytes of plain integers.
+    let mut v: [__m256i; R] = unsafe { std::mem::transmute_copy(&values) };
+    let lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let mut k = 2;
+    while k <= 8 * R {
+        let mut m = k - 1;
+        while m > 0 {
+            let (old, top) = (v, splat(1 << m.ilog2()));
+            for (r, v) in v.iter_mut().enumerate() {
+                let to = _mm256_xor_si256(lanes, splat(m as i32 & 7));
+                let other = _mm256_permutevar8x32_epi32(old[r ^ m / 8], to);
+                let position = _mm256_add_epi32(lanes, splat(8 * r as i32));
+                let upper = _mm256_cmpeq_epi32(_mm256_and_si256(position, top), top);
+                let (low, high) = (_mm256_min_epu32(*v, other), _mm256_max_epu32(*v, other));
+                *v = _mm256_blendv_epi8(low, high, upper);
+            }
+            m = if m == k - 1 { k / 4 } else { m / 2 };
+        }
+        k *= 2;
+    }
+    // SAFETY: as above.
+    let sorted: [[u32; 8]; R] = unsafe { std::mem::transmute_copy(&v) };
+    at.map(|i| sorted[i / 8][i % 8])
 }
 
 /// The six numbers an output line prints after the endpoint's name (spec §4): the request
@@ -814,38 +901,60 @@ fn digits(value: u64) -> usize {
     value.checked_ilog10().map_or(1, |log| log as usize + 1)
 }
 
-/// Appends the formatted lines of `hour` to `out`: `<hour> <endpoint>` and the six numbers.
+/// Writes the formatted lines of `hour` to `out`: `<hour> <endpoint>` and the six numbers.
+///
+/// `out` gets 8 bytes of slack at the end, because [`push_number`] always stores 8 digits.
 fn format_hour(hour: &Hour, names: &[&[u8]], out: &mut Vec<u8>) {
     let label = hour_label(hour.index);
+    out.resize(hour.len + 8, 0);
+    let mut at = 0;
     for line in &hour.lines {
-        out.extend_from_slice(label.as_bytes());
-        out.push(b' ');
-        out.extend_from_slice(names[line[0] as usize]);
+        let name = names[line[0] as usize];
+        out[at..at + 20].copy_from_slice(label.as_bytes());
+        out[at + 20] = b' ';
+        out[at + 21..at + 21 + name.len()].copy_from_slice(name);
+        at += 21 + name.len();
         for value in numbers(line) {
-            push_number(out, value);
+            at = push_number(out, at, value);
         }
-        out.push(b'\n');
+        out[at] = b'\n';
+        at += 1;
     }
+    out.truncate(at);
 }
 
-/// Appends a space and then `value` in decimal.
+/// Writes a space and then `value` in decimal at `out[at..]`, and returns the index after it.
 ///
-/// About 760,000 numbers go through here. `write!` runs each one through Rust's general
-/// formatting machinery, which costs more than producing the digits, so we write them directly:
-/// least significant first, into a small buffer from the back.
-fn push_number(out: &mut Vec<u8>, mut value: u64) {
-    let mut digits = [0; 20];
-    let mut at = digits.len();
-    loop {
-        at -= 1;
-        digits[at] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
+/// About 760,000 numbers go through here, so each one takes a fixed sequence of instructions:
+/// [`eight_ascii`] turns it into eight digits at once, we shift away the leading zeros, and one
+/// 8-byte store writes it. The bytes past the number are overwritten by whatever comes next.
+/// The rare value of nine or ten digits writes its leading digits first, then the other eight.
+fn push_number(out: &mut [u8], at: usize, value: u64) -> usize {
+    if value >= 100_000_000 {
+        let at = push_number(out, at, value / 100_000_000);
+        out[at..at + 8].copy_from_slice(&eight_ascii(value % 100_000_000).to_le_bytes());
+        return at + 8;
     }
-    out.push(b' ');
-    out.extend_from_slice(&digits[at..]);
+    let n = digits(value);
+    out[at] = b' ';
+    let ascii = eight_ascii(value) >> (8 * (8 - n));
+    out[at + 1..at + 9].copy_from_slice(&ascii.to_le_bytes());
+    at + 1 + n
+}
+
+/// Returns `value`, which must be below 10^8, as eight ASCII digits with leading zeros, the most
+/// significant one in the lowest byte.
+///
+/// This is SWAR, the reverse of [`eight_digits`]: we split the number into two 4-digit halves
+/// in 32-bit lanes, each of those into two 2-digit halves in 16-bit lanes, and those into single
+/// digits in bytes. Each split divides every lane at once by multiplying with a reciprocal,
+/// `x / 100 = x · 10486 >> 20` and `x / 10 = x · 103 >> 10`, which are exact for these ranges.
+fn eight_ascii(value: u64) -> u64 {
+    let x = value / 10_000 | (value % 10_000) << 32;
+    let hundreds = (x * 10_486 >> 20) & 0x0000_007F_0000_007F;
+    let x = hundreds | (x - hundreds * 100) << 16;
+    let tens = (x * 103 >> 10) & 0x000F_000F_000F_000F;
+    (tens | (x - tens * 10) << 8) | 0x3030_3030_3030_3030
 }
 
 /// Returns the output label `YYYY-MM-DDTHH:00:00Z` of hour index `hour`, the inverse of
