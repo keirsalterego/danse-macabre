@@ -187,10 +187,10 @@ fn summarize(log: &[u8], out_path: &Path) {
         newline.map_or(0, |p| p + 1)
     };
     // Each thread's chunk, with the table from its endpoint ids to ids in `all`, the merge of
-    // every chunk's names; then each hour's output lines.
+    // every chunk's names; then each hour's output lines, and the ids in output order.
     let chunks: Vec<OnceLock<(Chunk, Vec<u32>)>> = (0..threads).map(|_| OnceLock::new()).collect();
     let hours: Vec<OnceLock<Hour>> = (0..HOURS).map(|_| OnceLock::new()).collect();
-    let all = Mutex::new(Interner::default());
+    let (all, sorted) = (Mutex::new(Interner::default()), OnceLock::new());
     let (plan, places, barrier) = (OnceLock::new(), OnceLock::new(), Barrier::new(threads));
     let (taken, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let work = |t: usize| {
@@ -200,16 +200,9 @@ fn summarize(log: &[u8], out_path: &Path) {
         let ids = all.lock().expect("panics abort").merge(&endpoints);
         drop(endpoints);
         let _ = chunks[t].set((chunk, ids));
-        barrier.wait();
-        let (names, order, runs, by_size) = plan.get_or_init(|| {
-            // A name's padded copy sorts like the name itself, because the space after it and
-            // the zero padding are smaller than any byte a name can hold (§2): a proper prefix
-            // sorts first, which is exactly the order the spec asks for (§4). Comparing the
-            // copies saves reading 1,842 names from all over the input; only names that agree
-            // on 64 bytes compare in full.
+        // One thread, the barrier's leader, plans the hour pass while the others wait.
+        if barrier.wait().is_leader() {
             let all = std::mem::take(&mut *all.lock().expect("panics abort"));
-            let mut order: Vec<usize> = (0..all.names.len()).collect();
-            order.sort_unstable_by_key(|&id| (&all.padded[id].0, all.names[id].0));
             let mut runs: Vec<Vec<Run>> = vec![Vec::new(); HOURS];
             for (chunk, ids) in chunks.iter().map(|c| c.get().expect("parsed")) {
                 for &[(hour, start, first), (_, end, _)] in chunk.runs.array_windows() {
@@ -224,11 +217,22 @@ fn summarize(log: &[u8], out_path: &Path) {
             let size = |h: &usize| runs[*h].iter().map(|run| run.0.len()).sum::<usize>();
             by_size.sort_by_key(|h| std::cmp::Reverse(size(h)));
             let names: Vec<&[u8]> = all.names.iter().map(|&(name, _)| name).collect();
-            (names, order, runs, by_size)
-        });
+            let _ = plan.set((names, runs, by_size));
+            // No hour needs the names' order before its lines, so the others start counting
+            // while this thread sorts: the sort took 0.2 ms, and the others waited for all of it
+            // (0.9% of the run). A name's padded copy sorts like the name itself, because the
+            // space after it and the zero padding are smaller than any byte a name can hold (§2):
+            // a proper prefix sorts first, which is exactly the order the spec asks for (§4).
+            // Comparing the copies saves reading 1,842 names from all over the input; only names
+            // that agree on 64 bytes compare in full.
+            let mut order: Vec<usize> = (0..all.names.len()).collect();
+            order.sort_unstable_by_key(|&id| (&all.padded[id].0, all.names[id].0));
+            let _ = sorted.set(order);
+        }
+        let (names, runs, by_size) = plan.wait();
         let mut latencies = Vec::new();
         for &hour in std::iter::from_fn(|| by_size.get(taken.fetch_add(1, Relaxed))) {
-            let _ = hours[hour].set(summarize_hour(&runs[hour], order, names, &mut latencies));
+            let _ = hours[hour].set(summarize_hour(&runs[hour], &sorted, names, &mut latencies));
         }
         // The output will need this memory soon: every page given back now lowers the peak.
         release(&latencies);
@@ -628,6 +632,9 @@ type Hour = (Vec<[u32; 6]>, usize);
 /// first one on (see [`Chunk`]), and the table from their chunk's endpoint ids to global ids.
 type Run<'a> = (&'a [u32], &'a [u32], &'a [u32]);
 
+/// The endpoints' ids in output order, sorted once by one thread (see [`summarize`]).
+type Order = OnceLock<Vec<usize>>;
+
 /// Computes the output lines of one hour from its `runs` in every chunk.
 ///
 /// We go through the runs twice:
@@ -637,13 +644,14 @@ type Run<'a> = (&'a [u32], &'a [u32], &'a [u32]);
 ///    latencies end. A running sum of the counts tells where that is. Together, the two steps
 ///    are a counting sort by endpoint.
 ///
-/// Then we take the endpoints in output `order`, and the three percentiles of each. A thread
-/// keeps `buffer` from one hour to the next.
+/// Then we take the endpoints in output `order`, waiting for it if another thread is still
+/// sorting it, and the three percentiles of each. A thread keeps `buffer` from one hour to the
+/// next.
 ///
 /// Each run's records are freed right after the second pass, their last reader. Before, all
 /// 12 MB of records stayed until the hour pass ended, when the hours' lines and every
 /// thread's buffer had joined them: that was the program's memory peak.
-fn summarize_hour(runs: &[Run], order: &[usize], names: &[&[u8]], buffer: &mut Vec<u32>) -> Hour {
+fn summarize_hour(runs: &[Run], order: &Order, names: &[&[u8]], buffer: &mut Vec<u32>) -> Hour {
     // `start[e]` first counts endpoint e's lines, then, after the running sum, holds the end of
     // its latencies. Placing each latency moves it down by one, so it ends as their start.
     let (mut start, mut errors) = (vec![0u32; names.len() + 1], vec![0u32; names.len()]);
@@ -670,10 +678,10 @@ fn summarize_hour(runs: &[Run], order: &[usize], names: &[&[u8]], buffer: &mut V
         }
         release(records);
     }
-    let (mut lines, mut len) = (Vec::with_capacity(order.len()), 0);
+    let (mut lines, mut len) = (Vec::with_capacity(order.wait().len()), 0);
     // The number of decimal digits `put_number` writes for `value`.
     let digits = |value: u64| value.checked_ilog10().map_or(1, |log| log as usize + 1);
-    for &e in order {
+    for &e in order.wait() {
         let group = &mut buffer[start[e] as usize..start[e + 1] as usize];
         if !group.is_empty() {
             let [p50, p95, p99] = percentiles(group);

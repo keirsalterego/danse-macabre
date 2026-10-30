@@ -34,6 +34,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 27 | The sorting network's stages within one register take each lane's partner from the register itself, not from the stage's copy | run-ccf7ded5ed1d | 0.0199 | 21.0 | 84.3 |
 | 28 | 3 fewer lines with the same machine code: the run pairs taken with `array_windows`, and two lint exceptions moved to `Cargo.toml` | run-ccf7ded5ed1d | 0.0199 | 21.0 | 84.3 |
 | 29 | 1 fewer line with the same machine code: the network's compare-exchange blends its minimum and maximum in one expression | run-1286db1e2359 | 0.0199 | 21.2 | 84.3 |
+| 30 | The names' output order sorted by one thread while the others start the hour pass, which needs it only at its lines | | | | |
 
 ## Step 1: v1
 
@@ -355,6 +356,24 @@ Gate: 307 pass, 0 fail.
 
 The first board run of this code, run-9d734179de5e, drew 21.8 ms with the same machine code as
 step 28; the row cites the next run of the same commit's code.
+
+## Step 30: the name sort off the critical path
+
+Timed with rdtsc inside the plan, the barrier leader took about 0.28 ms while 11 threads waited,
+0.16–0.21 ms of it sorting the names into output order. No hour needs that order before its
+lines, and a thread's first hour spends about 0.4 ms counting and scattering before them. So the
+leader now publishes the runs and hour sizes first (`plan.set`), then sorts and publishes the
+order in a second `OnceLock`, and `summarize_hour` waits on it only when it reaches its lines.
+
+`ab.py` against step 29, interleaved: 101 runs twice, medians 22.58 → 22.37 and 22.46 → 22.26 ms,
+minimums 21.59 → 21.49 and 21.93 → 21.63 ms; 60 runs on seed 1, 22.45 → 22.33 ms, and on seed 2,
+22.56 → 22.23 ms. memory.peak medians 20.12 → 20.09 MB (5 runs each). S 375 → 377. Gate: 307
+pass, 0 fail.
+
+Not kept: giving out the last 10% of each thread's share as 48 pieces from a shared counter, so
+threads that start late do less. It evened the parse's end spread from 1.08 to 0.36 ms but cost
+1.5% (median 22.44 → 22.77 ms, user cycles +1.5%): a thread that finishes early already speeds up
+its hyperthread sibling, and the extra merges queue on the interner's lock.
 
 ## Experiments that did not stay
 
