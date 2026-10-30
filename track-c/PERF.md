@@ -20,8 +20,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 13 | 18 fewer lines in the region table, the exchange and the name set, at the same speed | run-5fd07fa31be9 | 0.0415 | 13.0 | 72.8 |
 | 14 | 11 fewer lines: one helper runs both thread groups, and the exchange wakes every worker | run-701b81269ca6 | 0.0368 | 12.4 | 74.3 |
 | 15 | The input padded with 32 zero bytes after the sentinel record, so the field parsers lose their end-of-input paths and a per-record `memcpy`; 11 fewer lines | run-94c175e1147b | 0.0427 | 12.6 | 72.7 |
-| 16 | Records parsed four at a time: each one's byte in the region table prefetched as soon as its region id is parsed, and the four groups looked up after the fourth record | | | | |
-| 17 | A static-pie build, which skips the dynamic loader | | | | |
+| 16 | Records parsed four at a time: each one's byte in the region table prefetched as soon as its region id is parsed, and the four groups looked up after the fourth record | run-521d52addb7b | 0.0362 | 12.7 | 74.4 |
+| 17 | A static-pie build, which skips the dynamic loader | run-521d52addb7b | 0.0362 | 12.7 | 74.4 |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -562,6 +562,8 @@ static PIE, so the process starts without the dynamic loader, as track A has don
 step 14. `ab.py`, 40 interleaved runs on top of step 16, median / min / mean: 40.14 / 38.97 /
 42.65 ms dynamic, 39.70 / 38.86 / 40.73 ms static. Gate: 307 pass, 0 fail; the image built
 offline and run with the harness's sandbox flags gives seed 1's hash.
+
+Steps 16 and 17 went to the board in one push, so both rows cite run-521d52addb7b.
 
 ## Experiments that did not stay
 
