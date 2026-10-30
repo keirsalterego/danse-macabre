@@ -278,7 +278,7 @@ fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
         // `space` precedes the latency; before it sit the 3-digit status and its own space.
         let (latency_us, space) = latency(line, lf);
         let name = &line[start..space - 4];
-        let id = endpoints.intern(name, hash(name));
+        let id = endpoints.intern(name, hash(name), line.get(start..).and_then(|w| w.first_chunk()));
         // Errors are exactly 500..=599, so the status's first digit decides.
         let error = u64::from(line[space - 3] == b'5');
         per_hour[hour] += 1;
@@ -299,7 +299,7 @@ fn parse(chunk: &[u8]) -> Result<Chunk<'_>, String> {
 /// Returns the index of the LF that ends the first line of `line`.
 ///
 /// No line is shorter than [`MIN_LINE`], so the search starts at byte 39 rather than 0. From
-/// there one 64-byte window, checked with two AVX2 compares in [`newline_mask`], holds the LF of
+/// there one 64-byte window, checked with two AVX2 compares in [`equal_mask`], holds the LF of
 /// about 90% of lines, which makes the branch after it easy to predict. Longer lines take
 /// another window, and the last line of a chunk, with fewer than 64 bytes left, falls back to a
 /// plain byte search.
@@ -308,7 +308,7 @@ fn line_end(line: &[u8]) -> usize {
     while at + 64 <= line.len() {
         let window = line[at..at + 64].try_into().expect("64-byte window");
         // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
-        let newlines = unsafe { newline_mask(window) };
+        let newlines = unsafe { equal_mask(window, &[b'\n'; 64]) };
         if newlines != 0 {
             return at + newlines.trailing_zeros() as usize;
         }
@@ -318,28 +318,29 @@ fn line_end(line: &[u8]) -> usize {
     at + tail.expect("every line ends in LF (spec §2)")
 }
 
-/// Returns a mask with bit `i` set wherever `block[i]` is an LF.
+/// Returns a mask with bit `i` set wherever `a[i] == b[i]`.
 ///
 /// AVX2 compares 32 bytes at once: `_mm256_cmpeq_epi8` turns every matching byte into `0xFF`,
 /// and `_mm256_movemask_epi8` gathers the top bit of each byte into a 32-bit integer. Two of
-/// those cover the 64-byte block, and `trailing_zeros` on the result gives the first match.
+/// those cover the 64-byte blocks. Against a block of LFs, `trailing_zeros` on the result finds
+/// the first LF ([`line_end`]); against another name, a mask of all ones means the bytes agree
+/// ([`same_name`]).
 #[target_feature(enable = "avx2")]
-fn newline_mask(block: &[u8; 64]) -> u64 {
-    use std::arch::x86_64::{
-        _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
-    };
-    let lf = _mm256_set1_epi8(b'\n'.cast_signed());
-    // SAFETY: both 32-byte unaligned loads lie inside the 64-byte `block`.
-    let (low, high) = unsafe {
-        let at = block.as_ptr();
-        (
-            _mm256_loadu_si256(at.cast()),
-            _mm256_loadu_si256(at.add(32).cast()),
-        )
-    };
-    let low = _mm256_movemask_epi8(_mm256_cmpeq_epi8(low, lf)).cast_unsigned();
-    let high = _mm256_movemask_epi8(_mm256_cmpeq_epi8(high, lf)).cast_unsigned();
-    u64::from(low) | (u64::from(high) << 32)
+fn equal_mask(a: &[u8; 64], b: &[u8; 64]) -> u64 {
+    use std::arch::x86_64::{_mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    let mut mask = 0;
+    for offset in [0, 32] {
+        // SAFETY: both 32-byte unaligned loads lie inside their 64-byte blocks.
+        let (a, b) = unsafe {
+            (
+                _mm256_loadu_si256(a.as_ptr().add(offset).cast()),
+                _mm256_loadu_si256(b.as_ptr().add(offset).cast()),
+            )
+        };
+        let equal = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)).cast_unsigned();
+        mask |= u64::from(equal) << offset;
+    }
+    mask
 }
 
 /// Returns the hour index `0..72` of a line's timestamp, or `None` outside the span.
@@ -449,6 +450,8 @@ struct Interner<'a> {
     /// Id → (name, hash). Keeping the hash lets a probe reject most non-matching slots without
     /// comparing bytes, and lets the table grow without hashing anything again.
     names: Vec<(&'a [u8], u64)>,
+    /// Id → the name's bytes, zero-padded to 128, for [`same_name`].
+    padded: Vec<[u8; 128]>,
 }
 
 impl Default for Interner<'_> {
@@ -456,17 +459,26 @@ impl Default for Interner<'_> {
         Self {
             slots: vec![0; 1024],
             names: Vec::new(),
+            padded: Vec::new(),
         }
     }
 }
 
 impl<'a> Interner<'a> {
     /// Returns `name`'s id, assigning the next free one if the name is new.
-    fn intern(&mut self, name: &'a [u8], hash: u64) -> u32 {
-        let slot = self.slot(name, hash);
+    ///
+    /// `window` is the 128 bytes that start with `name` when the input has that many left. Every
+    /// line but the last one or two of a chunk has them, and with them a probe compares names
+    /// without a call to `memcmp` (see [`same_name`]).
+    fn intern(&mut self, name: &'a [u8], hash: u64, window: Option<&[u8; 128]>) -> u32 {
+        let slot = self.slot(name, hash, window);
         if self.slots[slot] != 0 {
             return self.slots[slot] - 1;
         }
+        let mut padded = [0; 128];
+        let kept = name.len().min(128);
+        padded[..kept].copy_from_slice(&name[..kept]);
+        self.padded.push(padded);
         self.names.push((name, hash));
         self.slots[slot] = self.names.len() as u32;
         if self.names.len() * 2 > self.slots.len() {
@@ -474,7 +486,7 @@ impl<'a> Interner<'a> {
             let old = std::mem::replace(&mut self.slots, grown);
             for id in old.into_iter().filter(|&id| id != 0) {
                 let (name, hash) = self.names[id as usize - 1];
-                let slot = self.slot(name, hash);
+                let slot = self.slot(name, hash, None);
                 self.slots[slot] = id;
             }
         }
@@ -482,18 +494,45 @@ impl<'a> Interner<'a> {
     }
 
     /// Returns the slot that holds `name`, or the empty slot where it belongs.
-    fn slot(&self, name: &[u8], hash: u64) -> usize {
+    fn slot(&self, name: &[u8], hash: u64, window: Option<&[u8; 128]>) -> usize {
         let mask = self.slots.len() - 1;
         let mut slot = (hash >> 32) as usize & mask;
         while let Some(id) = self.slots[slot].checked_sub(1) {
             let (known, known_hash) = self.names[id as usize];
-            if known_hash == hash && known == name {
+            let same = match window {
+                Some(window) if name.len() <= 128 => {
+                    same_name(window, &self.padded[id as usize], name.len())
+                }
+                _ => known == name,
+            };
+            if known_hash == hash && same {
                 break;
             }
             slot = (slot + 1) & mask;
         }
         slot
     }
+}
+
+/// Returns whether the first `len` bytes of `window` and `known` agree, for `len <= 128`.
+///
+/// Names vary in length from line to line, and the branches inside `memcmp` that pick a path
+/// by length mispredict often; that was about a quarter of the parse loop. Here the length
+/// never steers a branch for names of up to 64 bytes: we compare all 64 bytes of both blocks at
+/// once and ignore the result for bytes past `len`. Bytes past the name differ, of course (the
+/// window goes on into the status and the latency, the padded copy holds zeros), which is
+/// why they are masked out: `u64::MAX >> (64 - len)` keeps bit `i` exactly for `i < len`.
+fn same_name(window: &[u8; 128], known: &[u8; 128], len: usize) -> bool {
+    let (window, known) = (window.as_chunks::<64>().0, known.as_chunks::<64>().0);
+    let wanted = |len: usize| u64::MAX.checked_shr(64 - len.min(64) as u32).unwrap_or(0);
+    // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
+    let low = unsafe { equal_mask(&window[0], &known[0]) };
+    if len <= 64 {
+        return !low & wanted(len) == 0;
+    }
+    // SAFETY: as above.
+    let high = unsafe { equal_mask(&window[1], &known[1]) };
+    !low == 0 && !high & wanted(len - 64) == 0
 }
 
 /// Sorts `records` by hour in place and returns where each hour starts.
@@ -534,7 +573,7 @@ fn rank_endpoints<'a>(chunks: &[Chunk<'a>]) -> (Vec<&'a [u8]>, Vec<Vec<u32>>) {
         .map(|c| {
             c.names
                 .iter()
-                .map(|&(name, hash)| all.intern(name, hash))
+                .map(|&(name, hash)| all.intern(name, hash, None))
                 .collect()
         })
         .collect();
