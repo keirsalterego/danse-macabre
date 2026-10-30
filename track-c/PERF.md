@@ -14,6 +14,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 7 | Each name's hash slot loaded as soon as the name is scanned, so its cache miss overlaps the rest of the record | run-7b03d961ed16 | 0.0799 | 15.3 | 65.7 |
 | 8 | Numbers parsed from one 8-byte word each, and the number and text-field parsers inlined | run-c66327de718b | 0.0734 | 15.2 | 66.6 |
 | 9 | Each distinct name owned by one thread: names travel to their owner in rounds, and each owner marks them in a private table. Region table at one byte per id | | | | |
+| 10 | Each run's first record guessed instead of found by a quote pre-pass, with a check after the parse and an exact rerun when a guess is wrong. Each worker gives its input pages back after the last round | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -322,6 +323,73 @@ Correctness checks: the gate (307 pass, 0 fail); fresh seeds 5–7; full seeds 2
 and 64 threads, which forces thousands of rounds and early round ends. The long-name sets hold
 every name length from 0 to 80 bytes, names equal in their first 24 bytes, trailing-space
 twins, `""` escapes at the 8-byte word edges, and quoted and unquoted spellings of one value.
+
+## Step 10: guessed run starts, and the input released by the workers
+
+This step goes after the time outside the worker loop. A timeline of step 8 (P-cores, an
+instrumented copy) put the regions parse at 3.1–3.3 ms, the quote pre-pass at 6.4–6.7 ms, the
+workers at 62–68 ms, the merge at 0.7–1.0 ms and the write at 0.05 ms. When the process
+exits, the kernel unmaps the 200 MB input on one thread: an explicit `munmap` took 2.8 ms, and
+the time from the program's last timestamp to the end of the wall was 4.5–5.1 ms (medians of
+40 runs, two sessions).
+
+1. **Each worker releases its own run.** After the last round, every worker calls
+   `madvise(MADV_DONTNEED)` on the whole pages of its run, so the unmapping runs on twelve
+   threads instead of one at exit. It waits for the last round because dropping pages makes
+   the kernel flush every thread's TLB, which slows any worker still parsing. On step 8, the
+   gap after the last timestamp fell from 4.51 and 5.08 ms to 2.03 and 2.70 ms (medians of 40
+   runs, two sessions). Releasing without waiting for the other workers was slower there:
+   `perf stat -r 30` elapsed 80.3 / 81.9 / 80.0 ms, against 79.6 / 77.8 / 79.3 ms after a
+   barrier. Step 9's rounds already end at a barrier, so the release needs none of its own.
+2. **Run starts are guessed.** Instead of the pre-pass, each cut takes the first LF after it
+   that a digit or a BOM follows. A record starts that way, and §2.2 says a note's LF is always
+   followed by a lowercase word or a quote, so on generated data no guess is wrong. §2.1 allows
+   any byte there, so the guesses are checked: each worker returns where the parse of its run
+   stopped, and every run must end exactly where the next one starts. Otherwise the join runs
+   again on the pre-pass's exact cuts, with a fresh exchange. The parse is exact from the file's
+   start, so if each run ends on the next one's start, by induction every start is a record
+   start.
+
+   A wrong guess must cost time, never a crash, and a misread record can read past its run.
+   Every scan in a record stops at a comma, a dot or an odd run of quotes, and a quoted field
+   that holds more than quotes opens and closes with an odd run. So a misread record never
+   reads past the first real record whose name and note are such fields. The file's tail, from
+   the first record start in its last 4 KiB, has an exact start: a valid file holds an even
+   number of quotes, so the parity of the quotes in the last 4 KiB is the quote state where
+   they begin. The tail must hold such a record, which takes a few records' parse to find, or
+   the join uses the pre-pass. The guessed runs all end at the tail's start, and the last worker parses the tail
+   after its run, from that exact start. A separate thread for the tail would have shared a CPU
+   with a worker and waited at all of the ~257 barriers.
+
+Both on top of step 9, P-cores, wall time of interleaved runs (`ab.py`), median and min in ms:
+
+| | step 9 | release only | guesses only | both |
+|---|---|---|---|---|
+| session 1, 60 runs each | 52.68 / 51.09 | 51.30 / 49.99 | 47.69 / 46.74 | 46.43 / 45.50 |
+| session 2, 60 runs each, order reversed | 53.61 / 51.49 | 52.25 / 49.96 | 48.88 / 46.51 | 47.81 / 45.48 |
+| session 3, 60 runs each | 54.04 / 51.19 | | | 47.88 / 45.73 |
+
+The release saves 1.1–1.5 ms and the guesses 4.4–5.0 ms; together 5.5–6.3 ms. In the quietest
+`perf stat -r 10` round, task-clock was 501.4 ms for step 9, 511.3 with the release, 490.4 with
+the guesses and 501.6 with both. Page faults stay at 6,675: the workers now fault the input in
+as they parse it.
+
+memory.peak in the container with the harness's flags and 12 CPUs, 12 alternating runs each:
+13.3–14.3 MiB (mean 13.99) for step 9 and 13.9–14.6 MiB (mean 14.16) for step 10. S 587 → 630:
+10 lines for the release and 33 for the guesses, their check and the tail.
+
+Correctness checks:
+
+- The gate (307 pass, 0 fail). Every guess held on all 300 tiny seeds at 1, 3, 12, 37 and 64
+  threads, and on full seeds 1–7 at 1, 12 and 64 threads.
+- The 400 random cases, and 400 hostile ones against the reference at 1, 3, 12 and 64 threads
+  with 64-, 200- and 1,000-byte tails. The hostile cases put into names and notes what §2.1
+  allows and §2.2 rules out: LFs followed by digits or BOMs, whole fake records, CRLFs, dots and
+  stray quotes. Up to 332 of the 400 runs guessed wrong, and all reran to the reference's output.
+- A forced test on every byte offset of 7 tiny seeds, the worked example, 4 random cases and 60
+  hostile ones, with 64-, 1,024- and 4,096-byte tails: 648,626 exact cuts gave the same output
+  and ended where the next run starts, and 498,540 offsets forced as guesses never crashed, were
+  accepted exactly when they were record starts, and then gave the same output.
 
 ## Experiments that did not stay
 
