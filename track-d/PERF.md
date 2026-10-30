@@ -9,7 +9,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 2 | Counting sort with no atomics (482dcb3), then a prefetch of the next node's edges (c13e637), two steps deep (599190a) | run-97e259c08579 | 0.1889 | 128.2 | 66.7 |
 | 3 | Numbers parsed eight bytes at a time (85568b4) | run-49af01c44df1 | 0.1665 | 125.8 | 68.0 |
 | 4 | Heap entries ordered by one packed 128-bit key (542bc46) | run-05e531e8754c | 0.1565 | 125.2 | 68.6 |
-| 5 | Edges packed into 4 bytes and read through a 32-byte copy, and glibc's mmap threshold fixed at 64 KiB | | | | |
+| 5 | Edges packed into 4 bytes and read through a 32-byte copy, and glibc's mmap threshold fixed at 64 KiB (680f4ad) | run-74c555d4ba4f | 0.1551 | 83.9 | 70.2 |
+| 6 | The build's arrays faulted in before pass 2, one write per 2 MB on half the threads | | | | |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
@@ -91,7 +92,7 @@ branches. A `u128` compares with one subtract-with-borrow and no branch.
 - Seed 2: 171 → 161 ms. Seed 3: 180 → 165 ms.
 - Peak memory unchanged. S 317 → 323.
 
-## Step 5: 4-byte edges and a fixed mmap threshold
+## Step 5: 4-byte edges and a fixed mmap threshold (680f4ad)
 
 Where step 4's peak went, from `memory.stat` sampled through a seed 1 run: 123.6 of its 127.2 MB
 were anonymous memory, and the peak came near the end of the queries. Of that:
@@ -128,6 +129,45 @@ parked the places in spare bits), so this step cuts the CSRs and the free space:
   81.0–82.3 MB; without the fixed threshold, 164–165 ms, task-clock 1.78–1.79 s, peak 90.6–95.6 MB.
 - S 323 → 352.
 
+## Step 6: the build's arrays faulted in before pass 2
+
+Round 7 looked at the build. Phase marks on seed 1 (medians of 7 runs on P-cores) split the 157 ms
+before the output is written into:
+
+- pass 1, 9.5 ms;
+- pass 2's runs, set up on the main thread, 1.2 ms;
+- pass 2, 19 ms;
+- pass 3, 6.6 ms;
+- the heavy edges and freeing the places, under 1 ms;
+- the queries, 120 ms.
+
+Outside `main`, the process takes about 1 ms to start and 2 ms at exit to unmap graph.txt.
+
+Pass 2 parses the same text as pass 1 and writes each edge twice, once per direction, yet took twice
+as long. In a run that stopped after the build, 0.21–0.24 G of its 0.95 G cycles were in the kernel,
+71% of those in `clear_page_erms`, which zeroes new pages. Pass 2 is the first write to the 60 MB of
+edge and place arrays, and every thread writes into every block, so all 12 threads fault on each new
+2 MB huge page at once. Each of them zeroes a huge page; the kernel maps one and frees the rest.
+
+Now, before pass 2, half the threads each write one value per 2 MB of their own share of the arrays,
+so each huge page is faulted in by one thread, bar those that straddle two shares.
+
+- Phase marks (seed 1, 7 runs each, interleaved): pass 2 18.7 → 13.0 ms, plus 3.3 ms for the new
+  step, so 18.7 → 16.2 ms in all, and 156.7 → 154.5 ms before the output. A second session: 19.3 →
+  16.4 ms, and 158.9 → 155.6 ms.
+- P-cores, seed 1: elapsed 164.7–165.8 → 161.2–167.9 ms (medians 165.3 → 163.7), task-clock
+  1.80–1.82 → 1.74–1.76 s.
+- Seed 2: medians 170.4 → 166.5 ms, task-clock 1.85–1.87 → 1.81–1.82 s. Seed 3: 173.6–175.8 →
+  170.1–172.1 ms, task-clock 1.90–1.91 → 1.84–1.85 s.
+- With huge pages off (`PR_SET_THP_DISABLE`), the new step takes 0.3 ms and pass 2 faults its 4 KB
+  pages as before: 20.8 → 21.2 ms for both, and elapsed medians 173.9 → 173.1 ms. The first
+  version wrote once per 4 KB page. That cost 1.6 ms with huge pages off (20.8 → 22.4 ms), and with
+  them on it did no better (16.5 against 16.2 ms).
+- This laptop runs Debian 13 with huge pages on for all anonymous memory (`always`), and the
+  scoring box runs Debian 13 too.
+- Peak memory unchanged: seed 1 82.2–83.8 → 83.3–85.4 MB, seed 2 79.8–84.1 → 79.4–85.3 MB.
+- S 352 → 359.
+
 ## Tried and reverted (local, turbo off, no run ID)
 
 Each row's baseline ran in the same interleaved session as the experiment, so baselines differ
@@ -151,3 +191,13 @@ between rows.
 | Step 5's rows read as 8-byte pairs, or even and odd edges from two load instructions | 55–60M L2 prefetches, but 5.85–5.93 G instructions and cycles 4.07–4.12 G, against 5.45 G and 4.07 G read in place (same session) | The extra instructions ate the gain |
 | Step 5's row copied by a `memcpy` of its exact length | cycles 3.97 G, 5.71 G instructions, against 3.91 G and 5.50 G for the 32-byte copy (same session) | A library call per row |
 | A 16-byte copy for rows of up to 4 edges | 89M L2 prefetches, cycles 3.99 G, against 55M and 3.91 G for the 32-byte copy (same session) | Rows of 5 to 8 edges still set the prefetchers off |
+| Two or four lines parsed at once per thread, interleaved, in both parse passes (on step 5, phase marks) | Two: pass 1 9.5 → 8.5 ms, pass 2 19.0 → 21.5 ms, 157.1 → 158.1 ms before the output. Four: 10.4, 22.6 and 162.6 ms | Pass 2 lost more than pass 1 gained |
+| Blocks of 4,096, 8,192, 16,384 or 32,768 nodes instead of 2,048 (on step 5, phase marks) | Runs set-up 1.2 → 0.6 / 0.3 / under 0.2 / under 0.2 ms, pass 2 19.1 → 18.6 / 18.2 / 17.8 / 17.6 ms, but pass 3 6.6 → 7.6 / 14.5 / 12.6 / 15.4 ms, so 157.0 → 156.6 / 162.5 / 161.5 / 165.8 ms before the output | A tie at 4,096, and pass 3 slower beyond. Past 64 KB a block's copy is a fresh `mmap`; with one buffer per thread reused instead, pass 3 took 6.6 / 7.7 / 8.8 / 9.9 ms at 2,048 / 4,096 / 8,192 / 16,384, against 6.8 ms for the copy at 2,048 |
+| Step 6's faulting on all 12 threads, or on a third of them | Faulting plus pass 2: 17.1 and 17.2 ms, against 16.4 ms on half (one write per 2 MB). With one write per 4 KB, 17.7 against 17.0 ms | Zeroing is memory traffic, and more threads only contend for it |
+| Step 6's faulting for the edge arrays only | 2.8 + 15.9 = 18.6 ms, against 4.3 + 12.4 = 16.7 ms for all four arrays and 18.8 ms for none (one write per 4 KB) | Pass 2's first writes to the place arrays race the same way |
+| Faulting inside pass 1, with the arrays sized from the header's edge count | Pass 1 9.5 → 15.2–15.9 ms, and 158.6–159.0 ms before the output, against 157.6 ms with step 6's separate step and 160.6 ms with neither | The parse slowed by more than the separate step takes |
+| Faulting during pass 1 on 6 extra threads, or on the main thread | Pass 1 9.6 → 23.4 ms (fastest 13.5) and 17.6 ms (fastest 13.8) | The 12 parse threads already fill the 12 CPUs |
+| Unmapping graph.txt and freeing the place arrays on background threads | 160.5 ms median with both, 160.4 ms without the unmap, 161.8 ms without the background free (5 rounds) | No gain in elapsed time worth the lines |
+| A cheaper bounds check in `number` | Pass 1 fastest 9.39 ms, against 9.43 ms | No gain |
+| Pass 2's run lists sized up front | Runs set-up 1.28 → 1.10 ms | 0.18 ms is less than the lines cost |
+| A statically linked binary (`-C target-feature=+crt-static`) | Start-up 1.0 → 0.73–0.77 ms | Not adopted: untested in the Docker build, for about 0.25 ms |

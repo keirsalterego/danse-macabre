@@ -265,8 +265,6 @@ fn build_graph(body: &[u8], n: usize, threads: usize) -> Result<[Csr; 2], Box<dy
     let in_block = |direction: usize, block: usize| counts.iter().map(move |c| c[direction][block]);
     let m: usize = (0..blocks).flat_map(|block| in_block(0, block)).sum();
     let edge_count = u32::try_from(m).map_err(|_| "over 2^32 - 1 edges")?;
-    // Zeroed allocations come from the kernel as untouched pages, so nothing zeroes 60 MB up
-    // front: each page is faulted in by the thread that first writes to it in pass 2.
     let id_bits = n.bit_width();
     let mut graphs = [(); 2].map(|()| Csr {
         offsets: vec![0; n + 1],
@@ -275,6 +273,19 @@ fn build_graph(body: &[u8], n: usize, threads: usize) -> Result<[Csr; 2], Box<dy
         heavy: HashMap::new(),
     });
     let mut places = [(); 2].map(|()| vec![0; m]);
+    // Zeroed allocations come from the kernel as untouched pages, which it zeroes on the first
+    // write. When several threads first write to the same 2 MB huge page at once, it zeroes a page
+    // for each of them and keeps one, and on seed 1 pass 2 took 19 ms instead of 13. So before
+    // pass 2, one write per 2 MB faults the arrays in, each thread in its own share. Zeroing is
+    // memory traffic, and half the threads did it faster than all of them or a third. Without huge
+    // pages, these writes fault in a few 4 KB pages, and pass 2 faults in the rest as before.
+    let share = (4 * m).div_ceil(threads).max(1);
+    let edge_parts = graphs.iter_mut().flat_map(|g| g.edges.chunks_mut(share));
+    let place_parts = places.iter_mut().flat_map(|p| p.chunks_mut(share));
+    on_threads(edge_parts.zip(place_parts), |(edges, places)| {
+        edges.iter_mut().step_by(1 << 19).for_each(|e| *e = 0);
+        places.iter_mut().step_by(1 << 20).for_each(|p| *p = 0);
+    });
 
     // Pass 2: runs[chunk][direction][block] is the chunk's run of slots in that block.
     let mut runs: Vec<[Vec<Run>; 2]> = chunks.iter().map(|_| Default::default()).collect();
