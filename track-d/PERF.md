@@ -15,6 +15,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 8 | The query code shortened by 24 lines at the same speed: `answer` reuses `on_threads`, and the queue's helpers are folded together | run-966433fb4d85 | 0.1264 | 84.0 | 71.8 |
 | 9 | Each node's edge range kept in 2 bytes instead of a 4-byte offset, in groups of 4 nodes, and pass 3 run one direction at a time with its index faulted in first | run-ee72c614f94f | 0.1297 | 75.5 | 71.8 |
 | 10 | Label distances aligned to 4 bytes, so a label table entry takes 12 bytes instead of 16 | | | | |
+| 11 | Each queue's top kept between steps; a step recomputes only its own side's | | | | |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
@@ -297,6 +298,24 @@ control byte 13 instead of 17.
 - `perf stat -r 5` on P-cores, seed 1, 3 rounds: task-clock 1.430–1.451 → 1.416–1.431 s, cycles
   3.25–3.30 → 3.22–3.27 G, instructions 5.04 → 5.11 G.
 - S 443 → 445.
+
+## Step 11: the queue tops kept between steps
+
+A time split of step 7 on seed 1: the build takes 35–43 ms, the queries 93–105 ms, the output
+0.08 ms. The search loop asked both queues for their top on every iteration, but a step moves
+only its own side's top. `step` now returns its queue's new top, and `distance` keeps the other
+side's. The side that did not step has an unchanged queue, so its top and the bucket cursor that
+`pop` relies on are still valid, and the stop rule sees the same values as before.
+
+`ab.py` against step 9, alternating full runs on seed 1, five sessions on a busy machine (load
+9–12), medians: 158.5 → 155.4, 142.9 → 139.7, 139.6 → 137.9, 138.8 → 134.3 and 142.2 → 139.8 ms,
+faster on median and minimum in all five, about −2.1% on average. The query phase alone, two
+sessions of 21 runs: 96.8 → 94.3 and 97.9 → 94.6 ms. S 445 → 447. Gate: 509 pass, 0 fail.
+
+Measured and not taken: the last threads idle for 3–5 ms at the end, because the top 5% of
+queries use 53% of the CPU and their cost can't be predicted, so no cheap reordering helps.
+Label and queue resets cost about 0.5 ms of wall time, and the 20 duplicate queries of a seed
+about 0.7 ms, which would take about 10 lines to remove.
 
 ## Tried and reverted (local, turbo off, no run ID)
 

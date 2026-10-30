@@ -555,15 +555,16 @@ fn distance(from_s: &mut Search, to_t: &mut Search, s: u32, t: u32) -> u64 {
     // at 0 and the loop never runs, since no queue top is below 0. Starting from UNREACHABLE
     // instead would answer a round trip, or -1 on a node with no edges.
     let mut best = if s == t { 0 } else { UNREACHABLE };
+    let (mut top_f, mut top_b) = (from_s.queue.top(), to_t.queue.top());
     // Saturating, because an empty queue's top is u64::MAX.
-    while from_s.queue.top().saturating_add(to_t.queue.top()) < best {
+    while top_f.saturating_add(top_b) < best {
         // Advance the smaller frontier, not the one with the smaller top key: a source with no
         // in-edges leaves through edges near 2^32 (spec §2), and comparing keys would make the
         // other side settle the whole graph before the source side took a second step.
         if from_s.queue.len <= to_t.queue.len {
-            from_s.step(&to_t.dist, &mut best);
+            top_f = from_s.step(&to_t.dist, &mut best);
         } else {
-            to_t.step(&from_s.dist, &mut best);
+            top_b = to_t.step(&from_s.dist, &mut best);
         }
     }
     best
@@ -599,8 +600,9 @@ impl<'g> Search<'g> {
 
     /// Settles the node on top of the queue, which [`Queue::top`] found, and relaxes its edges.
     /// Every label it improves on a node that `other` has labelled joins the two searches into a
-    /// path, which is offered to `best`.
-    fn step(&mut self, other: &Labels, best: &mut u64) {
+    /// path, which is offered to `best`. Returns the new top of its queue: a step moves no other
+    /// top, so [`distance`] keeps the other side's.
+    fn step(&mut self, other: &Labels, best: &mut u64) -> u64 {
         // A stale entry, one above its node's label, is settled again with no check. The label's
         // own entry came out first and relaxed the same edges from a shorter distance, so no label
         // improves now: nothing is pushed and `best` stays. The check would cost a lookup a step.
@@ -630,6 +632,7 @@ impl<'g> Search<'g> {
                 }
             }
         }
+        self.queue.top()
     }
 }
 
