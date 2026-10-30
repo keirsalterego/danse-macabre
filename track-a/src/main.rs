@@ -518,8 +518,8 @@ struct Interner<'a> {
     /// Id → (name, hash). Keeping the hash lets a probe reject most non-matching slots without
     /// comparing bytes, and lets the table grow without hashing anything again.
     names: Vec<(&'a [u8], u64)>,
-    /// Id → the name's bytes, zero-padded to 128, for [`same_name`].
-    padded: Vec<[u8; 128]>,
+    /// Id → the name's first 64 bytes, zero-padded, for [`same_name`].
+    padded: Vec<[u8; 64]>,
 }
 
 impl Default for Interner<'_> {
@@ -538,11 +538,12 @@ impl Default for Interner<'_> {
 impl<'a> Interner<'a> {
     /// Returns `name`'s id, assigning the next free one if the name is new.
     ///
-    /// `window` is the 128 bytes that start with `name` when the input has that many left. Every
-    /// line but the last one or two of a chunk has them, and with them a probe compares names
-    /// without a call to `memcmp` (see [`same_name`]).
+    /// `window` is the 64 bytes that start with `name` when the input has that many left. Every
+    /// line but the last one of a chunk has them, and with them a probe compares a name of up
+    /// to 64 bytes without a call to `memcmp` (see [`same_name`]). That covers 1,791 of the
+    /// 1,842 endpoints of seed 1 and 94% of its lines; longer names compare with `==`.
     #[inline(always)]
-    fn intern(&mut self, name: &'a [u8], hash: u64, window: Option<&[u8; 128]>) -> u32 {
+    fn intern(&mut self, name: &'a [u8], hash: u64, window: Option<&[u8; 64]>) -> u32 {
         let slot = self.slot(name, hash, window);
         match self.slots[slot].checked_sub(1) {
             Some(id) => id,
@@ -555,8 +556,8 @@ impl<'a> Interner<'a> {
     #[cold]
     #[inline(never)]
     fn insert(&mut self, slot: usize, name: &'a [u8], hash: u64) -> u32 {
-        let mut padded = [0; 128];
-        let kept = name.len().min(128);
+        let mut padded = [0; 64];
+        let kept = name.len().min(64);
         padded[..kept].copy_from_slice(&name[..kept]);
         self.padded.push(padded);
         self.names.push((name, hash));
@@ -575,14 +576,14 @@ impl<'a> Interner<'a> {
 
     /// Returns the slot that holds `name`, or the empty slot where it belongs.
     #[inline(always)]
-    fn slot(&self, name: &[u8], hash: u64, window: Option<&[u8; 128]>) -> usize {
+    fn slot(&self, name: &[u8], hash: u64, window: Option<&[u8; 64]>) -> usize {
         let mask = self.slots.len() - 1;
         let mut slot = (hash >> 32) as usize & mask;
         while let Some(id) = self.slots[slot].checked_sub(1) {
             let (known, known_hash) = self.names[id as usize];
             if known_hash == hash
                 && match window {
-                    Some(window) if name.len() <= 128 => {
+                    Some(window) if name.len() <= 64 => {
                         same_name(window, &self.padded[id as usize], name.len())
                     }
                     _ => known == name,
@@ -596,25 +597,20 @@ impl<'a> Interner<'a> {
     }
 }
 
-/// Returns whether the first `len` bytes of `window` and `known` agree, for `len <= 128`.
+/// Returns whether the first `len` bytes of `window` and `known` agree, for `len <= 64`.
 ///
 /// Names vary in length from line to line, and the branches inside `memcmp` that pick a path
 /// by length mispredict often; that was about a quarter of the parse loop. Here the length
-/// never steers a branch for names of up to 64 bytes: we compare all 64 bytes of both blocks at
-/// once and ignore the result for bytes past `len`. Bytes past the name differ, of course (the
-/// window goes on into the status and the latency, the padded copy holds zeros), which is
-/// why they are masked out: `u64::MAX >> (64 - len)` keeps bit `i` exactly for `i < len`.
-fn same_name(window: &[u8; 128], known: &[u8; 128], len: usize) -> bool {
-    let (window, known) = (window.as_chunks::<64>().0, known.as_chunks::<64>().0);
-    let wanted = |len: usize| u64::MAX.checked_shr(64 - len.min(64) as u32).unwrap_or(0);
+/// never steers a branch: we compare all 64 bytes of both blocks at once and ignore the result
+/// for bytes past `len`. Bytes past the name differ, of course (the window goes on into the
+/// status and the latency, the padded copy holds zeros), which is why they are masked out:
+/// `u64::MAX >> (64 - len)` keeps bit `i` exactly for `i < len`. The copies are 64 bytes, not
+/// the 125 a name can reach, because half the size keeps more of them in cache: that was worth
+/// 0.8 ms.
+fn same_name(window: &[u8; 64], known: &[u8; 64], len: usize) -> bool {
+    let wanted = u64::MAX.checked_shr(64 - len as u32).unwrap_or(0);
     // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
-    let low = unsafe { equal_mask(&window[0], &known[0]) };
-    if len <= 64 {
-        return !low & wanted(len) == 0;
-    }
-    // SAFETY: as above.
-    let high = unsafe { equal_mask(&window[1], &known[1]) };
-    !low == 0 && !high & wanted(len - 64) == 0
+    !unsafe { equal_mask(window, known) } & wanted == 0
 }
 
 /// Sorts `records` by hour in place and returns where each hour starts.
