@@ -24,6 +24,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 17 | A static-pie build, which skips the dynamic loader | run-521d52addb7b | 0.0362 | 12.7 | 74.4 |
 | 18 | A leaner rewrite, 211 fewer lines at the same speed: run starts found exactly from spec §2.2, so the guessed starts, their check and rerun, and the sentinel record go | run-5cc15fc89abe | 0.0351 | 12.4 | 76.5 |
 | 19 | 5 fewer lines with the same machine code: three pairs of variables set in one statement each, the regions header skipped in one line, and the cast lint exceptions in `Cargo.toml` | | | | |
+| 20 | 2 fewer lines with the same machine code: a worker's position, run end and groups set in one statement, and so are a quoted field's start and end | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -598,6 +599,15 @@ Line cuts on step 18 that leave `.text` and `.rodata` byte-identical to step 18'
 exceptions move to `Cargo.toml`, next to the one already there. Dropped: `names` and `sent`
 declared together, which moved one allocation's code. S 323 → 318. Gate: 307 pass, 0 fail;
 clippy reports no warnings.
+
+## Step 20: 2 fewer lines, the same machine code
+
+Two more declarations merged on step 19, with `.text` and `.rodata` byte-identical to step 19's
+binary: each worker sets its position, its run's end and its groups in one statement, and
+`text_field` sets the field's start and its scan position, both just past the opening quote, in
+one. Dropped because the machine code changed: the round's `half` and `round_end` declared
+together, and `regions.csv` mapped inside the `parse_regions` call, which drops its path later.
+S 318 → 316. Gate: 307 pass, 0 fail; clippy reports no warnings.
 
 ## Experiments that did not stay
 

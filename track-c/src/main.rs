@@ -326,8 +326,7 @@ fn join(data: &[u8], by_id: &[u8], group_count: usize, threads: usize) -> Vec<Gr
     // to it in its own [`NameSet`]. After the last round it gives its run's pages back (see
     // [`release`]).
     let parts = parallel(threads, &|me| {
-        let (mut at, end) = (bounds[me], bounds[me + 1]);
-        let mut groups = vec![EMPTY; group_count];
+        let (mut at, end, mut groups) = (bounds[me], bounds[me + 1], vec![EMPTY; group_count]);
         // Full scale draws from 100,000 names (spec §2.2) in 202 MB (§5), about one per 2 KiB,
         // and a thread owns a share of them. The set grows when a file has more.
         let mut names = NameSet::new(len / 2048 / threads);
@@ -483,8 +482,7 @@ fn text_field(data: &[u8], at: usize) -> (Range<usize>, i64, usize) {
         let end = at + data[at..].iter().position(|&b| b == b',').unwrap();
         return (at..end, (end - at) as i64, end + 1);
     }
-    let start = at + 1;
-    let (mut end, mut pairs) = (start, 0);
+    let (start, mut end, mut pairs) = (at + 1, at + 1, 0);
     // Inside quotes only `"` is special: `""` is one escaped quote, and any other `"` closes the
     // field. Never test for "a quote followed by a comma": a note can hold `"",` (an escaped
     // quote, then a comma), which that test would take for the end of the field.
