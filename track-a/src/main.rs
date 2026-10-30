@@ -487,10 +487,11 @@ fn word(bytes: &[u8], at: usize) -> u64 {
 /// inside the name, so equal names always hash equal. Two different names that agree on all
 /// three windows would only share a probe sequence: the interner still compares the bytes.
 ///
-/// The windows are rotated apart and XORed, and one multiply mixes the result, whose top bits
-/// then depend on every bit (the interner indexes by them). Three dependent multiply-rotate
-/// steps, as in rustc's `FxHasher`, cost 21 million more instructions in the parse and saved
-/// few second probes: 3.1% of lines took one, against 3.2% now (seeds 1, 3 and 5, simulated).
+/// The windows are rotated apart and combined with XOR, and one multiply mixes the result, whose
+/// top bits then depend on every bit (the interner indexes by them). Three dependent
+/// multiply-rotate steps, as in rustc's `FxHasher`, cost 21 million more instructions in the
+/// parse and saved few second probes: 3.1% of lines took one, against 3.2% now (seeds 1, 3 and
+/// 5, simulated).
 fn hash(name: &[u8], first: u64) -> u64 {
     let n = name.len();
     let words = if n < 8 {
@@ -744,8 +745,9 @@ fn sort_network<const R: usize>(group: &[u32], at: [usize; 3]) -> [u32; 3] {
             let (old, top) = (v, splat(1 << m.ilog2()));
             for (r, v) in v.iter_mut().enumerate() {
                 let to = _mm256_xor_si256(lanes, splat(m as i32 & 7));
-                // Each lane's partner `p`. Within a register (m < 8) it comes from `v` itself, not
-                // from the copy in `old`, which saves a store and a reload: 0.5% fewer instructions.
+                // Each lane's partner `p`. Within a register (m < 8) it comes from `v` itself,
+                // not from the copy in `old`, which saves a store and a reload: 0.5% fewer
+                // instructions.
                 let p = _mm256_permutevar8x32_epi32(if m < 8 { *v } else { old[r ^ (m / 8)] }, to);
                 let position = _mm256_add_epi32(lanes, splat(8 * r as i32));
                 let upper = _mm256_cmpeq_epi32(_mm256_and_si256(position, top), top);
@@ -786,7 +788,8 @@ fn format_hour(hour: usize, lines: &[[u32; 6]], names: &[&[u8]], mut place: &mut
             end = put_number(&mut text, end, value);
         }
         text[end] = b'\n';
-        place.write_all(&text[..=end]).expect("lengths add up"); // fails if the hour's length was short
+        // This fails if the hour's length, computed in `summarize_hour`, was short.
+        place.write_all(&text[..=end]).expect("lengths add up");
     }
 }
 
