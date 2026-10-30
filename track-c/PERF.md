@@ -23,7 +23,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 16 | Records parsed four at a time: each one's byte in the region table prefetched as soon as its region id is parsed, and the four groups looked up after the fourth record | run-521d52addb7b | 0.0362 | 12.7 | 74.4 |
 | 17 | A static-pie build, which skips the dynamic loader | run-521d52addb7b | 0.0362 | 12.7 | 74.4 |
 | 18 | A leaner rewrite, 211 fewer lines at the same speed: run starts found exactly from spec §2.2, so the guessed starts, their check and rerun, and the sentinel record go | run-5cc15fc89abe | 0.0351 | 12.4 | 76.5 |
-| 19 | 5 fewer lines with the same machine code: three pairs of variables set in one statement each, the regions header skipped in one line, and the cast lint exceptions in `Cargo.toml` | | | | |
+| 19 | 5 fewer lines with the same machine code: three pairs of variables set in one statement each, the regions header skipped in one line, and the cast lint exceptions in `Cargo.toml` | run-ad4d88cb83d7 | 0.0370 | 12.4 | 76.0 |
 | 20 | 2 fewer lines with the same machine code: a worker's position, run end and groups set in one statement, and so are a quoted field's start and end | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
