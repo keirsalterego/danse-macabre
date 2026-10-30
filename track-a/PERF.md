@@ -33,7 +33,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 26 | 3 fewer lines with the same machine code: `digits` a closure in its one caller, and a group's length read where it is used | run-b3536f948213 | 0.0200 | 21.2 | 84.2 |
 | 27 | The sorting network's stages within one register take each lane's partner from the register itself, not from the stage's copy | run-ccf7ded5ed1d | 0.0199 | 21.0 | 84.3 |
 | 28 | 3 fewer lines with the same machine code: the run pairs taken with `array_windows`, and two lint exceptions moved to `Cargo.toml` | run-ccf7ded5ed1d | 0.0199 | 21.0 | 84.3 |
-| 29 | 1 fewer line with the same machine code: the network's compare-exchange blends its minimum and maximum in one expression | | | | |
+| 29 | 1 fewer line with the same machine code: the network's compare-exchange blends its minimum and maximum in one expression | run-1286db1e2359 | 0.0199 | 21.2 | 84.3 |
 
 ## Step 1: v1
 
@@ -352,6 +352,9 @@ Steps 27 and 28 went to the board in one push, so both rows cite the same run.
 With the partner named `p` (step 27), the minimum and maximum fit inside the `blendv` call, so
 the `(low, high)` binding goes. `.text` and `.rodata` are byte-identical to step 28's. S 376 → 375.
 Gate: 307 pass, 0 fail.
+
+The first board run of this code, run-9d734179de5e, drew 21.8 ms with the same machine code as
+step 28; the row cites the next run of the same commit's code.
 
 ## Experiments that did not stay
 
