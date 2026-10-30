@@ -19,6 +19,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 12 | Pass 2's runs kept as two slice iterators instead of their `zip`: 32 bytes a run instead of 48 | run-0581a96cbf3c | 0.1259 | 70.7 | 72.4 |
 | 13 | Labels as `u32` distances, with the rare longer ones behind a `u32::MAX` in a second map | | | | |
 | 14 | 11 fewer lines with the same machine code: the single-item `use` lines in one, the `mmap` and `mallopt` constants written at their one call each with their names in a comment, the file descriptor passed straight to `mmap`, and two pairs of variables declared together | | | | |
+| 15 | 1 fewer line with the same machine code: `sort`'s counters and its running sum declared together | | | | |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
@@ -387,6 +388,11 @@ declare a pair of variables together. `.text` and `.rodata` are byte-identical t
 and M cannot move. S 453 → 442. Gate: 509 pass, 0 fail.
 
 Steps 13 and 14 went to the board in one push, so both rows cite the same run.
+
+## Step 15: 1 more line
+
+`sort` declares its counters and its running sum together. `.text` and `.rodata` are
+byte-identical to step 14's. S 442 → 441. Gate: 509 pass, 0 fail.
 
 ## Tried and reverted (local, turbo off, no run ID)
 

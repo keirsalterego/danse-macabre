@@ -368,11 +368,10 @@ fn sort(run: &mut [u32], places: &[u16], rows: &mut [u64], first: u32, wide: &mu
     // Degrees first, then an exclusive prefix sum turns them into each node's next slot. Node k
     // counts in `next[k + 1]`, one place up, so that the loop below leaves `next[k]` where node
     // k's edges start.
-    let mut next = vec![0; 4 * rows.len() + 1];
+    let (mut next, mut at) = (vec![0; 4 * rows.len() + 1], 0);
     for &place in places {
         next[usize::from(place) + 1] += 1;
     }
-    let mut at = 0;
     for next in &mut next {
         at += std::mem::replace(next, at);
     }
