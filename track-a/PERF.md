@@ -20,6 +20,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 13 | Hour checked by comparing 8 timestamp bytes; exact 64-byte name compare without the hash; padded copies for the merge | run-b262ef9cc01a | 0.0258 | 25.2 | 79.9 |
 | 14 | Lean parse on a padded mapping, SWAR number output, names merged inside the parse, sorting networks for groups of up to 64, threads spawned as a tree, and a static-pie build | run-3c59aa35895d | 0.0220 | 24.5 | 81.3 |
 | 15 | 137 fewer code lines: a fixed-size name table, `OnceLock` hand-offs instead of a barrier leader, records written straight into each chunk | run-f13e9cd22a88 | 0.0215 | 24.4 | 82.5 |
+| 16 | Records freed run by run once their hour is placed, buffers freed after the hour pass, name tables allocated once, output formatted line by line straight into place | | | | |
 
 ## Step 1: v1
 
@@ -161,6 +162,29 @@ Local, turbo off, against step 14 in the same sessions (`ab.py`, two rounds of 3
 runs): medians 24.15 and 24.26 ms against 24.52 and 24.57 ms. `perf stat`, 10 runs: instructions
 818.8 M against 817.4 M, cycles +0.9%. memory.peak, 6 runs each: 22.4–23.1 MB against
 22.7–23.8 MB. Gate: 307 pass, 0 fail.
+
+## Step 16: a lower peak
+
+memory.current, sampled per phase, showed the peak at the end of the hour pass: all 12.4 MB of
+records, the hours' lines (3 MB), every thread's latency buffer (2.8 MB) and allocator
+leftovers. The records were already freed before the formatting, so they were never live
+together with the 10.1 MB output. Four changes:
+
+- Each run's records are given back (whole pages, `MADV_DONTNEED`) right after their last
+  reader, the scatter pass of their hour.
+- Each thread frees its latency buffer after its last hour.
+- The name tables are allocated once at full size, so no grown-out buffer is left behind.
+- `format_hour` formats one line at a time into a 256-byte buffer and writes it straight into
+  its mapped place with `io::Write`, so the 12 per-thread hour buffers (1.6 MB) are gone from
+  the end. The check that each hour fills exactly its place stays.
+
+The peak is now about even between the start of the hour pass and the end (10.1 MB of output
+plus 3 MB of lines). Local, turbo off: memory.peak 22.3–23.1 → 19.9–20.4 MB (8 runs each);
+`ab.py` medians 24.15 and 24.17 → 24.06 and 23.87 ms (two rounds of 30); instructions 818.8 →
+826.6 M. S 424 → 425. Gate: 307 pass, 0 fail.
+
+Tried and dropped: formatting whole hours during the hour pass and copying them out afterwards
+(0.5 MB less, but +8% T).
 
 ## Experiments that did not stay
 

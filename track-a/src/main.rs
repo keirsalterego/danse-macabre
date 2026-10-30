@@ -36,10 +36,10 @@
 //!    It counts the lines per endpoint, uses the counts to place each latency next to the others
 //!    of its endpoint (a counting sort), and picks the three percentiles out of each endpoint's
 //!    latencies ([`percentiles`]). What it keeps is six numbers per output line, and the hour's
-//!    exact length once formatted.
+//!    exact length once formatted. The hour's records are freed as soon as they are read.
 //! 5. **Write in place.** With every hour's length known, we give the output file its final size
-//!    and map it into memory ([`map_output`]). Each thread then frees its chunk's records and
-//!    formats hours straight into place in the file ([`format_hour`]).
+//!    and map it into memory ([`map_output`]). Each thread then frees what is left of its
+//!    chunk's records and formats hours straight into place in the file ([`format_hour`]).
 //!
 //! ## Why it is fast
 //!
@@ -59,7 +59,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Barrier, Mutex, OnceLock};
 use std::{cmp::Reverse, error::Error, fs::File, num::NonZeroUsize, ops::Range, os::fd::AsRawFd};
-use std::{path::Path, ptr::null_mut, thread};
+use std::{io::Write, path::Path, ptr::null_mut, thread};
 
 /// The number of hours a log can span.
 ///
@@ -245,6 +245,8 @@ fn summarize(log: &[u8], out_path: &Path) {
         for &hour in std::iter::from_fn(|| by_size.get(taken.fetch_add(1, Relaxed))) {
             let _ = hours[hour].set(summarize_hour(&runs[hour], order, names, &mut latencies));
         }
+        // The output will need this memory soon: every page given back now lowers the peak.
+        release(&latencies);
         barrier.wait();
         // Every hour's length is known now, so the first thread here gives each its place.
         let queue = places.get_or_init(|| {
@@ -257,17 +259,16 @@ fn summarize(log: &[u8], out_path: &Path) {
             Mutex::new(places.enumerate().collect::<Vec<_>>())
         });
         // The threads format in parallel, taking the next hour from the queue until none is
-        // left. Each first frees its chunk's records: no hour needs them any more. Releasing
+        // left. Each first frees the rest of its chunk's records, the pages that two runs
+        // share, which `summarize_hour` had to keep: no hour needs them any more. Releasing
         // the input waits until the end, because freeing pages interrupts every other thread to
         // flush its TLB, which cost 3 ms in the hour pass.
         let (chunk, _) = chunks[t].get().expect("parsed");
         release(&chunk.records);
         release(&chunk.large);
-        let mut text = Vec::new();
         let next = || queue.lock().expect("panics abort").pop();
         while let Some((index, (hour, place))) = next() {
-            format_hour(index, &hour.lines, names, &mut text);
-            place.copy_from_slice(&text); // panics if `Hour::len` was wrong
+            format_hour(index, &hour.lines, names, place);
         }
         release(&log[len * t / threads..len * (t + 1) / threads]);
     };
@@ -295,6 +296,7 @@ fn fan_out<'s, F: Fn(usize) + Sync>(s: &'s thread::Scope<'s, '_>, ts: Range<usiz
 /// At exit the kernel frees every page we touched, on one thread and inside the timed window:
 /// for the 58,000 pages of the input alone that took 3.9 ms. So each thread frees its share of
 /// the input and of the records itself, in parallel with the others, once nothing reads them.
+/// Freeing memory early also lowers the peak our memory score counts.
 /// A page that only partly belongs to `items` stays mapped, since its other part may still be
 /// in use; if there is no whole page, the length is 0 and the call does nothing. The call is
 /// advice: if it fails, the exit does the work as before, so the result is ignored.
@@ -304,9 +306,10 @@ fn release<T>(items: &[T]) {
     let end = (start + size_of_val(items)) & !4095;
     let first_page = items.as_ptr().cast::<u8>().with_addr(first);
     // SAFETY: the pages lie inside `items`. In the input's private read-only file mapping, a
-    // later read (an endpoint name, say) just maps the same file data again. Records read as
-    // zeros afterwards, which is why a chunk's records are released only after every hour
-    // has been summarized and nothing reads them again.
+    // later read (an endpoint name, say) just maps the same file data again. Records and
+    // latencies read as zeros afterwards, which is why each is released only once nothing
+    // reads it again: a run's records once its hour has been placed, a buffer after its last
+    // hour.
     unsafe { madvise(first_page, end.saturating_sub(first), MADV_DONTNEED) };
 }
 
@@ -549,12 +552,14 @@ struct Interner<'a> {
     padded: Vec<[u8; 64]>,
 }
 
+// The tables never grow: each growing step leaves the old buffer behind in the allocator,
+// which kept 0.6 MB more memory in use. Capacity that is never written costs nothing.
 impl Default for Interner<'_> {
     fn default() -> Self {
         Self {
             slots: vec![0; 2 << 12],
-            names: Vec::new(),
-            padded: Vec::new(),
+            names: Vec::with_capacity(1 << 12),
+            padded: Vec::with_capacity(1 << 12),
         }
     }
 }
@@ -661,6 +666,10 @@ type Run<'a> = (&'a [u32], &'a [u32], &'a [u32]);
 ///
 /// Then we take the endpoints in output `order`, and the three percentiles of each. `buffer` is
 /// the latencies' buffer, which a thread keeps from one hour to the next.
+///
+/// Each run's records are freed right after the second pass, their last reader. Before, all
+/// 12 MB of records stayed until the hour pass ended, when the hours' lines and every
+/// thread's buffer had joined them: that was the program's memory peak.
 fn summarize_hour(runs: &[Run], order: &[usize], names: &[&[u8]], buffer: &mut Vec<u32>) -> Hour {
     // `start[e]` first counts endpoint e's lines, then, after the running sum, holds the end of
     // its latencies. Placing each latency moves it down by one, so it ends as their start.
@@ -687,6 +696,7 @@ fn summarize_hour(runs: &[Run], order: &[usize], names: &[&[u8]], buffer: &mut V
                 small => small,
             };
         }
+        release(records);
     }
     let (mut lines, mut len) = (Vec::with_capacity(order.len()), 0);
     for &e in order {
@@ -788,18 +798,23 @@ fn digits(value: u64) -> usize {
     value.checked_ilog10().map_or(1, |log| log as usize + 1)
 }
 
-/// Writes the formatted `lines` of hour index `hour` to `out`: `<hour> <endpoint>` and the six
-/// numbers.
-fn format_hour(hour: usize, lines: &[[u32; 6]], names: &[&[u8]], out: &mut Vec<u8>) {
-    let label = hour_label(hour);
-    out.clear();
+/// Writes the formatted `lines` of hour index `hour` to `place`: `<hour> <endpoint>` and the
+/// six numbers.
+///
+/// Each line is formatted in a small buffer and then copied into place, because
+/// [`push_number`] writes 8 bytes at a time and may write past a line's end. A whole hour's
+/// buffer per thread instead kept 1.6 MB more in memory while the output filled up.
+fn format_hour(hour: usize, lines: &[[u32; 6]], names: &[&[u8]], mut place: &mut [u8]) {
+    let (label, mut text) = (hour_label(hour), Vec::with_capacity(256));
     for line in lines {
-        out.extend_from_slice(label.as_bytes());
-        out.extend_from_slice(names[line[0] as usize]);
+        text.clear();
+        text.extend_from_slice(label.as_bytes());
+        text.extend_from_slice(names[line[0] as usize]);
         for value in numbers(line) {
-            push_number(out, value);
+            push_number(&mut text, value);
         }
-        out.push(b'\n');
+        text.push(b'\n');
+        place.write_all(&text).expect("lengths add up"); // fails if `Hour::len` was short
     }
 }
 
