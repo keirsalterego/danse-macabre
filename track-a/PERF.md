@@ -37,6 +37,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 30 | The names' output order sorted by one thread while the others start the hour pass, which needs it only at its lines | run-5d31ecdadb69 | 0.0198 | 20.9 | 84.4 |
 | 31 | The hours sorted by size with each hour's size computed once (`sort_by_cached_key`) | run-c441864672ce | 0.0195 | 21.1 | 84.5 |
 | 32 | Hours summarized smallest first, the smallest few last, into a latency buffer of untouched zero pages | run-13fb10f4c6ee | 0.0196 | 19.1 | 84.9 |
+| 33 | One endpoint table that all threads share while they parse, instead of one per thread merged after it | | | | |
 
 ## Step 1: v1
 
@@ -426,6 +427,31 @@ Tried and dropped, medians of memory.peak over 8 to 12 alternating runs, local, 
 - The kept order with the buffer grown by `resize`: 18.72 MiB.
 - `malloc_trim(0)` after each thread's merge, to give its freed name table back: 17.72 against
   18.04 MiB in one session, 18.01 against 17.99 MiB in another.
+
+## Step 33: one endpoint table for all threads
+
+Each thread used to give endpoint names ids in a table of its own, about 190 KB once written
+(slots, names and padded copies), then merge it into a shared table under a lock, and the hour
+pass mapped every record's chunk id to a shared id through one more table per chunk. Now all
+threads give out ids in one table while they parse (`Interner`). A lookup takes no lock: it
+loads a slot with `Acquire`, and a thread that adds a name writes the name and its padded copy
+before it stores the id with `Release`. Adding takes a mutex. Under it, the thread checks that
+the empty slot it found is still empty; if another thread filled it in the meantime, it probes
+again. The records hold shared ids, so the merge and the id table go.
+
+The same probe as in step 32 (four runs, local, turbo off, seed 1): the end of the parse falls
+from 17.6–18.3 to 16.2–16.4 MiB. The hour pass is now the peak, at 17.9–18.2 MiB: the per-thread
+tables had left freed memory in the threads' malloc arenas, which the hour pass's small
+allocations reused, and now those come from new pages. The output ends at 16.6–17.0 MiB.
+
+Local, turbo off: memory.peak, 20 alternating runs, median 18.14 → 17.65 MiB on seed 1; 10 each
+on seed 2, 17.91 → 17.81 MiB. `ab.py`, 61 interleaved runs, two rounds on seed 1: medians
+22.28 → 21.54 and 22.20 → 21.42 ms, minimums 21.44 → 20.94 and 21.35 → 20.83 ms; one round on
+seed 2: median 21.77 → 21.13 ms, minimum 21.30 → 20.49 ms. `perf stat` (10 runs, twice):
+773.7 → 747.8 million user instructions, task clock 220.1 → 212.7 ms. The hour pass no longer
+loads and bounds-checks an id for each record, twice, and the merge and the per-thread inserts
+are gone. S 378 → 381. Gate: 310 pass, 0 fail (full seeds 1–7 and 10–12, 300 tiny seeds).
+Seeds 1–3, 15 runs each on 12, 4 and 2 CPUs: all 135 outputs match the reference hash.
 
 ## Experiments that did not stay
 

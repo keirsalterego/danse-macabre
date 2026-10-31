@@ -32,6 +32,6 @@ inline_always = "allow"
 wildcard_imports = "allow"
 # `sort_network` turns group sizes and lane positions, all below 65, into i32 lanes.
 cast_possible_wrap = "allow"
-# `Box::new([0; 2 << 12])` in `Interner::default` is allocated zeroed on the heap: the release
+# The 8,192 slots that `Interner::default` boxes are allocated zeroed on the heap: the release
 # binary has no stack frame of that size.
 large_stack_arrays = "allow"

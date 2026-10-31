@@ -23,14 +23,12 @@
 //!    one chunk per thread at line breaks ([`summarize`]).
 //! 2. **Parse once.** Each thread turns every line of its chunk into a 4-byte record: endpoint
 //!    id, error bit and latency, with the rare latency too large for its 19 bits kept on a side
-//!    list ([`parse`]). Endpoint names become small integer ids through a per-thread hash table
-//!    ([`Interner`]). The hour is not stored per line: the records stay in file order, where
-//!    lines come in long runs of one hour, and the thread notes where each run starts
-//!    ([`Chunk`]).
-//! 3. **Merge.** Each thread adds its names to one shared table, which gives every distinct
-//!    endpoint a global id ([`Interner::merge`]). One thread then sorts the 1,842 names
-//!    bytewise. That order is also the order of the endpoints within an hour of the output, so
-//!    the output never needs sorting.
+//!    list ([`parse`]). Endpoint names become small integer ids through one hash table that
+//!    all threads share ([`Interner`]). The hour is not stored per line: the records stay in
+//!    file order, where lines come in long runs of one hour, and the thread notes where each
+//!    run starts ([`Chunk`]).
+//! 3. **Rank.** One thread sorts the 1,842 names bytewise. That order is also the order of the
+//!    endpoints within an hour of the output, so the output never needs sorting.
 //! 4. **Summarize by hour.** Threads take hours one at a time, smallest first, except that the
 //!    smallest few come last ([`summarize_hour`]). For one hour a thread goes through that hour's
 //!    runs in every chunk. It counts the lines per endpoint, uses the counts to place each
@@ -57,7 +55,8 @@
 //!
 //! Every step's measurements are in `PERF.md`.
 
-use std::sync::{Barrier, Mutex, OnceLock, atomic::AtomicUsize, atomic::Ordering::Relaxed};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::{Barrier, Mutex, OnceLock, atomic::AtomicU32, atomic::AtomicUsize};
 use std::{fs::File, io::Write, ops::Range, os::fd::AsRawFd, path::Path, ptr::null_mut, thread};
 
 /// The number of hours a log can span.
@@ -110,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arg = |n, default: &str| std::env::args().nth(n).unwrap_or(default.into());
     let log = map_file(&Path::new(&arg(1, "/data")).join("requests.log"))?;
     summarize(log, &Path::new(&arg(2, "/out")).join("summary.txt"));
-    // Exit without running destructors: freeing the interners and the hours' statistics would
+    // Exit without running destructors: freeing the interner and the hours' statistics would
     // only add to the timed wall clock, and the kernel reclaims the memory anyway. Every byte of
     // the output is already in the file's shared mapping, which the kernel keeps.
     std::process::exit(0)
@@ -187,27 +186,21 @@ fn summarize(log: &[u8], out_path: &Path) {
         let newline = log[..len * t / threads].iter().rposition(|&b| b == b'\n');
         newline.map_or(0, |p| p + 1)
     };
-    // Each thread's chunk, with the table from its endpoint ids to ids in `all`, the merge of
-    // every chunk's names; then each hour's output lines, and the ids in output order.
-    let chunks: Vec<OnceLock<(Chunk, Vec<u32>)>> = (0..threads).map(|_| OnceLock::new()).collect();
+    // Each thread's chunk, each hour's output lines, every endpoint's id, which all threads
+    // give out as they parse, and the ids in output order.
+    let chunks: Vec<OnceLock<Chunk>> = (0..threads).map(|_| OnceLock::new()).collect();
     let hours: Vec<OnceLock<Hour>> = (0..HOURS).map(|_| OnceLock::new()).collect();
-    let (all, sorted) = (Mutex::new(Interner::default()), OnceLock::new());
+    let (all, sorted) = (Interner::default(), OnceLock::new());
     let (plan, places, barrier) = (OnceLock::new(), OnceLock::new(), Barrier::new(threads));
     let (taken, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let work = |t: usize| {
-        let (endpoints, chunk) = parse(log, start(t)..start(t + 1));
-        // Each thread merges its names as soon as it is done, while others may still parse, and
-        // then frees its table: only `all` needs the names from now on.
-        let ids = all.lock().expect("panics abort").merge(&endpoints);
-        drop(endpoints);
-        let _ = chunks[t].set((chunk, ids));
+        let _ = chunks[t].set(parse(log, start(t)..start(t + 1), &all));
         // One thread, the barrier's leader, plans the hour pass while the others wait.
         if barrier.wait().is_leader() {
-            let all = std::mem::take(&mut *all.lock().expect("panics abort"));
             let mut runs: Vec<Vec<Run>> = vec![Vec::new(); HOURS];
-            for (chunk, ids) in chunks.iter().map(|c| c.get().expect("parsed")) {
+            for chunk in chunks.iter().map(|c| c.get().expect("parsed")) {
                 for &[(hour, start, first), (_, end, _)] in chunk.runs.array_windows() {
-                    runs[hour].push((&chunk.records[start..end], &chunk.large[first..], ids));
+                    runs[hour].push((&chunk.records[start..end], &chunk.large[first..]));
                 }
             }
             // Hours range from 14,000 to 73,000 lines (seed 1), so fixed blocks of hours would
@@ -225,7 +218,9 @@ fn summarize(log: &[u8], out_path: &Path) {
             let size = |h: &usize| runs[*h].iter().map(|run| run.0.len()).sum::<usize>();
             by_size.sort_by_cached_key(size);
             by_size.rotate_left(threads.min(HOURS));
-            let names: Vec<&[u8]> = all.names.iter().map(|&(name, _)| name).collect();
+            // Ids are given out in order, so the names set are those of ids 0, 1, 2 and so on.
+            let names: Vec<&[u8]> = all.names.iter().map_while(|n| n.get().copied()).collect();
+            let mut order: Vec<usize> = (0..names.len()).collect();
             let _ = plan.set((names, runs, by_size));
             // No hour needs the names' order before its lines, so the others start counting
             // while this thread sorts: the sort took 0.2 ms, and the others waited for all of it
@@ -234,8 +229,9 @@ fn summarize(log: &[u8], out_path: &Path) {
             // a proper prefix sorts first, which is exactly the order the spec asks for (§4).
             // Comparing the copies saves reading 1,842 names from all over the input; only names
             // that agree on 64 bytes compare in full.
-            let mut order: Vec<usize> = (0..all.names.len()).collect();
-            order.sort_unstable_by_key(|&id| (&all.padded[id].0, all.names[id].0));
+            // SAFETY: no thread writes a padded copy after the barrier.
+            let padded = |id: usize| unsafe { &(*all.padded[id].get()).0 };
+            order.sort_unstable_by_key(|&id| (padded(id), all.names[id].get()));
             let _ = sorted.set(order);
         }
         let (names, runs, by_size) = plan.wait();
@@ -264,7 +260,7 @@ fn summarize(log: &[u8], out_path: &Path) {
         // share, which `summarize_hour` had to keep: no hour needs them any more. Releasing
         // the input waits until the end, because freeing pages interrupts every other thread to
         // flush its TLB, which cost 3 ms in the hour pass.
-        let (chunk, _) = chunks[t].get().expect("parsed");
+        let chunk = chunks[t].get().expect("parsed");
         release(&chunk.records);
         release(&chunk.large);
         let next = || queue.lock().expect("panics abort").pop();
@@ -319,7 +315,7 @@ fn release<T>(items: &[T]) {
 ///
 /// | bits    | field                                                  |
 /// |---------|--------------------------------------------------------|
-/// | 31 – 20 | the endpoint's id in this chunk (12 bits)              |
+/// | 31 – 20 | the endpoint's id (12 bits)                            |
 /// | 19      | 1 if the status is 500–599                             |
 /// | 18 – 0  | the latency in microseconds, or [`LARGE`]              |
 ///
@@ -335,8 +331,7 @@ fn release<T>(items: &[T]) {
 /// no bound on the disorder: a log whose hour changed on every line would simply have one run
 /// per line.
 ///
-/// Four bytes per line keep all 3.1 million records at 12.4 MB. The ids are local to the chunk:
-/// [`Interner::merge`] maps them to global ids.
+/// Four bytes per line keep all 3.1 million records at 12.4 MB.
 #[derive(Default)]
 struct Chunk {
     records: Vec<u32>,
@@ -350,7 +345,7 @@ struct Chunk {
 /// latencies (see [`Chunk`]).
 const LARGE: u32 = (1 << 19) - 1;
 
-/// Parses one chunk of whole lines into records, and returns them with the chunk's endpoints.
+/// Parses one chunk of whole lines into records, with the endpoints' ids from `endpoints`.
 ///
 /// The spec guarantees well-formed input (§2), so we locate fields by fixed offsets and single
 /// byte checks instead of validating them. No field is scanned byte by byte. Once [`line_end`]
@@ -365,15 +360,14 @@ const LARGE: u32 = (1 << 19) - 1;
 /// | latency   | the digits between `space` and the LF                            |
 ///
 /// Here `space` is the last space of the line, which [`latency`] finds.
-fn parse(log: &[u8], lines: Range<usize>) -> (Interner<'_>, Chunk) {
-    let (mut endpoints, mut chunk) = (Interner::default(), Chunk::default());
-    // Every line takes at least MIN_LINE bytes. The records start out zero, which costs nothing
-    // until a page is written, and the unused tail is cut off at the end.
-    chunk.records = vec![0; lines.len() / MIN_LINE + 1];
+fn parse<'a>(log: &'a [u8], lines: Range<usize>, endpoints: &Interner<'a>) -> Chunk {
     // A run lasts while the timestamp's bytes 5 to 12, `MM-DDTHH`, stay the same, so most lines
     // compare those 8 bytes and decode nothing. No line's bytes are all zero, so line 0 starts a
     // run.
-    let (mut count, mut current, mut i) = (0, 0, lines.start);
+    let (mut chunk, mut count, mut current, mut i) = (Chunk::default(), 0, 0, lines.start);
+    // Every line takes at least MIN_LINE bytes. The records start out zero, which costs nothing
+    // until a page is written, and the unused tail is cut off at the end.
+    chunk.records = vec![0; lines.len() / MIN_LINE + 1];
     assert!(lines.end + LINE <= log.len(), "map_file pads the log");
     while i < lines.end {
         // SAFETY: i < lines.end, so the LINE bytes from i lie inside `log` (asserted above).
@@ -403,7 +397,7 @@ fn parse(log: &[u8], lines: Range<usize>) -> (Interner<'_>, Chunk) {
     }
     chunk.records.truncate(count);
     chunk.runs.push((HOURS, count, chunk.large.len()));
-    (endpoints, chunk)
+    chunk
 }
 
 /// Returns the index of the LF that ends the first line of `line`.
@@ -527,31 +521,47 @@ fn hash(name: &[u8], first: u64) -> u64 {
 /// seed 1's lines needed a second probe, each a mispredicted branch; at a quarter, 3.4% do. It
 /// never grows: ids have 12 bits in a record, so a table takes at most 4,096 names, and at that
 /// it is half full and probes still end.
+///
+/// All threads share one table while they parse, so a name has the same id in every chunk.
+/// Lookups take no lock: a thread that adds a name writes its entry first and only then its id
+/// into a slot, with `Release`, so a lookup that loads the id with `Acquire` finds the entry
+/// complete. Adding a name takes a lock, so two threads that both miss it add it once. Each
+/// thread used to fill a table of its own and merge it into a shared one after its parse. That
+/// meant twelve tables of about 190 KB, held while others still parsed, and a table from chunk
+/// ids to shared ids that the hour pass read for every record (`PERF.md`, step 33).
 struct Interner<'a> {
     /// The table. A slot holds `id + 1`, so that 0 can mark an empty slot. Its size is part of
     /// its type, so a probe needs no bounds check: 0.9% fewer instructions in the parse.
-    slots: Box<[u32; 2 << 12]>,
-    /// Id → (name, hash). Names borrow the mapped file, so none are copied. The hash lets
-    /// [`Interner::merge`] add a chunk's names without reading them from the input again.
-    names: Vec<(&'a [u8], u64)>,
+    slots: Box<[AtomicU32; 2 << 12]>,
+    /// Id → name. Names borrow the mapped file, so none are copied.
+    names: Box<[OnceLock<&'a [u8]>]>,
     /// Id → the name and the space after it, zero-padded to 64 bytes, for [`same_name`]. A name of
     /// 64 bytes or more has no room for the space and keeps only its first 64 bytes.
-    padded: Vec<Padded>,
+    padded: Box<[std::cell::UnsafeCell<Padded>]>,
+    /// How many names have an id; the lock that adding a name takes.
+    count: Mutex<usize>,
 }
+
+// SAFETY: the padded copies are the only state shared without an atomic or a lock. Each is
+// written once, under the lock, before its id goes into a slot (`Interner::insert`), and read
+// only through an id loaded from a slot with `Acquire`, or after the parse.
+unsafe impl Sync for Interner<'_> {}
 
 /// A padded copy, aligned to one cache line. The allocator aligns the table to 16 bytes, so
 /// each copy used to span two lines, and every probe loaded both: 16% of the L1 misses.
 #[repr(align(64))]
 struct Padded([u8; 64]);
 
-// The tables never grow: each growing step leaves the old buffer behind in the allocator,
-// which kept 0.6 MB more memory in use. Capacity that is never written costs nothing.
+// The tables never grow: lookups index them while other threads add names.
 impl Default for Interner<'_> {
     fn default() -> Self {
         Self {
-            slots: Box::new([0; 2 << 12]),
-            names: Vec::with_capacity(1 << 12),
-            padded: Vec::with_capacity(1 << 12),
+            slots: Box::new([const { AtomicU32::new(0) }; 2 << 12]),
+            names: (0..1 << 12).map(|_| OnceLock::new()).collect(),
+            // SAFETY: zero bytes are a valid `Padded`. Fresh pages of zeros, they take memory
+            // only once a copy is written to them.
+            padded: unsafe { Box::new_zeroed_slice(1 << 12).assume_init() },
+            count: Mutex::new(0),
         }
     }
 }
@@ -568,14 +578,16 @@ impl<'a> Interner<'a> {
     /// of its lines; longer names compare with `==`. Folding the two into one test, the window
     /// first and `==` only for long names, cost 5% more instructions in the parse.
     #[inline(always)]
-    fn intern(&mut self, name: &'a [u8], hash: u64, window: &[u8; 64]) -> u32 {
+    fn intern(&self, name: &'a [u8], hash: u64, window: &[u8; 64]) -> u32 {
         // The top 13 bits, one of 8,192 slots: they are the ones that every hashed bit reaches.
         let mut slot = (hash >> 51) as usize;
-        while let Some(id) = self.slots[slot].checked_sub(1) {
+        while let Some(id) = self.slots[slot].load(Acquire).checked_sub(1) {
             let found = if name.len() < 64 {
-                same_name(window, &self.padded[id as usize].0, name.len())
+                // SAFETY: the copy was written before `id` went into the slot, and never again.
+                let known = unsafe { &(*self.padded[id as usize].get()).0 };
+                same_name(window, known, name.len())
             } else {
-                self.names[id as usize].0 == name
+                self.names[id as usize].get() == Some(&name)
             };
             if found {
                 return id;
@@ -585,34 +597,33 @@ impl<'a> Interner<'a> {
         self.insert(slot, name, window)
     }
 
-    /// Gives `name`, which belongs in the empty `slot`, the next id. New names are rare (one
-    /// per distinct endpoint per chunk), so this stays out of line, away from the hot loop. It
-    /// hashes the name again instead of taking the hash from `intern`: keeping that alive
-    /// through the probe loop cost 5.8 million instructions in the parse.
+    /// Gives `name`, which belongs in the empty `slot`, the next id. New names are rare (1,842
+    /// per seed), so this stays out of line, away from the hot loop. It hashes the name again
+    /// instead of taking the hash from `intern`: keeping that alive through the probe loop cost
+    /// 5.8 million instructions in the parse.
     #[cold]
     #[inline(never)]
-    fn insert(&mut self, slot: usize, name: &'a [u8], window: &[u8; 64]) -> u32 {
+    fn insert(&self, slot: usize, name: &'a [u8], window: &[u8; 64]) -> u32 {
+        let mut count = self.count.lock().expect("panics abort");
+        // Only the lock's holder fills a slot, and none is ever emptied. If `slot` is still empty,
+        // no thread has added the name since we probed: it would have gone there. If another
+        // thread has filled the slot since, with this name or another, we probe again.
+        if self.slots[slot].load(Relaxed) != 0 {
+            drop(count);
+            return self.intern(name, hash(name, word(window, 0)), window);
+        }
         // The spec gives every seed 1,842 endpoints (§2), well below the 4,096 that 12 bits hold.
-        assert!(self.names.len() < 1 << 12, "over 4,096 distinct endpoints");
+        assert!(*count < 1 << 12, "over 4,096 distinct endpoints");
         // The name, then the space if there is room for it, then zeros.
         let mut padded = *window;
         padded[name.len().min(63) + 1..].fill(0);
-        self.padded.push(Padded(padded));
-        self.names.push((name, hash(name, word(window, 0))));
-        self.slots[slot] = self.names.len() as u32;
-        self.names.len() as u32 - 1
-    }
-
-    /// Adds the names of `chunk`, another table, and returns a table from their ids there to
-    /// their ids here.
-    ///
-    /// It reuses the stored hashes and compares the padded copies, never the names: each name's
-    /// bytes in the input lie in a different place, and reading them there took most of a
-    /// millisecond, one cache miss after another, while the other threads waited for the lock.
-    /// Hashing the names again cost 0.4 ms for that reason.
-    fn merge(&mut self, chunk: &Interner<'a>) -> Vec<u32> {
-        let names = chunk.names.iter().zip(&chunk.padded);
-        (names.map(|(&(name, hash), padded)| self.intern(name, hash, &padded.0))).collect()
+        // SAFETY: no slot holds this id yet, so no other thread reads the copy, and only the
+        // lock's holder writes one.
+        unsafe { *self.padded[*count].get() = Padded(padded) };
+        let _ = self.names[*count].set(name);
+        *count += 1;
+        self.slots[slot].store(*count as u32, Release);
+        *count as u32 - 1
     }
 }
 
@@ -641,9 +652,9 @@ fn same_name(window: &[u8; 64], known: &[u8; 64], len: usize) -> bool {
 /// is formatted.
 type Hour = (Vec<[u32; 6]>, usize);
 
-/// One run of lines from one hour: their records, their chunk's large latencies from the run's
-/// first one on (see [`Chunk`]), and the table from their chunk's endpoint ids to global ids.
-type Run<'a> = (&'a [u32], &'a [u32], &'a [u32]);
+/// One run of lines from one hour: their records, and their chunk's large latencies from the
+/// run's first one on (see [`Chunk`]).
+type Run<'a> = (&'a [u32], &'a [u32]);
 
 /// The endpoints' ids in output order, sorted once by one thread (see [`summarize`]).
 type Order = OnceLock<Vec<usize>>;
@@ -652,7 +663,7 @@ type Order = OnceLock<Vec<usize>>;
 ///
 /// We go through the runs twice:
 ///
-/// 1. **Count** the lines and errors of each endpoint (by global id).
+/// 1. **Count** the lines and errors of each endpoint.
 /// 2. **Place** each latency in one buffer, `buffer`, just below where its endpoint's
 ///    latencies end. A running sum of the counts tells where that is. Together, the two steps
 ///    are a counting sort by endpoint.
@@ -668,9 +679,9 @@ fn summarize_hour(runs: &[Run], order: &Order, names: &[&[u8]], buffer: &mut [u3
     // `start[e]` first counts endpoint e's lines, then, after the running sum, holds the end of
     // its latencies. Placing each latency moves it down by one, so it ends as their start.
     let (mut start, mut errors) = (vec![0u32; names.len() + 1], vec![0u32; names.len()]);
-    for &(records, _, ids) in runs {
+    for &(records, _) in runs {
         for &r in records {
-            let e = ids[(r >> 20) as usize] as usize;
+            let e = (r >> 20) as usize;
             start[e] += 1;
             errors[e] += r >> 19 & 1;
         }
@@ -679,10 +690,10 @@ fn summarize_hour(runs: &[Run], order: &Order, names: &[&[u8]], buffer: &mut [u3
         start[e] += start[e - 1];
     }
     let buffer = &mut buffer[..start[names.len()] as usize];
-    for &(records, large, ids) in runs {
+    for &(records, large) in runs {
         let mut large = large.iter();
         for &r in records {
-            let e = ids[(r >> 20) as usize] as usize;
+            let e = (r >> 20) as usize;
             start[e] -= 1;
             buffer[start[e] as usize] = match r & LARGE {
                 LARGE => *large.next().expect("one large latency per LARGE record"),
