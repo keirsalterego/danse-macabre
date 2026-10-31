@@ -335,11 +335,9 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
         barrier(&arrived, threads);
         // Step 1: the number of each code that occurs, and the group of each of this share's
         // ids. The numbers are freed before the groups are made, which then reuse their pages.
-        let (mut num, mut group_count) = (vec![0; CODES], 1);
-        for code in present() {
-            num[code] = u8::try_from(group_count).expect("at most 255 countries");
-            group_count += 1;
-        }
+        let (mut num, group_count) = (vec![0; CODES], 1 + present().count());
+        (present().zip(1..))
+            .for_each(|(c, n)| num[c] = u8::try_from(n).expect("at most 255 countries"));
         region_rows(regions, me, threads, |i, c| by_id[i].store(num[c], Relaxed));
         drop(num);
         barrier(&arrived, 2 * threads);
@@ -445,9 +443,8 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
                     merge(unsafe { groups.get_unchecked_mut(group) }, &record);
                 }
             }
-            for (to, &next) in sent.iter().enumerate() {
-                ends[mailbox(half, me, to)].store(next as u64, Relaxed);
-            }
+            (sent.iter().enumerate())
+                .for_each(|(to, &n)| ends[mailbox(half, me, to)].store(n as u64, Relaxed));
             barrier(&arrived, (round + 3) * threads);
             (0..threads).for_each(|from| names.read(mail(mailbox(half, from, me)), &mut groups));
         }

@@ -48,6 +48,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 41 | A name is known by a 128-bit hash of its bytes, three AES rounds: a letter is 16 bytes instead of 32 and is posted with one store, and a name set's entry is 40 bytes instead of 64, 64 bits of the hash beside the name's group bits | run-65f94ca68a16 | 0.0226 | 11.5 | 81.1 |
 | 42 | 13 fewer lines at the same speed: `region_amount` and `ALIGN` written shorter, the cold paths without `#[inline(never)]`, the mailboxes read in one `for_each` and published by their ends, and `parallel` written into `join` | run-d7d23764cf12 | 0.0219 | 11.4 | 81.6 |
 | 43 | A waiter at the barrier sleeps in steps of 10 µs with 1 ns of timer slack, so a sleeper is no longer late for its next round, and rounds of 128 KiB, half as many barriers | run-f276c02c1223 | 0.0219 | 11.4 | 81.6 |
+| 44 | 3 fewer lines at the same speed: the country numbers given by one `for_each` over `present().zip(1..)`, with the count from `present().count()`, and the mailbox ends published in one `for_each` | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1511,6 +1512,27 @@ Dropped, against step 42, 41 interleaved runs unless noted:
   the tails grew: 3 runs in 61 took 47 to 96 ms, and with a busy loop on CPU 5, 172.9 ms against
   38.5 ms. While the spinners hold every other CPU, the worker that shares its CPU is not moved.
   With rounds of 128 KiB on top, medians 13.14 and 13.10 ms, the same as this step.
+
+## Step 44: 3 fewer lines
+
+S 369 → 366. Both cuts are in code that runs once per worker or once per round, not per record:
+
+- Step 1 numbers the present country codes with `(present().zip(1..)).for_each(…)` and takes
+  `group_count` as `1 + present().count()`, instead of a `for` loop with a counter. The extra
+  walk over the 17,576 code bits runs once per worker during setup.
+- A round's mailbox ends are stored with one `(sent.iter().enumerate()).for_each(…)`.
+
+Four other cuts came out longer after `rustfmt` (calls and chains over 60 characters are split
+one argument per line): the `money` closure on one line, the two `write!`s of an output line as
+one, the country-code closure inlined into its `collect`, and the rehash's probe as a `find`.
+
+`ab.py`, full seed 1, turbo off, 41 interleaved runs, medians / minimums, step 43 → step 44:
+23.57 / 22.96 → 23.47 / 22.65 ms and 23.47 / 22.75 → 23.60 / 23.03 ms, the same within noise.
+The gate passes (310 of 310).
+
+On the same machine with turbo off, step 43 runs at 23.5 ms against step 42's 23.62 ms before it:
+the 7–12% that step 43 measured with turbo on most likely came from idle states the board's
+machine does not reach (its run drew 21.88 ms, step 42's 21.86 and 22.25).
 
 ## Experiments that did not stay
 
