@@ -51,8 +51,8 @@ const SHOWN_IDS: usize = 10;
 /// [`answer_all`] keeps below `2^SUM_BITS`; the high bits hold their count.
 const SUM_BITS: u32 = 40;
 /// A term is common when at least one sampled document in this many holds it: as a list of
-/// 16-bit offsets ([`Window`]), it would then take at least half the memory of its bitset.
-const DENSE_SHARE: usize = 32;
+/// 16-bit offsets ([`Window`]), it would then take at least a third of the memory of its bitset.
+const DENSE_SHARE: usize = 48;
 /// The queries on sets are evaluated every `64 * WINDOW` documents, on bitsets of `WINDOW`
 /// words ([`Window`]). Its id lists hold 16-bit offsets, so it spans at most 2^16 documents.
 const WINDOW: usize = 64;
@@ -360,8 +360,7 @@ impl Plan {
             let grouping = s.spawn(|| {
                 // SAFETY: an all-zero check is a valid one.
                 let grouped = unsafe { huge(checks.iter().map(Vec::len).sum()) };
-                let items = checks.iter().flatten().rev().copied();
-                (group_into(n, items, grouped), grouped)
+                (group_into(n, &checks, grouped), grouped)
             });
             let (phrase_at, phrases) = group(n, &phrases);
             // A term triggers phrases when its group holds any, and checks when it keys one.
@@ -431,26 +430,21 @@ impl Plan {
 /// `k`'s are `grouped[at[k]..at[k + 1]]`. A counting sort, so it allocates no list per key.
 fn group<T: Copy + Default>(keys: usize, parts: &[Vec<(u32, T)>]) -> (Vec<u32>, Vec<T>) {
     let mut grouped = vec![T::default(); parts.iter().map(Vec::len).sum()];
-    let items = parts.iter().flatten().rev().copied();
-    (group_into(keys, items, &mut grouped), grouped)
+    (group_into(keys, parts, &mut grouped), grouped)
 }
 
-/// [`group`] into `grouped`, given the items from the last to the first, as many as `grouped`
-/// holds; returns `at`.
-fn group_into<T, I>(keys: usize, items: I, grouped: &mut [T]) -> Vec<u32>
-where
-    I: Clone + Iterator<Item = (u32, T)>,
-{
+/// [`group`] into `grouped`, which holds as many items as `parts`; returns `at`.
+fn group_into<T: Copy>(keys: usize, parts: &[Vec<(u32, T)>], grouped: &mut [T]) -> Vec<u32> {
     // Written here, as in [`Tally::new`], so the counts' loads find no shared zero page.
     let mut at = [0].repeat(keys + 1);
-    for (k, _) in items.clone() {
+    for &(k, _) in parts.iter().flatten() {
         at[k as usize] += 1;
     }
     for k in 1..=keys {
         at[k] += at[k - 1];
     }
     // Each key's end moves back to its start as its items go in, last first.
-    for (k, item) in items {
+    for &(k, item) in parts.iter().flatten().rev() {
         at[k as usize] -= 1;
         grouped[at[k as usize] as usize] = item;
     }
@@ -728,15 +722,9 @@ struct Tally {
     /// Per query, how many first matches its checks recorded: a byte, which stays in cache where
     /// the query's cell would not.
     shown: Vec<u8>,
-    /// Each query's first matches in the chunk, a doc at a time: the queries the doc is one of the
-    /// first matches of, then its id marked with [`DOC`]. Half the memory of (query, doc) pairs,
-    /// as a doc that has any holds 3.7 on average (seed 1).
-    first: Vec<u32>,
+    /// (query index, doc id) of each query's first matches in the chunk, in doc order.
+    first: Vec<(u32, u32)>,
 }
-
-/// Marks a doc id in [`Tally::first`]: the doc ids stay below 2^20 ([`answer_all`]), and the query
-/// indices below 2^31.
-const DOC: u32 = 1 << 31;
 
 impl Tally {
     fn new(queries: usize, checks: usize) -> Self {
@@ -758,14 +746,7 @@ impl Tally {
         let cell = &mut self.queries[q as usize];
         *cell += 1 << SUM_BITS | u64::from(doc);
         if *cell >> SUM_BITS <= SHOWN_IDS as u64 {
-            self.first.push(q);
-        }
-    }
-
-    /// Ends `doc`'s first matches, if it has any, with its marked id.
-    fn mark(&mut self, doc: u32) {
-        if self.first.last().is_some_and(|&e| e & DOC == 0) {
-            self.first.push(DOC | doc);
+            self.first.push((q, doc));
         }
     }
 
@@ -798,10 +779,9 @@ impl Tally {
         for &q in &todo[..firsts] {
             if usize::from(self.shown[q as usize]) < SHOWN_IDS {
                 self.shown[q as usize] += 1;
-                self.first.push(q);
+                self.first.push((q, doc));
             }
         }
-        self.mark(doc);
     }
 
     /// Records the documents `start + i` for each bit `i` set in `bits`, as [`Tally::add`] would
@@ -811,9 +791,7 @@ impl Tally {
         let mut i = 0;
         while i < WINDOW && self.queries[q as usize] >> SUM_BITS < SHOWN_IDS as u64 {
             if bits[i] != 0 {
-                let doc = start + 64 * i as u32 + pop(&mut bits[i]) as u32;
-                self.add(q, doc);
-                self.mark(doc);
+                self.add(q, start + 64 * i as u32 + pop(&mut bits[i]) as u32);
             }
             i += usize::from(bits[i] == 0);
         }
@@ -825,15 +803,7 @@ impl Tally {
     /// `ids[at[q]..at[q + 1]]`. Each scanning thread groups its own, instead of one big sort
     /// after the pass.
     fn take_first(&mut self) -> (Vec<u32>, Vec<u32>) {
-        let first = std::mem::take(&mut self.first);
-        let mut ids = vec![0; first.iter().filter(|&&e| e & DOC == 0).count()];
-        // From the back, a doc's mark comes before its queries.
-        let pairs = first.iter().rev().scan(0, |doc, &e| {
-            *doc = if e & DOC != 0 { e ^ DOC } else { *doc };
-            Some((e & DOC == 0).then_some((e, *doc)))
-        });
-        let at = group_into(self.queries.len(), pairs.flatten(), &mut ids);
-        (at, ids)
+        group(self.queries.len(), &[std::mem::take(&mut self.first)])
     }
 }
 

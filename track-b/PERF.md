@@ -52,7 +52,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 45 | A token whose home slot holds another term stops there unless the slot is marked as the home of a term stored further on; a key's long bit is its byte 12's bit 5, moved by one shift | run-636a838e4422 | 0.1135 | 42.3 | 77.3 |
 | 46 | A window's matches counted and summed four words at a time from two nibble tables, instead of six masked popcounts per word | run-f954cb1f35f8 | 0.1117 | 43.3 | 77.4 |
 | 47 | A document's phrase triggers are listed in a fifth run of the token loop's slice, by a store and an add, instead of pushed to a `Vec` behind a branch | run-f954cb1f35f8 | 0.1117 | 43.3 | 77.4 |
-| 48 | Memory: a chunk's first matches kept as query indices, each doc's followed by its id, 4 bytes per match instead of 8; the long terms' keys kept off transparent huge pages | | | | |
+| 48 | Memory: a chunk's first matches kept as query indices, each doc's followed by its id, 4 bytes per match instead of 8; the long terms' keys kept off transparent huge pages | run-f91848d73390 | 0.1134 | 37.6 | 77.2 |
+| 49 | Step 48's first-match list undone, since B's memory sits at the cap; the long terms' keys stay off huge pages, and a term is common from one sampled document in 48 instead of 32 | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1293,6 +1294,25 @@ but for formatting): medians 116.99, 117.29, 117.51 and 117.49 → 116.33, 116.5
 ms, minimums 115.09, 115.58, 115.33 and 115.76 → 114.79, 115.16, 115.06 and 115.30 ms. S 818 →
 841. Gate: 510 pass, 0 fail. Step 47's memory median, 40.2 → 37.8 MB, was most likely the keys'
 huge page coming and going.
+
+## Step 49: memory is at its cap in B, so spend it on time
+
+The board's run of step 48 had memory.peak 37.6 MB against 43.3 MB for step 47, and its points fell
+(77.40 → 77.16). The memory factor is `min(M_ref / M, 50)^0.20`, and B's reference used 2,200 MB
+(`harness/calibration-seed1.json`), so any peak under 44.0 MB already earns the cap. Across four
+board runs (steps 45 to 48, 37.6 to 43.3 MB), K · T^0.5 · S^0.15 is the same, 32.3: the memory
+factor did not move. Step 48's 23 lines bought nothing in B.
+
+This step undoes step 48's first-match list (S 841 → 818) and keeps its other part, the two lines
+that keep the long terms' `keys` off huge pages, which take about 2 MB off a typical run. It then
+spends some of the room under the cap on time: `DENSE_SHARE` 48 instead of 32, so terms held by one
+sampled document in 33 to 48 become bitsets. Measured on step 44, that was −1.1% in four rounds
+for +0.85 MB.
+
+Full seed 1, step 47 → step 49, `ab.py`, 41 interleaved runs, medians / minimums: 118.95 /
+115.45 → 116.45 / 113.25 ms and 118.12 / 115.67 → 115.96 / 113.58 ms (−2.1%, −1.8%).
+memory.peak (systemd-run, alternating): 40.2, 37.6, 40.6 → 39.8, 39.6, 39.1 MiB, under the cap
+with about 2 MB to spare at the board's usual reading. S 818 → 820. The gate passes (510 of 510).
 
 ## Experiments that did not stay
 
