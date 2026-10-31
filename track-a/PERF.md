@@ -52,6 +52,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 45 | 2 fewer lines with the same machine code: the build stage mounts its sources instead of copying them, and `insert` stays out of line by `#[cold]` alone | run-379b43c0200f | 0.0189 | 18.7 | 85.5 |
 | 46 | The input prefetched five lines ahead, `parse` out of line with a pointer for its loop, and the endpoint interner a static | | | | |
 | 47 | 5.8 instructions fewer per line: the probe counts the compare mask's trailing ones, the latency's digits combine in three steps, and their mask is one shifted constant | | | | |
+| 48 | An endpoint table of 16,384 slots instead of 8,192: 1.9% of lines take a second probe instead of 3.9% | | | | |
 
 ## Step 1: v1
 
@@ -724,6 +725,27 @@ minimums 326.9 → 330.6 M and 328.3 → 313.7 M, L1-dcache-load-misses:u 3.85 �
 and 342.2 M against 345.8 and 343.1 M in another session, L1 misses 3.85 M. memory.peak, as in step
 46: median 18.09 → 18.00 MB. S 367 → 366. Gate: 310 pass, 0 fail; full seeds 1–7 and 10–12 give the
 reference hashes; clippy reports no warnings.
+
+## Step 48: an endpoint table of 16,384 slots
+
+With 8,192 slots, 3.9% of seed 1's lines took a second probe, and each one is a mispredicted
+branch. A simulation of the table, names inserted in file order, gives 1.9% with 16,384 slots:
+4.20% → 2.27% on average over seeds 1–7 and 10–12, and at most 3.33% (seed 11). branch-misses:u
+went 1.09 → 1.01 M a run (`perf stat`, 10 interleaved runs). The slots take 32 KB more of `.data`,
+64 KB in all, and the L1 misses rose 3.85 → 3.93 M.
+
+`ab.py` cannot tell this step from step 47. On AC power (local, P-cores, turbo off), 61 interleaved
+runs, four rounds: medians 19.54 → 19.54, 19.61 → 19.60, 19.63 → 19.65 and 19.54 → 19.49 ms,
+minimums 18.92 → 19.03, 19.06 → 18.90, 19.08 → 18.93 and 18.91 → 18.67 ms; timed as the board does,
+41 runs, two rounds, medians 18.46 → 18.49 and 18.47 → 18.36 ms. Without the static interner of
+step 46, the same change measured 19.72 → 19.53, 19.76 → 19.62, 19.75 → 19.52 and 19.65 → 19.58 ms
+in the same rounds. Counters, measured on battery power, so only the counts compare (`perf stat`,
+40 interleaved runs, two rounds): instructions:u 644.6 → 643.2 M (−0.2%), cycles:u medians
+343.4 → 340.9 M and 342.9 → 341.7 M (−0.4 to −0.7%), and 345.8 → 342.1 M and 343.1 → 340.7 M in a
+second session, minimums 330.6 → 327.2 M and 313.7 → 321.9 M. A copy moved as in step 47 ran the
+same: cycles:u 342.1 and 340.3 M against 342.1 and 340.7 M, L1 misses 3.94 M. memory.peak: median
+18.00 → 18.12 MB, and 18.40 → 18.26 MB in an earlier session. S 366 → 366. Gate: 310 pass, 0 fail;
+full seeds 1–7 and 10–12 give the reference hashes; clippy reports no warnings.
 
 ## Experiments that did not stay
 

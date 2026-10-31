@@ -533,11 +533,11 @@ fn hash(name: &[u8], first: u64) -> u64 {
 /// A hash table that gives every distinct endpoint name a dense id: 0, 1, 2, and so on.
 ///
 /// It uses open addressing with linear probing. A name's hash picks a slot, and on a collision
-/// we try the next slot until we find the name or an empty slot. The table has 8,192 slots, so
-/// with the 1,842 endpoints of a seed it is less than a quarter full: at half full, 8.2% of
-/// seed 1's lines would need a second probe, each a mispredicted branch; at a quarter, 3.9% do. It
-/// never grows: ids have 12 bits in a record, so a table takes at most 4,096 names, and at that
-/// it is half full and probes still end.
+/// we try the next slot until we find the name or an empty slot. The table has 16,384 slots, so
+/// with the 1,842 endpoints of a seed it is about an eighth full. Of seed 1's lines, 8.2% would
+/// need a second probe, each a mispredicted branch, at half full, 3.9% at a quarter and 1.9% at
+/// an eighth (simulated). It never grows: ids have 12 bits in a record, so a table takes at most
+/// 4,096 names, and at that it is a quarter full and probes still end.
 ///
 /// All threads share one table while they parse, so a name has the same id in every chunk.
 /// Lookups take no lock: a thread that adds a name writes its entry first and only then its id
@@ -549,7 +549,7 @@ fn hash(name: &[u8], first: u64) -> u64 {
 struct Interner<'a> {
     /// The table. A slot holds `id + 1`, so that 0 can mark an empty slot. Its size is part of
     /// its type, so a probe needs no bounds check: 0.9% fewer instructions in the parse.
-    slots: [AtomicU32; 2 << 12],
+    slots: [AtomicU32; 4 << 12],
     /// Id → name. Names borrow the mapped file, so none are copied.
     names: [OnceLock<&'a [u8]>; 1 << 12],
     /// Id → the name and the space after it, zero-padded to 64 bytes, for the probes of
@@ -567,7 +567,7 @@ unsafe impl Sync for Interner<'_> {}
 
 /// The endpoints' interner. As a static, its tables lie at fixed addresses, and a probe loads
 /// no pointer to them first: 3 instructions fewer per line. A `OnceLock` starts out nonzero, so
-/// the tables take 393 KB of `.data` in the binary instead of `.bss`; a page of it is read in only
+/// the tables take 426 KB of `.data` in the binary instead of `.bss`; a page of it is read in only
 /// when touched, like the heap pages the tables took before.
 static ENDPOINTS: Interner<'static> = Interner::new();
 
@@ -583,7 +583,7 @@ impl<'a> Interner<'a> {
     /// An empty table. The tables never grow: lookups index them while other threads add names.
     const fn new() -> Self {
         Self {
-            slots: [const { AtomicU32::new(0) }; 2 << 12],
+            slots: [const { AtomicU32::new(0) }; 4 << 12],
             names: [const { OnceLock::new() }; 1 << 12],
             // SAFETY: the copies are `MaybeUninit`, which needs no initialization.
             padded: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
@@ -612,8 +612,8 @@ impl<'a> Interner<'a> {
     /// that was worth 0.8 ms.
     #[inline(always)]
     fn intern(&self, name: &'a [u8], hash: u64, window: &[u8; 64]) -> u32 {
-        // The top 13 bits, one of 8,192 slots: they are the ones that every hashed bit reaches.
-        let mut slot = (hash >> 51) as usize;
+        // The top 14 bits, one of 16,384 slots: they are the ones that every hashed bit reaches.
+        let mut slot = (hash >> 50) as usize;
         while let Some(id) = self.slots[slot].load(Acquire).checked_sub(1) {
             let found = if name.len() < 64 {
                 // SAFETY: the copy was written before `id` went into the slot, and never again.
