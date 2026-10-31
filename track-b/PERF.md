@@ -667,6 +667,8 @@ Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
 Comparing a phrase's span term by term instead of as slices, which calls `bcmp`, did not
 measure.
 
+A second run of the step 29 code, run-2d06517dbcd4, measured 160.2 ms and 42.2 MB (73.8 points).
+
 ## Experiments that did not stay
 
 - **After step 17, on the serial start and the end** (local, alternating runs, 16 each, against
