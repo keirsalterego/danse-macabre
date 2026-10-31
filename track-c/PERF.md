@@ -47,6 +47,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 40 | `number` reads a field's word without a bounds check, as an `unsafe fn` whose six calls each show that the 8 bytes lie in the input or its pad, and the BOM test reads its byte unchecked | run-d1b2c0ca269e | 0.0240 | 12.2 | 80.1 |
 | 41 | A name is known by a 128-bit hash of its bytes, three AES rounds: a letter is 16 bytes instead of 32 and is posted with one store, and a name set's entry is 40 bytes instead of 64, 64 bits of the hash beside the name's group bits | run-65f94ca68a16 | 0.0226 | 11.5 | 81.1 |
 | 42 | 13 fewer lines at the same speed: `region_amount` and `ALIGN` written shorter, the cold paths without `#[inline(never)]`, the mailboxes read in one `for_each` and published by their ends, and `parallel` written into `join` | run-d7d23764cf12 | 0.0219 | 11.4 | 81.6 |
+| 43 | A waiter at the barrier sleeps in steps of 10 µs with 1 ns of timer slack, so a sleeper is no longer late for its next round, and rounds of 128 KiB, half as many barriers | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1473,6 +1474,43 @@ no warnings.
 
 The board ran step 41's code a second time in run-13fb3e0130ce (commit c9d5326, which changed only
 PERF.md): 21.49 ms, 11.4 MB and 81.65 points.
+
+## Step 43: no runs of late rounds, and rounds of 128 KiB
+
+An instrumented copy of step 42 took a timestamp as each worker arrived at and left each barrier
+(local, P-cores, 21 runs; the machine now runs with turbo on, so a run takes about 14 ms instead
+of 23). The waits took 1.87 ms of each worker's 11.6 ms of rounds, 16%, though in half the rounds
+the last worker arrived within 2 µs of the first. The rest came from about 20 rounds per run in
+which the last worker arrived 90 to 110 µs after the first, and in 18 of them that worker had
+slept at the barrier before: 2,000 spins last about 60 µs, a sleep of 50 µs may end 50 µs late
+with the default timer slack, and the CPU goes idle, so the sleeper left the barrier about 180 µs
+after it arrived, late for the next round, its waiters slept in turn, and the run went on for up
+to 20 rounds. About two rounds per run started one fresh, with a worker whose round took 140 µs
+instead of 40.
+
+- **Short sleeps.** `main` sets the timer slack to 1 ns (`PR_SET_TIMERSLACK`, which the threads
+  inherit), and a waiter that has spun 2,000 times sleeps in steps of 10 µs instead of 50. +1 line.
+- **Rounds of 128 KiB.** Step 16 found them flat against 64 KiB, with more memory: a round's
+  letters to one owner, about 180 of 32 bytes, took two pages of its mailbox. Since step 41 a
+  letter is 16 bytes, so they fill 2.9 KB, part of one page as at 64 KiB. Alone, on step 42's
+  barrier, they were slower (15.23 against 14.40 ms, medians of 41 runs): each late round now
+  costs more.
+
+`ab.py` against step 42, 41 interleaved runs, medians / minimums: seed 1, 14.86 / 12.95 → 13.11 /
+12.00 ms (−11.8%); seed 2, 14.20 / 12.99 → 13.26 / 12.16 ms (−6.6%); in the same way with the
+tails printed, seed 1, 14.40 → 13.07 ms (−9.2%), and seed 3, 14.10 → 13.02 ms (−7.7%), p90 17.05 →
+13.79 ms. With a busy loop of another program on CPU 5 (15 runs): 38.52 → 31.00 ms. memory.peak,
+5 alternating runs: 9.9–10.5 MB for step 42 and 10.2–10.7 MB for this step; no allocation
+changed. S 368 → 369. Correctness: the gate, 310 pass, 0 fail; full seeds 1, 2, 3, 7 and 12 give
+the reference hashes, and seed 2 does on 1, 3 and 4 CPUs; clippy reports no warnings.
+
+Dropped, against step 42, 41 interleaved runs unless noted:
+- **A longer spin**, `SPINS` 30,000 (about 1 ms) instead of short sleeps: as fast in the medians
+  (seed 1, 14.48 → 13.05 ms; seed 3, 14.33 → 13.47 ms; 10,000, 100,000 and 200,000 spins within
+  0.2 ms of it), and on the instrumented copy the waits fell from 1.87 to 0.76 ms per worker. But
+  the tails grew: 3 runs in 61 took 47 to 96 ms, and with a busy loop on CPU 5, 172.9 ms against
+  38.5 ms. While the spinners hold every other CPU, the worker that shares its CPU is not moved.
+  With rounds of 128 KiB on top, medians 13.14 and 13.10 ms, the same as this step.
 
 ## Experiments that did not stay
 

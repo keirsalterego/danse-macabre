@@ -42,7 +42,7 @@
 //!    thread keeps the names it owns in a [`NameSet`] that no other thread touches: a hash table
 //!    whose entry for a name holds 64 bits of the name's hash and a bitset with one bit per
 //!    country. A record's name usually comes from another thread's run, so the threads trade
-//!    names in rounds. In each round a thread parses 64 KiB of its records and posts each
+//!    names in rounds. In each round a thread parses 128 KiB of its records and posts each
 //!    record's name and group to the name's owner as a 16-byte letter, the name's 128-bit hash
 //!    with the group in its top byte (see [`name_letter`]). All threads then meet at a barrier,
 //!    and each reads the letters posted to it and sets the bits (see [`join`]). A bit that goes
@@ -98,13 +98,15 @@ const BOM: &[u8] = b"\xEF\xBB\xBF";
 /// needs a shorter path for its end.
 const PAD: usize = 64;
 /// Bytes of its run a worker parses per round before the workers swap names. Small rounds keep
-/// the mailboxes small and the names just parsed still in cache when their owner reads them.
-const ROUND_BYTES: usize = 64 << 10;
+/// the mailboxes small and the names just parsed still in cache when their owner reads them, and
+/// at 128 KiB a round's letters to one owner still fit in one page of its mailbox (see
+/// [`MAILBOX`]), with half the barriers of 64 KiB (PERF.md, step 43).
+const ROUND_BYTES: usize = 128 << 10;
 /// Letters one worker can post to another in one round: one per record that starts in the
 /// round, and a record takes at least 11 bytes (`1,,,1,0.00` and its LF), so no round fills a
 /// mailbox. The pages of a mailbox that no round reaches are never touched, so they cost address
 /// space only. The count is rounded up to whole 4 KiB pages, of 256 letters of 16 bytes, so that
-/// each mailbox starts a page: a round posts about 90 letters to each owner, which then fill part
+/// each mailbox starts a page: a round posts about 180 letters to each owner, which then fill part
 /// of one page, where mailboxes that started mid-page mostly touched two and peaked 1.7 MiB
 /// higher.
 const MAILBOX: usize = (ROUND_BYTES / 11 + 1).next_multiple_of(256);
@@ -171,6 +173,10 @@ extern "C" fn main() -> ! {
     // fails, only that is lost, so its result is not checked.
     // SAFETY: the call takes plain integers and only changes this process's page-size policy.
     unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) }; // PR_SET_THP_DISABLE
+    // A sleep may run 50 µs past its end by default, and a worker that slept too long at the
+    // barrier was late for its next round (see [`barrier`]). 1 ns is the least slack there is.
+    // SAFETY: as above; the call only changes this thread's timer slack, which threads inherit.
+    unsafe { prctl(29, 1u64, 0u64, 0u64, 0u64) }; // PR_SET_TIMERSLACK
     // Every buffer of 64 KiB or more gets its own mapping, so a grown or freed one returns its
     // pages at once. By default glibc raises this threshold to the size of the largest buffer
     // freed so far, and after the regions parse freed its lists, every worker's name set came
@@ -498,12 +504,15 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
 /// microseconds of each other, so a waiter spins first. A worker that is late because the
 /// scheduler put it aside would keep every spinner busy for whole time slices, and busy CPUs
 /// never look idle enough for the scheduler to move it. So a waiter that has spun long sleeps in
-/// short steps, which frees its CPU.
+/// steps of 10 µs, which frees its CPU. Steps of 50 µs, with the default timer slack, let a
+/// sleeper leave about 180 µs after it arrived, late for its next round, so its waiters slept in
+/// turn, in runs of up to 20 rounds; spinning 1 ms instead was as fast, but with one CPU busy
+/// with another program a run took 173 ms instead of 39 (PERF.md, step 43).
 fn barrier(arrived: &AtomicU64, all: usize) {
     arrived.fetch_add(1, Ordering::Release);
     for spins in (0..).take_while(|_| (arrived.load(Ordering::Acquire) as usize) < all) {
         std::hint::spin_loop();
-        (spins > SPINS).then(|| thread::sleep(Duration::from_micros(50)));
+        (spins > SPINS).then(|| thread::sleep(Duration::from_micros(10)));
     }
 }
 
