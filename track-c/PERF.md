@@ -774,6 +774,11 @@ step 27's results; clippy reports no warnings.
 
 ## Experiments that did not stay
 
+- **PGO** (local, turbo off, on step 27's code): a profile from three runs on each of full seeds
+  2–4, passed as `-C profile-use`, with every function matching it. `ab.py`, 40 interleaved runs,
+  medians / minimums: 36.35 / 35.39 → 37.71 / 36.69 ms and 36.27 / 35.64 → 37.39 / 36.79 ms on
+  seed 1; 37.38 / 36.22 → 38.55 / 37.47 ms and 37.14 / 36.35 → 38.39 / 37.31 ms on seed 10, which
+  it was not trained on. `perf stat -r 5`: instructions:u the same, 1.535 G; cycles:u 0.841 → 0.875 G.
 - **The empty name counted by its posters** (local, on step 25's code). Every record with an
   empty name posts its letter to one owner, which then gets 11% more letters than the others
   (306k against 273–277k at full scale) and marks for 0.4–0.5 ms longer. Each poster instead kept
