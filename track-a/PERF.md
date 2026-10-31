@@ -56,8 +56,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 49 | Three rare paths of the parse marked `std::hint::cold_path`, so its loop keeps its count, its end and its constants in registers | run-7eca9cefcfac | 0.0186 | 18.2 | 85.8 |
 | 50 | Sorting networks unrolled level by level, and a network of 128 values instead of selection for groups of 65 to 128 values | run-9a8d6161d86a | 0.0235 | 18.0 | 83.2 |
 | 51 | 6 fewer lines at the same speed: the parse's intrinsics from the file's one wildcard import, and the interner's padded copies zeroed in its static | run-b35557b63892 | 0.0180 | 18.8 | 85.9 |
-| 52 | Endpoint names hashed with the CPU's CRC32C instruction instead of a multiply: 9.2 M instructions fewer | | | | |
-| 53 | 9 fewer lines in the hour pass at the same speed: the large latency taken in `unwrap_or_else`, empty groups filtered out, the three selections in one `map`, the chunk's two releases in one | | | | |
+| 52 | Endpoint names hashed with the CPU's CRC32C instruction instead of a multiply: 9.2 M instructions fewer | run-3367489cfd2c | 0.0176 | 18.6 | 86.3 |
+| 53 | 9 fewer lines in the hour pass at the same speed: the large latency taken in `unwrap_or_else`, empty groups filtered out, the three selections in one `map`, the chunk's two releases in one | run-3367489cfd2c | 0.0176 | 18.6 | 86.3 |
 
 ## Step 1: v1
 
@@ -831,8 +831,8 @@ rounds (three of 41 runs, four of 61), medians 19.25 → 19.12, 19.16 → 19.11,
 19.06 → 19.03, 18.99 → 19.05, 19.06 → 19.03 and 19.69 → 19.62 ms. S 379 → 373. Gate: 310 pass,
 0 fail.
 
-The board drew 18.0 ms at 18.8 MB for it in run-b35557b63892, and 19.5 ms for the same code in
-run-dbba1dbc4ea4.
+The board drew 18.0 ms at 18.8 MB for it in run-b35557b63892, 19.5 ms for the same code in
+run-dbba1dbc4ea4, and 17.7 ms at 18.2 MB in run-d68025a3c15c.
 
 ## Step 52: a CRC32C name hash
 
