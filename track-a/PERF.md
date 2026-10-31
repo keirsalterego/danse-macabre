@@ -39,7 +39,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 32 | Hours summarized smallest first, the smallest few last, into a latency buffer of untouched zero pages | run-13fb10f4c6ee | 0.0196 | 19.1 | 84.9 |
 | 33 | One endpoint table that all threads share while they parse, instead of one per thread merged after it | run-9e334b5f00fa | 0.0190 | 18.9 | 85.3 |
 | 34 | The padded copies allocated uninitialized, not zeroed, and each list of large latencies reserved once | run-2c0e91287411 | 0.0190 | 18.3 | 85.4 |
-| 35 | The name hash reads two 8-byte windows of the name instead of three | | | | |
+| 35 | The name hash reads two 8-byte windows of the name instead of three | run-b8eed3b9c923 | 0.0187 | 18.3 | 85.6 |
 
 ## Step 1: v1
 

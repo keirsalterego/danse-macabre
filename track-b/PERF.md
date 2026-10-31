@@ -32,7 +32,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 25 | The token loop takes no branch on what a token is: a token that is no query term probes to an empty slot, id 0, and a document's new stored terms and BOOL triggers are listed by a store and an add | run-ab97ce51555f | 0.1746 | 43.5 | 72.9 |
 | 26 | A document's term bits are cleared by zeroing their words, a store with no load, and the probe's end test is kept one branch by an empty asm block instead of `black_box`, which sent it through the stack | run-1d7859f315a0 | 0.1682 | 43.2 | 73.3 |
 | 27 | Every thread plans a share of the queries, and the term table's flags are added to every slot, an empty one adding 0, without a test for empty slots | run-fc3b46db2437 | 0.1650 | 41.7 | 73.5 |
-| 28 | The rarity sample probes a line's tokens at its end, as the pass does, and counts without a branch; interning a term takes no branch on whether it is new; the sample's end is found without the other 63 cuts | | | | |
+| 28 | The rarity sample probes a line's tokens at its end, as the pass does, and counts without a branch; interning a term takes no branch on whether it is new; the sample's end is found without the other 63 cuts | run-75ef64ef4099 | 0.1643 | 42.2 | 73.5 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
