@@ -30,6 +30,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 23 | 17 fewer lines outside the record loop: each run's pages given back in two lines, rounded out to whole pages; the region rows cut, marked and written in one line each; and the rounds counted and the parts merged in one line each | run-d4936b9f2b5b | 0.0349 | 12.7 | 76.7 |
 | 24 | 1 fewer line: `main` maps both input files through one closure | run-b455f587cb61 | 0.0358 | 12.9 | 76.4 |
 | 25 | A name's letter masked to its length by a 24-byte window of a constant, and each letter posted at a running index into its owner's mailbox | run-b89d1be25a5e | 0.0348 | 12.5 | 76.9 |
+| 26 | The long-name compare out of line, so the probe for every other name stops paying for its bounds checks | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -702,6 +703,27 @@ shuffled ids passes, and the two with 689 and 692 countries stop with the error;
 no warnings.
 The board's run, run-b89d1be25a5e, drew 34.8 ms, against 34.9 ms for step 24's: one draw on the
 board does not show the 5% measured here.
+
+## Step 26: the long-name compare out of the probe
+
+`NameSet::holds` compared the text of two long names, which only names over 24 bytes need, in
+the same expression as the 32-byte key compare. Inlined into `NameSet::read`, the slice bounds
+checks of that compare were hoisted out of the probe loop into the setup of every letter, about
+a dozen instructions and a few spills per letter for names that are almost never long. The
+compare is now `same_text`, a cold function that the probe calls only when two long names'
+keys match.
+
+`perf stat -r 10`, twice: instructions:u 1.592 → 1.533 G, 18 fewer per record, and cycles:u
+0.860 → 0.837 G. S 296 → 299. `ab.py` against step 25, 40 interleaved runs, medians / minimums:
+37.20 / 36.45 → 36.76 / 35.92 ms and 37.52 / 36.37 → 36.69 / 35.94 ms; on a build whose
+`same_text` named the two slices through a closure, 37.39 / 36.66 → 36.48 / 35.80 ms and
+37.30 / 36.54 → 36.81 / 35.71 ms. memory.peak, 10 alternating rounds: medians 12.37 → 12.59 MB,
+means 12.49 → 12.69 MB, inside this machine's spread of 12.1–13.6 MB for both. Correctness: the
+gate, 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes; the 402 fuzz cases,
+two of them sets of long names, pass at the default thread count, at 1, 3, 12, 37 and 64
+threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300 tiny seeds pass at 10 thread
+counts with 100-byte rounds; the region sets give step 25's results; clippy reports no
+warnings.
 
 ## Experiments that did not stay
 

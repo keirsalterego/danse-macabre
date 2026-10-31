@@ -588,8 +588,7 @@ impl NameSet {
     /// with the same hash are compared there.
     fn holds(&self, entry: usize, key: [u64; 4], data: &[u8]) -> bool {
         let held = &self.lines[entry].0[..4];
-        let text = |key: &[u64]| &data[key[0] as usize..key[1] as usize];
-        held == key || held[3] == key[3] && key[3] >> 32 == LONG && text(held) == text(&key)
+        held == key || held[3] == key[3] && key[3] >> 32 == LONG && same_text(held, &key, data)
     }
 
     /// Appends an entry with this key and no groups, puts it in the empty `slot` with its `tag`,
@@ -613,6 +612,14 @@ impl NameSet {
         }
         self.lines.len() - 1
     }
+}
+
+/// Whether the long names whose keys are `a` and `b` are the same bytes of `data` (see
+/// [`NameSet::holds`]). It is cold and out of line because inlined, its bounds checks were
+/// hoisted into the setup of every letter's probe, 18 instructions per record.
+#[cold]
+fn same_text(a: &[u64], b: &[u64], data: &[u8]) -> bool {
+    data[a[0] as usize..a[1] as usize] == data[b[0] as usize..b[1] as usize]
 }
 
 /// Writes one line per group that has records: the countries in bytewise order, then
