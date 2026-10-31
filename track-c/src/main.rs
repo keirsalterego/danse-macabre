@@ -102,6 +102,9 @@ const MAILBOX: usize = (ROUND_BYTES / 11 + 1).next_multiple_of(128);
 const SPINS: usize = 2000;
 /// The length field of a letter whose name is longer than the 24 bytes a letter holds.
 const LONG: u64 = 0xFFFF;
+/// 24 bytes of ones, then 24 zeros. The 24 bytes from `24 - len` on are the mask that keeps the
+/// first `len` bytes of a name (see [`name_letter`]).
+const KEEP: [[u8; 24]; 2] = [[!0; 24], [0; 24]];
 /// The low 24 bits of a slot: its entry's index plus 1, so that 0 is an empty slot. The top 8
 /// bits are bits 20 to 27 of the name's hash, so a probe that passes a different name usually
 /// skips its entry without loading it.
@@ -290,6 +293,7 @@ fn join(data: &[u8], by_id: &[u8], group_count: usize, threads: usize) -> Vec<Gr
     let (counts, arrived) = (zeroed(2 * threads * threads), AtomicU64::new(0));
     let mailbox = |half: usize, from: usize, to: usize| (half * threads + from) * threads + to;
     let mail = |mb: usize| &letters[mb * MAILBOX * 4..][..counts[mb].load(Relaxed) as usize * 4];
+    let boxes = letters.as_chunks::<4>().0;
     // The hot loop, one run per worker `me`. The fields come in a fixed order, so the state is
     // simply the position in the record. [`number`] parses each number from one word, and
     // [`text_field`] skips names and notes while counting their escapes. In each round the
@@ -304,7 +308,7 @@ fn join(data: &[u8], by_id: &[u8], group_count: usize, threads: usize) -> Vec<Gr
         let mut sent = vec![0; threads];
         for round in 0..rounds {
             let half = round % 2;
-            sent.fill(0);
+            (sent.iter_mut().enumerate()).for_each(|(to, s)| *s = mailbox(half, me, to) * MAILBOX);
             let round_end = end.min(at + ROUND_BYTES);
             while at < round_end {
                 // The records of a batch are parsed and posted first, and added to their groups
@@ -335,11 +339,10 @@ fn join(data: &[u8], by_id: &[u8], group_count: usize, threads: usize) -> Vec<Gr
                     // file instead (§2.1), which leaves `at` past the end and stops the loop.
                     at = dot + 4 + usize::from(data[dot + 3] == b'\r');
                     let to = ((u64::from(letter[3] as u32) * threads as u64) >> 32) as usize;
-                    let word = (mailbox(half, me, to) * MAILBOX + sent[to]) * 4;
-                    (0..4).for_each(|i| letters[word + i].store(letter[i], Relaxed));
-                    sent[to] += 1;
+                    (0..4).for_each(|i| boxes[sent[to]][i].store(letter[i], Relaxed));
                     let cents = if negative { -cents } else { cents };
-                    batch[parsed] = (region_id, word + 3, id, cents, name_len, note_len);
+                    batch[parsed] = (region_id, sent[to], id, cents, name_len, note_len);
+                    sent[to] += 1;
                     parsed += 1;
                 }
                 for &(region_id, top, id, cents, name_len, note_len) in &batch[..parsed] {
@@ -348,13 +351,15 @@ fn join(data: &[u8], by_id: &[u8], group_count: usize, threads: usize) -> Vec<Gr
                     let group = by_id.get(region_id as usize).map_or(0, |&g| g as usize);
                     // The group goes into the top 16 bits of the letter's last word, `top`,
                     // which no one reads before the barrier.
-                    letters[top].store(letters[top].load(Relaxed) | (group as u64) << 48, Relaxed);
+                    let top = &boxes[top][3];
+                    top.store(top.load(Relaxed) | (group as u64) << 48, Relaxed);
                     let record = [1, id as i64, cents, name_len, note_len, 0, cents, cents];
                     merge(&mut groups[group], &record);
                 }
             }
-            for (to, &count) in sent.iter().enumerate() {
-                counts[mailbox(half, me, to)].store(count as u64, Relaxed);
+            for (to, &next) in sent.iter().enumerate() {
+                let mb = mailbox(half, me, to);
+                counts[mb].store((next - mb * MAILBOX) as u64, Relaxed);
             }
             // The barrier. Its `Release` add passes this worker's letters on, and a waiter's
             // `Acquire` load that sees every worker's add sees every letter posted this round.
@@ -507,10 +512,9 @@ fn text_field(data: &[u8], at: usize) -> (Range<usize>, i64, usize) {
 fn name_letter(data: &[u8], Range { start, end }: Range<usize>) -> [u64; 4] {
     let len = end - start;
     let bytes: &[u8; 24] = data[start..].first_chunk().expect("the input is padded");
-    let words: [u64; 3] = std::array::from_fn(|i| {
-        let keep = len.saturating_sub(8 * i).min(8);
-        u64::from_le_bytes(bytes.as_chunks().0[i]) & ((1u128 << (8 * keep)) - 1) as u64
-    });
+    let keep = &KEEP.as_flattened()[24 - len.min(24)..];
+    let word = |b: &[u8], i| u64::from_le_bytes(b.as_chunks().0[i]);
+    let words: [u64; 3] = std::array::from_fn(|i| word(bytes, i) & word(keep, i));
     let mix = |h: u64, w: u64| (h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
     let h = words.iter().fold(len as u64, |h, &w| mix(h, w));
     let hash = (h ^ (h >> 32)) & 0xFFFF_FFFF;

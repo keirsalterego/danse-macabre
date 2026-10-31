@@ -29,6 +29,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 22 | 1 fewer line with the same machine code: the name set's probe names the hash once and takes the slot and the tag from it | run-af528e5f49cc | 0.0353 | 12.3 | 76.6 |
 | 23 | 17 fewer lines outside the record loop: each run's pages given back in two lines, rounded out to whole pages; the region rows cut, marked and written in one line each; and the rounds counted and the parts merged in one line each | run-d4936b9f2b5b | 0.0349 | 12.7 | 76.7 |
 | 24 | 1 fewer line: `main` maps both input files through one closure | run-b455f587cb61 | 0.0358 | 12.9 | 76.4 |
+| 25 | A name's letter masked to its length by a 24-byte window of a constant, and each letter posted at a running index into its owner's mailbox | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -673,7 +674,42 @@ step 23, interleaved, medians / minimums: 101 runs on seed 1, 39.30 / 38.16 → 
 hashes; the fuzz cases, the tiny seeds and the region sets give step 23's results; a missing
 input directory still stops with the file's path in the error.
 
+## Step 25: fewer instructions to build and post a letter
+
+Two cuts in the record loop on step 24:
+
+- `name_letter` keeps the first `len` bytes of a name by ANDing its three words with a 24-byte
+  window of `KEEP`, 24 bytes of ones and then 24 of zeros, taken from `24 - len` on. Each word
+  was masked by a shift of a `u128` by its own byte count, which took a clamp and a 128-bit
+  shift per word.
+- A worker keeps, for each owner, the index of its next letter in that owner's mailbox instead
+  of the number of letters it posted there this round. A letter's four stores, and the batch's
+  later write of its group, address the mailbox by that index alone, where each record
+  computed `(mailbox(half, me, to) * MAILBOX + sent[to]) * 4`. The counts come from the
+  indices once per round.
+
+`perf stat -r 10`, twice: instructions:u 1.667 → 1.594 G, 22 fewer per record, and cycles:u
+0.91 → 0.87 G. S 294 → 296. `ab.py` against step 24, 40 interleaved runs, medians / minimums:
+39.27 / 38.23 → 37.27 / 36.41 ms and 39.31 / 38.45 → 37.46 / 36.52 ms; in two earlier sessions,
+on a build that differed only in the type of the window, 39.23 / 38.56 → 37.33 / 36.55 ms and
+39.40 / 38.48 → 37.45 / 36.82 ms. memory.peak, 17 alternating rounds: medians 12.63 → 12.77 MB,
+means 12.84 → 12.69 MB, the same within this machine's spread. Correctness: the gate, 310 pass,
+0 fail; full seeds 1–7 and 10–12 give the reference hashes; the 402 fuzz cases pass at the
+default thread count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12
+and 64, where that build now asserts that no worker's index runs past its mailbox; the 300 tiny
+seeds pass at 10 thread counts with 100-byte rounds; of step 11's region sets, the one with
+shuffled ids passes, and the two with 689 and 692 countries stop with the error; clippy reports
+no warnings.
+
 ## Experiments that did not stay
+
+- **The empty name counted by its posters** (local, on step 25's code). Every record with an
+  empty name posts its letter to one owner, which then gets 11% more letters than the others
+  (306k against 273–277k at full scale) and marks for 0.4–0.5 ms longer. Each poster instead kept
+  one bit per country for the empty name, ORed together at the end. Not posting those letters
+  measured the same, 37.33 against 37.16 ms (`ab.py`, 40 interleaved runs, medians), and keeping
+  the bits in the batch loop, with or without a branch, cost 2.2–2.3 ms through the loop's
+  register allocation.
 
 - **The name slots written at allocation** (`[0].repeat(n)` instead of `vec![0; n]`, local, turbo
   off, on step 17), after track B found that a first load from a calloc'd page maps the shared
