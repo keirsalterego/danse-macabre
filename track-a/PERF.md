@@ -50,6 +50,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 43 | 4 fewer lines on cold paths: `Interner::new` instead of an `impl Default`, the format queue as a lazy iterator, and a new name's padded copy from `array::from_fn` | run-a6b1091911cb | 0.0192 | 18.7 | 85.4 |
 | 44 | 4 fewer lines in `summarize`: a chunk's start found through a one-line `newline` closure, and the format loop as one `for_each` over the queue | run-a6b1091911cb | 0.0192 | 18.7 | 85.4 |
 | 45 | 2 fewer lines with the same machine code: the build stage mounts its sources instead of copying them, and `insert` stays out of line by `#[cold]` alone | run-379b43c0200f | 0.0189 | 18.7 | 85.5 |
+| 46 | The input prefetched five lines ahead, `parse` out of line with a pointer for its loop, and the endpoint interner a static | | | | |
 
 ## Step 1: v1
 
@@ -658,8 +659,58 @@ byte-identical binaries. `insert` drops `#[inline(never)]`: `#[cold]` alone keep
 line. `.text` is byte-identical to step 44's, and `.rodata` differs only in the line numbers of
 27 panic locations, so T and M cannot move. S 363 → 361. Gate: 310 pass, 0 fail.
 
+## Step 46: the input prefetched, and `parse` on its own
+
+`parse` was inlined into the work closure, and its speed depended on where its loop landed. A
+change elsewhere in that function, or one that only moved the loop, raised the L1 misses by half,
+all on the input: `L1-dcache-load-misses:u` on seed 1 was 4.27 M for step 45, and 6.72–6.74 M both
+with `parse` out of line and with a change to `hour_index` alone, whose cycles:u rose 3.7–4.1%
+though they ran about 6.4 M fewer instructions (battery, `perf stat`, 40 interleaved runs, two
+rounds). Step 45's layout was the lucky one: the hardware prefetcher kept the input in L1 for it
+and not for the others. Five changes:
+
+- Each line prefetches the two cache lines from 384 bytes on (`_mm_prefetch` with `_MM_HINT_T0`),
+  about five lines ahead. With them the misses are 3.85 M in every layout tried: 3.85–3.86 M in a
+  copy whose `parse` an `#[inline(never)]` on `summarize_hour` moved 0x1b0 bytes on, and its
+  cycles:u matched too (346.6 and 346.1 M against 346.6 and 347.1 M).
+- `parse` is `#[inline(never)]`. The work closure realigns its stack to 32 bytes and so keeps `rbp`
+  as its frame pointer; out of line, the loop has `rbp` for itself.
+- The loop moves a pointer to the line instead of an index into the log: 9.7 M instructions fewer.
+- The status bit and a large latency are taken before the lookup, so fewer values live through it.
+- The interner is a static, `ENDPOINTS`, so its tables lie at fixed addresses: a probe loads no
+  pointer to them, and `parse` keeps no register for them: 9.6 M instructions fewer. A `OnceLock`
+  starts out nonzero, so the tables take 393 KB of `.data`; only the pages that are touched are
+  read in, as with the heap pages they took before. The static alone gained nothing on step 45's
+  code (see the experiments below): inlined into the work closure, the loop had no register to give
+  back.
+
+`parse` now has its own symbol, 0x8f1 bytes; the work closure shrank from 0x40ba to 0x36de bytes.
+
+On AC power (local, P-cores, turbo off), `ab.py`, 61 interleaved runs, four rounds, against step
+45: medians 20.33 → 19.73, 20.23 → 19.70, 20.21 → 19.70 and 20.25 → 19.74 ms (−2.5 to −3.0%),
+minimums 19.67 → 19.12, 19.43 → 19.07, 19.63 → 19.18 and 19.50 → 19.04 ms. Timed by fork, exec and
+wait, as the board's timer does, 41 runs, two rounds: medians 19.07 → 18.50 and 19.09 → 18.47 ms.
+Without the static, the other four changes measured 19.81, 19.83, 19.83 and 19.78 ms in the same
+rounds, and 18.66 and 18.66 ms by the second timer. Counters, measured on battery power, so only
+the counts compare (`perf stat`, 40 interleaved runs, two rounds): instructions:u 690.9 → 662.6 M
+(−4.1%), cycles:u medians 362.8 → 346.6 M and 363.0 → 347.1 M (−4.4%), minimums 351.2 → 326.9 M and
+347.7 → 328.3 M, L1-dcache-load-misses:u 4.27 → 3.85 M. memory.peak, five alternating rounds on
+seeds 1, 2, 3, 5, 7, 10 and 11: median 18.09 → 18.09 MB. S 361 → 367. Gate: 310 pass, 0 fail; full
+seeds 1–7 and 10–12 give the reference hashes; clippy reports no warnings.
+
 ## Experiments that did not stay
 
+- **Slots of 16 bits** (local, turbo off, on step 45's code): an id needs 12, so `AtomicU16` slots
+  halve the table to 16 KB. `ab.py`, 41 interleaved runs, two rounds: medians 20.25 → 20.44 and
+  20.19 → 20.38 ms. Not kept.
+- **Padded copies indexed by slot instead of by id** (battery, on step 45's code): a probe compares
+  the window with the copy at its own slot, without loading the id first, and the hour pass maps
+  ids to slots. The copies then take 512 KB, 128 pages, against 256 KB: DTLB misses that hit the
+  STLB 1.9 → 4.8 M a run, and cycles:u +1.5–2%. Not kept.
+- **The record written through a moving pointer** instead of at `records[count]` (battery, on an
+  early form of step 46): 3.0 M instructions fewer, no fewer cycles, for 2 more lines. Not kept.
+- **The status bit and the latency merged into one value before the lookup** (battery, on an early
+  form of step 46): 6.3 M instructions more. Not kept.
 - **Hours summarized during the parse, for a lower peak** (local, turbo off, on step 45's code).
   The log went out in 72 pieces of about an hour each, in file order. An hour was summarized and
   its records freed as soon as every piece from the one before its first line to the one after

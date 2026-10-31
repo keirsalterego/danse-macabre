@@ -176,7 +176,7 @@ fn map(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32) -> std::io::Re
 /// with its message, so the others never wait forever for it at a barrier. That is how the
 /// rare errors a worker can meet end the run: failing to create the output file, or input
 /// that breaks a guarantee of the spec, which we otherwise rely on without checking.
-fn summarize(log: &[u8], out_path: &Path) {
+fn summarize(log: &'static [u8], out_path: &Path) {
     let threads = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let len = log.len() - LINE;
     // Chunk t starts at the last line start at or before byte `len * t / threads`, so
@@ -188,11 +188,11 @@ fn summarize(log: &[u8], out_path: &Path) {
     // give out as they parse, and the ids in output order.
     let chunks: Vec<OnceLock<Chunk>> = (0..threads).map(|_| OnceLock::new()).collect();
     let hours: Vec<OnceLock<Hour>> = (0..HOURS).map(|_| OnceLock::new()).collect();
-    let (all, sorted) = (Interner::new(), OnceLock::new());
+    let (all, sorted) = (&ENDPOINTS, OnceLock::new());
     let (plan, places, barrier) = (OnceLock::new(), OnceLock::new(), Barrier::new(threads));
     let (taken, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let work = |t: usize| {
-        let _ = chunks[t].set(parse(log, start(t)..start(t + 1), &all));
+        let _ = chunks[t].set(parse(log, start(t)..start(t + 1)));
         // One thread, the barrier's leader, plans the hour pass while the others wait.
         if barrier.wait().is_leader() {
             let mut runs: Vec<Vec<Run>> = vec![Vec::new(); HOURS];
@@ -341,7 +341,7 @@ struct Chunk {
 /// latencies (see [`Chunk`]).
 const LARGE: u32 = (1 << 19) - 1;
 
-/// Parses one chunk of whole lines into records, with the endpoints' ids from `endpoints`.
+/// Parses one chunk of whole lines into records, with the endpoints' ids from [`ENDPOINTS`].
 ///
 /// The spec guarantees well-formed input (§2), so we locate fields by fixed offsets and single
 /// byte checks instead of validating them. No field is scanned byte by byte. Once [`line_end`]
@@ -356,11 +356,16 @@ const LARGE: u32 = (1 << 19) - 1;
 /// | latency   | the digits between `space` and the LF                            |
 ///
 /// Here `space` is the last space of the line, which [`latency`] finds.
-fn parse<'a>(log: &'a [u8], lines: Range<usize>, endpoints: &Interner<'a>) -> Chunk {
+///
+/// The function stays out of line. Inlined into the work closure, whose stack frame is aligned
+/// to 32 bytes, the loop lost `rbp` to the frame pointer and kept more of its values on the stack.
+#[inline(never)]
+fn parse(log: &'static [u8], lines: Range<usize>) -> Chunk {
+    use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
     // A run lasts while the timestamp's bytes 5 to 12, `MM-DDTHH`, stay the same, so most lines
     // compare those 8 bytes and decode nothing. No line's bytes are all zero, so line 0 starts a
     // run.
-    let (mut chunk, mut count, mut current, mut i) = (Chunk::default(), 0, 0, lines.start);
+    let (mut chunk, mut count, mut current) = (Chunk::default(), 0, 0);
     // Every line takes at least MIN_LINE bytes. The records start out zero, which costs nothing
     // until a page is written, and the unused tail is cut off at the end. The large latencies
     // get the same room, so their list never grows: each step of growth left the old buffer
@@ -368,11 +373,21 @@ fn parse<'a>(log: &'a [u8], lines: Range<usize>, endpoints: &Interner<'a>) -> Ch
     chunk.records = vec![0; lines.len() / MIN_LINE + 1];
     chunk.large = Vec::with_capacity(lines.len() / MIN_LINE + 1);
     assert!(lines.end + LINE <= log.len(), "map_file pads the log");
-    while i < lines.end {
-        // SAFETY: i < lines.end, so the LINE bytes from i lie inside `log` (asserted above).
-        let line: &[u8; LINE] = unsafe { &*log.as_ptr().add(i).cast() };
+    // The loop moves a pointer to the line, not an index into `log`: one register fewer.
+    let (mut at, end) = (log[lines.start..].as_ptr(), log[lines.end..].as_ptr());
+    while at < end {
+        // How well the hardware prefetcher kept the input in L1 depended on where the loop's
+        // code landed: a change elsewhere in its function could raise the misses by half
+        // (`PERF.md`, step 46). So we ask for the two cache lines from 384 bytes on, about five
+        // lines ahead.
+        // SAFETY: a prefetch never faults, whatever the address.
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(at.wrapping_add(384).cast()) };
+        // SAFETY: the same.
+        unsafe { _mm_prefetch::<_MM_HINT_T0>(at.wrapping_add(448).cast()) };
+        // SAFETY: at < end, so the LINE bytes from `at` lie inside `log` (asserted above).
+        let line: &[u8; LINE] = unsafe { &*at.cast() };
         let lf = line_end(line);
-        i += lf + 1;
+        at = at.wrapping_add(lf + 1);
         if word(line, 5) != current {
             let hour = hour_index(line).expect("timestamps lie in the 72 hours (§2)");
             chunk.runs.push((hour, count, chunk.large.len()));
@@ -383,14 +398,15 @@ fn parse<'a>(log: &'a [u8], lines: Range<usize>, endpoints: &Interner<'a>) -> Ch
         let start = 32 + (!word(line, 31) & 0x4040_4040_4040_4040).trailing_zeros() as usize / 8;
         // `space` precedes the latency; before it sit the 3-digit status and its own space.
         let (mut micros, space) = latency(line, lf);
-        let name = &line[start..space - 4];
-        let window = line[start..start + 64].try_into().expect("start <= 40");
-        let id = endpoints.intern(name, hash(name, word(line, start)), window);
+        // The status and a large latency come before the lookup, so fewer values live through it.
         // Errors are exactly 500..=599, so the status's first digit decides.
         let error = u32::from(line[space - 3] == b'5');
         // A large latency goes on the side list, and its field holds LARGE in its place.
         (micros >= LARGE).then(|| chunk.large.push(std::mem::replace(&mut micros, LARGE)));
-        // SAFETY: each line moves `i` on by at least MIN_LINE bytes, malformed or not, since
+        let name = &line[start..space - 4];
+        let window = line[start..start + 64].try_into().expect("start <= 40");
+        let id = ENDPOINTS.intern(name, hash(name, word(line, start)), window);
+        // SAFETY: each line moves `at` on by at least MIN_LINE bytes, malformed or not, since
         // `line_end` starts looking at byte MIN_LINE - 1, so `count` stays below the length the
         // records were given.
         unsafe { *chunk.records.get_unchecked_mut(count) = id << 20 | error << 19 | micros };
@@ -531,13 +547,13 @@ fn hash(name: &[u8], first: u64) -> u64 {
 struct Interner<'a> {
     /// The table. A slot holds `id + 1`, so that 0 can mark an empty slot. Its size is part of
     /// its type, so a probe needs no bounds check: 0.9% fewer instructions in the parse.
-    slots: Box<[AtomicU32; 2 << 12]>,
+    slots: [AtomicU32; 2 << 12],
     /// Id → name. Names borrow the mapped file, so none are copied.
-    names: Box<[OnceLock<&'a [u8]>]>,
+    names: [OnceLock<&'a [u8]>; 1 << 12],
     /// Id → the name and the space after it, zero-padded to 64 bytes, for the probes of
     /// [`Interner::intern`]. A name of 64 bytes or more has no room for the space and keeps only
     /// its first 64 bytes.
-    padded: Box<[std::cell::UnsafeCell<std::mem::MaybeUninit<Padded>>]>,
+    padded: [std::cell::UnsafeCell<std::mem::MaybeUninit<Padded>>; 1 << 12],
     /// How many names have an id; the lock that adding a name takes.
     count: Mutex<usize>,
 }
@@ -546,6 +562,12 @@ struct Interner<'a> {
 // written once, under the lock, before its id goes into a slot (`Interner::insert`), and read
 // only through an id loaded from a slot with `Acquire`, or after the parse.
 unsafe impl Sync for Interner<'_> {}
+
+/// The endpoints' interner. As a static, its tables lie at fixed addresses, and a probe loads
+/// no pointer to them first: 3 instructions fewer per line. A `OnceLock` starts out nonzero, so
+/// the tables take 393 KB of `.data` in the binary instead of `.bss`; a page of it is read in only
+/// when touched, like the heap pages the tables took before.
+static ENDPOINTS: Interner<'static> = Interner::new();
 
 /// A padded copy, aligned to one cache line. The allocator aligns the table to 16 bytes, so
 /// each copy used to span two lines, and every probe loaded both: 16% of the L1 misses.
@@ -557,14 +579,12 @@ struct Padded([u8; 64]);
 // allowed in `Cargo.toml`); `insert` stays out of line.
 impl<'a> Interner<'a> {
     /// An empty table. The tables never grow: lookups index them while other threads add names.
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
-            slots: Box::new([const { AtomicU32::new(0) }; 2 << 12]),
-            names: (0..1 << 12).map(|_| OnceLock::new()).collect(),
-            // SAFETY: a `MaybeUninit` needs no initialization. A zeroed block aligned to 64 bytes
-            // would be written with zeros by the allocator; this one takes memory only as copies
-            // are written to it.
-            padded: unsafe { Box::new_uninit_slice(1 << 12).assume_init() },
+            slots: [const { AtomicU32::new(0) }; 2 << 12],
+            names: [const { OnceLock::new() }; 1 << 12],
+            // SAFETY: the copies are `MaybeUninit`, which needs no initialization.
+            padded: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
             count: Mutex::new(0),
         }
     }
