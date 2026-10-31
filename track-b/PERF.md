@@ -918,6 +918,7 @@ The board's run, run-ce4c2e1d13c6, drew 134.2 ms against 131.3 ms for step 35's,
 in the same run, track C's unchanged code drew 60.1 ms, against its usual 27 ms.
 A second run of the same commit, run-fa751616d535, drew 169.1 ms and 39.9 MB, while track C's
 unchanged code drew its usual 27.2 ms in it, so this draw was slow for B alone.
+A third, run-ab34f37502a1, drew 131.2 ms and 42.6 MB.
 
 ## Experiments that did not stay
 

@@ -39,7 +39,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 32 | The name set's probe ends at its entry's line, so a hit's index is checked once, and the test for a long name moves into the cold compare | run-4ca7cce6e305 | 0.0303 | 11.9 | 78.4 |
 | 33 | The join's threads build the region table themselves, in two steps behind the round barrier, instead of on a pool of its own followed by two serial passes, with its pages mapped in on one CPU first; and the name sets are never freed | run-45ab2da93bdb | 0.0291 | 12.2 | 78.7 |
 | 34 | The amount parses as one number in cents, every number finds its stop as its first byte below `0`, the BOM test reads the id's word, a letter's stores read `sent[to]` once, the batch is made once per worker, and the input is prefetched 448 bytes ahead | run-91b80b654f7a | 0.0269 | 12.2 | 79.4 |
-| 35 | The region id and the amount parse together in one SSE vector, the name and the note come from one mask of quotes and commas whose prefix XOR marks the quoted bytes, the name hash is CRC32, the name set's key stays in one AVX2 register, and a letter's slot is read unchecked | | | | |
+| 35 | The region id and the amount parse together in one SSE vector, the name and the note come from one mask of quotes and commas whose prefix XOR marks the quoted bytes, the name hash is CRC32, the name set's key stays in one AVX2 register, and a letter's slot is read unchecked | run-6252826712db | 0.0252 | 12.9 | 79.3 |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1048,6 +1048,10 @@ noted:
 - The probe's slots read without bounds checks: instructions −0.3%, cycles +0.3%.
 - The slow text path counting its quotes byte by byte, which takes fewer lines (on AC power, on
   the final code): instructions +1.3%, cycles +1.5%; 2% of the records is enough for that.
+
+The board's run, run-6252826712db, drew 25.2 ms against 27.2 ms for step 34's second run,
+run-835b63d0f252, and 26.9 ms for its first: −6 to −7%, less than the −10% measured here, while
+the 61 more lines cost about as many points as 5% of T.
 
 ## Experiments that did not stay
 

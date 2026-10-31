@@ -811,7 +811,8 @@ alternating rounds on seeds 1, 2, 3, 5, 7, 10 and 11: median 18.34 → 18.24 MB.
 
 The board's run, run-9a8d6161d86a, drew 23.5 ms, a slow draw: in the same run, track C's unchanged
 code drew 60.1 ms, against its usual 27 ms, and track D's 135.9 ms, against 122 to 127 ms.
-A second run of the same commit, run-65986567a603, drew 17.9 ms.
+A second run of the same commit, run-65986567a603, drew 17.9 ms, and a third, run-148a82d5f70d,
+17.6 ms.
 
 ## Experiments that did not stay
 
