@@ -44,7 +44,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 37 | 5 fewer lines with the same machine code: the hour sizes summed inside `sort_by_cached_key`, the name hash's two cases as a `match`, and `same_name` folded into its one caller | run-9fe0786e93d3 | 0.0195 | 18.3 | 85.1 |
 | 38 | A large latency's record field set in the branch that lists it, instead of by a `min` on every line | run-e44188ffe025 | 0.0197 | 18.5 | 84.9 |
 | 39 | 5 fewer lines with the same machine code: the running sum of the hour's counts as one `for_each`, and a large latency listed and replaced by `LARGE` in one `bool::then` | run-89adcd077219 | 0.0196 | 18.4 | 85.1 |
-| 40 | A plain static executable instead of a static PIE (`relocation-model=static`) | | | | |
+| 40 | A plain static executable instead of a static PIE (`relocation-model=static`) | run-ebf9f6a49ad5 | 0.0190 | 17.9 | 85.5 |
 
 ## Step 1: v1
 
