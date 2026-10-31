@@ -950,7 +950,9 @@ bounds checks a few percent each. The cuts, each measured as instructions:u and 
   (the quote masks' 64-byte loads and the number words). With the prefetch, L1 misses 10.11 →
   9.39 M, instructions +0.5% and cycles −1.1% (40 interleaved runs); 384 bytes ahead, −1.0%.
 
-Measured on battery power, so wall time is not comparable and no `ab.py` number is given (local,
+On AC power again (profile `performance`, turbo off), `ab.py`, 41 interleaved runs, two
+rounds: medians 32.26 and 32.15 → 29.84 and 29.81 ms, minimums 31.34 and 31.29 → 29.13 and
+28.96 ms, 7.1 to 7.5% faster. The counters were measured on battery power before that (local,
 P-cores): `perf stat`, 40 interleaved runs, two rounds, instructions:u 1418.0 → 1271.2 M (−10.4%),
 cycles:u medians 768.5 → 703.0 M and 764.2 → 699.1 M (−8.5%), minimums 758.3 → 694.4 M and
 754.6 → 694.1 M. memory.peak, 30 alternating runs: medians 12.01 → 11.96 MiB, the highest of 5
