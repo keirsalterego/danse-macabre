@@ -45,6 +45,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 38 | The last worker to finish merges the groups, writes the output and ends the process while the others sleep, so no thread ends first, and each worker gives back its name set's entries after its run; and `main` is C's, so the Rust runtime's setup, whose stack-overflow handler gave every thread a signal stack, does not run | run-490c7c238e52 | 0.0235 | 12.1 | 80.3 |
 | 39 | The name's 24 bytes, the region id's and the amount's 16 and the byte after the cents are read without bounds checks, a name set's slot holds its entry above its tag, the quotes are counted with `bzhi`, a CR is told from an LF by its lowest bit, the region id's length takes one compare, and the marking takes its group unchecked | run-d0d0e233e6f7 | 0.0228 | 12.5 | 80.5 |
 | 40 | `number` reads a field's word without a bounds check, as an `unsafe fn` whose six calls each show that the 8 bytes lie in the input or its pad, and the BOM test reads its byte unchecked | run-d1b2c0ca269e | 0.0240 | 12.2 | 80.1 |
+| 41 | A name is known by a 128-bit hash of its bytes, three AES rounds: a letter is 16 bytes instead of 32 and is posted with one store, and a name set's entry is 40 bytes instead of 64, 64 bits of the hash beside the name's group bits | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1408,6 +1409,43 @@ interleaved runs:
 The board's run, run-d1b2c0ca269e (commit ca86ea9), drew 24.0 ms, a slow draw: step 39's code drew
 22.8 ms in its own run, and this step runs 0.8–1.4% faster locally. A second run of the same code,
 run-604f816aac75 (commit 0327cbc, which changed only track A), drew 22.76 ms, 12.5 MB and 80.5 points.
+
+## Step 41: a name known by its hash
+
+Until step 40, a letter carried the name's first 24 bytes, a CRC32 and the length, 32 bytes,
+and a longer name as its offsets in the file, and an owner's entry for a name was a 64-byte
+cache line: that 32-byte key and 32 bytes of group bits. At full scale the ~100k entries took
+6.4 MB, about half of memory.peak.
+
+- **The letter is a hash.** `name_letter` reads the name's 32 bytes as two 16-byte blocks, `a`
+  and `b`, masked to its length (names hold no NUL byte, §2.2, so the blocks are one to one with
+  the name), and hashes them in three instructions, `aesenc(aesenc(aesenc(a, b), KEY), KEY)`.
+  The record's group goes into the hash's top byte. A name over 32 bytes, which no generated
+  input has, takes the cold `long_letter`.
+- **One store per letter.** The 16 bytes go to the mailbox in one store, where the two atomic
+  stores took 7 more instructions per record.
+- **The entry is 40 bytes.** A slot holds the entry's number and 8 bits of the hash, so a probe
+  loads an entry only when they match. The entry holds 64 more bits of the hash, the key, beside
+  the 256 group bits. Two names are taken for one only if those 72 bits agree: with about 8,400
+  names per worker, a run merges two names with odds of about 1 in 10^13.
+
+Built up on step 39's code (`perf stat`, 20 interleaved runs, against step 39): the hash and the
+40-byte entries, instructions −4.3%, cycles −3.0%; with the one store, −6.8% and −3.7%. Kept
+apart, as an array of keys and an array of group bits, the marking took 21% more L1 misses and
+the runs 0.6% longer; 48-byte entries ran slower than 40-byte ones. Four round keys instead of
+one, with `a` and `b` passed through as many rounds, took five instructions and a table of nine
+lines, and gained nothing for names that no adversary chose.
+
+Local, against step 40 (`ab.py`, 41 interleaved runs on the P-cores, four rounds; the first three
+with a browser busy on one P-core, so the minimums are the steadier figures): medians 25.63,
+27.68, 24.22 and 24.81 → 24.69, 25.67, 23.10 and 23.68 ms (−3.7%, −7.3%, −4.6% and −4.6%),
+minimums 24.17, 24.30, 23.87 and 24.32 → 22.92, 23.16, 22.69 and 23.22 ms (−5.2%, −4.7%, −4.9%
+and −4.5%). `perf stat`: instructions:u 909.4 → 852.6 M (−6.3%, 274 → 257 per record).
+memory.peak, 80 alternating runs: median 12.34 → 10.88 MiB, expected highest of five 12.91 →
+11.06 MiB. S 393 → 381. Correctness: the gate, 310 pass, 0 fail; full seeds 1–7 and 10–12 give
+the reference hashes; the fuzz and thread-count suite, 3,000 cases, and the 30 edge-case files
+pass; of the wide region sets, w2 gives the reference, and w0 and w1 stop with the error as
+before; clippy reports no warnings.
 
 ## Experiments that did not stay
 

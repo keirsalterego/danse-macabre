@@ -40,17 +40,19 @@
 //!    with no loop over their digits.
 //! 4. **Each distinct name belongs to one thread.** The name's hash picks its owner, and each
 //!    thread keeps the names it owns in a [`NameSet`] that no other thread touches: a hash table
-//!    whose entry for a name holds the name's bytes and a bitset with one bit per country, on
-//!    one cache line. A record's name usually comes from another thread's run, so the threads
-//!    trade names in rounds. In each round a thread parses 64 KiB of its records and posts each
-//!    record's name and group to the name's owner as a 32-byte letter (see [`name_letter`]).
-//!    All threads then meet at a barrier, and each reads the letters posted to it and sets the
-//!    bits (see [`join`]). A bit that goes from 0 to 1 is a name new to that country, so the
-//!    counts come out of the marking with no pass over the tables afterwards.
+//!    whose entry for a name holds 64 bits of the name's hash and a bitset with one bit per
+//!    country. A record's name usually comes from another thread's run, so the threads trade
+//!    names in rounds. In each round a thread parses 64 KiB of its records and posts each
+//!    record's name and group to the name's owner as a 16-byte letter, the name's 128-bit hash
+//!    with the group in its top byte (see [`name_letter`]). All threads then meet at a barrier,
+//!    and each reads the letters posted to it and sets the bits (see [`join`]). A bit that goes
+//!    from 0 to 1 is a name new to that country, so the counts come out of the marking with no
+//!    pass over the tables afterwards.
 //!
-//!    Names are compared still escaped. Escaping is one to one, so two raw names differ exactly
+//!    Names are hashed still escaped. Escaping is one to one, so two raw names differ exactly
 //!    when their unescaped values do, and the quoted empty name `""` and the unquoted one are
-//!    both the empty slice.
+//!    both the empty slice. A name is known by its hash alone: two names count as one only if 72
+//!    bits of their hashes agree, which a run's names do with odds of about 1 in 10^13.
 //!
 //!    This replaced one lock-free table that all threads shared. There, each record's lookup
 //!    missed the cache on a line that other cores also wrote, and set its bit with an atomic OR.
@@ -63,22 +65,23 @@
 //! # Memory
 //!
 //! The input is mapped and never copied (see [`map_file`]). What the program allocates is
-//! mostly the name sets, about 6.4 MB of entries (one 64-byte line for each of ~100k names) and
-//! 0.8 MB of slots at full scale, then about 1.2 MB of mailbox pages that the rounds touch and
+//! mostly the name sets, about 4.0 MB of entries (40 bytes for each of ~100k names) and 0.8 MB
+//! of slots at full scale, then about 1.2 MB of mailbox pages that the rounds touch and
 //! the 1 MB array from region id to group. Every buffer of 64 KiB or more gets its own mapping,
 //! so a freed buffer returns its pages at once, and transparent huge pages are off (see
 //! [`main`]).
 //!
 //! # What the code relies on
 //!
-//! The parser implements the grammar of spec §2.1. It relies on §2.2 in one place: an LF inside
+//! The parser implements the grammar of spec §2.1. It relies on §2.2 in two places: an LF inside
 //! a note is followed by a lowercase word or a quote, never by a digit or a BOM, which is what
-//! makes the run starts exact. It relies on §2.3, where country codes are `[A-Z]{3}` and there
-//! are 240 countries (more than 255 stop the join with an error), and on §3, where `id_sum` and
-//! `amount_sum` fit in 64 bits. The name pool of §2.2 and the sizes in §5 only set the name
-//! sets' starting sizes, and §2.2's bounds on region ids and amounts only size the window of
-//! [`region_amount`]: a field past them takes a slower path. Records outside the §2.1 grammar are
-//! not validated.
+//! makes the run starts exact, and a name holds no NUL byte, so that its bytes padded with zeros
+//! stand for it in its hash (see [`name_letter`]). It relies on §2.3, where country codes are
+//! `[A-Z]{3}` and there are 240 countries (more than 255 stop the join with an error), and on §3,
+//! where `id_sum` and `amount_sum` fit in 64 bits. The name pool of §2.2 and the sizes in §5 only
+//! set the name sets' starting sizes, and §2.2's bounds on region ids and amounts only size the
+//! window of [`region_amount`]: a field past them takes a slower path. Records outside the §2.1
+//! grammar are not validated.
 
 #![no_main]
 
@@ -91,7 +94,7 @@ use std::{fs::write, io::Write, ops::Range, os::fd::AsRawFd, path::Path, thread,
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 /// Zero bytes that [`map_file`] puts after the last byte of each file. Every position a parse
 /// reaches lies before them, so the fixed-size reads of [`number`] (8 bytes), [`region_amount`]
-/// (16), [`name_letter`] (24) and [`byte_mask`] (64) always fit in the input, and none of them
+/// (16), [`name_letter`] (32) and [`byte_mask`] (64) always fit in the input, and none of them
 /// needs a shorter path for its end.
 const PAD: usize = 64;
 /// Bytes of its run a worker parses per round before the workers swap names. Small rounds keep
@@ -100,22 +103,27 @@ const ROUND_BYTES: usize = 64 << 10;
 /// Letters one worker can post to another in one round: one per record that starts in the
 /// round, and a record takes at least 11 bytes (`1,,,1,0.00` and its LF), so no round fills a
 /// mailbox. The pages of a mailbox that no round reaches are never touched, so they cost address
-/// space only. The count is rounded up to whole 4 KiB pages so that each mailbox starts a page:
-/// a round posts about 90 letters to each owner, which then fill part of one page, where
-/// mailboxes that started mid-page mostly touched two and peaked 1.7 MiB higher.
-const MAILBOX: usize = (ROUND_BYTES / 11 + 1).next_multiple_of(128);
+/// space only. The count is rounded up to whole 4 KiB pages, of 256 letters of 16 bytes, so that
+/// each mailbox starts a page: a round posts about 90 letters to each owner, which then fill part
+/// of one page, where mailboxes that started mid-page mostly touched two and peaked 1.7 MiB
+/// higher.
+const MAILBOX: usize = (ROUND_BYTES / 11 + 1).next_multiple_of(256);
 /// Spins of a worker that waits at the barrier before it starts to sleep (see [`barrier`]).
 const SPINS: usize = 2000;
 /// The country codes. They are `[A-Z]{3}` (spec §2.3), so a code read as a base-26 number is
 /// below 26³, and that number sorts like the code's bytes.
 const CODES: usize = 26 * 26 * 26;
-/// The length field of a letter whose name is longer than the 24 bytes a letter holds.
-const LONG: u64 = 0xFFFF;
-/// 24 bytes of ones, then 24 zeros. The 24 bytes from `24 - len` on are the mask that keeps the
+/// 32 bytes of ones, then 32 zeros. The 32 bytes from `32 - len` on are the mask that keeps the
 /// first `len` bytes of a name (see [`name_letter`]).
-const KEEP: [[u8; 24]; 2] = [[!0; 24], [0; 24]];
+const KEEP: [[u8; 32]; 2] = [[!0; 32], [0; 32]];
+/// The round key of the name hash's last two rounds (see [`name_letter`]), the first 32 hex
+/// digits of π's fraction. Any constant whose four 4-byte columns differ would do, and one key
+/// serves both rounds: four keys took a table of nine lines and gained nothing for names that no
+/// adversary chose.
+// SAFETY: `u128` and `__m128i` are both 16 bytes, and every bit pattern is a valid one.
+const KEY: __m128i = unsafe { std::mem::transmute(0x243F_6A88_85A3_08D3_1319_8A2E_0370_7344_u128) };
 /// The largest entry number a slot holds. A slot's top 24 bits are its entry's index plus 1, so
-/// that 0 is an empty slot, and its low 8 bits are bits 20 to 27 of the name's hash, so a probe
+/// that 0 is an empty slot, and its low 8 bits are the name's tag, byte 14 of its hash, so a probe
 /// that passes a different name usually skips its entry without loading it. With the number on
 /// top, one shift takes it out and the bits compare as a byte: with the bits on top, a mask for
 /// each took one more instruction per probe and one more per letter.
@@ -266,7 +274,7 @@ fn region_rows(csv: &[u8], share: usize, shares: usize, mut row: impl FnMut(usiz
 /// # The exchange
 ///
 /// The workers hand each name to the worker that owns it through mailboxes, `[half][from][to]`,
-/// of [`MAILBOX`] letters of four words each (see [`name_letter`]), and `counts` says how many
+/// of [`MAILBOX`] letters of two words each (see [`name_letter`]), and `counts` says how many
 /// letters each holds this round. There are two sets of mailboxes, one per parity of the round.
 /// In round r a worker posts into set r % 2, which nobody reads at that time: the set was last
 /// read in round r - 2, and every worker finished reading it before it arrived at the barrier of
@@ -289,11 +297,11 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
     let rounds = (bounds.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0)).div_ceil(ROUND_BYTES);
     // SAFETY: `AtomicU64` has the same layout as `u64`, and all-zero bits are a valid 0.
     let zeroed = |len| unsafe { Box::<[AtomicU64]>::new_zeroed_slice(len).assume_init() };
-    let letters = zeroed(2 * threads * threads * MAILBOX * 4);
+    let letters = zeroed(2 * threads * threads * MAILBOX * 2);
     let (counts, arrived) = (zeroed(2 * threads * threads), AtomicU64::new(0));
     let mailbox = |half: usize, from: usize, to: usize| (half * threads + from) * threads + to;
-    let mail = |mb: usize| &letters[mb * MAILBOX * 4..][..counts[mb].load(Relaxed) as usize * 4];
-    let boxes = letters.as_chunks::<4>().0;
+    let mail = |mb: usize| &letters[mb * MAILBOX * 2..][..counts[mb].load(Relaxed) as usize * 2];
+    let boxes = letters.as_chunks::<2>().0;
     // The region table (see above): the codes that occur, as bits, and the group of each id.
     let last_row = (regions[..regions.len() - PAD - 1].iter()).rposition(|&b| b == b'\n');
     // SAFETY: the LF lies before the pad, so the 8 bytes past it end inside the pad.
@@ -383,8 +391,9 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
                         (id, comma) = unsafe { number(data, at + BOM.len(), b',') };
                     }
                     let (name, name_len, note_len, after_note) = text_fields(data, comma + 1);
-                    // SAFETY: `text_fields` has read the 64 bytes from `comma + 1` on, its first
-                    // window, and the name starts there or one byte later, past its quote.
+                    // SAFETY: the name ends at the latest at the comma after it, which
+                    // `text_fields` found. The 64 bytes of the pad are zeros, so the comma lies
+                    // before them, and the name ends more than 64 bytes before the end of `data`.
                     let letter = unsafe { name_letter(data, name) };
                     // SAFETY: `after_note` is one past a comma of the input. The 64 bytes of the
                     // pad are zeros, so the comma lies before them, and the 16 bytes from it on
@@ -404,13 +413,19 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
                     at = dot + 4 + usize::from(unsafe { *data.get_unchecked(dot + 3) } & 1);
                     // The thread count as `sent.len()`: `threads`, read through the closure's
                     // reference to it, took one more load per record.
-                    let to = ((u64::from(letter[3] as u32) * sent.len() as u64) >> 32) as usize;
-                    // Read once, because the four stores made the compiler load `sent[to]` again
-                    // for each, and unchecked, which saves its bounds check.
+                    let to = ((u64::from(letter[1] as u32) * sent.len() as u64) >> 32) as usize;
+                    // Read once, because the compiler loaded `sent[to]` again for each of the four
+                    // atomic stores that posted a letter (PERF.md, step 34), and unchecked, which
+                    // saves its bounds check.
                     // SAFETY: the hash is below 2^32, so `to` is below `sent.len()`.
                     let sent = unsafe { sent.get_unchecked_mut(to) };
                     let slot = *sent;
-                    (0..4).for_each(|i| boxes[slot][i].store(letter[i], Relaxed));
+                    // One 16-byte store. The compiler does not merge atomic stores, and the two
+                    // that posted the letter took 7 more instructions per record (PERF.md, step
+                    // 41).
+                    // SAFETY: the letter's atomics are writable through a shared reference, and
+                    // no other thread reads or writes them before the barrier.
+                    unsafe { std::ptr::write(boxes[slot].as_ptr().cast_mut().cast(), letter) };
                     batch[parsed] = (id, region_id, cents, note_len, name_len, &boxes[slot]);
                     *sent = slot + 1;
                     parsed += 1;
@@ -419,13 +434,13 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
                     // Records also reference ids past the table's largest (§2.2), so the lookup
                     // is bounds-checked; those ids are unmatched like the holes inside the table.
                     let group = by_id.get(region_id as usize).map_or(0, |&g| g as usize);
-                    // The group goes into byte 30 of the letter, bits 48 to 55 of its last word,
-                    // which `name_letter` left 0. Storing the byte alone takes one instruction and
-                    // no load, where the OR into the word took three.
+                    // The group goes into byte 15 of the letter, the top byte of its hash, which
+                    // no owner reads as hash (see [`NameSet`]). Storing the byte alone takes one
+                    // instruction and no load, where an OR into the word took three.
                     let byte = std::ptr::from_ref(top).cast_mut().cast::<u8>();
                     // SAFETY: the byte is inside the letter's atomics, writable through a shared
                     // reference, and no other thread reads or writes them before the barrier.
-                    unsafe { byte.add(30).write(group as u8) };
+                    unsafe { byte.add(15).write(group as u8) };
                     let record = [1, id as i64, cents, name_len, note_len, 0, cents, cents];
                     // SAFETY: `by_id` holds 0 or a number from step 1, below `group_count`, the
                     // length of `groups`. The bounds check took two instructions per record.
@@ -438,24 +453,25 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
             }
             barrier(&arrived, (round + 3) * threads);
             for from in 0..threads {
-                names.read(mail(mailbox(half, from, me)), data, &mut groups);
+                names.read(mail(mailbox(half, from, me)), &mut groups);
             }
         }
         // The run's pages go back to the kernel with `madvise(MADV_DONTNEED)`, and then the name
         // set's entries. At exit the kernel unmaps every page left on one thread, inside the timed
-        // window: the input's took 2.8 ms (an explicit `munmap`), and the 6.4 MB of entries 0.4 ms
-        // (PERF.md, step 38), so each worker drops its own here, in parallel. Every worker is done
-        // parsing by the last barrier, and with its name set after its last round; dropping pages
-        // earlier would slow the threads still parsing, because it makes the kernel flush every
-        // thread's TLB. The set is at its largest here, so memory.peak has counted its pages.
+        // window: the input's took 2.8 ms (an explicit `munmap`), and the entries 0.4 ms when they
+        // were 6.4 MB (PERF.md, step 38), so each worker drops its own here, in parallel. Every
+        // worker is done parsing by the last barrier, and with its name set after its last round;
+        // dropping pages earlier would slow the threads still parsing, because it makes the kernel
+        // flush every thread's TLB. The set is at its largest here, so memory.peak has counted its
+        // pages.
         let page = bounds[me] & !4095;
         // SAFETY: `data` is the read-only file mapping from [`map_file`], which starts a page,
         // and the range, rounded out to whole pages, stays inside the file's pages. A dropped
-        // page that is read again, such as the end of the run before or a long name that an
-        // owner still compares, maps the same bytes from the file, so the call is only advice
-        // and its result is ignored. Advice 4 is `MADV_DONTNEED`.
+        // page that is read again, such as the end of the run before, maps the same bytes from
+        // the file, so the call is only advice and its result is ignored. Advice 4 is
+        // `MADV_DONTNEED`.
         unsafe { madvise(data[page..].as_ptr(), bounds[me + 1] - page, 4) };
-        let (at, len) = (names.lines.as_ptr().addr(), size_of_val(&*names.lines));
+        let (at, len) = (names.entries.as_ptr().addr(), size_of_val(&*names.entries));
         let start = std::ptr::without_provenance(at.next_multiple_of(4096));
         // SAFETY: the range is the whole pages inside the entries, which hold no other buffer's
         // bytes, and no entry is read again. The set itself is never freed: its `munmap` calls,
@@ -749,63 +765,102 @@ fn byte_mask(data: &[u8], at: usize, byte: u8) -> u64 {
     u64::from(half(0).cast_unsigned()) | u64::from(half(32).cast_unsigned()) << 32
 }
 
-/// A letter for the name at `start..end` of `data`, without its group, which the poster writes
-/// to byte 30: the name's bytes as three little-endian words zero-padded to 24 bytes, then its
-/// 32-bit hash with its length above it. A name longer than that travels as its start and
-/// end offsets instead, with [`LONG`] as length.
+/// A letter for the name at `start..end` of `data`: a 128-bit hash of the name, as two words,
+/// whose top byte the poster overwrites with the record's group. The owner knows the name by its
+/// hash alone (see [`NameSet`]). A letter used to carry the name's first 24 bytes, a CRC32 and
+/// the length, 32 bytes, and a longer name as its offsets in the file, where the owner compared
+/// it. A 16-byte letter halves the exchange's traffic, and the owner's entry for a name shrinks
+/// from 64 bytes to 40 (PERF.md, step 41).
 ///
-/// The three words come from one fixed-size read past the name's start, masked to its length,
-/// so short names need no variable-length copy. The bytes after a name are the rest of its
-/// record, and the [`PAD`] follows the input, so the read always fits.
-///
-/// The hash is the CRC32C of the three words, one SSE4.2 instruction per word, and its 32 bits
-/// depend on every word with no final fold. `FxHash`, the rotate-XOR-multiply hash rustc uses for
-/// its own tables, took 12 more instructions per record (PERF.md, step 35). The length seeds it,
-/// so names that differ only by trailing spaces, such as `Betts` and `Betts `, differ from the
-/// first step. For a long name it covers the first 24 bytes, which is enough to pick an owner,
-/// and the owner compares long names in full.
+/// A name of up to 32 bytes comes from one fixed-size read past its start, masked to its length,
+/// as two 16-byte blocks, `a` and `b`. The bytes after a name are the rest of its record, and
+/// the [`PAD`] follows the input, so the read always fits. Names hold no NUL byte (§2.2), so the
+/// blocks are one to one with the name, trailing spaces included. Three AES rounds, one
+/// instruction each, chain them: the first takes `a` with `b` as its round key, which is added
+/// after it, and two more with [`KEY`] give the hash, `aesenc(aesenc(aesenc(a, b), KEY), KEY)`.
+/// So `a` passes three rounds and `b` two. A round is a permutation of its input, so two names
+/// with the same `a` get different hashes for certain, and so do two with the same `b`. Two
+/// names one byte apart, such as `Betts` and `Betts `, differ in all four bytes of a column
+/// after the first round that takes the byte through its S-box, since `MixColumns` spreads one
+/// byte over its column, then in all 16 bytes after the next round, and so in every column of
+/// the hash, including the two of its low word, the key. Other names agree in a given 72 bits of
+/// their hashes with odds of about 2^-72, as for a random function. With `b` as a round key, the
+/// hash takes three instructions, where `aesenc(aesenc(aesenc(a ^ K0, K1) ^ b, K2), K3)`, which
+/// passes `a` and `b` through as many rounds, took five (PERF.md, step 41). A name over 32 bytes
+/// takes [`long_letter`].
 ///
 /// # Safety
 ///
-/// The 24 bytes from `start` on lie in `data`. The record loop knows it from the window of
-/// [`text_fields`], so the read is not checked again: its check took four instructions per record.
-unsafe fn name_letter(data: &[u8], Range { start, end }: Range<usize>) -> [u64; 4] {
+/// The 32 bytes from the start of the name lie in `data`, and if the name is longer than that,
+/// so do the 32 bytes after its end. The record loop knows it from the comma that ends the name,
+/// a byte of the input, so the read is not checked again: its check took four instructions per
+/// record (step 39).
+unsafe fn name_letter(data: &[u8], Range { start, end }: Range<usize>) -> [u64; 2] {
     let len = end - start;
-    // SAFETY: the caller keeps the 24 bytes in `data`, and `[u8; 24]` needs no alignment.
-    let bytes: &[u8; 24] = unsafe { &*data.as_ptr().add(start).cast() };
-    let keep = &KEEP.as_flattened()[24 - len.min(24)..];
-    let word = |b: &[u8], i| u64::from_le_bytes(b.as_chunks().0[i]);
-    let words: [u64; 3] = std::array::from_fn(|i| word(bytes, i) & word(keep, i));
-    // SAFETY: the build targets Alder Lake, which has SSE4.2 (see `.cargo/config.toml`).
-    let hash = (words.iter()).fold(len as u64, |h, &w| unsafe { _mm_crc32_u64(h, w) });
-    if len > 24 {
-        return [start as u64, end as u64, 0, hash | LONG << 32];
+    if len > 32 {
+        // SAFETY: the caller keeps the contract of `long_letter`, which is this one.
+        return unsafe { long_letter(data, start, end) };
     }
-    [words[0], words[1], words[2], hash | (len as u64) << 32]
+    // SAFETY: the caller keeps the 32 bytes from `start` in `data`, and the 32 bytes of `KEEP`
+    // from `32 - len` on lie in it. The build targets Alder Lake, which has AVX2 and AES-NI (see
+    // `.cargo/config.toml`), and `loadu` needs no alignment. `__m256i` is 32 bytes, as the two
+    // blocks are, and `__m128i` 16, as the hash is, and every bit pattern of each is valid.
+    unsafe {
+        let name = _mm256_loadu_si256(data.as_ptr().add(start).cast());
+        let keep = _mm256_loadu_si256(KEEP.as_flattened().as_ptr().add(32 - len).cast());
+        let [a, b]: [__m128i; 2] = std::mem::transmute(_mm256_and_si256(name, keep));
+        let x = _mm_aesenc_si128(_mm_aesenc_si128(a, b), KEY);
+        std::mem::transmute(_mm_aesenc_si128(x, KEY))
+    }
 }
 
-/// One [`NameSet`] entry, one cache line: the four-word key from [`name_letter`], then one bit
-/// per group. 255 countries and `_UNMATCHED` fill the 256 bits.
-#[repr(align(64))]
-struct Line([u64; 8]);
+/// [`name_letter`] for a name over 32 bytes. The first 32 bytes and the rest each get a hash,
+/// and the two hashes, with the length in the first, are hashed as the 32 bytes of a name, so
+/// that every byte and the length enter the hash. No generated name is that long (the longest of
+/// full seed 1 has 27 bytes), so it is cold and out of line.
+///
+/// # Safety
+///
+/// As for [`name_letter`] with a name over 32 bytes: the 32 bytes after its end lie in `data`.
+#[cold]
+unsafe fn long_letter(data: &[u8], start: usize, end: usize) -> [u64; 2] {
+    // SAFETY: the first part lies in the name. The rest ends where the name does, and its first
+    // 32 bytes end before the 32 after the name do, so the caller's contract holds for both.
+    let [[a, b], c] = [start..start + 32, start + 32..end].map(|r| unsafe { name_letter(data, r) });
+    let words = [a ^ (end - start) as u64, b, c[0], c[1]].map(u64::to_le_bytes);
+    // SAFETY: the name is all 32 bytes of `words`.
+    unsafe { name_letter(words.as_flattened(), 0..32) }
+}
+
+/// One [`NameSet`] entry, 40 bytes: the name's key, 64 bits of its hash, then one bit per group.
+/// 255 countries and `_UNMATCHED` fill the 256 bits. A key and the word of its bit mostly share a
+/// cache line: as two dense arrays, keys and bits, the marking took 21% more L1 misses and the
+/// runs 0.6% longer (PERF.md, step 41).
+struct Entry(u64, [u64; 4]);
 
 /// One worker's share of the distinct names, with the countries each name occurs in.
 ///
 /// It is a hash table with open addressing and linear probing that only its worker ever
-/// touches: no atomics and no cache line shared with another core. Each distinct name has one
-/// entry of one cache line, so a record's compare and its bit land on the same line. A slot
-/// holds an entry's number and 8 more bits of the name's hash (see [`ENTRY`]), so an empty slot
-/// costs 4 bytes, and a probe loads an entry only when those bits match. Names longer than 24
-/// bytes are rare. Their keys say where they lie in the file, and two of them are compared there
-/// (see [`NameSet::holds`]).
+/// touches: no atomics and no cache line shared with another core. A slot holds an entry's
+/// number and 8 bits of the name's hash (see [`ENTRY`]), so an empty slot costs 4 bytes, and a
+/// probe loads an entry only when those bits match. An entry holds 64 more bits of the hash, the
+/// key, and the name's group bits, 40 bytes, where the cache line that held the name's bytes
+/// took 64 (PERF.md, step 41).
 ///
-/// Names are keyed still escaped. Escaping is one to one (each `"` becomes `""`), so two raw
+/// A name is known by its hash alone (see [`name_letter`]). The letter's low word is the key, whose
+/// low bits give the slot, byte 14 is the tag, and bytes 8 to 11 picked the owner, so each comes
+/// from other bits. Two names are taken for one only if their tags and keys agree, 72 bits. At
+/// full scale each of 12 workers owns about 8,400 of the 100,000 names, 35 M pairs of names, so
+/// a run merges two names with odds of about 12 × 35 M / 2^72, 1 in 10^13. A single worker would
+/// own them all, 5 × 10^9 pairs, 1 in 10^12.
+///
+/// Names are hashed still escaped. Escaping is one to one (each `"` becomes `""`), so two raw
 /// names are equal exactly when their unescaped values are. The empty quoted name `""` and the
 /// empty unquoted name both arrive as an empty slice, so they are one name, as spec §3 asks.
 struct NameSet {
     /// The entry of each name, with 8 bits of its hash below it (see [`ENTRY`]), or 0.
     slots: Vec<u32>,
-    lines: Vec<Line>,
+    entries: Vec<Entry>,
 }
 
 impl NameSet {
@@ -814,48 +869,31 @@ impl NameSet {
         // The slots may fill to three quarters before they grow (see `insert`). Pages of the
         // entries' capacity that no entry reaches cost nothing, so it is generous.
         let slots = vec![0; (4 * names / 3).next_power_of_two().max(16)];
-        let lines = Vec::with_capacity(2 * names);
-        Self { slots, lines }
+        let entries = Vec::with_capacity(2 * names);
+        Self { slots, entries }
     }
 
     /// Marks the names of `letters` and counts each name that is new for its group in
     /// `groups`. Kept out of line so that this loop gets the registers to itself.
-    ///
-    /// The letters are read with plain loads, which the compiler may merge: the four atomic
-    /// loads of a letter took four instructions and seven more to put its key in one vector.
     #[inline(never)]
-    fn read(&mut self, letters: &[AtomicU64], data: &[u8], groups: &mut [Group]) {
-        // SAFETY: `AtomicU64` has the layout of `u64`, and no letter here is stored while this
-        // reads it: each was posted before the barrier this worker passed, and no worker posts
-        // to its mailbox again until every worker has passed the next barrier (see [`join`]).
-        let letters: &[[u64; 4]] =
-            unsafe { std::slice::from_raw_parts(letters.as_ptr().cast(), letters.len() / 4) };
-        // SAFETY: the build targets Alder Lake, which has AVX2 (see `.cargo/config.toml`).
-        let keep = unsafe { _mm256_set_epi64x((1 << 48) - 1, -1, -1, -1) };
-        for letter in letters {
-            // A group fits in a byte (see [`join`]), so the bit's word is one of four
-            // with no bounds check. The key is the letter without its group: the hash and the
-            // length, 48 bits.
-            let d = letter[3];
-            let group = (d >> 48) as u8 as usize;
-            // SAFETY: as above, and the load reads the 32 bytes of `letter`.
-            let key = unsafe { _mm256_and_si256(_mm256_loadu_si256(letter.as_ptr().cast()), keep) };
-            let (mask, hash) = (self.slots.len() - 1, d as u32);
-            let (mut slot, tag) = (hash as usize & mask, (hash >> 20) as u8);
-            // The probe ends at the entry's line rather than its index: `holds` has checked
-            // that index, and the index taken out of the loop was checked once more.
-            let line = loop {
+    fn read(&mut self, letters: &[AtomicU64], groups: &mut [Group]) {
+        for [key, high] in letters.as_chunks().0 {
+            let (key, high) = (key.load(Relaxed), high.load(Relaxed));
+            // A group fits in a byte (see [`join`]), so the bit's word is one of four with no
+            // bounds check.
+            let (mask, tag) = (self.slots.len() - 1, (high >> 48) as u8);
+            let (group, mut slot) = ((high >> 56) as usize, key as usize & mask);
+            let entry = loop {
                 let found = self.slots[slot];
                 match (found >> 8) as usize {
                     0 => break self.insert(slot, tag, key),
-                    e if found as u8 == tag && self.holds(e - 1, key, data) => {
-                        // SAFETY: see `holds`.
-                        break unsafe { self.lines.get_unchecked_mut(e - 1) };
+                    e if found as u8 == tag && self.entries[e - 1].0 == key => {
+                        break &mut self.entries[e - 1];
                     }
                     _ => slot = (slot + 1) & mask,
                 }
             };
-            let (word, bit) = (&mut line.0[4 + group / 64], 1 << (group % 64));
+            let (word, bit) = (&mut entry.1[group / 64], 1 << (group % 64));
             // SAFETY: the group is the byte that the letter's poster took from `by_id`, 0 or a
             // number below `group_count`. Every worker counts the same codes, so that is the
             // length of `groups` here too (see [`join`]).
@@ -864,64 +902,30 @@ impl NameSet {
         }
     }
 
-    /// Whether `entry` is the name of `key`. A short name's key is the whole name, so equal keys
-    /// are equal names. A long name's key says where the name lies in `data`, so two long names
-    /// with the same hash are compared there.
-    ///
-    /// The key stays in one AVX2 register from the letter's load to this compare, and the cold
-    /// calls take it that way too: as four words, the probe stored every letter's key to the stack
-    /// for the rare call.
-    fn holds(&self, entry: usize, key: __m256i, data: &[u8]) -> bool {
-        // SAFETY: a slot holds the number of an entry that exists, because `insert` pushes the
-        // entry before it writes the slot, and no entry is ever removed.
-        let held = unsafe { self.lines.get_unchecked(entry) };
-        // SAFETY: the build targets Alder Lake, which has AVX2, and the load reads the first 32
-        // bytes of `held`, a 64-byte aligned line.
-        let diff = unsafe { _mm256_xor_si256(_mm256_load_si256(held.0.as_ptr().cast()), key) };
-        // SAFETY: as above.
-        let same = unsafe { _mm256_testz_si256(diff, diff) == 1 };
-        same || same_text(&held.0, key, data)
-    }
-
     /// Appends an entry with the key and no groups, puts it in the empty `slot` with its `tag`,
-    /// and returns its line. When the entries fill three quarters of the slots, the slots double
-    /// and every entry is placed again, so every probe ends at an empty slot.
+    /// and returns it. When the entries fill three quarters of the slots, the slots double and
+    /// every slot is placed again by its entry's key, so every probe ends at an empty slot. The
+    /// slots are placed from the old ones, which hold the tags that no entry keeps.
     ///
     /// Cold, because inlined into [`NameSet::read`] it spilled the key of every letter.
     #[cold]
-    fn insert(&mut self, slot: usize, tag: u8, key: __m256i) -> &mut Line {
-        assert!(self.lines.len() < ENTRY as usize, "over 2^24 names");
-        // SAFETY: `__m256i` and `[u64; 4]` are both 32 bytes, and every bit pattern is valid.
-        let [a, b, c, d]: [u64; 4] = unsafe { std::mem::transmute(key) };
-        self.lines.push(Line([a, b, c, d, 0, 0, 0, 0]));
-        self.slots[slot] = (self.lines.len() as u32) << 8 | u32::from(tag);
-        if 4 * self.lines.len() > 3 * self.slots.len() {
-            self.slots = vec![0; 2 * self.slots.len()];
-            let mask = self.slots.len() - 1;
-            for (entry, line) in self.lines.iter().enumerate() {
-                let mut slot = line.0[3] as u32 as usize & mask;
+    fn insert(&mut self, slot: usize, tag: u8, key: u64) -> &mut Entry {
+        assert!(self.entries.len() < ENTRY as usize, "over 2^24 names");
+        self.entries.push(Entry(key, [0; 4]));
+        self.slots[slot] = (self.entries.len() as u32) << 8 | u32::from(tag);
+        if 4 * self.entries.len() > 3 * self.slots.len() {
+            let mask = 2 * self.slots.len() - 1;
+            let old = std::mem::replace(&mut self.slots, vec![0; mask + 1]);
+            for found in old.into_iter().filter(|&found| found != 0) {
+                let mut slot = self.entries[(found >> 8) as usize - 1].0 as usize & mask;
                 while self.slots[slot] != 0 {
                     slot = (slot + 1) & mask;
                 }
-                self.slots[slot] = ((entry + 1) as u32) << 8 | (line.0[3] as u32 >> 20 & 255);
+                self.slots[slot] = found;
             }
         }
-        self.lines.last_mut().expect("an entry was just pushed")
+        self.entries.last_mut().expect("an entry was just pushed")
     }
-}
-
-/// Whether the entry's key `a` and `key`, which differ, are of one long name: the same hash and
-/// length, and the same bytes of `data` (see [`NameSet::holds`]). It is cold and out of line
-/// because inlined, its bounds checks were hoisted into the setup of every letter's probe, 18
-/// instructions per record. The tests of the hash and of a long name are here too, so that the
-/// probe's compare is one vector compare, and because in the probe the long name's two 64-bit
-/// constants held two registers for every letter.
-#[cold]
-fn same_text(a: &[u64; 8], key: __m256i, data: &[u8]) -> bool {
-    // SAFETY: `__m256i` and `[u64; 4]` are both 32 bytes, and every bit pattern is valid.
-    let b: [u64; 4] = unsafe { std::mem::transmute(key) };
-    let text = |key: &[u64]| &data[key[0] as usize..key[1] as usize];
-    a[3] == b[3] && a[3] >> 32 == LONG && text(a) == text(&b)
 }
 
 /// Writes one line per group that has records: the countries in bytewise order, then
