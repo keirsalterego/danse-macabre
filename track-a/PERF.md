@@ -829,6 +829,9 @@ rounds (three of 41 runs, four of 61), medians 19.25 → 19.12, 19.16 → 19.11,
 19.06 → 19.03, 18.99 → 19.05, 19.06 → 19.03 and 19.69 → 19.62 ms. S 379 → 373. Gate: 310 pass,
 0 fail.
 
+The board drew 18.0 ms at 18.8 MB for it in run-b35557b63892, and 19.5 ms for the same code in
+run-dbba1dbc4ea4.
+
 ## Experiments that did not stay
 
 - **`put_number` inlined, with its eight- to ten-digit path in a `#[cold]` function** (local, turbo
