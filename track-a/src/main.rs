@@ -189,9 +189,8 @@ fn summarize(log: &'static [u8], out_path: &Path) {
     // give out as they parse, and the ids in output order.
     let chunks: Vec<OnceLock<Chunk>> = (0..threads).map(|_| OnceLock::new()).collect();
     let hours: Vec<OnceLock<Hour>> = (0..HOURS).map(|_| OnceLock::new()).collect();
-    let (all, sorted) = (&ENDPOINTS, OnceLock::new());
+    let (all, sorted, [taken, done]) = (&ENDPOINTS, OnceLock::new(), [0; 2].map(AtomicUsize::new));
     let (plan, places, barrier) = (OnceLock::new(), OnceLock::new(), Barrier::new(threads));
-    let (taken, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let work = |t: usize| {
         // SAFETY: every chunk ends by `len`, LINE bytes before the end of `log`.
         let _ = chunks[t].set(unsafe { parse(log, start(t)..start(t + 1)) });
@@ -248,12 +247,11 @@ fn summarize(log: &'static [u8], out_path: &Path) {
         barrier.wait();
         // Every hour's length is known now, so the first thread here gives each its place.
         let queue = places.get_or_init(|| {
-            let hours: Vec<&Hour> = hours.iter().map(|h| h.get().expect("summarized")).collect();
-            let len = hours.iter().map(|(_, len)| len).sum();
+            let len = hours.iter().map(|h| h.wait().1).sum();
             let mut rest = map_output(out_path, len).unwrap_or_else(|e| panic!("{e}"));
             // The queue hands out the hours in order, each cutting its place from the rest.
-            let mut place = move |len| rest.split_off_mut(..len).expect("lengths add up");
-            Mutex::new(hours.into_iter().map(move |h| (h, place(h.1))).enumerate())
+            let mut cut = move |len| rest.split_off_mut(..len).expect("lengths add up");
+            Mutex::new(hours.iter().map(move |h| (h, cut(h.wait().1))).enumerate())
         });
         // The threads format in parallel, taking the next hour from the queue until none is
         // left. Each first frees the rest of its chunk's records, the pages that two runs
@@ -263,10 +261,10 @@ fn summarize(log: &'static [u8], out_path: &Path) {
         let chunk = chunks[t].get().expect("parsed");
         let _ = [&chunk.records, &chunk.large].map(|v| release(v));
         std::iter::from_fn(|| queue.lock().expect("panics abort").next())
-            .for_each(|(index, ((lines, _), place))| format_hour(index, lines, names, place));
+            .for_each(|(index, (hour, place))| format_hour(index, &hour.wait().0, names, place));
         release(&log[len * t / threads..len * (t + 1) / threads]);
         // The output is complete once the last thread gets here: skip joining the others.
-        (finished.fetch_add(1, Relaxed) + 1 == threads).then(|| std::process::exit(0));
+        (done.fetch_add(1, Relaxed) + 1 == threads).then(|| std::process::exit(0));
     };
     thread::scope(|s| fan_out(s, 0..threads, &work));
 }
@@ -722,9 +720,7 @@ fn summarize_hour(runs: &[Run], order: &Order, names: &[&[u8]], buffer: &mut [u3
         }
     }
     (1..start.len()).for_each(|e| start[e] += start[e - 1]);
-    let buffer = &mut buffer[..start[names.len()] as usize];
-    for &(records, large) in runs {
-        let mut large = large.iter();
+    for (records, mut large) in runs.iter().map(|&(records, large)| (records, large.iter())) {
         for &r in records {
             let (e, small) = ((r >> 20) as usize, Some(r & LARGE).filter(|&v| v < LARGE));
             start[e] -= 1;
@@ -856,9 +852,7 @@ fn format_hour(hour: usize, lines: &[[u32; 6]], names: &[&[u8]], mut place: &mut
     for line in lines {
         let mut end = 21 + names[line[0] as usize].len();
         text[21..end].copy_from_slice(names[line[0] as usize]);
-        for value in numbers(line) {
-            end = put_number(&mut text, end, value);
-        }
+        let _ = numbers(line).map(|value| end = put_number(&mut text, end, value));
         text[end] = b'\n';
         // This fails if the hour's length, computed in `summarize_hour`, was short.
         place.write_all(&text[..=end]).expect("lengths add up");

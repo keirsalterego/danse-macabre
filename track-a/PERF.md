@@ -60,6 +60,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 53 | 9 fewer lines in the hour pass at the same speed: the large latency taken in `unwrap_or_else`, empty groups filtered out, the three selections in one `map`, the chunk's two releases in one | run-3367489cfd2c | 0.0176 | 18.6 | 86.3 |
 | 54 | The latency's space bounded with `assert_unchecked`, so reading the status and ending the name take no bounds checks: 9.8 M instructions fewer | | | | |
 | 55 | 3 fewer lines: `parse` an `unsafe fn` whose contract is the padding its `assert!` checked, and two range checks left to the indexes behind them | | | | |
+| 56 | 6 fewer lines at the same speed: a line's six numbers written in one `map`, the format queue built without collecting the hours, the latencies placed in the whole buffer, the two counters on one line | | | | |
 
 ## Step 1: v1
 
@@ -928,6 +929,31 @@ medians 18.76 → 18.78, 18.77 → 18.76, 18.80 → 18.80, 18.79 → 18.99, 18.7
 S 364 → 361. Gate: 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes; clippy
 reports no warnings.
 
+## Step 56: 6 fewer lines
+
+- `format_hour` writes a line's six numbers with one `map` instead of a `for` loop: 2 lines, with
+  the same machine code.
+- The work closure's two counters come from one `[0; 2].map(AtomicUsize::new)` on the line that
+  names `all` and `sorted`, with `finished` renamed `done` so that the line fits: 1 line.
+- The format queue no longer collects the hours into a `Vec<&Hour>`. The output's length and
+  each hour's place read the hour's `OnceLock` with `wait`, which returns at once, since every
+  hour is done by the barrier: 1 line.
+- `summarize_hour` builds each run's iterator over its large latencies in the `for` header:
+  1 line, with the same machine code.
+- `summarize_hour` places the latencies in the whole buffer instead of a slice of the hour's
+  length: 1 line. On step 45's code this cost 3% (see "Line cuts that moved the hour pass's code"
+  below); here, beside the other four cuts, `ab.py` medians went 18.83 → 18.90, 18.87 → 18.84,
+  18.80 → 18.79 and 18.88 → 18.85 ms (61 interleaved runs, four rounds).
+
+`perf stat`, 10 interleaved rounds of 3 runs: instructions:u 593.1 → 593.3 M, cycles:u median
+327.2 → 325.8 M. `ab.py`, 61 interleaved runs, six rounds against step 53, two of them under
+outside load: medians 18.74 → 18.66, 18.79 → 18.84, 18.51 → 18.55, 19.10 → 19.07,
+18.81 → 18.72 and 18.82 → 18.81 ms (−0.1% on average). memory.peak, alternating rounds on
+seeds 1, 2, 3, 5, 7, 10 and 11, medians: 18.24 → 18.17, 18.19 → 18.33 and 18.23 → 18.33 MB in
+five rounds each, 18.29 → 18.28 and 18.32 → 18.28 MB in ten; the one allocation that changes is
+the queue's 576-byte vector, which goes. S 361 → 355 (on step 53's code, 363 → 357). Gate: 310 pass, 0 fail; full seeds 1–7
+and 10–12 give the reference hashes; clippy reports no warnings.
+
 ## Experiments that did not stay
 
 - **The records written through a pointer** (local, AC power, turbo off, on step 52's code). The
@@ -942,6 +968,15 @@ reports no warnings.
   18.96 / 18.81 / 18.82, 18.83 / 18.71 / 18.63 and 18.78 / 18.68 / 18.64 ms. On average the bound
   gained 0.11 ms (0.6%) for its line, and the pointer 0.04 ms (0.2%) more for its two, about what
   two lines cost.
+- **`fan_out` as a binomial tree** (local, turbo off, on step 53's code): thread `t` starts
+  `t + 1`, `t + 2`, `t + 4` and so on above `2t`, which needs no ranges: 6 lines instead of 8.
+  The last of twelve threads still starts after four spawns, but thread 0 makes four spawns
+  before its own parse instead of three. `ab.py`, 61 interleaved runs, four rounds: medians
+  18.92 → 18.97, 18.37 → 18.58, 18.78 → 18.89 and 18.80 → 18.91 ms (+0.6%). Not kept.
+- **The network's functions without `#[target_feature]`**: `target-cpu=alderlake` enables AVX2
+  for the whole crate, but rustc still counts a call to an AVX2 intrinsic as unsafe unless the
+  calling function has the attribute itself ("the context requires the following additional
+  target feature: avx2"), so the three attributes stay.
 - **Selection for every group, without the networks** (local, turbo off, on step 50's code):
   `percentiles` with only its three selections, and `sort_network`, `merge`, `stage` and their
   wildcard import deleted, S 379 → 334. `ab.py`, 61 interleaved runs: median 19.06 → 20.84 ms
