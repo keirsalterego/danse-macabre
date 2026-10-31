@@ -28,6 +28,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 21 | 3 fewer lines with the same machine code: one `unsafe` statement per `mmap` call, and the digit loop's two updates in one assignment | run-af528e5f49cc | 0.0353 | 12.3 | 76.6 |
 | 22 | 1 fewer line with the same machine code: the name set's probe names the hash once and takes the slot and the tag from it | run-af528e5f49cc | 0.0353 | 12.3 | 76.6 |
 | 23 | 17 fewer lines outside the record loop: each run's pages given back in two lines, rounded out to whole pages; the region rows cut, marked and written in one line each; and the rounds counted and the parts merged in one line each | run-d4936b9f2b5b | 0.0349 | 12.7 | 76.7 |
+| 24 | 1 fewer line: `main` maps both input files through one closure | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -660,6 +661,17 @@ gate, 307 pass, 0 fail; full seeds 1–7 give the reference hashes; the 402 fuzz
 default thread count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12
 and 64; the 300 tiny seeds pass at 10 thread counts with 100-byte rounds; clippy reports no
 warnings.
+
+## Step 24: 1 fewer line
+
+`main` maps both input files through one closure that takes the file's name. Only `main`'s code
+changes, with `map_file` now inlined into the closure, and `NameSet::read` moves 96 bytes down
+the binary, onto a 32-byte boundary instead of a 64-byte one. S 295 → 294. `ab.py` against
+step 23, interleaved, medians / minimums: 101 runs on seed 1, 39.30 / 38.16 → 39.31 / 38.34 ms;
+101 runs on seed 2, 39.24 / 37.95 → 39.21 / 38.06 ms; 61 runs on seed 3, 39.08 / 38.17 →
+39.09 / 38.15 ms. Correctness: the gate, 307 pass, 0 fail; full seeds 1–7 give the reference
+hashes; the fuzz cases, the tiny seeds and the region sets give step 23's results; a missing
+input directory still stops with the file's path in the error.
 
 ## Experiments that did not stay
 

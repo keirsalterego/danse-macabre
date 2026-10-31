@@ -151,10 +151,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
     let out = Path::new(&args.next().unwrap_or_else(|| "/out".into())).join("aggregates.txt");
     let threads = thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let regions = map_file(&Path::new(&data_dir).join("regions.csv"))?;
-    let (by_id, codes) = parse_regions(regions, threads);
-    let records = map_file(&Path::new(&data_dir).join("records.csv"))?;
-    let groups = join(records, &by_id, codes.len() + 1, threads);
+    let file = |name| map_file(&Path::new(&data_dir).join(name));
+    let (by_id, codes) = parse_regions(file("regions.csv")?, threads);
+    let groups = join(file("records.csv")?, &by_id, codes.len() + 1, threads);
     std::fs::write(&out, format_output(&groups, &codes))
         .map_err(|e| format!("{}: {e}", out.display()))?;
     // Exit without running destructors: freeing the name sets would only add to the timed
