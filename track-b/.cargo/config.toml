@@ -1,4 +1,6 @@
 # alderlake = Raptor Lake's feature set (AVX2, BMI2, PCLMULQDQ). Never `native`: the board builds
 # on a different host (Depot, AVX-512) and `native` reroutes builds to the box's E-cores.
+# Every loop starts on a 64-byte boundary, so the pass's hot loops keep their speed when a change
+# elsewhere moves their function (PERF.md, step 21).
 [build]
-rustflags = ["-C", "target-cpu=alderlake"]
+rustflags = ["-C", "target-cpu=alderlake", "-C", "llvm-args=-align-loops=64"]

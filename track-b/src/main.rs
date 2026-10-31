@@ -127,39 +127,33 @@ fn answer_all(query_text: &[u8], docs: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     {
         return Err("docs.txt: too many documents".into());
     }
-    let (queries, plan) = (&queries, &plan);
-    let chunks: Vec<Chunk> = thread::scope(|s| {
-        let scanners: Vec<_> = (0..threads)
-            .map(|c| {
-                let (text, ids) = (&docs[bounds[c]..bounds[c + 1]], firsts[c]..firsts[c + 1]);
-                s.spawn(move || scan(text, ids, queries, plan))
-            })
-            .collect();
-        (scanners.into_iter())
-            .map(|h| h.join().expect("a panic aborts the process"))
-            .collect()
+    let chunks = parallel(threads, &|c| {
+        let (text, ids) = (&docs[bounds[c]..bounds[c + 1]], firsts[c]..firsts[c + 1]);
+        scan(text, ids, &queries, &plan)
     });
-    let (chunks, n) = (&chunks, queries.len());
-    Ok(thread::scope(|s| {
-        let workers: Vec<_> = (0..threads)
-            .map(|t| n * t / threads..n * (t + 1) / threads)
-            .map(|range| s.spawn(move || format_range(range, chunks)))
-            .collect();
-        (workers.into_iter())
-            .map(|w| w.join().expect("a panic aborts the process"))
-            .collect()
-    }))
+    let range = |t| queries.len() * t / threads..queries.len() * (t + 1) / threads;
+    Ok(parallel(threads, &|t| format_range(range(t), &chunks)))
+}
+
+/// Runs `work(i)` for each `i` in `0..n`, each on a thread of its own, and returns the results
+/// in order.
+fn parallel<T: Send>(n: usize, work: &(impl Fn(usize) -> T + Sync)) -> Vec<T> {
+    thread::scope(|s| {
+        let threads: Vec<_> = (0..n).map(|i| s.spawn(move || work(i))).collect();
+        let join = |t: thread::ScopedJoinHandle<T>| t.join().expect("a panic aborts the process");
+        threads.into_iter().map(join).collect()
+    })
 }
 
 /// Splits `docs` at `parts - 1` line starts, so every line lands in exactly one chunk.
 fn line_bounds(docs: &[u8], parts: usize) -> Vec<usize> {
     let mut bounds = vec![0];
-    for i in 1..parts {
+    // The last cut, at `docs.len()`, finds no LF after it and ends there.
+    for i in 1..=parts {
         let at = docs.len() * i / parts;
         let newline = docs[at..].iter().position(|&b| b == b'\n');
         bounds.push(newline.map_or(docs.len(), |p| at + p + 1));
     }
-    bounds.push(docs.len());
     bounds
 }
 
@@ -216,18 +210,11 @@ struct Lines {
 }
 
 /// Parses `queries.txt` (grammar in spec §2.3). Every thread parses a share of the lines; then
-/// one thread gives each distinct term its id, in file order, loading the table slot of the
-/// term 16 ahead while it interns one, so that its cache misses overlap.
+/// one thread gives each distinct term its id, in file order.
 fn parse_queries(text: &[u8], threads: usize) -> Result<(Queries, TermTable), String> {
     let bounds = line_bounds(text, threads);
-    let parts = thread::scope(|s| {
-        let workers: Vec<_> = (bounds.windows(2))
-            .map(|w| s.spawn(move || parse_lines(&text[w[0]..w[1]])))
-            .collect();
-        (workers.into_iter())
-            .map(|w| w.join().expect("a panic aborts the process"))
-            .collect::<Result<Vec<_>, _>>()
-    })?;
+    let parts = parallel(threads, &|i| parse_lines(&text[bounds[i]..bounds[i + 1]]));
+    let parts = parts.into_iter().collect::<Result<Vec<_>, _>>()?;
     let occurrences = parts.iter().map(|part| part.keys.len()).sum();
     let (mut queries, mut table) = (Queries::default(), TermTable::new(occurrences));
     queries.at.push(0);
@@ -237,12 +224,7 @@ fn parse_queries(text: &[u8], threads: usize) -> Result<(Queries, TermTable), St
             queries.at.push(queries.at[queries.at.len() - 1] + len);
         }
         queries.ops.extend(part.ops);
-        for (i, key) in part.keys.iter().enumerate() {
-            if let Some(ahead) = part.keys.get(i + 16) {
-                table.prefetch(ahead);
-            }
-            queries.terms.push(table.intern(*key));
-        }
+        (queries.terms).extend(part.keys.iter().map(|&key| table.intern(key)));
     }
     Ok((queries, table))
 }
@@ -353,7 +335,8 @@ impl Plan {
         // (trigger term, phrase) and (trigger term, check word) pairs, in query order.
         let (mut phrases, mut checks) = (Vec::new(), Vec::new());
         let mut store = vec![Store::None; terms.len()];
-        let (mut rows, mut lists) = (0, 0);
+        // How many `Store::Bits` rows and `Store::List` lists are numbered so far.
+        let mut sizes = [0; 2];
         let mut sets = Vec::new();
         let mut cover = Vec::new();
         for (i, &phrase) in queries.phrase.iter().enumerate() {
@@ -380,13 +363,10 @@ impl Plan {
             sets.push(i as u32);
             for &t in query {
                 if let Store::None = store[t as usize] {
-                    store[t as usize] = if common(t) {
-                        rows += 1;
-                        Store::Bits(rows - 1)
-                    } else {
-                        lists += 1;
-                        Store::List(lists - 1)
-                    };
+                    // A common term keeps a bitset row, any other an id list: the next of its kind.
+                    let kind = usize::from(!common(t));
+                    store[t as usize] = [Store::Bits, Store::List][kind](sizes[kind]);
+                    sizes[kind] += 1;
                     flags[t as usize] |= Slot::STORED;
                 }
             }
@@ -401,8 +381,8 @@ impl Plan {
             check_at,
             checks,
             store,
-            rows: rows as usize,
-            lists: lists as usize,
+            rows: sizes[0] as usize,
+            lists: sizes[1] as usize,
             sets,
         }
     }
@@ -740,9 +720,9 @@ impl Tally {
 struct Chunk {
     tally: Tally,
     /// Each query's first matches in the chunk, smallest first: query `q`'s are
-    /// `shown[shown_at[q]..shown_at[q + 1]]`.
-    shown_at: Vec<u32>,
-    shown: Vec<u32>,
+    /// `ids[at[q]..at[q + 1]]`.
+    at: Vec<u32>,
+    ids: Vec<u32>,
 }
 
 /// The documents of one window of `64 * WINDOW` that contain the terms of the queries on sets
@@ -916,30 +896,22 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
     for (check, cell) in plan.checks.iter().zip(std::mem::take(&mut tally.checks)) {
         tally.queries[check.q as usize] += cell;
     }
-    let (shown_at, shown) = tally.take_first();
-    Chunk {
-        tally,
-        shown_at,
-        shown,
-    }
+    let (at, ids) = tally.take_first();
+    Chunk { tally, at, ids }
 }
 
 /// Formats the answers to queries `range`, in order (spec §4).
 fn format_range(range: Range<usize>, chunks: &[Chunk]) -> Vec<u8> {
-    let (mut out, mut shown) = (Vec::new(), Vec::<u32>::new());
+    let mut out = Vec::new();
     for q in range {
-        shown.clear();
-        // Chunks hold ascending ids, so the first chunks' first matches are the smallest.
-        for c in chunks {
-            let ids = &c.shown[c.shown_at[q] as usize..c.shown_at[q + 1] as usize];
-            shown.extend(ids.iter().take(SHOWN_IDS - shown.len()));
-        }
-        let count: u64 = chunks.iter().map(|c| c.tally.queries[q] >> SUM_BITS).sum();
-        let sum: u64 = (chunks.iter())
-            .map(|c| c.tally.queries[q] & ((1 << SUM_BITS) - 1))
-            .sum();
+        // The id sums of all chunks together stay below `2^SUM_BITS`, as each one does
+        // ([`answer_all`]), so the cells add up without a carry into the count.
+        let cell: u64 = chunks.iter().map(|c| c.tally.queries[q]).sum();
+        let (count, sum) = (cell >> SUM_BITS, cell & ((1 << SUM_BITS) - 1));
         write!(out, "{count} {sum}").expect("writing to a Vec cannot fail");
-        for id in &shown {
+        // Chunks hold ascending ids, so the first chunks' first matches are the smallest.
+        let shown = (chunks.iter()).flat_map(|c| &c.ids[c.at[q] as usize..c.at[q + 1] as usize]);
+        for id in shown.take(SHOWN_IDS) {
             write!(out, " {id}").expect("writing to a Vec cannot fail");
         }
         out.push(b'\n');

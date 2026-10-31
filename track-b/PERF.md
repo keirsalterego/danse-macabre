@@ -25,6 +25,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 18 | A term table slot holds a term's first 12 bytes instead of 8, so a token of 9 to 12 bytes no longer loads its term's key from a second array | run-e847cb4a493b | 0.2208 | 41.8 | 69.9 |
 | 19 | 99 fewer code lines: the cold code and the term table simplified (no doubling), the walk's bit pops in one helper; the key-mask table aligned to a cache line | run-74f2276732d6 | 0.2241 | 42.9 | 70.1 |
 | 20 | The rarity sample is the corpus's first 1/64 (4,005 documents on seed 1) instead of its first 1,000 documents, each thread counting a part | run-75d28a617cc4 | 0.2158 | 42.8 | 70.5 |
+| 21 | 35 fewer code lines: one helper runs and joins each set of threads, the intern loop drops its prefetch, the output adds each query's cells once; every loop starts on a 64-byte boundary | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -415,6 +416,44 @@ and 230.8 → 226.8 and 226.7 ms. `perf stat`: user cycles 5.59 → 5.51–5.56 
 8.686 G. In a `perf record` timeline the pass starts at 21.4 ms instead of 21.1–22.0 ms, and
 its threads' cycles fall 5.59 → 5.51 G. memory.peak over six interleaved runs: median 39.3 →
 39.1 MiB. S 758 → 771. Gate: 510 pass, 0 fail.
+
+## Step 21: 35 fewer lines, loops on 64-byte boundaries
+
+Cuts in code that runs once per run or once per thread:
+
+- **One `parallel` helper** (7 lines) runs `work(i)` for each `i` on a thread of its own and
+  returns the results in order. The pass, the output and the query parse each spelled out a
+  `thread::scope` in 8 to 12 lines; each now takes 2 to 4 (−15 in all). The sample keeps its
+  own: it adds each part as its thread is joined, and collecting every part first made the
+  sample 0.08–0.19 ms longer (min and median of 15 timed runs).
+- **The intern loop without its prefetch 16 terms ahead** (−5). The serial end of the parse
+  (table allocation, merge and intern of seed 1's 152,904 term occurrences) took 5.49 ms with
+  it and 5.48 ms without, median of 15 timed runs each.
+- **The output** adds a query's cells over all chunks and splits the total once (−2): together
+  the chunks' id sums stay below `2^SUM_BITS`, as each one does, since `answer_all` bounds the
+  sum of all ids. The first matches come straight from the chunks through
+  `flat_map(..).take(SHOWN_IDS)` instead of a buffer, and `Chunk`'s fields are `at` and `ids`,
+  so its literal fits on one line (−8).
+- **`Plan::new`** numbers a stored term's bitset row or id list from one two-entry counter
+  (−4), and **`line_bounds`** takes its last bound from the loop: a cut at `docs.len()` finds
+  no LF after it (−1).
+
+**Loops on 64-byte boundaries.** Built as before, this step ran slower than step 20 though it
+adds no work: alternating runs (`ab.py`, 61 each), two rounds, median 226.4 and 226.2 → 227.2
+and 227.0 ms. Each cut alone on step 20, two rounds: the helper +0.41 and +0.38 ms, the intern
+loop +0.07 and −0.13 ms, the rest +0.88 and +0.85 ms. The cost is where the hot loops sit. The
+`Plan::new` cut alone, which runs once and leaves the instruction count at 8,686.1 M, moved the
+scan thread's code, byte for byte the same, from offset 16 of a 64-byte line to offset 0, and
+user cycles rose 0.3–0.6%. `-C llvm-args=-align-loops=64` in `.cargo/config.toml` starts every
+loop on a 64-byte boundary; executing the padding adds 28 M instructions (8,686 → 8,711 M).
+Step 20 built that way ran 226.5 and 226.3 ms, this step 225.9 and 225.8 ms, in the same
+sessions as step 20 as built before at 226.0 and 226.0 ms. A loop now keeps its offset in a
+line wherever later changes move its function.
+
+Locally, against step 20 (alternating runs, 41 and 61 each): median 226.00 and 225.99 → 225.86
+and 225.80 ms, min 224.90 and 225.00 → 224.32 and 224.15 ms. memory.peak over 10 and 16
+alternating runs: medians 42.95 and 42.74 → 43.61 and 42.93 MB. S 771 → 736. Gate: 510 pass,
+0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
 
 ## Experiments that did not stay
 
