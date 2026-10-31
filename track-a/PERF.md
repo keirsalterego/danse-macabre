@@ -58,9 +58,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 51 | 6 fewer lines at the same speed: the parse's intrinsics from the file's one wildcard import, and the interner's padded copies zeroed in its static | run-b35557b63892 | 0.0180 | 18.8 | 85.9 |
 | 52 | Endpoint names hashed with the CPU's CRC32C instruction instead of a multiply: 9.2 M instructions fewer | run-3367489cfd2c | 0.0176 | 18.6 | 86.3 |
 | 53 | 9 fewer lines in the hour pass at the same speed: the large latency taken in `unwrap_or_else`, empty groups filtered out, the three selections in one `map`, the chunk's two releases in one | run-3367489cfd2c | 0.0176 | 18.6 | 86.3 |
-| 54 | The latency's space bounded with `assert_unchecked`, so reading the status and ending the name take no bounds checks: 9.8 M instructions fewer | | | | |
-| 55 | 3 fewer lines: `parse` an `unsafe fn` whose contract is the padding its `assert!` checked, and two range checks left to the indexes behind them | | | | |
-| 56 | 6 fewer lines at the same speed: a line's six numbers written in one `map`, the format queue built without collecting the hours, the latencies placed in the whole buffer, the two counters on one line | | | | |
+| 54 | The latency's space bounded with `assert_unchecked`, so reading the status and ending the name take no bounds checks: 9.8 M instructions fewer | run-c0db6c54d9a4 | 0.0225 | 18.0 | 83.8 |
+| 55 | 3 fewer lines: `parse` an `unsafe fn` whose contract is the padding its `assert!` checked, and two range checks left to the indexes behind them | run-c0db6c54d9a4 | 0.0225 | 18.0 | 83.8 |
+| 56 | 6 fewer lines at the same speed: a line's six numbers written in one `map`, the format queue built without collecting the hours, the latencies placed in the whole buffer, the two counters on one line | run-c0db6c54d9a4 | 0.0225 | 18.0 | 83.8 |
 
 ## Step 1: v1
 
@@ -953,6 +953,10 @@ seeds 1, 2, 3, 5, 7, 10 and 11, medians: 18.24 → 18.17, 18.19 → 18.33 and 18
 five rounds each, 18.29 → 18.28 and 18.32 → 18.28 MB in ten; the one allocation that changes is
 the queue's 576-byte vector, which goes. S 361 → 355 (on step 53's code, 363 → 357). Gate: 310 pass, 0 fail; full seeds 1–7
 and 10–12 give the reference hashes; clippy reports no warnings.
+
+The board's run of steps 54 to 56 together, run-c0db6c54d9a4 (commit ace82cf), drew 22.5 ms, a
+slow draw: locally, step 56's binary ran a median of 18.84 ms against step 53's 18.87 (`ab.py`, 82
+interleaved runs), and in the same run track D's unchanged code drew 127.8 ms, against 122 to 127.
 
 ## Experiments that did not stay
 

@@ -42,7 +42,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 35 | The region id and the amount parse together in one SSE vector, the name and the note come from one mask of quotes and commas whose prefix XOR marks the quoted bytes, the name hash is CRC32, the name set's key stays in one AVX2 register, and a letter's slot is read unchecked | run-6252826712db | 0.0252 | 12.9 | 79.3 |
 | 36 | The record batch holds each letter by reference, in an order whose loads are forwarded from their stores, and the group goes into its letter as one byte | run-5a15a73439c1 | 0.0246 | 12.5 | 79.7 |
 | 37 | The merge takes its group from `by_id` without a bounds check, and a letter's thread is picked with `sent.len()` instead of a load through the closure's reference to the thread count | run-0ff0124ce494 | 0.0237 | 12.5 | 80.1 |
-| 38 | The last worker to finish merges the groups, writes the output and ends the process while the others sleep, so no thread ends first, and each worker gives back its name set's entries after its run; and `main` is C's, so the Rust runtime's setup, whose stack-overflow handler gave every thread a signal stack, does not run | | | | |
+| 38 | The last worker to finish merges the groups, writes the output and ends the process while the others sleep, so no thread ends first, and each worker gives back its name set's entries after its run; and `main` is C's, so the Rust runtime's setup, whose stack-overflow handler gave every thread a signal stack, does not run | run-490c7c238e52 | 0.0235 | 12.1 | 80.3 |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
