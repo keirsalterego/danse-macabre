@@ -40,7 +40,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 33 | A document's checks are added in one `Tally` method that takes no branch on a check's result: the queries of the checks that the document is one of the first matches of are moved to the front of its list of checks, and only those go on to the first-match counts | run-94e224675c5a | 0.1455 | 41.3 | 74.8 |
 | 34 | The term lookups take no bounds checks: the probe reads the slots unchecked from a key's home slot on, the prefetches take pointers, and the token loop holds the term table and the seen bits as locals | run-401b90111691 | 0.1618 | 40.5 | 73.7 |
 | 35 | 11% fewer instructions in the corpus pass: a document's checks are written to a slice sized once and evaluated without bounds checks, the tokenizer picks the start of a token carried over from the previous block once per block, a key's window takes one bounds check and its hash two words, phrases are compared inline, and a long key's mark rides in its slot's tail | run-8bf61f0fec95 | 0.1313 | 43.3 | 75.9 |
-| 36 | The serial start about 2.2 ms shorter: the intern prefetches 16 keys ahead and keeps each term's length and only the long terms' keys, a term's cost is computed where the planning reads it, the sample keeps each term's count and last document in one cell, and the term table's flags are collected in bytes | | | | |
+| 36 | The serial start about 2.2 ms shorter: the intern prefetches 16 keys ahead and keeps each term's length and only the long terms' keys, a term's cost is computed where the planning reads it, the sample keeps each term's count and last document in one cell, and the term table's flags are collected in bytes | run-ce4c2e1d13c6 | 0.1342 | 42.8 | 75.7 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -913,6 +913,9 @@ grouping from 0.47 to 1.33 ms and the checks' from 2.03 to 1.65 ms, and the star
 to 18.92 ms, for 15 more lines. A long key found by a binary search in a sorted list of the long
 terms, or in a cold function, instead of in an array by id, added 200–302 M instructions to the
 pass, as the probe loop then spilled registers.
+
+The board's run, run-ce4c2e1d13c6, drew 134.2 ms against 131.3 ms for step 35's, on a slow box:
+in the same run, track C's unchanged code drew 60.1 ms, against its usual 27 ms.
 
 ## Experiments that did not stay
 

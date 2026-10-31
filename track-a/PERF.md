@@ -54,7 +54,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 47 | 5.8 instructions fewer per line: the probe counts the compare mask's trailing ones, the latency's digits combine in three steps, and their mask is one shifted constant | run-7eca9cefcfac | 0.0186 | 18.2 | 85.8 |
 | 48 | An endpoint table of 16,384 slots instead of 8,192: 1.9% of lines take a second probe instead of 3.9% | run-7eca9cefcfac | 0.0186 | 18.2 | 85.8 |
 | 49 | Three rare paths of the parse marked `std::hint::cold_path`, so its loop keeps its count, its end and its constants in registers | run-7eca9cefcfac | 0.0186 | 18.2 | 85.8 |
-| 50 | Sorting networks unrolled level by level, and a network of 128 values instead of selection for groups of 65 to 128 values | | | | |
+| 50 | Sorting networks unrolled level by level, and a network of 128 values instead of selection for groups of 65 to 128 values | run-9a8d6161d86a | 0.0235 | 18.0 | 83.2 |
 
 ## Step 1: v1
 
@@ -808,6 +808,9 @@ changes.
 instructions:u 616.0 → 598.9 M (−2.8%), cycles:u median 337.8 → 332.7 M (−1.5%). memory.peak, five
 alternating rounds on seeds 1, 2, 3, 5, 7, 10 and 11: median 18.34 → 18.24 MB. S 369 → 379. Gate:
 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes; clippy reports no warnings.
+
+The board's run, run-9a8d6161d86a, drew 23.5 ms, a slow draw: in the same run, track C's unchanged
+code drew 60.1 ms, against its usual 27 ms, and track D's 135.9 ms, against 122 to 127 ms.
 
 ## Experiments that did not stay
 
