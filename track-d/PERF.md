@@ -20,6 +20,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 13 | Labels as `u32` distances, with the rare longer ones behind a `u32::MAX` in a second map | run-954b4981ddcb | 0.1255 | 68.1 | 72.7 |
 | 14 | 11 fewer lines with the same machine code: the single-item `use` lines in one, the `mmap` and `mallopt` constants written at their one call each with their names in a comment, the file descriptor passed straight to `mmap`, and two pairs of variables declared together | run-954b4981ddcb | 0.1255 | 68.1 | 72.7 |
 | 15 | 1 fewer line with the same machine code: `sort`'s counters and its running sum declared together | run-5194056b1310 | 0.1244 | 68.4 | 72.7 |
+| 16 | `Queue::push` forced inline, so a relaxation no longer pays for a call: 1.8% fewer instructions | | | | |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
@@ -393,6 +394,19 @@ Steps 13 and 14 went to the board in one push, so both rows cite the same run.
 
 `sort` declares its counters and its running sum together. `.text` and `.rodata` are
 byte-identical to step 14's. S 442 → 441. Gate: 509 pass, 0 fail.
+
+## Step 16: the queue's push inline
+
+LLVM kept `Queue::push` out of line, so every relaxation in `Search::step` paid for a call and
+its spills. `#[inline(always)]` puts it in the loop (pedantic clippy's `inline_always` is allowed
+in `Cargo.toml`, with the reason). Local, AC power, turbo off, seed 1, 12 threads: `perf stat`,
+5 runs, twice: instructions 5.188 → 5.093 G and 5.206 → 5.112 G (−1.8%), cycles 3.485 → 3.310 G
+and 3.555 → 3.442 G, task-clock 1,458 → 1,384 ms and 1,487 → 1,440 ms. `ab.py`, interleaved
+against step 15, medians (minimums): 31 runs, 132.43 → 130.56 ms (130.38 → 126.92); 41 runs,
+135.63 → 130.98 (128.91 → 126.39); 41 runs, 133.52 → 130.68 (128.87 → 126.43); and on a first
+build, 31 runs twice, 131.09 → 127.92 and 132.38 → 128.69. memory.peak cannot move, as `push`
+runs only in the queries. S 441 → 442. Gate: 512 pass, 0 fail (full seeds 1–12 and every tiny
+seed).
 
 ## Tried and reverted (local, turbo off, no run ID)
 

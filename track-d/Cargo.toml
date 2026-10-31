@@ -26,3 +26,5 @@ perf = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 # Offsets, ids and counts are narrowed on purpose: the input is under 4 GiB with under 2^32 lines.
 cast_possible_truncation = "allow"
+# `#[inline(always)]` goes only where a measurement backs it (PERF.md, step 16).
+inline_always = "allow"

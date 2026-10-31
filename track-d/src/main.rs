@@ -694,6 +694,11 @@ impl Queue {
     }
 
     /// Queues `node` at distance `key`, which is at least `cur`.
+    ///
+    /// LLVM keeps this out of line, so every relaxation in [`Search::step`] paid for a call.
+    /// Forced inline, a run on seed 1 executes 1.7% fewer instructions and takes 2% fewer cycles
+    /// (PERF.md, step 16).
+    #[inline(always)]
     fn push(&mut self, key: u64, node: u32) {
         self.len += 1;
         if key - self.cur >= RING as u64 {
