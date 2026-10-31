@@ -572,6 +572,8 @@ four-line `if`. `.text` and `.rodata` are byte-identical to step 38's, so T and 
 S 381 → 376. Gate: 310 pass, 0 fail.
 The board's run, run-89adcd077219, drew 19.6 ms: the fourth draw of 19.5–19.7 ms in a row since
 step 36's 18.3 ms, on code that has changed by 3 instructions per line since.
+A second run of the same code, run-a0af33fbe24c (commit f25c5c2, which changed only track C),
+measured 19.7 ms, 18.1 MB and 85.1 points.
 
 ## Step 40: a plain static executable
 
