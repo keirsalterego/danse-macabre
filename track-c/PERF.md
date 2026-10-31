@@ -50,6 +50,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 43 | A waiter at the barrier sleeps in steps of 10 µs with 1 ns of timer slack, so a sleeper is no longer late for its next round, and rounds of 128 KiB, half as many barriers | run-f276c02c1223 | 0.0219 | 11.4 | 81.6 |
 | 44 | 3 fewer lines at the same speed: the country numbers given by one `for_each` over `present().zip(1..)`, with the count from `present().count()`, and the mailbox ends published in one `for_each` | run-42fe84676c85 | 0.0218 | 11.6 | 81.6 |
 | 45 | The two hyperthreads of a core mark and parse side by side: a worker on an even CPU marks the round before's letters before its parse and one on an odd CPU after it. The 64-byte window of `text_fields` and the name set's probe read unchecked, and a new min or max is a branch instead of two stores per record | run-15ada601c130 | 0.0206 | 11.4 | 82.2 |
+| 46 | `NameSet::read` leaves its loop at a new name, and `insert` calls it again from that letter, so the loop keeps the set's slots, mask and entries in registers instead of loading them for every letter; and `number` parses on a 16-byte SSE window, with the shuffle and multiply-adds of `region_amount` | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1572,8 +1573,51 @@ on top of them: 23.04 → 22.74 ms and 23.08 → 22.82 ms (−1.3%, −1.1%). me
 runs: 10.3–10.6 MB for step 44 and 10.0–10.4 MB for this step. S 366 → 376. The gate passes
 (310 of 310), full seeds 1 and 2 give the reference hashes, and clippy reports no warnings.
 
+## Step 46: the name set's loop never calls out of it, and `number` on an SSE window
+
+`perf stat` on step 45 counted 801 M instructions, and both hyperthreads of each core stay busy,
+so the instruction count decides T (see "where step 45 stands" below). Two cuts, together:
+
+- **`read` without a call in its loop.** `insert` was a call inside the marking loop, so after
+  it the slots' pointer, their length (for the mask) and the entries' pointer could have
+  changed, and the loop loaded all three again for every letter: 3 loads and a `dec` per letter.
+  Now a new name returns from `read` into `insert`, which adds it and calls `read` again on the
+  letters from that one on; it finds its entry this time. Both calls are in tail position with at
+  most six register arguments, so each is a `jmp` and the stack does not grow. `insert` reads the
+  key and the tag from the letter itself, `read` takes the letters as `[AtomicU64; 2]` pairs
+  (`mail` slices `boxes`), and it walks them as a slice, `letters = &letters[1..]`, since an
+  `enumerate` index or a separate rest took two more instructions per letter and spilled
+  `groups`. A letter whose name is in its home slot runs 32 instructions instead of 35; each new
+  name pays about 70 for the second entry and its probe, 100k times per run. +1 line.
+- **`number` on an SSE window**, as measured on step 45 below: 16 M fewer instructions, the same
+  lines. Alone it was within noise (below); with the change above it holds.
+
+`perf stat -r 10`, full seed 1, interleaved: instructions:u 800.6–802.0 M (step 45) → 797.1–799.4
+M (the loop alone) → 773.7–775.1 M (both), branch misses 1.84 M throughout. `ab.py`, turbo off,
+61 interleaved runs per round, medians / minimums, step 45 → step 46: full seed 1, 23.36 / 22.67
+→ 23.07 / 22.21, 23.50 / 22.68 → 23.02 / 22.33, 23.24 / 22.53 → 23.10 / 22.24, 23.28 / 22.86 →
+22.92 / 22.33 and 23.42 / 22.35 → 22.95 / 22.33 ms; full seed 2, 23.24 / 22.57 → 22.91 / 21.99,
+23.80 / 22.76 → 23.55 / 22.59, 23.33 / 22.72 → 22.96 / 22.50, 24.06 / 22.60 → 24.83 / 22.52 (a
+busy round, means 30.8 and 31.8 ms) and 23.45 / 22.76 → 22.95 / 22.25 ms. Nine of ten medians
+and all ten minimums lower, typically by 1.5%. The loop alone: 23.30 → 23.19 and 23.30 → 23.15
+ms; `number` alone: 23.30 → 23.20 and 23.30 → 23.29 ms (seed 1, same rounds). memory.peak, 3
+alternating runs: 10.0–10.3 MB for step 45 and 10.1–10.5 MB for this step. S 376 → 377. The gate
+passes (310 of 310), full seeds 1 and 2 give the reference hashes, and clippy reports no warnings.
+
 ## Experiments that did not stay
 
+- **The record's sums as one vector in the batch** (local, turbo off, on step 46's loop): the
+  batch held `[1, id, cents, name_len]` as one `__m256i` from `_mm256_set_epi64x`, so the merge
+  adds it with one `vpaddq` from memory and no vector built from four loads. Instructions 797.3
+  → 794.1 M only: the vector is now built at the parse, as two halves that the compiler stores
+  with two 16-byte stores, and the merge's 32-byte load cannot be forwarded from them
+  (`ld_blocks.store_forward` 3.5 k → 1.02 M per run). As eight `i64` in the batch, stored one by
+  one, the same forwarding fails, and it loses the knowledge that word 5 is 0.
+- **The probe's tag compared first, with an unused entry 0** (local, turbo off, on step 46's
+  code): a slot holds its entry's index, entry 0 is a placeholder with key 0, and the probe tests
+  the tag and the key before the empty slot, which drops a `jmp`, an `add` and a move from a hit.
+  764.2 against 773.7 M instructions, but branch misses 1.84 → 1.89 M and `ab.py`, 61 interleaved
+  runs, medians: 23.10 → 23.12, 22.92 → 22.96 and 22.96 → 23.10 ms. +1 line.
 - **Prefetching ahead in `NameSet::read`** (local, turbo off, on step 44's code), now that the
   entry's load holds 43% of its samples: at letter i, the slot of letter i + 2k prefetched and the
   entry of the slot of letter i + k (its first probe) prefetched, k = 4, 8 or 16, with the key's
@@ -1605,7 +1649,8 @@ runs: 10.3–10.6 MB for step 44 and 10.0–10.4 MB for this step. S 366 → 376
   792.4 M, cycles 522.9 → 520.6 M and 526.5 → 517.8 M (`perf stat -r 10`, interleaved), but
   memory.peak 9.9–10.2 → 10.6–10.9 MB (4 alternating runs): +0.7 MB costs about 0.25 points,
   which 1% of T does not pay for.
-- **`number` on an SSE window** (local, turbo off, on step 45's code): the id, and every other
+- **`number` on an SSE window** (local, turbo off, on step 45's code; kept in step 46 with the
+  name set's loop): the id, and every other
   field `number` reads, parsed as `region_amount` parses the region id, a compare with `/`, its
   mask's first zero for the length, and the `pshufb` and multiply-adds of step 35 shared with
   `region_amount`, instead of three multiplies of one word. The same lines (S 376), 800.8 →

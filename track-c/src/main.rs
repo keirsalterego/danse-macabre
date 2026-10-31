@@ -302,8 +302,8 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
     let letters = zeroed(2 * threads * threads * MAILBOX * 2);
     let (ends, arrived) = (zeroed(2 * threads * threads), AtomicU64::new(0));
     let mailbox = |half: usize, from: usize, to: usize| (half * threads + from) * threads + to;
-    let mail = |mb: usize| &letters[mb * MAILBOX * 2..ends[mb].load(Relaxed) as usize * 2];
     let boxes = letters.as_chunks::<2>().0;
+    let mail = |mb: usize| &boxes[mb * MAILBOX..ends[mb].load(Relaxed) as usize];
     // The region table (see above): the codes that occur, as bits, and the group of each id.
     let last_row = (regions[..regions.len() - PAD - 1].iter()).rposition(|&b| b == b'\n');
     // SAFETY: the LF lies before the pad, so the 8 bytes past it end inside the pad.
@@ -544,38 +544,30 @@ fn merge(group: &mut Group, other: &Group) {
 /// Parses the decimal digits from `at` up to the `stop` byte, and returns the value and the
 /// position of `stop`. The field's end and its value come out of the same pass.
 ///
-/// A field that fits in 8 bytes with its `stop` is parsed from one 8-byte word, with no loop and
-/// no branch on its length (SWAR: SIMD within a register). Subtracting `0` from every byte leaves
-/// each digit's value in its byte and sets the top bit of each byte below `0`, which every `stop`
-/// is (`,` or `.`). Shifting the digits to the top of the word turns the missing ones into leading
-/// zeros and drops `stop` and the bytes after it, and three multiplies then join neighbouring
-/// digits into pairs, pairs into fours and fours into the value. Longer fields, such as an id with
-/// leading zeros (§2.1 allows them), take the loop over bytes.
+/// A field of up to 7 digits is parsed from one 16-byte vector, as [`region_amount`] parses the
+/// region id: a compare with `/` marks the digits, so the first byte that is not one, below `0`
+/// or from 0x80 on, is the field's end, which every `stop` is (`,` or `.`), and [`values`] takes
+/// the value. Longer fields, such as an id with leading zeros (§2.1 allows them), take the loop
+/// over bytes. Three multiplies of one word (SWAR) took 6 more instructions per record (PERF.md,
+/// step 46).
 ///
 /// It is always inlined, so the id's parse at the start of each record is not a call.
 ///
 /// # Safety
 ///
-/// The 8 bytes from `at` on lie in `data`. Every caller starts it at most a few bytes past the
+/// The 16 bytes from `at` on lie in `data`. Every caller starts it at most a few bytes past the
 /// input's end, which the [`PAD`] follows, so the read is not checked: its check took about
 /// five instructions per record.
 #[inline(always)]
 unsafe fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
-    const ONES: u64 = u64::from_le_bytes([1; 8]);
-    // SAFETY: the caller keeps the 8 bytes in `data`, and `[u8; 8]` needs no alignment.
-    let word = u64::from_le_bytes(unsafe { *data.as_ptr().add(at).cast() });
-    let digits = word.wrapping_sub(ONES * u64::from(b'0'));
-    // The lowest set bit marks the first byte below `0`, so the first `stop`. Bits above it
-    // can be false, which is why only the lowest one is used.
-    let stops = digits & !word & (ONES << 7);
-    if stops != 0 {
-        let len = stops.trailing_zeros() as usize / 8;
-        // The subtraction borrows at `stop` and spoils the bytes after it, which the shift drops.
-        // In two steps, because a 0-digit field would need a shift by 64.
-        let digits = digits << (8 * (7 - len)) << 8;
-        let pairs = (digits.wrapping_mul(10 << 8 | 1) >> 8) & 0x00FF_00FF_00FF_00FF;
-        let fours = (pairs.wrapping_mul(100 << 16 | 1) >> 16) & 0x0000_FFFF_0000_FFFF;
-        return (fours.wrapping_mul(10000 << 32 | 1) >> 32, at + len);
+    // SAFETY: the build targets Alder Lake, which has SSE2 (see `.cargo/config.toml`), and the
+    // caller keeps the 16 bytes from `at` in `data`. `loadu` needs no alignment.
+    let window = unsafe { _mm_loadu_si128(data.as_ptr().add(at).cast()) };
+    // SAFETY: as above.
+    let len = unsafe { !_mm_movemask_epi8(_mm_cmpgt_epi8(window, _mm_set1_epi8(b'/' as i8))) };
+    if len.trailing_zeros() < 8 {
+        let len = len.trailing_zeros() as usize;
+        return (values(window, len << 4) & 0xFFFF_FFFF, at + len);
     }
     let mut value = 0;
     while data[at] != stop {
@@ -627,19 +619,27 @@ unsafe fn region_amount(data: &[u8], at: usize) -> (u64, i64, usize) {
         // SAFETY: the caller keeps `at` at most the input's length.
         return unsafe { region_amount_slow(data, at) };
     }
-    let control = ALIGN[(comma << 4 | dot) & 127];
+    let both = values(window, comma << 4 | dot);
+    let negative = stops >> (comma + 1) & 1 == 1;
+    let cents = (both >> 32).cast_signed() * if negative { -1 } else { 1 };
+    (both & 0xFFFF_FFFF, cents, at + dot)
+}
+
+/// Steps 2 to 4 of [`region_amount`]: the values of the fields that the control `ALIGN[i]` moves
+/// out of `window`, the one before the comma in the low 32 bits.
+fn values(window: __m128i, i: usize) -> u64 {
     // SAFETY: the build targets Alder Lake, which has SSSE3 and SSE4.1 (see `.cargo/config.toml`).
-    let both = unsafe {
-        let aligned = _mm_shuffle_epi8(_mm_subs_epu8(window, _mm_set1_epi8(b'0' as i8)), control);
+    unsafe {
+        let aligned = _mm_shuffle_epi8(
+            _mm_subs_epu8(window, _mm_set1_epi8(b'0' as i8)),
+            ALIGN[i & 127],
+        );
         // The weights of each lane's halves, low half first: 10 and 1, 100 and 1, 10000 and 1.
         let pairs = _mm_maddubs_epi16(aligned, _mm_set1_epi16((1 << 8) + 10));
         let fours = _mm_madd_epi16(pairs, _mm_set1_epi32((1 << 16) + 100));
         let fours = _mm_packus_epi32(fours, fours);
         _mm_cvtsi128_si64(_mm_madd_epi16(fours, _mm_set1_epi32((1 << 16) + 10000))).cast_unsigned()
-    };
-    let negative = stops >> (comma + 1) & 1 == 1;
-    let cents = (both >> 32).cast_signed() * if negative { -1 } else { 1 };
-    (both & 0xFFFF_FFFF, cents, at + dot)
+    }
 }
 
 /// [`region_amount`] for fields that do not fit its window. No record of a generated file takes
@@ -893,9 +893,14 @@ impl NameSet {
 
     /// Marks the names of `letters` and counts each name that is new for its group in
     /// `groups`. Kept out of line so that this loop gets the registers to itself.
+    ///
+    /// A new name leaves the loop: [`NameSet::insert`] adds it and calls `read` again on the
+    /// letters from it on, so both calls are jumps, and nothing in the loop calls out of it. A
+    /// loop that resumed after the call had to load the slots, their length and the entries again
+    /// for every letter, 15 M instructions per run (PERF.md, step 46).
     #[inline(never)]
-    fn read(&mut self, letters: &[AtomicU64], groups: &mut [Group]) {
-        for [key, high] in letters.as_chunks().0 {
+    fn read(&mut self, mut letters: &[[AtomicU64; 2]], groups: &mut [Group]) {
+        while let [[key, high], ..] = letters {
             let (key, high) = (key.load(Relaxed), high.load(Relaxed));
             // A group fits in a byte (see [`join`]), so the bit's word is one of four with no
             // bounds check.
@@ -906,7 +911,7 @@ impl NameSet {
                 // length. Checked, the load took two instructions per probe.
                 let found = *unsafe { self.slots.get_unchecked(slot) };
                 match (found >> 8) as usize {
-                    0 => break self.insert(slot, tag, key),
+                    0 => return self.insert(slot, letters, groups),
                     // SAFETY: a slot that is not 0 holds the entry count just after its entry was
                     // pushed (see `insert`), and no entry is removed, so `e - 1` is an entry.
                     e if found as u8 == tag
@@ -923,21 +928,23 @@ impl NameSet {
             // number below `group_count`. Every worker counts the same codes, so that is the
             // length of `groups` here too (see [`join`]).
             unsafe { groups.get_unchecked_mut(group)[5] += i64::from(*word & bit == 0) }
-            *word |= bit;
+            (*word, letters) = (*word | bit, &letters[1..]);
         }
     }
 
-    /// Appends an entry with the key and no groups, puts it in the empty `slot` with its `tag`,
-    /// and returns it. When the entries fill three quarters of the slots, the slots double and
-    /// every slot is placed again by its entry's key, so every probe ends at an empty slot. The
-    /// slots are placed from the old ones, which hold the tags that no entry keeps.
+    /// Appends an entry with the key of the first letter and no groups, puts it in the empty
+    /// `slot` with its tag, and marks the letters, that one first. When the entries fill three
+    /// quarters of the slots, the slots double and every slot is placed again by its entry's key,
+    /// so every probe ends at an empty slot. The slots are placed from the old ones, which hold
+    /// the tags that no entry keeps.
     ///
     /// Cold, because inlined into [`NameSet::read`] it spilled the key of every letter.
     #[cold]
-    fn insert(&mut self, slot: usize, tag: u8, key: u64) -> &mut Entry {
+    fn insert(&mut self, slot: usize, letters: &[[AtomicU64; 2]], groups: &mut [Group]) {
+        let [key, high] = letters[0].each_ref().map(|word| word.load(Relaxed));
         assert!(self.entries.len() < ENTRY as usize, "over 2^24 names");
         self.entries.push(Entry(key, [0; 4]));
-        self.slots[slot] = (self.entries.len() as u32) << 8 | u32::from(tag);
+        self.slots[slot] = (self.entries.len() as u32) << 8 | u32::from((high >> 48) as u8);
         if 4 * self.entries.len() > 3 * self.slots.len() {
             let mask = 2 * self.slots.len() - 1;
             let old = std::mem::replace(&mut self.slots, vec![0; mask + 1]);
@@ -949,7 +956,7 @@ impl NameSet {
                 self.slots[slot] = found;
             }
         }
-        self.entries.last_mut().expect("an entry was just pushed")
+        self.read(letters, groups);
     }
 }
 
