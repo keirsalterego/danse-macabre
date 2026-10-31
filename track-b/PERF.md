@@ -45,7 +45,8 @@ run-6280980d331c, measured 202.0 ms and 43.5 MB (71.3 points). Draws of the same
 step 21's machine code measured 216.5 and 217.7 ms (rows 21 and 22).
 
 Local numbers below come from 12 threads on the P-cores (CPUs 0-11, turbo off), full seed 1,
-`perf stat -r 5`, with the variants interleaved over three rounds.
+`perf stat -r 5`, with the variants interleaved over three rounds, unless a section says
+otherwise.
 
 ## Step 2: term lookup and tokenizer
 
@@ -165,7 +166,7 @@ first matches (5 ms faster, 2.7 MB more).
 
 At step 6 the pass spent 7.5% of its cycles walking page tables: 18.7 million dTLB load
 misses walked to completion, 541 M cycles with a walk under way. Each token probes the 4 MiB
-term table at a random slot, and a long token then reads its full key from a 2.4 MiB array.
+term table at a random slot, and a long token then reads its full key from a 2.4 MB array.
 On 4 KiB pages those tables span more pages than the TLB holds. The kernel here has
 transparent huge pages set to `always`, but in the middle of a run only 2 MiB of the 18 MiB of
 large blocks sat on huge pages: the blocks did not start on 2 MiB boundaries, and without
@@ -195,7 +196,7 @@ to their length once the intern ends, since the spare capacity would stay reside
 The scan's machine code is unchanged.
 
 Local, the time from start to the end of planning, medians of 6 interleaved runs: 27.96 → 23.5
-ms. User instructions 10.23 → 10.06 G. memory.peak 40.2 → 40.6 MiB (noise about ±1 MiB). S
+ms. User instructions 10.23 → 10.06 G. memory.peak 42.2 → 42.6 MB (noise about ±1 MB). S
 unchanged. Gate: 507 pass, 0 fail; full seeds 1–7 match.
 
 What is left of start-up, and why it stays: query parsing 3 ms (already parallel), intern 6.3,
@@ -227,7 +228,7 @@ Walk cycles: 427–517 M with no huge pages, 136 M at step 9, 246–257 M now.
 Locally, against step 9, three interleaved rounds: cycles 6.87–6.90 → 6.85–6.90 G, task-clock
 2,952–2,967 → 2,969–2,989 ms, elapsed 0.2755–0.2770 → 0.2770–0.2791 s. Alternating runs, 14 each,
 twice: median wall 275.6 and 276.9 → 276.8 and 278.7 ms (no huge pages at all: 282.5 and 282.2).
-memory.peak over six runs each: 39.4–42.8 → 39.3–41.8 MiB; this machine does not show the
+memory.peak over six runs each: 41.3–44.9 → 41.2–43.8 MB; this machine does not show the
 board's difference. S 871 → 849. Gate: 507 pass, 0 fail.
 
 ## Step 11: no branch on a check's result
@@ -253,7 +254,7 @@ loop. The `Event` enum goes.
 
 Locally, against step 11, three interleaved rounds: instructions 10.22 → 8.86 G, cycles
 6.60–6.67 → 6.16–6.25 G, task-clock 2,858–2,893 → 2,669–2,710 ms. Alternating runs, 16 each,
-twice: median wall 272.0 and 270.5 → 255.4 and 254.0 ms (b-c4: 297.5 and 295.6). S 849 → 846.
+twice: median wall 272.0 and 270.5 → 255.4 and 254.0 ms (step 6: 297.5 and 295.6). S 849 → 846.
 Gate: 507 pass, 0 fail.
 
 ## Step 13: one multiply per token hash
@@ -278,7 +279,7 @@ the pass, so it no longer needs zeroing before the checks' cells are added in.
 
 Locally, against step 13, three interleaved rounds: cycles 6.05–6.15 → 5.94–6.00 G, task-clock
 2,623–2,669 → 2,582–2,607 ms. Alternating runs, 16 each, twice: median wall 247.9 and 247.3 →
-245.4 and 244.8 ms. memory.peak over four runs: 40.2–44.1 → 41.7–42.5 MiB (the bytes add 0.6 MB
+245.4 and 244.8 ms. memory.peak over four runs: 42.2–46.2 → 43.7–44.6 MB (the bytes add 0.6 MB
 over 12 threads). S 844 → 845. Gate: 507 pass, 0 fail.
 
 Not kept: each check pushing its first ten matches with no per-query count (format already takes
@@ -293,8 +294,8 @@ its 349 bitset rows (179 KB) included, and [`group`] cloned its 50,001 group sta
 fill cursors. The window is now dropped after its last flush, and the grouping uses the starts
 themselves as cursors, then shifts them back by one place.
 
-Locally, memory.peak over seven runs each: 41.1–43.3 MiB (median 42.6) → 39.6–40.5 MiB
-(median 39.9). The window alone: median 40.0, but one run at 42.8. Cycles and wall unchanged:
+Locally, memory.peak over seven runs each: 43.1–45.4 MB (median 44.7) → 41.5–42.5 MB
+(median 41.8). The window alone: median 41.9, but one run at 44.9. Cycles and wall unchanged:
 5.94–5.96 → 5.93–5.94 G; alternating runs, 12 each: median 246.0 → 245.1 ms. S 845 → 848.
 Gate: 507 pass, 0 fail.
 
@@ -313,7 +314,7 @@ threads, so 2,059 rounds of interrupts to 11 cores each. [`Tally::new`] now buil
 Locally, against step 15: page faults 18,800 → 16,710, kernel cycles 214 → 156–157 M, user
 cycles unchanged (5.95–6.00 → 5.88–5.99 G). Alternating runs, 16 each, twice: median 246.4 and
 246.1 → 244.9 and 243.4 ms, min 244.2 and 244.5 → 241.5 and 241.4 ms. memory.peak over seven
-runs: median 39.8 → 39.9 MiB. S 848 → 848. Gate: 507 pass, 0 fail.
+runs: median 41.7 → 41.8 MB. S 848 → 848. Gate: 507 pass, 0 fail.
 
 Not kept: the same writes as `black_box(&mut cells).fill(0)` after `vec!`, for the same time
 (median 244.6 and 242.9 ms in the same runs) and 5 more lines. Also measured: recording first
@@ -336,7 +337,7 @@ Locally, against step 16, alternating runs, 16 each, three rounds: median 245.3,
 range rounded inward instead, to the chunk's own whole pages: 242.7 → 240.7 ms. Kernel cycles
 rise a little, 171–182 → 178–192 M in a noisy session (the same work, spread over cores, plus
 one TLB-flush interrupt per thread), but no longer at the end. memory.peak over seven
-interleaved runs: median 40.0 → 40.1 MiB. S 848 → 852. Gate: 507 pass, 0 fail.
+interleaved runs: median 41.9 → 42.0 MB. S 848 → 852. Gate: 507 pass, 0 fail.
 
 A second board run of the same code, run-7a898680a856 (from the next push), measured 0.2293 s
 and 42.2 MB.
@@ -360,7 +361,7 @@ stops with an error before that, at 2^28 term occurrences.
 Locally, against step 17: user cycles 5.85–5.89 → 5.68–5.70 G over five rounds of `perf stat
 -r 5`, instructions 8.573 → 8.687 G (the extra compare). Alternating runs (`ab.py`), 15 or 16
 each, five rounds: median 237.3, 237.9, 237.8, 237.2 and 237.1 → 229.8, 229.8, 230.6, 229.5 and
-229.5 ms (−3.2%). memory.peak over six interleaved runs: median 41.2 → 41.0 MiB (the table is
+229.5 ms (−3.2%). memory.peak over six interleaved runs: median 43.2 → 43.0 MB (the table is
 the same size). S 852 → 857. Gate: 510 pass, 0 fail.
 
 ## Step 19: 99 fewer lines
@@ -429,8 +430,8 @@ other rounds: 229.5 and 230.1 → 226.9 and 227.1 ms. The loop form with every f
 to 64 bytes, so that the hot functions, whose code is the same, sit at the same offsets: 230.8
 and 230.8 → 226.8 and 226.7 ms. `perf stat`: user cycles 5.59 → 5.51–5.56 G, instructions 8.739 →
 8.686 G. In a `perf record` timeline the pass starts at 21.4 ms instead of 21.1–22.0 ms, and
-its threads' cycles fall 5.59 → 5.51 G. memory.peak over six interleaved runs: median 39.3 →
-39.1 MiB. S 758 → 771. Gate: 510 pass, 0 fail.
+its threads' cycles fall 5.59 → 5.51 G. memory.peak over six interleaved runs: median 41.2 →
+41.0 MB. S 758 → 771. Gate: 510 pass, 0 fail.
 
 ## Step 21: 35 fewer lines, loops on 64-byte boundaries
 
@@ -460,7 +461,7 @@ loop +0.07 and −0.13 ms, the rest +0.88 and +0.85 ms. The cost is where the ho
 `Plan::new` cut alone, which runs once and leaves the instruction count at 8,686.1 M, moved the
 scan thread's code, byte for byte the same, from offset 16 of a 64-byte line to offset 0, and
 user cycles rose 0.3–0.6%. `-C llvm-args=-align-loops=64` in `.cargo/config.toml` starts every
-loop on a 64-byte boundary; executing the padding adds 28 M instructions (8,686 → 8,711 M).
+loop on a 64-byte boundary; executing the padding adds 28 M instructions (8,683 → 8,711 M).
 Step 20 built that way ran 226.5 and 226.3 ms, this step 225.9 and 225.8 ms, in the same
 sessions as step 20 as built before at 226.0 and 226.0 ms. A loop now keeps its offset in a
 line wherever later changes move its function.
@@ -488,7 +489,8 @@ unchanged. S 736 → 728. Gate: 510 pass, 0 fail.
 
 On seed 1 the per-document checks ([`Check`]) run 16.9 million times. Each one built its truth
 table's index from its six terms: per term a bounds-checked load of the document's bit set
-`seen`, a shift and an OR, 29 cycles a check in all (0.49 G of step 20's 5.66 G user cycles).
+`seen`, a shift and an OR. With the loads unchecked, that still took 29 cycles a check:
+0.49 G of 5.49 G user cycles on step 20.
 Now one AVX2 gather (`vpgatherdd`) loads the 32-bit words of `seen` that hold the six terms'
 bits, a variable shift moves each bit to the top of its lane, and `movemask` collects the six
 bits as the index. The two spare lanes read word 0 and are masked off. Every term id, and the
@@ -526,7 +528,7 @@ Locally, against step 23 (alternating runs, `ab.py`, 20 each), three rounds: med
 instructions 7,517 → 7,625 M. memory.peak over six alternating runs: median 43.8 → 43.3 MB.
 S 732 → 733. Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
 
-## Step 25: a token loop without data-dependent branches
+## Step 25: a token loop without branches on what a token is
 
 Step 24's 52 million mispredicted branches came from four tests per token, counted by branch
 address in the last branch record (`perf record -b`): the term table probe's compare (34%),
@@ -666,8 +668,8 @@ lists apart on top of that 169.72 → 168.34. Locally, against step 28 (alternat
 18.3–18.4 M. memory.peak over eight alternating runs: median 41.3 → 40.8 MB. S 746 → 745.
 Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
 
-Comparing a phrase's span term by term instead of as slices, which calls `bcmp`, did not
-measure.
+Comparing a phrase's span term by term instead of as slices, which calls `bcmp`, gained
+nothing: median 171.91 ms against 171.52 ms, 18 alternating runs each.
 
 A second run of the step 29 code, run-2d06517dbcd4, measured 160.2 ms and 42.2 MB (73.8 points).
 
@@ -733,8 +735,9 @@ and the run took 11 ms longer.
   ms, writing 0.6 ms, and the exit 0.8 ms. None of these changes paid:
   - The sample counted by all threads, one part each, then summed: the plan was ready 1.3 ms
     sooner (21.4–21.8 → 20.0–20.7 ms), but the wall did not move (239.6 → 240.1 and 238.5 →
-    239.1 ms), for 16 more lines. The sample's slots prefetched as in the pass instead (4 more
-    lines) cut the sample from 5.3 to about 4.1 ms: 239.0 → 239.6 and 239.0 → 240.3 ms.
+    239.1 ms), for 16 more lines (kept at step 20). The sample's slots prefetched as in the pass
+    instead (4 more lines) cut the sample from 5.3 to about 4.1 ms: 239.0 → 239.6 and 239.0 →
+    240.3 ms (kept at step 28).
   - The queries, plan and chunks leaked instead of freed after formatting: the exit then took
     1.7–1.9 ms instead of 0.7–1.0, and the wall went from 238.5 to 240.6 ms.
   - The grouping's two arrays written when allocated, as in step 16: 238.9 → 239.5 ms. Each
@@ -748,36 +751,46 @@ and the run took 11 ms longer.
   elapsed 0.383–0.385 → 0.392–0.397 s. Huge pages off without the fixed threshold gave
   49.8–50.8 MB, and `malloc_trim(0)` after planning 49.2–50.1 MB.
 - **Every BOOL query checked per document, with no sets at all** (step 3 without the sets):
-  1.29 s, 29.0 G cycles, 53.3 MB, against 0.63 s and 14.6 G for step 2. That meant about 100
-  million evaluations, each chasing a query's heap-allocated terms and operators.
+  1.29 s, 29.0 G cycles, 53.3 MB, against 0.67–0.75 s and 14.0–14.2 G for step 2 in the same
+  session. That meant about 100 million evaluations, each chasing a query's heap-allocated
+  terms and operators.
 - **Step 3a's two paths with per-term arrays instead of table slots:** 15.1 G cycles, 0.64 s,
   76 MB, against 13.2 G and 0.58 s for step 2. With 75,747 terms, every hit touched about six
   random cache lines: the 1 MB slot array, 2.4 MB of keys, the last-seen array, the store array,
   and two 1.8 MB arrays of `Vec` headers. Moving the flags into the slots fixed that.
-- **Term table grown at 3/4 load instead of 1/2** (2 MB of slots instead of 4): cycles 11.07 →
+- **Term table grown at 3/4 load instead of 1/2** (2.1 MB of slots instead of 4.2): cycles 11.07 →
   11.53 G, elapsed 0.535 → 0.55 s, memory 81 → 77.7 MB. The longer probe runs cost more than the
   smaller table saved.
 - **One per-document loop shared by the sample and the pass**, taking closures: fewer code
   lines, but cycles 10.0 → 10.6 G and instructions 12.25 → 13.60 G. A shared probe function
   that returned the slot cost 4% more cycles on its own. The pass keeps its loop inline.
 - **A term table sized for every term occurrence up front** instead of doubling: parse
-  13.8–14.7 → 10.7–11.0 ms, but 8 MB of slots instead of 4, as the queries hold 152,904 term
+  13.8–14.7 → 10.7–11.0 ms, but 8.4 MB of slots instead of 4.2, as the queries hold 152,904 term
   occurrences and only 75,747 distinct terms.
 - **Huge pages without the `realloc` path**, every resize a new block and a copy: median wall
   288.9 ms against 295.5 for step 6 (285.3 with it). The parse and the plan grow their arrays
   by copying. With `alloc_zeroed` also sent to glibc's `calloc` as well: 288.4 ms.
 - **Huge pages only for blocks of 4 MiB or more** (the term table and its keys): the same
   cycles and memory as 2 MiB.
-- **No branch per token at the line end, on top of step 6.** A token that is no query term
-  resolved to an empty slot with a reserved id and no flags, and the trigger lists grew by
-  writing each entry and advancing by 0 or 1. Branch misses fell from 77.6 to 65.1 M, but
-  instructions rose from 10.07 to 10.57 G and cycles stayed at 7.19–7.20 G. Prefetching the
-  triggered checks after the token loop, or at first sight behind one branch, was 0.5–1%
-  slower than step 6.
-- **The full keys of long tokens prefetched** in a pass between hashing and probing, on the
-  step 5 code: cycles 8.40–8.44 → 9.09–9.12 G, as the extra pass stalls on the slot loads it
-  reads. On step 6, skipping the long-key comparison altogether (wrong answers, as an upper
-  bound) saved only 1.5–2.8% of cycles, too little for a prefetch scheme to chase.
+- **No branch per token at the line end, on top of step 6** (kept at step 25). A token that
+  is no query term resolved to an empty slot with a reserved id and no flags, and the trigger
+  lists grew by writing each entry and advancing by 0 or 1. Branch misses fell from 77.6 to
+  65.1 M, but instructions rose from 10.07 to 10.57 G and cycles stayed at 7.19–7.20 G.
+  Prefetching the triggered checks after the token loop, or at first sight behind one branch,
+  was 0.5–1% slower than step 6.
+- **The full keys of long tokens prefetched** in a pass between hashing and probing, on a
+  variant of step 5 that was never merged: cycles 8.40–8.44 → 9.09–9.12 G, as the extra pass
+  stalls on the slot loads it reads. On step 6, skipping the long-key comparison altogether
+  (wrong answers, as an upper bound) saved only 1.5–2.8% of cycles, too little for a prefetch
+  scheme to chase.
 - **Phrase triggers pushed without a branch** (each position pushed, then dropped again unless
   the term triggers phrases), on top of step 9: branch misses 68.8 → 67.2 M, but instructions
   10.06 → 10.44 G and cycles 6.80 → 6.87 G.
+- **Every BOOL query on sets, a window at a time, on step 25** (a prototype). Common terms keep
+  their bitset rows; for the others the pass logs each document they occur in, and at each
+  window's end a counting sort groups the log by term into lists that every BOOL query is
+  evaluated on, merging with galloping search. Correct on seeds 1 and 2; `ab.py`, 12 runs each,
+  two rounds: median 179.82 and 179.46 ms against 183.80 and 183.09 ms, about 2% faster, but
+  memory.peak over four runs 52.1–53.9 MB against 41.9–43.0 MB. Of its 58.8 ms of BOOL work,
+  logging took 11.5, grouping 8.3 and evaluation 39.0: at least 55 million merge steps, where
+  the per-document checks run 16.9 million times.

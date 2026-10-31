@@ -24,19 +24,19 @@
 //! 3. **One pass on every thread.** Each thread scans a chunk of whole lines ([`scan`]), and
 //!    [`walk`] finds the tokens 64 bytes at a time from AVX2 bit masks. At the end of each
 //!    document, every query its triggers point at is checked against that document alone: a
-//!    phrase at each position of its trigger term, a BOOL query by applying its operators to
-//!    "does this document contain the term" ([`Check`]). Set operations act on each
+//!    phrase at each position of its trigger term, a BOOL query by one lookup in a truth table
+//!    of which of its terms this document contains ([`Check`]). Set operations act on each
 //!    document separately, so this gives the same answer as combining whole sets (spec §3).
 //!    For the queries on sets, the pass records which documents of the current [`Window`]
 //!    hold their terms, a bitset per common term and an id list per rare one, and evaluates
 //!    the queries at the window's end.
 //! 4. **Merge.** Per query, the chunks' counts and id sums add up, and the smallest ids come
-//!    from the earliest chunks ([`Tally`]).
+//!    from the earliest chunks ([`format_range`]).
 //!
 //! Memory stays at a few arrays per thread: per query a count, an id sum and the first
 //! matches, and per kept term one window's documents. Numbers: PERF.md.
 
-// The AVX2 intrinsics of `classify` and the prefetch of `prefetch`.
+// The AVX2 intrinsics of `classify` and `Check::matches`, and the prefetch of `prefetch`.
 use std::{
     alloc::Layout, arch::asm, arch::x86_64::*, error::Error, fs::File, io::Write,
     num::NonZeroUsize, ops::Range, os::fd::AsRawFd, path::Path, thread,
@@ -82,7 +82,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let parts = answer_all(file("queries.txt")?, file("docs.txt")?)?;
     let mut results = File::create(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     (parts.iter()).try_for_each(|part| results.write_all(part))?;
-    // Exit without running destructors: freeing the posting lists would only add to the timed
+    // Exit without running destructors: freeing the output's pieces would only add to the timed
     // wall. `File` keeps no user-space buffer, so every byte is already written.
     std::process::exit(0)
 }
@@ -301,13 +301,13 @@ struct Plan {
 impl Plan {
     /// Picks every query's triggers and every term's [`Store`].
     ///
-    /// A phrase match holds each of its terms at a fixed offset from the window start, so
-    /// checking the windows around one term's occurrences finds all of them, and the rarest
+    /// A phrase match holds each of its terms at a fixed offset from the match's start, so
+    /// checking the spans around one term's occurrences finds all of them, and the rarest
     /// term costs the fewest checks. A BOOL query whose cover holds a common term would be
     /// evaluated on a large share of the documents, so it runs on sets instead: its common
-    /// terms keep a bitset and the others an id list, whichever is smaller. A term absent
-    /// from the corpus never fires and keeps an empty list, which leaves its queries at `0 0`
-    /// with no special case.
+    /// terms keep a bitset and the others an id list ([`DENSE_SHARE`]). A term absent from
+    /// the corpus never fires and keeps an empty list, so its queries see it as the empty
+    /// set, with no special case.
     fn new(queries: &Queries, mut terms: TermTable, docs: &[u8], threads: usize) -> Self {
         let (hits, sampled) = sample_hits(docs, &terms, threads);
         // Fewer sample hits cost less. Among equals (often zero hits), longer terms tend to be
@@ -386,7 +386,7 @@ impl Plan {
     }
 }
 
-/// Returns terms such that every document matching the BOOL `query` contains one of them.
+/// Fills `cover` with terms such that every document matching the BOOL query `steps` holds one.
 ///
 /// Read left to right, the first term covers `S(t1)`. `AND t` leaves a subset of both sides,
 /// so the cheaper of the running cover and `t` alone will do. `OR t` adds `S(t)`, so `t`
@@ -495,7 +495,7 @@ impl Check {
         // SAFETY: the mask reads the six lanes of `terms` only, and zeroes the other two.
         let terms = unsafe { _mm256_maskload_epi32(self.terms.as_ptr().cast(), lanes) };
         let at = _mm256_srli_epi32::<5>(terms);
-        // SAFETY: each lane's word index `t / 32` lies inside `seen`, as `t < 64 * seen.len()`.
+        // SAFETY: word `t / 32` lies inside `seen`, which `scan` sizes past every id and the pad.
         let words = unsafe { _mm256_i32gather_epi32::<4>(seen.as_ptr().cast(), at) };
         let top = _mm256_sllv_epi32(words, _mm256_andnot_si256(terms, _mm256_set1_epi32(31)));
         // The two zeroed lanes hold term 0's bit; the mask drops them.
@@ -713,7 +713,7 @@ impl Tally {
     /// Records the documents `start + i` for each bit `i` set in `bits`, as [`Tally::add`] would
     /// one by one. So it does until the query has its first matches; the rest are counted a
     /// word at a time, and all words in one sum, which the compiler vectorizes. A word's count
-    /// is a popcount, and its id sum is its first id times the count plus the sum of the set
+    /// is a popcount, and its id sum is its bit 0's id times the count plus the sum of the set
     /// bits' positions ([`bit_index_sum`]).
     fn add_bits(&mut self, q: u32, start: u32, mut bits: [u64; WINDOW]) {
         let mut i = 0;
@@ -841,9 +841,9 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
         let n = probes.len();
         kept.resize(kept.len().max(4 * n), 0);
         let (kept, mut rows, mut lists, mut bools) = (&mut kept[..4 * n], n, 2 * n, 3 * n);
-        // No branch on what a token is, a query term or not, seen in the doc before or not,
-        // stored or a BOOL trigger: none of it follows a pattern, so each branch would
-        // mispredict often.
+        // No branch on what a token is, a query term or not, new in the doc or not, kept in a
+        // row or a list, or a BOOL trigger: none of it follows a pattern. Phrase triggers keep
+        // their branch below: pushing them without one lost on step 9 (PERF.md, experiments).
         for (k, (key, at)) in probes.iter().enumerate() {
             let slot = plan.terms.find_from(key, *at);
             let (t, bit) = (slot.id() as usize / 64, 1 << (slot.id() % 64));
@@ -1012,7 +1012,7 @@ fn fold(window: &[u8; MAX_TERM], len: usize) -> Key {
     // Flattened, `ONES` is 32 bytes of 0xFF then 32 zeros, so `len` bytes of 0xFF, then zeros,
     // start at `MAX_TERM - len`. On one 64-byte cache line, that 32-byte load never splits
     // across two; unaligned, the table sat wherever the rest of the constants left it, and a
-    // split load per token cost up to 1% of the run.
+    // split load per token cost 0.7 ms of a run (PERF.md, step 19).
     #[repr(align(64))]
     struct Line([[u8; MAX_TERM]; 2]);
     const ONES: Line = Line([[0xFF; MAX_TERM], [0; MAX_TERM]]);
@@ -1160,8 +1160,8 @@ impl TermTable {
         let long = key[1] >> 32 | key[2] | key[3] != 0;
         loop {
             let slot = &self.slots[at];
-            // No `&&`: whether a token is a query term follows no pattern, so the probe takes
-            // one branch, mostly taken, which ends it at the term or at an empty slot.
+            // No `&&`: whether a token is a query term follows no pattern, so the probe takes one
+            // branch, mostly taken, ending at the term or an empty slot; long keys take one more.
             let mut found = (slot.head ^ key[0]) | u64::from(slot.tail ^ key[1] as u32) == 0;
             found &= (slot.flags & Slot::LONG != 0) == long;
             if found & long {

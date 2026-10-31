@@ -26,5 +26,5 @@ perf = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 # Offsets, ids and counts are narrowed on purpose: the input is under 4 GiB with under 2^32 lines.
 cast_possible_truncation = "allow"
-# One glob import brings in the AVX2 intrinsics that `classify` and `prefetch` call.
+# One glob import brings in the intrinsics that `classify`, `Check::matches` and `prefetch` call.
 wildcard_imports = "allow"
