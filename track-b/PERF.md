@@ -36,6 +36,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 29 | A query on sets adds its window's matches in one vectorized sum instead of a call per word; a term's store is a `u32` code instead of an enum; the terms kept in rows and in lists are listed apart, so adding them takes no branch on which | run-575e79713710 | 0.1623 | 43.1 | 73.7 |
 | 30 | A plain static executable (`crt-static` and `relocation-model=static`) instead of a dynamically linked PIE | run-4654d088e3bb | 0.1615 | 41.1 | 73.7 |
 | 31 | The token loop writes a document's term ids and its kept rows, lists and BOOL triggers into four runs of one slice, and its seen bits, without bounds checks, so its registers no longer spill | run-ea58cfb946e5 | 0.1483 | 42.1 | 74.6 |
+| 32 | 1 fewer line with the same binary: the build stage mounts its sources instead of copying them | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -722,6 +723,15 @@ past the home slot and cut branch misses from 18.4 to 15.6 M, but it added 91 M 
 the user cycles stayed at 4.13–4.16 G, and the wall did not move: 169.69 → 169.10 and 168.87
 → 169.29 ms, for 9 more lines. Without `#[inline(always)]`, its lookup was no longer inlined
 and the run took 11 ms longer.
+
+## Step 32: the sources mounted, not copied
+
+The Dockerfile's build stage mounts its context (`RUN --mount=type=bind,target=/src`) instead of
+copying it with `COPY . .`, and cargo builds into `--target-dir /out`, since the mount is
+read-only. `harness/dockerfile_check.py` accepts a bind mount of the context, and the board
+built track A's Dockerfile with the same mount (its step 45). A local `docker build
+--network=none` gives a binary byte-identical to step 31's, so T and M cannot move. S 746 →
+745.
 
 ## Experiments that did not stay
 
