@@ -51,6 +51,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 44 | The line end's token loop prefetches each token's entry of `check_at`, which the BOOL triggers' loop reads at random, one token ahead of that loop | run-0f0011884453 | 0.1166 | 42.4 | 77.1 |
 | 45 | A token whose home slot holds another term stops there unless the slot is marked as the home of a term stored further on; a key's long bit is its byte 12's bit 5, moved by one shift | run-636a838e4422 | 0.1135 | 42.3 | 77.3 |
 | 46 | A window's matches counted and summed four words at a time from two nibble tables, instead of six masked popcounts per word | | | | |
+| 47 | A document's phrase triggers are listed in a fifth run of the token loop's slice, by a store and an add, instead of pushed to a `Vec` behind a branch | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1237,6 +1238,25 @@ and 115.99 ms; as committed, two rounds, medians 120.49 and 118.39 → 120.41 an
 minimums 117.53 and 116.36 → 115.91 and 114.73 ms. memory.peak over 5 alternating runs: median
 40.0 → 39.7 MB, with the same allocations. S 800 → 819 (the first form, with its tables as
 `_mm_setr_epi8` calls and tuples that rustfmt splits, cost 35). Gate: 510 pass, 0 fail.
+
+## Step 47: phrase triggers without a branch
+
+After step 46, the line end's token loop still pushed each phrase trigger's position to a `Vec`
+behind a test of the slot's `PHRASE` flag: the one branch on what a token is that it kept, and
+the `Vec`'s length, loaded and stored at each push, the one value of the loop on the stack.
+Step 9 had measured a branch-free push as a loss, when the trigger lists were `Vec`s. Since
+step 31 the token loop writes its runs into one slice with cursors, so the positions now go to a
+fifth run of `kept`, a store and an add per token like the other four, and the phrase checks
+read that run. One line fewer.
+
+Against step 46 (`perf stat -r 5`, interleaved, two rounds): instructions 5,264.2 → 5,305.6 M,
+branch misses 12.63 → 11.61 M, cycles 2,719 → 2,706 M in the round without an outlier.
+
+Local, against step 46 (`ab.py`, 41 alternating runs, load average 5–7 from other work), four
+rounds: medians 120.51, 119.23, 118.19 and 117.84 → 118.32, 118.01, 117.17 and 117.19 ms, minimums
+117.50, 116.63, 116.03 and 116.29 → 115.37, 115.46, 115.66 and 115.34 ms. memory.peak over 5
+alternating runs: median 40.2 → 37.8 MB, one `Vec` fewer per thread. S 819 → 818. Gate: 510
+pass, 0 fail.
 
 ## Experiments that did not stay
 

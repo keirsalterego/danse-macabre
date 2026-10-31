@@ -888,16 +888,15 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
     let mut seen = vec![0u64; (plan.terms.len() + 1).div_ceil(64)];
     // The token loop below reads the words of `seen` without bounds checks.
     assert!(64 * seen.len() > plan.terms.len());
-    // The positions of the current doc's phrase triggers, and the phrases it matched, so none
-    // counts twice.
-    let (mut phrase_at, mut found) = (Vec::new(), Vec::new());
+    // The phrases the current doc matched, so none counts twice.
+    let mut found = Vec::new();
     // The checks of the current doc's BOOL triggers, from the start: each term triggers once per
     // doc, and no two terms share a check, so they are at most all the checks, plus 4, as a
     // trigger's four writes below may run past its own.
     let mut todo = vec![0; plan.checks.len() + 4];
-    // For the current doc's `n` tokens, four runs of `n` entries: each token's term id (0 for
-    // the rest), then the doc's distinct terms kept in rows, in lists, and BOOL triggers, up to
-    // the cursors `rows`, `lists` and `bools`. Keeping a term takes a store and an add, not a
+    // For the current doc's `n` tokens, five runs of `n` entries: each token's term id (0 for
+    // the rest), then the doc's distinct terms kept in rows, in lists, and BOOL triggers, and the
+    // positions of its phrase triggers, up to the cursors `rows`, `lists`, `bools` and `phrases`. Keeping a term takes a store and an add, not a
     // branch, and one slice without bounds checks leaves the loop registers to spare.
     let mut kept = Vec::new();
     let mut doc = ids.start;
@@ -905,12 +904,13 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
     // under way ([`TermTable::prefetch`]), instead of each stalling in turn.
     walk(text, &plan.terms, |probes| {
         let n = probes.len();
-        kept.resize(kept.len().max(4 * n), 0);
-        let (kept, mut rows, mut lists, mut bools) = (&mut kept[..4 * n], n, 2 * n, 3 * n);
+        kept.resize(kept.len().max(5 * n), 0);
+        let (kept, mut rows, mut lists) = (&mut kept[..5 * n], n, 2 * n);
+        let (mut bools, mut phrases) = (3 * n, 4 * n);
         let (table, seen) = (&plan.terms, &mut seen[..]);
         // No branch on what a token is, a query term or not, new in the doc or not, kept in a
-        // row or a list, or a BOOL trigger: none of it follows a pattern. Phrase triggers keep
-        // their branch below: pushing them without one lost on step 9 (PERF.md, experiments).
+        // row or a list, a BOOL or a phrase trigger: none of it follows a pattern. A phrase
+        // trigger pushed to a `Vec` behind a branch held 1 M mispredicts (PERF.md, step 47).
         for (k, (key, at)) in probes.iter().enumerate() {
             // SAFETY: `at` is the key's home slot, from [`TermTable::prefetch`].
             let slot = unsafe { table.find_from(key, *at) };
@@ -925,7 +925,7 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
             let word = unsafe { seen.get_unchecked_mut(t) };
             let new = std::hint::select_unpredictable(*word & bit == 0, slot.flags, 0);
             *word |= bit;
-            // SAFETY: `kept` holds `4 * n` entries, as the slicing above checks. `k < n`, and each
+            // SAFETY: `kept` holds `5 * n` entries, as the slicing above checks. `k < n`, and each
             // cursor has moved at most `k` times from the start of its run of `n` entries, so it
             // is still inside the run.
             unsafe {
@@ -933,13 +933,12 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
                 *kept.get_unchecked_mut(rows) = slot.id();
                 *kept.get_unchecked_mut(lists) = slot.id();
                 *kept.get_unchecked_mut(bools) = slot.id();
+                *kept.get_unchecked_mut(phrases) = k as u32;
             }
             rows += usize::from(new & Slot::ROW != 0);
             lists += usize::from(new & Slot::LISTED != 0);
             bools += usize::from(new & Slot::BOOL != 0);
-            if slot.flags & Slot::PHRASE != 0 {
-                phrase_at.push(k);
-            }
+            phrases += usize::from(slot.flags & Slot::PHRASE != 0);
         }
         let terms = &kept[..n];
         // As locals, their addresses stay in registers across the stores to `todo`.
@@ -970,7 +969,7 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
         for &t in &kept[2 * n..lists] {
             sets.lists[(store[t as usize] ^ LIST) as usize].push(i as u16);
         }
-        for &at in &phrase_at {
+        for at in kept[4 * n..phrases].iter().map(|&k| k as usize) {
             for &(q, offset, other, term) in plan.phrases(terms[at]) {
                 // `terms` holds this doc only, so a match never spans two docs (spec §3).
                 let start = at.checked_sub(offset as usize);
@@ -999,7 +998,6 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
             // SAFETY: `terms` holds term ids and 0, all below `64 * seen.len()`.
             *unsafe { seen.get_unchecked_mut(t as usize / 64) } = 0;
         }
-        phrase_at.clear();
         found.clear();
         doc += 1;
         if doc - sets.start == 64 * WINDOW as u32 {
