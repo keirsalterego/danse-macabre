@@ -215,8 +215,7 @@ fn summarize(log: &[u8], out_path: &Path) {
             // finish together. Each hour's size is summed once, not in every comparison: that
             // took 0.03 ms of the plan, which the other threads wait for.
             let mut by_size: Vec<usize> = (0..HOURS).collect();
-            let size = |h: &usize| runs[*h].iter().map(|run| run.0.len()).sum::<usize>();
-            by_size.sort_by_cached_key(size);
+            by_size.sort_by_cached_key(|h| runs[*h].iter().map(|run| run.0.len()).sum::<usize>());
             by_size.rotate_left(threads.min(HOURS));
             // Ids are given out in order, so the names set are those of ids 0, 1, 2 and so on.
             let names: Vec<&[u8]> = all.names.iter().map_while(|n| n.get().copied()).collect();
@@ -432,7 +431,7 @@ fn line_end(line: &[u8; LINE]) -> usize {
 /// and `_mm256_movemask_epi8` gathers the top bit of each byte into a 32-bit integer. Two of
 /// those cover the 64-byte blocks. Against a block of LFs, `trailing_zeros` on the result finds
 /// the first LF ([`line_end`]); against another name, a mask of all ones means the bytes agree
-/// ([`same_name`]).
+/// ([`Interner::intern`]).
 #[target_feature(enable = "avx2")]
 fn equal_mask(a: &[u8; 64], b: &[u8; 64]) -> u64 {
     use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8 as equal, _mm256_movemask_epi8 as mask};
@@ -514,10 +513,9 @@ fn word(bytes: &[u8], at: usize) -> u64 {
 /// Three dependent multiply-rotate steps, as in rustc's `FxHasher`, cost 21 million more.
 fn hash(name: &[u8], first: u64) -> u64 {
     let n = name.len();
-    let words = if n < 8 {
-        first & u64::MAX >> (64 - 8 * n)
-    } else {
-        first ^ word(name, n - 8).rotate_left(42)
+    let words = match n {
+        ..8 => first & u64::MAX >> (64 - 8 * n),
+        _ => first ^ word(name, n - 8).rotate_left(42),
     };
     (words ^ n as u64).wrapping_mul(0x517c_c1b7_2722_0a95)
 }
@@ -544,8 +542,9 @@ struct Interner<'a> {
     slots: Box<[AtomicU32; 2 << 12]>,
     /// Id → name. Names borrow the mapped file, so none are copied.
     names: Box<[OnceLock<&'a [u8]>]>,
-    /// Id → the name and the space after it, zero-padded to 64 bytes, for [`same_name`]. A name of
-    /// 64 bytes or more has no room for the space and keeps only its first 64 bytes.
+    /// Id → the name and the space after it, zero-padded to 64 bytes, for the probes of
+    /// [`Interner::intern`]. A name of 64 bytes or more has no room for the space and keeps only
+    /// its first 64 bytes.
     padded: Box<[std::cell::UnsafeCell<std::mem::MaybeUninit<Padded>>]>,
     /// How many names have an id; the lock that adding a name takes.
     count: Mutex<usize>,
@@ -584,9 +583,20 @@ impl<'a> Interner<'a> {
     ///
     /// `window` is 64 bytes that start with `name` and the space after it: the line itself, or a
     /// padded copy. With them a probe compares a name of up to 63 bytes without a call to
-    /// `memcmp` (see [`same_name`]). That covers 1,791 of the 1,842 endpoints of seed 1 and 94%
-    /// of its lines; longer names compare with `==`. Folding the two into one test, the window
-    /// first and `==` only for long names, cost 5% more instructions in the parse.
+    /// `memcmp`. That covers 1,791 of the 1,842 endpoints of seed 1 and 94% of its lines; longer
+    /// names compare with `==`. Folding the two into one test, the window first and `==` only for
+    /// long names, cost 5% more instructions in the parse.
+    ///
+    /// Names vary in length from line to line, and the branches inside `memcmp` that pick a path
+    /// by length mispredict often; that was about a quarter of the parse loop. Here the length
+    /// never steers a branch: a probe compares all 64 bytes of `window` with the known name's
+    /// padded copy at once ([`equal_mask`]) and keeps the result for bytes `0..=n` of a name of
+    /// `n` bytes, the name and the space: `u64::MAX >> (63 - n)` keeps bit `i` exactly for
+    /// `i <= n`. Comparing the space makes the answer exact without comparing lengths. The spec
+    /// rules out spaces in endpoints (§2), so a known name longer than `n` has no space at `n`,
+    /// and one shorter has its space where the window still holds part of the name. The copies
+    /// are 64 bytes, not the 125 a name can reach, because half the size keeps more of them in
+    /// cache: that was worth 0.8 ms.
     #[inline(always)]
     fn intern(&self, name: &'a [u8], hash: u64, window: &[u8; 64]) -> u32 {
         // The top 13 bits, one of 8,192 slots: they are the ones that every hashed bit reaches.
@@ -598,7 +608,8 @@ impl<'a> Interner<'a> {
                 // 4,096 copies, so the index needs no check.
                 let known =
                     unsafe { (*self.padded.get_unchecked(id as usize).get()).assume_init_ref() };
-                same_name(window, &known.0, name.len())
+                // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
+                !unsafe { equal_mask(window, &known.0) } & u64::MAX >> (63 - name.len()) == 0
             } else {
                 self.names[id as usize].get() == Some(&name)
             };
@@ -638,23 +649,6 @@ impl<'a> Interner<'a> {
         self.slots[slot].store(*count as u32, Release);
         *count as u32 - 1
     }
-}
-
-/// Returns whether the name of `len < 64` bytes that starts `window`, followed by a space, is
-/// the name whose padded copy is `known`.
-///
-/// Names vary in length from line to line, and the branches inside `memcmp` that pick a path
-/// by length mispredict often; that was about a quarter of the parse loop. Here the length
-/// never steers a branch: we compare all 64 bytes of both blocks at once and keep the result
-/// for bytes `0..=len`, the name and the space: `u64::MAX >> (63 - len)` keeps bit `i` exactly
-/// for `i <= len`. Comparing the space makes the answer exact without comparing lengths. The
-/// spec rules out spaces in endpoints (§2), so a known name longer than `len` has no space at
-/// `len`, and one shorter has its space where the window still holds part of the name. The
-/// copies are 64 bytes, not the 125 a name can reach, because half the size keeps more of them
-/// in cache: that was worth 0.8 ms.
-fn same_name(window: &[u8; 64], known: &[u8; 64], len: usize) -> bool {
-    // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
-    !unsafe { equal_mask(window, known) } & u64::MAX >> (63 - len) == 0
 }
 
 /// One hour of output, ready to format: [`summarize_hour`] fills it, [`format_hour`] writes it.

@@ -41,6 +41,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 34 | The padded copies allocated uninitialized, not zeroed, and each list of large latencies reserved once | run-2c0e91287411 | 0.0190 | 18.3 | 85.4 |
 | 35 | The name hash reads two 8-byte windows of the name instead of three | run-b8eed3b9c923 | 0.0187 | 18.3 | 85.6 |
 | 36 | Each record stored, and each padded copy read, without a bounds check | run-921f52908023 | 0.0183 | 18.5 | 85.7 |
+| 37 | 5 fewer lines with the same machine code: the hour sizes summed inside `sort_by_cached_key`, the name hash's two cases as a `match`, and `same_name` folded into its one caller | | | | |
 
 ## Step 1: v1
 
@@ -532,6 +533,15 @@ Local, turbo off: instructions 714.2 → 701.5 M (4 per line), cycles 375.6 → 
 and 21.13 → 20.93 ms, minimums 20.67 → 20.30, 20.60 → 20.18, 20.61 → 20.51 and 20.80 → 20.50 ms.
 memory.peak, 11 alternating rounds on each of seeds 1–7 and 10–12: median 18.09 → 18.07 MB.
 S 382 → 385. Gate: 310 pass, 0 fail.
+
+## Step 37: 5 fewer lines
+
+The plan hands the closure that sums an hour's run lengths straight to `sort_by_cached_key`
+instead of binding it first. `hash` picks between the masked short name and the last window
+with a `match` on the length, whose two arms rustfmt keeps on two lines where the `if`/`else`
+took four. `same_name`, a one-line function with one caller, is folded into `Interner::intern`,
+whose doc now carries its explanation. `.text` and `.rodata` are byte-identical to step 36's, so
+T and M cannot move. S 385 → 380. Gate: 310 pass, 0 fail.
 
 ## Experiments that did not stay
 
