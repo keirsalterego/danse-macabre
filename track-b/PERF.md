@@ -39,7 +39,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 32 | 1 fewer line with the same binary: the build stage mounts its sources instead of copying them | run-ced2f9ec7167 | 0.1491 | 41.1 | 74.6 |
 | 33 | A document's checks are added in one `Tally` method that takes no branch on a check's result: the queries of the checks that the document is one of the first matches of are moved to the front of its list of checks, and only those go on to the first-match counts | run-94e224675c5a | 0.1455 | 41.3 | 74.8 |
 | 34 | The term lookups take no bounds checks: the probe reads the slots unchecked from a key's home slot on, the prefetches take pointers, and the token loop holds the term table and the seen bits as locals | run-401b90111691 | 0.1618 | 40.5 | 73.7 |
-| 35 | 11% fewer instructions in the corpus pass: a document's checks are written to a slice sized once and evaluated without bounds checks, the tokenizer picks the start of a token carried over from the previous block once per block, a key's window takes one bounds check and its hash two words, phrases are compared inline, and a long key's mark rides in its slot's tail | | | | |
+| 35 | 11% fewer instructions in the corpus pass: a document's checks are written to a slice sized once and evaluated without bounds checks, the tokenizer picks the start of a token carried over from the previous block once per block, a key's window takes one bounds check and its hash two words, phrases are compared inline, and a long key's mark rides in its slot's tail | run-8bf61f0fec95 | 0.1313 | 43.3 | 75.9 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -849,7 +849,8 @@ picked once per block 6,179 M.
 Against step 34 (`perf stat -r 3`, three alternating rounds; battery, not comparable): user
 cycles 3,661–3,672 → 3,361–3,391 M, instructions 6,980 → 6,178 M, branch misses 16.9 → 16.6 M.
 memory.peak over five alternating runs: median 42.2 → 41.5 MB. S 751 → 761. Gate: 510 pass, 0
-fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
+fail; seeds 2, 3, 7, 10 and 12 match their reference hashes. The board's run,
+run-8bf61f0fec95, measured 131.3 ms and 43.3 MB, against 145.5 ms and 41.3 MB for step 33's.
 
 Peeling the carried token out of the loop behind a branch cut instructions to 6,259 M but added
 0.6 M branch misses, as whether a block starts inside a token follows no pattern; peeling only
