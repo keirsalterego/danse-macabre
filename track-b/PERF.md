@@ -48,7 +48,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 41 | 5.5% fewer instructions in the corpus pass: the walk keys and prefetches the tokens itself, into a buffer whose address and count stay in registers; a block's token ends are taken one line at a time, split at its LFs by one mask, so the token loop tests no LF; a line's id is left out at its end instead of tested for at each token; a key is folded in two vector operations instead of four | run-ff1ae2c91791 | 0.1269 | 43.1 | 76.3 |
 | 42 | 7.1% fewer instructions in the corpus pass: the walk's token loop runs in a call of its own per line, so the line end no longer holds the registers it needs, and a key's 32-byte window is tested against a bound held in a register | run-b96f907a19fc | 0.1151 | 41.2 | 77.2 |
 | 43 | A phrase candidate is first tested on one more of the phrase's terms, which the plan keeps beside the trigger, before the phrase's terms are loaded: 97.5% of the candidates stop there | run-b96f907a19fc | 0.1151 | 41.2 | 77.2 |
-| 44 | The line end's token loop prefetches each token's entry of `check_at`, which the BOOL triggers' loop reads at random, one token ahead of that loop | | | | |
+| 44 | The line end's token loop prefetches each token's entry of `check_at`, which the BOOL triggers' loop reads at random, one token ahead of that loop | run-0f0011884453 | 0.1166 | 42.4 | 77.1 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
