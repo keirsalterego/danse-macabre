@@ -25,8 +25,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 18 | A leaner rewrite, 211 fewer lines at the same speed: run starts found exactly from spec §2.2, so the guessed starts, their check and rerun, and the sentinel record go | run-5cc15fc89abe | 0.0351 | 12.4 | 76.5 |
 | 19 | 5 fewer lines with the same machine code: three pairs of variables set in one statement each, the regions header skipped in one line, and the cast lint exceptions in `Cargo.toml` | run-ad4d88cb83d7 | 0.0370 | 12.4 | 76.0 |
 | 20 | 2 fewer lines with the same machine code: a worker's position, run end and groups set in one statement, and so are a quoted field's start and end | run-66de751504ed | 0.0389 | 13.0 | 75.3 |
-| 21 | 3 fewer lines with the same machine code: one `unsafe` statement per `mmap` call, and the digit loop's two updates in one assignment | | | | |
-| 22 | 1 fewer line with the same machine code: the name set's probe names the hash once and takes the slot and the tag from it | | | | |
+| 21 | 3 fewer lines with the same machine code: one `unsafe` statement per `mmap` call, and the digit loop's two updates in one assignment | run-af528e5f49cc | 0.0353 | 12.3 | 76.6 |
+| 22 | 1 fewer line with the same machine code: the name set's probe names the hash once and takes the slot and the tag from it | run-af528e5f49cc | 0.0353 | 12.3 | 76.6 |
 | 23 | 17 fewer lines outside the record loop: each run's pages given back in two lines, rounded out to whole pages; the region rows cut, marked and written in one line each; and the rounds counted and the parts merged in one line each | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
@@ -632,6 +632,8 @@ and the max in one assignment. S 316 → 313. Gate: 307 pass, 0 fail; clippy rep
 it, where it cast `key[3]` twice, so its three declarations before the probe become two.
 `.text` and `.rodata` are byte-identical to step 21's binary. S 313 → 312. Gate: 307 pass,
 0 fail; clippy reports no warnings.
+
+Steps 21 and 22 went to the board in one push, so both rows cite run-af528e5f49cc.
 
 ## Step 23: 17 fewer lines outside the record loop
 
