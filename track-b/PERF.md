@@ -22,6 +22,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 15 | Memory at its peak: a thread frees its window before grouping its first matches, and the grouping keeps no second copy of the group starts | run-7458013fd46b | 0.2346 | 42.3 | 69.2 |
 | 16 | The query and check cells are written when allocated, so the pass's first store to a page no longer replaces the shared zero page and interrupts every core | run-6afbb627903d | 0.2343 | 42.0 | 69.2 |
 | 17 | Each thread drops its chunk's pages of the corpus mapping when its pass ends, instead of the exit unmapping all of them on one core after the output is written | run-bfce9886b69d | 0.2354 | 43.4 | 69.2 |
+| 18 | A term table slot holds a term's first 12 bytes instead of 8, so a token of 9 to 12 bytes no longer loads its term's key from a second array | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -321,6 +322,28 @@ interleaved runs: median 40.0 → 40.1 MiB. S 848 → 852. Gate: 507 pass, 0 fai
 
 A second board run of the same code, run-7a898680a856 (from the next push), measured 0.2293 s
 and 42.2 MB.
+
+## Step 18: 12 bytes of the key in each slot
+
+A profile of step 17 by source line (a build with line tables, `perf record` every 100k user
+cycles) put 6.3% of all samples on one line of `TermTable::position`: the comparison of the
+token's whole key with `keys[slot.id]`, made when the slot's first 8 bytes match a term longer
+than 8 bytes. That load depends on the slot load, so the prefetch made at the token does not
+cover it, and `keys` is 2.4 MB. Far from rare: in the first 25 MB of seed 1, 20% of the tokens
+are longer than 8 bytes, and 12.7% of all tokens share their first 8 bytes with a long query
+term, nearly all of them (98.5%) 9 to 12 bytes long.
+
+A slot now also holds the term's bytes 8 to 11 (`tail`), and the id and the flags share one
+u32 (id × 16 + flags), so it is still 16 bytes. `LONG` marks a term past 12 bytes, and only
+those read `keys`: 0.2% of the tokens. In the same profile that line falls from 3,763 samples
+to 38, and all samples from 59,522 to 56,962. Ids from 2^28 up would not fit; `TermTable::new`
+stops with an error before that, at 2^28 term occurrences.
+
+Locally, against step 17: user cycles 5.85–5.89 → 5.68–5.70 G over five rounds of `perf stat
+-r 5`, instructions 8.573 → 8.687 G (the extra compare). Alternating runs (`ab.py`), 15 or 16
+each, five rounds: median 237.3, 237.9, 237.8, 237.2 and 237.1 → 229.8, 229.8, 230.6, 229.5 and
+229.5 ms (−3.2%). memory.peak over six interleaved runs: median 41.2 → 41.0 MiB (the table is
+the same size). S 852 → 857. Gate: 510 pass, 0 fail.
 
 ## Experiments that did not stay
 

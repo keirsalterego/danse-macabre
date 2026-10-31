@@ -569,10 +569,10 @@ fn sample_hits(docs: &[u8], terms: &TermTable) -> (Vec<u32>, usize) {
     let token = |&mut doc: &mut usize, start, end| {
         if let Some(key) = key_in(sample, start, end)
             && let Some(slot) = terms.find_from(&key, terms.home(&key))
-            && counted[slot.id as usize] != doc
+            && counted[slot.id() as usize] != doc
         {
-            counted[slot.id as usize] = doc;
-            hits[slot.id as usize] += 1;
+            counted[slot.id() as usize] = doc;
+            hits[slot.id() as usize] += 1;
         }
     };
     walk(sample, &mut doc, token, |doc| *doc += 1);
@@ -891,15 +891,15 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
                 terms.push(miss);
                 continue;
             };
-            let (t, bit) = (slot.id as usize / 64, 1 << (slot.id % 64));
+            let (t, bit) = (slot.id() as usize / 64, 1 << (slot.id() % 64));
             if seen[t] & bit == 0 {
                 seen[t] |= bit;
                 if slot.flags & Slot::STORED != 0 {
-                    sets.add(plan.store[slot.id as usize], doc);
+                    sets.add(plan.store[slot.id() as usize], doc);
                 }
                 if slot.flags & Slot::BOOL != 0 {
                     // Start loading its checks and their cells now, to use at the line end.
-                    let checks = plan.check_range(slot.id);
+                    let checks = plan.check_range(slot.id());
                     prefetch(&plan.checks[checks.start]);
                     prefetch(&tally.checks[checks.start]);
                     bool_terms.push(checks);
@@ -908,7 +908,7 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
             if slot.flags & Slot::PHRASE != 0 {
                 phrase_at.push(terms.len());
             }
-            terms.push(slot.id);
+            terms.push(slot.id());
         }
         for &at in &phrase_at {
             for &(q, offset) in plan.phrases(terms[at]) {
@@ -1068,21 +1068,21 @@ fn key_hash(key: &Key) -> u64 {
     (key.iter().fold(0, |hash, &word| hash ^ word)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
-/// One slot of a [`TermTable`]: a term's first key word, its id and what the corpus pass does
+/// One slot of a [`TermTable`]: a term's first 12 bytes, its id and what the corpus pass does
 /// with it, 16 bytes that one load brings in.
 #[derive(Clone, Copy)]
 struct Slot {
     /// `key[0]`, the term's first 8 bytes; 0 marks an empty slot, as a term's first byte is
     /// never zero.
     head: u64,
-    /// The term id.
-    id: u32,
-    /// `LONG`, plus the [`Plan`]'s flags for the term.
+    /// The low half of `key[1]`, the term's bytes 8 to 11.
+    tail: u32,
+    /// The term id times 16, plus `LONG` and the [`Plan`]'s flags for the term.
     flags: u32,
 }
 
 impl Slot {
-    /// The term runs past 8 bytes, so `head` alone does not identify it.
+    /// The term runs past 12 bytes, so `head` and `tail` alone do not identify it.
     const LONG: u32 = 1;
     /// The term triggers phrase checks.
     const PHRASE: u32 = 2;
@@ -1090,6 +1090,11 @@ impl Slot {
     const BOOL: u32 = 4;
     /// The corpus pass keeps the term's documents ([`Store`]).
     const STORED: u32 = 8;
+
+    /// The term id.
+    fn id(self) -> u32 {
+        self.flags >> 4
+    }
 }
 
 /// `len` empty slots on their own transparent huge pages, never freed. The pass reads the term
@@ -1108,11 +1113,11 @@ fn huge_slots(len: usize) -> &'static mut [Slot] {
     }
 }
 
-/// Open-addressing map from query term to its [`Slot`]. A probe compares a slot's `head` with
-/// the token's first key word; only a term longer than 8 bytes, rare among tokens, then loads
-/// the rest of its key. So most tokens cost one memory access here, whether or not they are
-/// query terms. It doubles at half load, so it assumes nothing about how many distinct terms
-/// the queries use.
+/// Open-addressing map from query term to its [`Slot`]. A probe compares a slot's `head` and
+/// `tail` with the token's first 12 bytes; only a term longer than 12 bytes, rare among tokens,
+/// then loads the rest of its key. So most tokens cost one memory access here, whether or not
+/// they are query terms. It doubles at half load, so it assumes nothing about how many distinct
+/// terms the queries use.
 struct TermTable {
     /// The slot count is a power of two.
     slots: &'static mut [Slot],
@@ -1124,6 +1129,8 @@ impl TermTable {
     /// An empty table with a slot per term occurrence, rounded up to a power of two: it only
     /// doubles when more than half of `occurrences` are distinct terms.
     fn new(occurrences: usize) -> Self {
+        // A term id times 16 fits in `Slot::flags`.
+        assert!(occurrences < 1 << 28, "queries.txt: too many terms");
         Self {
             slots: huge_slots(occurrences.next_power_of_two()),
             keys: Vec::new(),
@@ -1156,7 +1163,7 @@ impl TermTable {
     fn intern(&mut self, key: Key) -> u32 {
         let at = self.position(&key, self.home(&key));
         if self.slots[at].head != 0 {
-            return self.slots[at].id;
+            return self.slots[at].id();
         }
         self.keys.push(key);
         if self.keys.len() * 2 <= self.slots.len() {
@@ -1181,27 +1188,28 @@ impl TermTable {
     /// Puts term `id` into the free slot `at`.
     fn place(&mut self, id: usize, at: usize) {
         let key = &self.keys[id];
-        let flags = if key[1] != 0 { Slot::LONG } else { 0 };
-        let (head, id) = (key[0], id as u32);
-        self.slots[at] = Slot { head, id, flags };
+        let long = u32::from(key[1] >> 32 | key[2] | key[3] != 0) * Slot::LONG;
+        let (head, tail, flags) = (key[0], key[1] as u32, (id as u32) << 4 | long);
+        self.slots[at] = Slot { head, tail, flags };
     }
 
     /// Adds `flags[id]` to the flags of each term `id`.
     fn mark(&mut self, flags: &[u32]) {
         for slot in self.slots.iter_mut().filter(|slot| slot.head != 0) {
-            slot.flags |= flags[slot.id as usize];
+            slot.flags |= flags[slot.id() as usize];
         }
     }
 
     /// The slot holding `key`, or the empty slot where it belongs, probing linearly from `at`.
     fn position(&self, key: &Key, mut at: usize) -> usize {
         let mask = self.slots.len() - 1;
-        let long = key[1] != 0;
+        let long = key[1] >> 32 | key[2] | key[3] != 0;
         loop {
             let slot = &self.slots[at];
             let found = slot.head == key[0]
+                && slot.tail == key[1] as u32
                 && (slot.flags & Slot::LONG != 0) == long
-                && (!long || self.keys[slot.id as usize] == *key);
+                && (!long || self.keys[slot.id() as usize] == *key);
             if slot.head == 0 || found {
                 return at;
             }
