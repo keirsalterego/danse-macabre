@@ -45,7 +45,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 38 | A large latency's record field set in the branch that lists it, instead of by a `min` on every line | run-e44188ffe025 | 0.0197 | 18.5 | 84.9 |
 | 39 | 5 fewer lines with the same machine code: the running sum of the hour's counts as one `for_each`, and a large latency listed and replaced by `LARGE` in one `bool::then` | run-89adcd077219 | 0.0196 | 18.4 | 85.1 |
 | 40 | A plain static executable instead of a static PIE (`relocation-model=static`) | run-ebf9f6a49ad5 | 0.0190 | 17.9 | 85.5 |
-| 41 | 4 fewer lines with the same machine code: the record store on one line, the counting pass without a binding for the endpoint, and each output line's length summed in one statement | | | | |
+| 41 | 4 fewer lines with the same machine code: the record store on one line, the counting pass without a binding for the endpoint, and each output line's length summed in one statement | run-32182846e438 | 0.0256 | 18.0 | 82.3 |
 
 ## Step 1: v1
 
@@ -604,6 +604,9 @@ numbers first: summed after the name's length, the same arithmetic compiled to d
 `.text` is byte-identical to step 40's, and `.rodata` differs only in the line numbers of 30
 panic locations, which the plain static executable of step 40 keeps there, so T and M cannot
 move. S 376 → 372. Gate: 310 pass, 0 fail.
+The board's run, run-32182846e438, drew 25.6 ms against 19.0 ms for step 40's identical `.text`.
+In the same push, track D's unchanged code drew 132.6 ms against its usual 122–128 ms: the box
+was slow for that run.
 
 ## Experiments that did not stay
 

@@ -31,7 +31,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 24 | 1 fewer line: `main` maps both input files through one closure | run-b455f587cb61 | 0.0358 | 12.9 | 76.4 |
 | 25 | A name's letter masked to its length by a 24-byte window of a constant, and each letter posted at a running index into its owner's mailbox | run-b89d1be25a5e | 0.0348 | 12.5 | 76.9 |
 | 26 | The long-name compare out of line, so the probe for every other name stops paying for its bounds checks | run-8378d5c7581d | 0.0334 | 12.6 | 77.2 |
-| 27 | A plain static executable instead of a static PIE (`relocation-model=static`) | | | | |
+| 27 | A plain static executable instead of a static PIE (`relocation-model=static`) | run-a8bc41aa5aa0 | 0.0340 | 12.5 | 77.1 |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
