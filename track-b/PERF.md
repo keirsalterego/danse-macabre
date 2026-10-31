@@ -41,8 +41,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 34 | The term lookups take no bounds checks: the probe reads the slots unchecked from a key's home slot on, the prefetches take pointers, and the token loop holds the term table and the seen bits as locals | run-401b90111691 | 0.1618 | 40.5 | 73.7 |
 | 35 | 11% fewer instructions in the corpus pass: a document's checks are written to a slice sized once and evaluated without bounds checks, the tokenizer picks the start of a token carried over from the previous block once per block, a key's window takes one bounds check and its hash two words, phrases are compared inline, and a long key's mark rides in its slot's tail | run-8bf61f0fec95 | 0.1313 | 43.3 | 75.9 |
 | 36 | The serial start about 2.2 ms shorter: the intern prefetches 16 keys ahead and keeps each term's length and only the long terms' keys, a term's cost is computed where the planning reads it, the sample keeps each term's count and last document in one cell, and the term table's flags are collected in bytes | run-ce4c2e1d13c6 | 0.1342 | 42.8 | 75.7 |
-| 37 | The term table's huge pages asked for again: once the table is written, `MADV_COLLAPSE` collapses its 4 KiB pages into huge pages if its faults found no free one | | | | |
-| 38 | No frees once the output is formatted, as the plan and the chunks are `ManuallyDrop`, and the output's numbers written by `format_into` instead of `write!` | | | | |
+| 37 | The term table's huge pages asked for again: once the table is written, `MADV_COLLAPSE` collapses its 4 KiB pages into huge pages if its faults found no free one | run-5de0cb146d0e | 0.1445 | 41.4 | 74.8 |
+| 38 | No frees once the output is formatted, as the plan and the chunks are `ManuallyDrop`, and the output's numbers written by `format_into` instead of `write!` | run-5de0cb146d0e | 0.1445 | 41.4 | 74.8 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -988,6 +988,10 @@ four rounds: medians 138.53, 138.27, 138.88 and 137.75 → 137.86, 138.38, 139.0
 minimums 137.34, 136.68, 137.12 and 136.98 → 135.85, 136.61, 137.15 and 136.31 ms. memory.peak
 over 8 alternating runs: median 41.1 → 41.1 MB. S 762 → 763. Gate: 510 pass, 0 fail; seeds 2, 3,
 7, 10 and 12 match their reference hashes.
+
+The board measured steps 37 and 38 together, in run-5de0cb146d0e, on a slow box: 144.5 ms at
+41.4 MB, while track C's unchanged code drew 45.9 ms in the same run, against 25.2 ms in the one
+before, and track D's 147.7 ms, against 122 to 132 ms.
 
 ## Experiments that did not stay
 
