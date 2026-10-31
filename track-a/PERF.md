@@ -1224,6 +1224,22 @@ hashes; clippy reports no warnings.
 - **Loops on 64-byte boundaries** (`-C llvm-args=-align-loops=64`, as track B builds; local,
   on step 45's code): `ab.py`, 40 interleaved runs, two rounds, medians / minimums 20.22 / 19.46
   → 20.87 / 20.22 ms and 20.37 / 19.61 → 20.99 / 20.35 ms. The output hash is unchanged.
+- **Where memory.peak comes from, at step 57** (local, seed 1, a copy that reads its cgroup's
+  memory.current and memory.stat in a loop on a 13th CPU, five runs; systemd-run's peak for the
+  unchanged binary: 16.7–17.2 MiB). memory.current moves in steps of 0.25 MiB, the 64 pages that
+  the kernel charges at a time and keeps per CPU, so it reads up to 3 MiB above the pages in use.
+  At the end of the parse it reads 14.8–15.8 MiB: 13,064 KiB of anonymous memory (12,144 of it
+  records, 244 the interner's `.data`) and 1.07 MiB of kernel memory (0.70 page tables, mostly the
+  input's). Within 0.4 ms of the hour pass's start it peaks at 16.8–17.4 MiB: each worker's first
+  hour (18,300–23,700 lines) scatters into fresh buffer pages before any record is freed, about
+  1 MiB in all, 1.0–1.6 MiB above the parse's end. Formatting ends at 15.8–16.8 MiB: the 10.1 MB
+  output, 4.1 MiB of anonymous memory (2.9 of it the hours' lines) and the kernel's 1.1. So the
+  records set a floor of about 15 to 15.8 MiB
+  under any order of the work. The cheap cuts in reach: the 12 smallest hours first, about
+  0.25 MiB off the spike, for a later tail; the interner's slots and padded copies released after
+  the name sort, 0.18 MiB; each hour's lines released once formatted, which only matters once the
+  spike is gone and cost 0.18 ms before. A counting sort holds its source and its destination at
+  once, so removing the spike needs an in-place sort of each first hour. Not built.
 
 ## Profile notes
 
