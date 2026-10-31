@@ -677,6 +677,39 @@ line. `.text` is byte-identical to step 44's, and `.rodata` differs only in the 
   and waited for the last one, 0.8 ms each on average against 0.42 ms at the parse barrier, and
   with only the 10 hours left after the parse for 12 threads, each sat idle 0.56 ms on average,
   against 0.3 ms at the end of the full hour pass. S 361 → 461. Not kept.
+- **Keeping each run's records until the hour pass ends** (local, turbo off, on step 45's code).
+  Deleting `release(records)` after each run's scatter in `summarize_hour`, one line fewer, cost
+  2.3%: `ab.py`, 61 interleaved runs, two rounds, medians 20.25 → 20.68 and 20.33 → 20.78 ms.
+  The frees were not the cause. The work closure grew from 0x40ba to 0x40fb bytes and every
+  spill offset moved, the parse loop's too, so cycles:u rose 2–4% (`perf stat -r 9`, twice:
+  367–373 → 381–382 M) while cycles:k fell 5%. Keeping the call as `release(&records[..0])`
+  frees nothing and leaves the closure's size and address as they were: `ab.py` medians
+  20.25 → 19.96 and 20.08 → 19.93 ms (61 runs) and 20.17 → 20.14 and 20.39 → 20.03 ms (41 runs),
+  0.8–1.5% faster, with cycles:k −2.7%. But memory.peak on seeds 1, 2, 3, 5, 7, 10 and 11, five
+  rounds, went 18.15 → 23.06 MB (+4.9 MB): about a point lost, against 0.09–0.16 gained from T.
+  Releasing only runs of at least 4 or 8 pages kept memory.peak within 0.16 MB (18.26 →
+  18.42 MB, same seeds, four rounds), but it moved the closure again, to 0x4145 bytes: `ab.py`,
+  41 runs, two rounds, medians +0.2 to +0.6 ms. Few of the calls free anything: seed 1 has 1,065
+  runs, and only 222 of them hold a whole page, though those hold 98% of the records. For the
+  others `madvise` gets no page and returns without interrupting the other threads. Not kept.
+- **`#![no_main]` and a static interner, for an earlier start** (local, turbo off, on step 45's
+  code). `#![no_main]`, with an `extern "C" fn main`, skips std's start-up, which reads
+  `/proc/self/maps` and sets up signal stacks. The static interner kept its three tables in
+  statics instead of on the heap. `ab.py`, 61 interleaved runs, four rounds, mean change of the
+  medians: −0.02 ms for `#![no_main]`, 0 for the static interner and −0.06 ms for both. Phase
+  timestamps (21 runs, two rounds) put `main` 94 µs sooner and the threads' median start
+  0.16 ms sooner, but the last parse ended no sooner: 11.95 → 12.00 and 11.82 → 11.83 ms.
+  Start-up savings barely reach the barrier: until a thread starts, its SMT sibling has the core
+  to itself, so only about a quarter of a start delay shows at the barrier. Not kept.
+- **A lock-free `insert`** (local, turbo off, on step 45's code): a new name took its id with a
+  `fetch_add`, wrote its padded copy and its name, then claimed its slot with a compare-exchange
+  and probed again if another thread had filled it first. The insert mutex costs a thread up to
+  0.4 ms of waiting, about 3 ms summed over a run. Without it, context switches went from about
+  340 to 118 (`perf stat -r 11`, twice) and cycles:k fell 3.5%, and phase timestamps put the
+  parse's end 0.15–0.2 ms sooner. The wall did not follow: `ab.py`, 61 interleaved runs, four
+  rounds, medians 20.25 → 20.26, 20.23 → 20.23, 20.13 → 20.12 and 20.23 → 20.28 ms. A timer
+  that measures fork to wait as the board does, without `ab.py`'s extra `taskset` exec, gave
+  19.11 → 19.18, 19.01 → 19.17 and 19.29 → 19.33 ms (61 runs, three rounds). Not kept.
 - **No barrier before the output is mapped** (one line fewer: the first thread done with its
   hours waits for each hour's `OnceLock` instead). On step 39's PIE build, `ab.py` medians went
   20.92 → 20.44 and 20.80 → 20.31 ms, but phase timestamps put only 20 µs of that in the wait
