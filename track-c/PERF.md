@@ -1642,6 +1642,21 @@ no warnings.
   in the 1 MB as the others started: `ab.py`, 41 interleaved runs, medians 24.86 → 25.00 ms;
   memory.peak, 40 alternating runs, medians 12.18 → 12.36 MiB, highest of five 12.61 → 12.96 MiB
   (expected).
+- **Main maps in the region table after it starts the workers** (local, turbo off, on step 41's
+  code), so that the 0.2 ms of `MADV_POPULATE_WRITE` overlaps the spawns: `parallel` inlined into
+  `join` as a `thread::scope` that spawns the workers and then makes the call, with no change in
+  lines. Main began spawning 0.20 ms sooner and the first worker started at 0.33 instead of
+  0.55 ms, but the last still started at 0.875 ms: each spawn took about 45 µs instead of 27 µs,
+  and the first round began at 1.314 against 1.306 ms (instrumented copies, medians of 31 runs).
+  `ab.py`, 41 interleaved runs: 23.37 → 23.33 ms. On step 42's code, where `join` already spawns
+  the workers in a `thread::scope`, the call moved after the spawns: 23.57 → 23.73 ms.
+- **The workers started as a tree**, each thread handing the upper half of its numbers to a new
+  thread, as track A's `fan_out` does (local, turbo off, on step 41's code): the last worker
+  started at 0.963 against 0.938 ms and the first round at 1.429 against 1.353 ms; `ab.py`, 41
+  interleaved runs, 23.37 → 23.93 ms (+2.4%).
+- **The workers that finish first spin until the exit** instead of parking (local, turbo off, on
+  step 41's code), so that their CPUs are awake when the exit kills their threads: `ab.py`, 41
+  interleaved runs, 23.37 → 23.35 ms; the output was written at 21.33 against 21.27 ms.
 
 ## Profile notes
 
@@ -1662,3 +1677,12 @@ no warnings.
   0.61 to 0.92 ms; the workers that waited longest had gone to sleep and leave that barrier up
   to 0.12 ms after the last arrival; the second barrier passes at 1.22 ms. About 5% of T passes
   before the first round.
+- Setup and tail at step 41 (P-cores, 12 threads, turbo off, instrumented copy, medians of 31
+  runs, from the start of `main`): `join` starts at 0.09 ms and spawns the workers at 0.34 ms,
+  after the region table's 1 MB is mapped in; the workers start at 0.55 to 0.87 ms and end step 0
+  of the region table at 0.69 to 1.00 ms; the first round starts at 1.31 ms. The last round ends
+  at 20.53 ms, the workers have given back their pages at 20.97 to 21.05 ms, and the last one
+  merges in 0.04 ms, formats in 0.15 ms and has written the output at 21.27 ms. `ab.py` measures
+  23.4 ms, against 1.6 ms for an empty C program, so about 0.5 ms passes between the write and the
+  exit, and before `main`. Whether main spawns early, late or as a tree, the last worker starts
+  at 0.87 to 0.96 ms.
