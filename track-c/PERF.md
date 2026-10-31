@@ -888,6 +888,9 @@ of XORs, which keeps the key out of memory but has LLVM build it from four scala
   pair of slots with `select_unpredictable` cut branch misses to 2.14 M and cost 2.6% more
   cycles. The mark loop's mispredicts are partly hidden by the hyperthread sibling, so removing
   them gains less than their count suggests.
+- **Loops on 64-byte boundaries** (`-C llvm-args=-align-loops=64`, as track B builds; local,
+  on step 32's code): `ab.py`, 40 interleaved runs, two rounds, medians / minimums 33.12 / 32.24
+  → 33.67 / 32.61 ms and 33.09 / 32.05 → 33.62 / 32.92 ms. The output hash is unchanged.
 - **`sent[to]` read once per record** (local, on step 32's code): the four atomic stores of a
   letter make the compiler reload `sent[to]` five times, each with a bounds check. Reading it
   into a local first measured slower: medians 33.04 → 33.78 and 33.09 → 33.62 ms (`ab.py`, 40
