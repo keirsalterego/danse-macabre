@@ -51,6 +51,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 44 | 4 fewer lines in `summarize`: a chunk's start found through a one-line `newline` closure, and the format loop as one `for_each` over the queue | run-a6b1091911cb | 0.0192 | 18.7 | 85.4 |
 | 45 | 2 fewer lines with the same machine code: the build stage mounts its sources instead of copying them, and `insert` stays out of line by `#[cold]` alone | run-379b43c0200f | 0.0189 | 18.7 | 85.5 |
 | 46 | The input prefetched five lines ahead, `parse` out of line with a pointer for its loop, and the endpoint interner a static | | | | |
+| 47 | 5.8 instructions fewer per line: the probe counts the compare mask's trailing ones, the latency's digits combine in three steps, and their mask is one shifted constant | | | | |
 
 ## Step 1: v1
 
@@ -697,6 +698,32 @@ the counts compare (`perf stat`, 40 interleaved runs, two rounds): instructions:
 347.7 → 328.3 M, L1-dcache-load-misses:u 4.27 → 3.85 M. memory.peak, five alternating rounds on
 seeds 1, 2, 3, 5, 7, 10 and 11: median 18.09 → 18.09 MB. S 361 → 367. Gate: 310 pass, 0 fail; full
 seeds 1–7 and 10–12 give the reference hashes; clippy reports no warnings.
+
+## Step 47: 5.8 instructions fewer per line
+
+Three cuts in the probe and the latency, each measured alone (instructions:u, seed 1):
+
+- **The probe counts the compare mask's ones.** A probe matches when the first `n + 1` bytes agree,
+  the name and the space: when the mask starts with more than `n` ones. `trailing_ones() > n` ran
+  5.5 M instructions fewer, 1.8 per line, than masking off the bits above `n` and testing the rest.
+- **The digits in three steps.** `eight_digits` combines the digit lanes into pairs, the pairs into
+  fours and the fours into the number, each with one multiply by `k·2^s + 1`, a shift and a mask,
+  for k = 10, 100 and 10,000. Step 45's form, which took the pairs into the number with two
+  multiplies side by side, ran 9.2 M instructions more, 3 per line.
+- **The digit mask as one shifted constant**, `0x0F0F_0F0F_0F0F_0F0F << s`, instead of the constant
+  and a shifted all-ones mask: 2.9 M instructions fewer.
+
+On AC power (local, P-cores, turbo off), `ab.py`, 61 interleaved runs, four rounds, against step
+46: medians 19.73 → 19.54, 19.70 → 19.61, 19.70 → 19.63 and 19.74 → 19.54 ms (−0.4 to −1.0%),
+minimums 19.12 → 18.92, 19.07 → 19.06, 19.18 → 19.08 and 19.04 → 18.91 ms; timed as the board does,
+41 runs, two rounds, medians 18.50 → 18.46 and 18.47 → 18.47 ms. Counters, measured on battery
+power, so only the counts compare (`perf stat`, 40 interleaved runs, two rounds): instructions:u
+662.6 → 644.6 M (−2.7%), cycles:u medians 346.6 → 343.4 M and 347.1 → 342.9 M (−0.9 to −1.2%),
+minimums 326.9 → 330.6 M and 328.3 → 313.7 M, L1-dcache-load-misses:u 3.85 → 3.85 M. A copy whose
+`parse` an `#[inline(never)]` on `summarize_hour` moved 0x1b0 bytes on ran the same: cycles:u 344.5
+and 342.2 M against 345.8 and 343.1 M in another session, L1 misses 3.85 M. memory.peak, as in step
+46: median 18.09 → 18.00 MB. S 367 → 366. Gate: 310 pass, 0 fail; full seeds 1–7 and 10–12 give the
+reference hashes; clippy reports no warnings.
 
 ## Experiments that did not stay
 

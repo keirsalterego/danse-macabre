@@ -482,7 +482,7 @@ fn latency(line: &[u8], lf: usize) -> (u32, usize) {
         return (digits.fold(0, |v, &d| v * 10 + u32::from(d - b'0')), space);
     }
     let last_space = 7 - found.leading_zeros() as usize / 8;
-    let digits = w & 0x0F0F_0F0F_0F0F_0F0F & u64::MAX << (8 * (last_space + 1));
+    let digits = w & 0x0F0F_0F0F_0F0F_0F0F << (8 * (last_space + 1));
     (eight_digits(digits), lf - 8 + last_space)
 }
 
@@ -490,15 +490,17 @@ fn latency(line: &[u8], lf: usize) -> (u32, usize) {
 ///
 /// Each byte holds a digit value `0..=9`, the most significant digit in the lowest byte; unused
 /// leading lanes are zero. This is SWAR (SIMD within a register): instead of eight
-/// multiply-adds, we combine neighbouring digits into pairs (`d0·10 + d1`), then pairs into the
-/// final number, using three multiplies on the whole word. For the lanes `0 0 0 0 1 2 3 4` the
-/// pairs are `00 00 12 34`, and the result is `12·100 + 34 = 1234`. The method is from Daniel
-/// Lemire, "Fast numeric string to int" (2018).
+/// multiply-adds, three multiplies on the whole word combine neighbouring digits into pairs
+/// (`d0·10 + d1`), the pairs into groups of four and those into the number. Multiplying by
+/// `k·2^s + 1` and shifting right by `s` adds to `k` times each lane the lane above it, and the
+/// mask keeps every other result. For the lanes `0 0 0 0 1 2 3 4` the pairs are `00 00 12 34`,
+/// the fours `0000 1234`, and the result is 1234. The method is from Daniel Lemire, "Fast
+/// numeric string to int" (2018). The form step 45 used, which took the pairs into the number
+/// with two multiplies side by side, ran 3 instructions more per line.
 fn eight_digits(lanes: u64) -> u32 {
-    let pairs = lanes * 10 + (lanes >> 8);
-    let high = (pairs & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32));
-    let low = ((pairs >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32));
-    ((high + low) >> 32) as u32
+    let pairs = (lanes.wrapping_mul(10 << 8 | 1) >> 8) & 0x00FF_00FF_00FF_00FF;
+    let quads = (pairs.wrapping_mul(100 << 16 | 1) >> 16) & 0x0000_FFFF_0000_FFFF;
+    (quads.wrapping_mul(10_000 << 32 | 1) >> 32) as u32
 }
 
 /// Reads the 8 bytes at `at` as one little-endian integer, so that byte `at` becomes the lowest
@@ -600,13 +602,14 @@ impl<'a> Interner<'a> {
     /// Names vary in length from line to line, and the branches inside `memcmp` that pick a path
     /// by length mispredict often; that was about a quarter of the parse loop. Here the length
     /// never steers a branch: a probe compares all 64 bytes of `window` with the known name's
-    /// padded copy at once ([`equal_mask`]) and keeps the result for bytes `0..=n` of a name of
-    /// `n` bytes, the name and the space: `u64::MAX >> (63 - n)` keeps bit `i` exactly for
-    /// `i <= n`. Comparing the space makes the answer exact without comparing lengths. The spec
-    /// rules out spaces in endpoints (§2), so a known name longer than `n` has no space at `n`,
-    /// and one shorter has its space where the window still holds part of the name. The copies
-    /// are 64 bytes, not the 125 a name can reach, because half the size keeps more of them in
-    /// cache: that was worth 0.8 ms.
+    /// padded copy at once ([`equal_mask`]), and a name of `n` bytes matches when bytes `0..=n`,
+    /// the name and the space, all agree: when the mask starts with more than `n` ones. Counting
+    /// them, `trailing_ones() > n`, took 2 instructions fewer than masking off bits `n + 1` and up
+    /// first. Comparing the space makes the answer exact without comparing lengths. The spec rules
+    /// out spaces in endpoints (§2), so a known name longer than `n` has no space at `n`, and one
+    /// shorter has its space where the window still holds part of the name. The copies are 64
+    /// bytes, not the 125 a name can reach, because half the size keeps more of them in cache:
+    /// that was worth 0.8 ms.
     #[inline(always)]
     fn intern(&self, name: &'a [u8], hash: u64, window: &[u8; 64]) -> u32 {
         // The top 13 bits, one of 8,192 slots: they are the ones that every hashed bit reaches.
@@ -619,7 +622,7 @@ impl<'a> Interner<'a> {
                 let known =
                     unsafe { (*self.padded.get_unchecked(id as usize).get()).assume_init_ref() };
                 // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
-                !unsafe { equal_mask(window, &known.0) } & u64::MAX >> (63 - name.len()) == 0
+                unsafe { equal_mask(window, &known.0) }.trailing_ones() as usize > name.len()
             } else {
                 self.names[id as usize].get() == Some(&name)
             };
