@@ -27,6 +27,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 20 | The rarity sample is the corpus's first 1/64 (4,005 documents on seed 1) instead of its first 1,000 documents, each thread counting a part | run-75d28a617cc4 | 0.2158 | 42.8 | 70.5 |
 | 21 | 35 fewer code lines: one helper runs and joins each set of threads, the intern loop drops its prefetch, the output adds each query's cells once; every loop starts on a 64-byte boundary | run-f0c533c66a88 | 0.2165 | 42.9 | 70.6 |
 | 22 | 8 fewer code lines in code that runs once, with the same machine code | run-59d37d7b5803 | 0.2177 | 42.3 | 70.5 |
+| 23 | A per-document check reads its terms' bits with one AVX2 gather instead of six loads, and the document's term bits are read and cleared without bounds checks | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -469,6 +470,27 @@ Four spots in code that runs once, written so that rustfmt keeps them on fewer l
 Checks: the built binary's `.text` and `.rodata` are byte for byte those of step 21, and only
 88 bytes of `.data.rel.ro` differ (the line numbers in panic locations), so T and memory are
 unchanged. S 736 → 728. Gate: 510 pass, 0 fail.
+
+## Step 23: a check's terms in one gather
+
+On seed 1 the per-document checks ([`Check`]) run 16.9 million times. Each one built its truth
+table's index from its six terms: per term a bounds-checked load of the document's bit set
+`seen`, a shift and an OR, 29 cycles a check in all (0.49 G of step 20's 5.66 G user cycles).
+Now one AVX2 gather (`vpgatherdd`) loads the 32-bit words of `seen` that hold the six terms'
+bits, a variable shift moves each bit to the top of its lane, and `movemask` collects the six
+bits as the index. The two spare lanes read word 0 and are masked off. Every term id, and the
+pad `miss`, is below `64 * seen.len()`, so no lane reads outside `seen`; the loop that clears
+the document's bits at its end skips its bounds check on the same grounds. Gather Data
+Sampling, whose mitigation slows gathers, does not affect Raptor Lake (locally the kernel
+reports "Not affected").
+
+Locally, against step 21, whose `.text` and `.rodata` step 22 keeps (alternating runs, `ab.py`,
+20 each), two rounds: median 226.44 and 225.92 → 215.61 and 215.19 ms, min 224.58 and 224.32 →
+214.20 and 213.85 ms. `perf stat`: user cycles 5.64 → 5.30–5.31 G, instructions 8,711 → 7,517
+M; branch misses 57.3 → 58.7 M. On step 20, built with every function aligned to 64 bytes, the
+unchecked loads alone ran 226.6 → 221.1 ms and the gather on top of them 213.8 ms.
+memory.peak over six alternating runs: median 43.5 → 43.2 MB. S 728 → 732. Gate: 510 pass, 0
+fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
 
 ## Experiments that did not stay
 

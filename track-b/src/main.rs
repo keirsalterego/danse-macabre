@@ -483,10 +483,20 @@ impl Check {
         self
     }
 
-    /// Whether a document matches, given `has(t)`: 1 when it holds term `t`, else 0.
-    fn matches(&self, has: impl Fn(u32) -> u64) -> bool {
-        let x = (self.terms.iter().enumerate()).fold(0, |x, (j, &t)| x | has(t) << j);
-        self.table >> x & 1 != 0
+    /// Whether a document matches, given `seen`, where bit `t` is set when it holds term `t`.
+    /// One AVX2 gather loads the 32-bit words that hold the six terms' bits, and a shift moves
+    /// each bit to the top of its lane, where `movemask` collects them as the table's index.
+    #[target_feature(enable = "avx2")]
+    fn matches(&self, seen: &[u64]) -> bool {
+        let lanes = _mm256_setr_epi32(-1, -1, -1, -1, -1, -1, 0, 0);
+        // SAFETY: the mask reads the six lanes of `terms` only, and zeroes the other two.
+        let terms = unsafe { _mm256_maskload_epi32(self.terms.as_ptr().cast(), lanes) };
+        let at = _mm256_srli_epi32::<5>(terms);
+        // SAFETY: each lane's word index `t / 32` lies inside `seen`, as `t < 64 * seen.len()`.
+        let words = unsafe { _mm256_i32gather_epi32::<4>(seen.as_ptr().cast(), at) };
+        let top = _mm256_sllv_epi32(words, _mm256_andnot_si256(terms, _mm256_set1_epi32(31)));
+        // The two zeroed lanes hold term 0's bit; the mask drops them.
+        self.table >> (_mm256_movemask_ps(_mm256_castsi256_ps(top)) & 63) & 1 != 0
     }
 }
 
@@ -857,15 +867,16 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
                 }
             }
         }
-        let has = |t: u32| seen[t as usize / 64] >> (t % 64) & 1;
         for checks in bool_terms.drain(..) {
             for c in checks {
                 let check = &plan.checks[c];
-                tally.add_check(c, check.q, doc, check.matches(has));
+                // SAFETY: the binary targets alderlake (.cargo/config.toml), which has AVX2.
+                tally.add_check(c, check.q, doc, unsafe { check.matches(&seen) });
             }
         }
         for &t in &terms {
-            seen[t as usize / 64] &= !(1 << (t % 64));
+            // SAFETY: `terms` holds term ids and `miss`, all below `64 * seen.len()`.
+            *unsafe { seen.get_unchecked_mut(t as usize / 64) } &= !(1 << (t % 64));
         }
         terms.clear();
         phrase_at.clear();
