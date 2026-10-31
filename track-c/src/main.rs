@@ -125,8 +125,8 @@ const KEEP: [[u8; 32]; 2] = [[!0; 32], [0; 32]];
 /// adversary chose.
 // SAFETY: `u128` and `__m128i` are both 16 bytes, and every bit pattern is a valid one.
 const KEY: __m128i = unsafe { std::mem::transmute(0x243F_6A88_85A3_08D3_1319_8A2E_0370_7344_u128) };
-/// The largest entry number a slot holds. A slot's top 24 bits are its entry's index plus 1, so
-/// that 0 is an empty slot, and its low 8 bits are the name's tag, byte 14 of its hash, so a probe
+/// The largest entry number a slot holds. A slot's top 24 bits are its entry's index, and an
+/// empty slot is 0, the index of an entry that holds no name (see [`NameSet::new`]); its low 8 bits are the name's tag, byte 14 of its hash, so a probe
 /// that passes a different name usually skips its entry without loading it. With the number on
 /// top, one shift takes it out and the bits compare as a byte: with the bits on top, a mask for
 /// each took one more instruction per probe and one more per letter.
@@ -885,9 +885,12 @@ impl NameSet {
     /// An empty set with room for about `names` names.
     fn new(names: usize) -> Self {
         // The slots may fill to three quarters before they grow (see `insert`). Pages of the
-        // entries' capacity that no entry reaches cost nothing, so it is generous.
-        let slots = vec![0; (4 * names / 3).next_power_of_two().max(16)];
-        let entries = Vec::with_capacity(2 * names);
+        // entries' capacity that no entry reaches cost nothing, so it is generous. One slot more
+        // stays empty, so the last slot has a next to be read with it (see `read`), and entry 0
+        // holds no name, so a slot holds its entry's index with no `- 1` in the probe.
+        let slots = vec![0; (4 * names / 3).next_power_of_two().max(16) + 1];
+        let mut entries = Vec::with_capacity(2 * names);
+        entries.push(Entry(0, [0; 4]));
         Self { slots, entries }
     }
 
@@ -900,27 +903,43 @@ impl NameSet {
     /// for every letter, 15 M instructions per run (PERF.md, step 46).
     #[inline(never)]
     fn read(&mut self, mut letters: &[[AtomicU64; 2]], groups: &mut [Group]) {
+        let (slots, entries) = (&self.slots[..], &mut self.entries[..]);
         while let [[key, high], ..] = letters {
             let (key, high) = (key.load(Relaxed), high.load(Relaxed));
             // A group fits in a byte (see [`join`]), so the bit's word is one of four with no
             // bounds check.
-            let (mask, tag) = (self.slots.len() - 1, (high >> 48) as u8);
+            let (mask, tag) = (slots.len() - 2, (high >> 48) as u8);
             let (group, mut slot) = ((high >> 56) as usize, key as usize & mask);
-            let entry = loop {
-                // SAFETY: the slots are never empty (see `new`), so `mask` keeps `slot` below their
-                // length. Checked, the load took two instructions per probe.
-                let found = *unsafe { self.slots.get_unchecked(slot) };
-                match (found >> 8) as usize {
-                    0 => return self.insert(slot, letters, groups),
-                    // SAFETY: a slot that is not 0 holds the entry count just after its entry was
-                    // pushed (see `insert`), and no entry is removed, so `e - 1` is an entry.
-                    e if found as u8 == tag
-                        && unsafe { self.entries.get_unchecked(e - 1) }.0 == key =>
-                    {
+            // The home slot and the next are read as one word, and the next is taken when the
+            // home slot's tag is not the name's, with no branch. A quarter of the names sit one
+            // slot past home, and the branch on the home slot's tag missed 1.6 M times per run;
+            // now only names further on, a tenth of them, take the probe loop (PERF.md, step 47).
+            // SAFETY: `slot` is at most `mask`, two below the slots' length (see `new`), so the
+            // two slots from it lie in them, and `read_unaligned` needs no alignment.
+            let pair = unsafe { slots.as_ptr().add(slot).cast::<u64>().read_unaligned() };
+            let found = std::hint::select_unpredictable(pair as u8 == tag, pair, pair >> 32) as u32;
+            // An empty slot leads to entry 0, whose key 0 a name with tag 0 matches only as any
+            // two names match, by 72 bits of hash (see [`NameSet`]).
+            let e = (found >> 8) as usize;
+            // SAFETY: a slot holds the number of an entry pushed before it (see `insert`), or 0,
+            // the number of the set's first entry, and no entry is removed.
+            let entry = if found as u8 == tag && unsafe { entries.get_unchecked(e) }.0 == key {
+                // SAFETY: as above.
+                unsafe { entries.get_unchecked_mut(e) }
+            } else {
+                loop {
+                    // SAFETY: `mask` keeps `slot` below the slots' length. Checked, the load took
+                    // two instructions per probe.
+                    let found = *unsafe { slots.get_unchecked(slot) };
+                    match (found >> 8) as usize {
+                        0 => return self.insert(slot, letters, groups),
                         // SAFETY: as above.
-                        break unsafe { self.entries.get_unchecked_mut(e - 1) };
+                        e if found as u8 == tag && unsafe { entries.get_unchecked(e) }.0 == key => {
+                            // SAFETY: as above.
+                            break unsafe { entries.get_unchecked_mut(e) };
+                        }
+                        _ => slot = (slot + 1) & mask,
                     }
-                    _ => slot = (slot + 1) & mask,
                 }
             };
             let (word, bit) = (&mut entry.1[group / 64], 1 << (group % 64));
@@ -943,13 +962,13 @@ impl NameSet {
     fn insert(&mut self, slot: usize, letters: &[[AtomicU64; 2]], groups: &mut [Group]) {
         let [key, high] = letters[0].each_ref().map(|word| word.load(Relaxed));
         assert!(self.entries.len() < ENTRY as usize, "over 2^24 names");
-        self.entries.push(Entry(key, [0; 4]));
         self.slots[slot] = (self.entries.len() as u32) << 8 | u32::from((high >> 48) as u8);
+        self.entries.push(Entry(key, [0; 4]));
         if 4 * self.entries.len() > 3 * self.slots.len() {
-            let mask = 2 * self.slots.len() - 1;
-            let old = std::mem::replace(&mut self.slots, vec![0; mask + 1]);
+            let mask = 2 * self.slots.len() - 3;
+            let old = std::mem::replace(&mut self.slots, vec![0; mask + 2]);
             for found in old.into_iter().filter(|&found| found != 0) {
-                let mut slot = self.entries[(found >> 8) as usize - 1].0 as usize & mask;
+                let mut slot = self.entries[(found >> 8) as usize].0 as usize & mask;
                 while self.slots[slot] != 0 {
                     slot = (slot + 1) & mask;
                 }

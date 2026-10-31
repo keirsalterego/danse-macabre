@@ -51,6 +51,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 44 | 3 fewer lines at the same speed: the country numbers given by one `for_each` over `present().zip(1..)`, with the count from `present().count()`, and the mailbox ends published in one `for_each` | run-42fe84676c85 | 0.0218 | 11.6 | 81.6 |
 | 45 | The two hyperthreads of a core mark and parse side by side: a worker on an even CPU marks the round before's letters before its parse and one on an odd CPU after it. The 64-byte window of `text_fields` and the name set's probe read unchecked, and a new min or max is a branch instead of two stores per record | run-15ada601c130 | 0.0206 | 11.4 | 82.2 |
 | 46 | `NameSet::read` leaves its loop at a new name, and `insert` calls it again from that letter, so the loop keeps the set's slots, mask and entries in registers instead of loading them for every letter; and `number` parses on a 16-byte SSE window, with the shuffle and multiply-adds of `region_amount` | run-9d22ed670100 | 0.0208 | 11.6 | 82.0 |
+| 47 | `NameSet::read` reads a name's home slot and the next as one word and takes the next, with a `cmov`, when the home slot's tag is not the name's, so a name one slot past home no longer mispredicts; only names further on take the probe loop | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1604,8 +1605,53 @@ ms; `number` alone: 23.30 → 23.20 and 23.30 → 23.29 ms (seed 1, same rounds)
 alternating runs: 10.0–10.3 MB for step 45 and 10.1–10.5 MB for this step. S 376 → 377. The gate
 passes (310 of 310), full seeds 1 and 2 give the reference hashes, and clippy reports no warnings.
 
+## Step 47: a name one slot past home found without a branch
+
+At step 46, 87% of the 1.84 M branch misses per run were the probe's tag compare in
+`NameSet::read`, for a name that is not in its home slot. Names are drawn uniformly (spec §2.2),
+so no placement can favour the frequent ones. With 8,400 names in 16,384 slots, as a worker holds
+at full scale, a simulation of the table puts 74.6% of names in their home slot, 14.6% one past
+it and 10.8% further on.
+
+- **Home and next in one read.** The probe reads the home slot and the next as one `u64`, and
+  `select_unpredictable` takes the next when the home slot's tag is not the name's. If the
+  chosen slot's tag and its entry's key match, that is the entry. Otherwise the probe loop runs
+  from the home slot as before, so empty slots and inserts are handled where they were. The
+  slots get one more, always empty, so the last slot has a next. Entry 0 holds no name, so a
+  slot holds its entry's index (no `- 1`) and an empty slot that is chosen leads to entry 0. Its
+  key, 0, matches only a name with tag 0 and key 0, as two names collide, on 72 bits. `read`
+  takes the slots and the entries as slices first: through `self` the compiler loaded both, and
+  the slots' length, again for every letter. +7 lines.
+
+`perf stat -r 10`, full seed 1, interleaved, step 46 → step 47: branch misses 1.84 → 1.02 M,
+instructions:u 774.6 → 778.3 M and 774.7 → 778.7 M, cycles:u 528.1 → 553.2 M and 531.4 → 562.2 M.
+cycles:u rose while the wall time fell. One likely reason: it counts the barrier's spins, which
+grow when the marking ends sooner. `ab.py`, turbo off, interleaved, medians / minimums: full seed
+1, 41 runs, 23.29 / 22.36 → 22.75 / 21.90 ms; 61 runs, 22.87 / 22.26 → 22.59 / 21.75, 22.89 /
+22.10 → 22.69 / 22.16, 22.89 / 22.12 → 22.76 / 22.10 and 23.19 / 22.21 → 22.81 / 22.04 ms; full
+seed 2, 61 runs, 22.99 / 22.36 → 22.67 / 21.92, 22.97 / 22.37 → 22.65 / 22.09, 23.17 / 22.38 →
+22.99 / 21.68 and 23.17 / 22.43 → 22.93 / 22.16 ms. All nine medians are lower, by 0.6% to 2.3%
+(about 1.2% typically), and eight of nine minimums. memory.peak, 5 alternating runs:
+10.0–10.3 MB for step 46 and 9.8–10.5 MB for this step. S 377 → 384. The gate passes (310 of
+310), full seeds 1 and 2 give the reference hashes, and clippy reports no warnings.
+
 ## Experiments that did not stay
 
+- **Other ways to make the not-home case cheaper, costed before step 47** (simulation of 8,400
+  names in 16,384 slots, as one worker at full scale; none built):
+  - Robin Hood insertion: 64.0% at home, 24.6% one past it and 11.4% further on, against linear
+    probing's 74.6%, 14.6% and 10.8%. That is more names off home, and no fewer beyond the next
+    slot.
+  - Aligned buckets of two slots, with overflow into the next bucket: 12.7% leave the home
+    bucket, against 10.8% beyond home + 1 for the unaligned pair of step 47.
+  - A "displaced" bit in the home slot: whether a name is home stays as unpredictable as before
+    (a quarter are not), so the bit only moves the missed branch.
+  - Starting the probe one slot past home when the home slot's tag differs, branch-free, with
+    no separate hit path: skipping a home slot that is empty makes it linear probing from home
+    + 1, with the same misses, and testing that the home slot is taken costs 7 to 8 instructions
+    per letter.
+  - A dense tag array matched 16 slots at a time: at least 16 KB more per worker beside the
+    32-bit indexes. Step 32's eight-slot AVX2 compare already cost 32 M instructions for no gain.
 - **The record's sums as one vector in the batch** (local, turbo off, on step 46's loop): the
   batch held `[1, id, cents, name_len]` as one `__m256i` from `_mm256_set_epi64x`, so the merge
   adds it with one `vpaddq` from memory and no vector built from four loads. Instructions 797.3
