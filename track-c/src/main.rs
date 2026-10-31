@@ -226,7 +226,8 @@ fn region_rows(csv: &[u8], share: usize, shares: usize, mut row: impl FnMut(usiz
     let cut = |i| ((len * i / shares + 1..len).find(|&p| body[p - 1] == b'\n')).unwrap_or(len);
     let (mut at, end) = (cut(share), cut(share + 1));
     while at < end {
-        let (id, comma) = number(body, at, b',');
+        // SAFETY: `at` is below `end`, at most `len`, so the 8 bytes from it end inside the pad.
+        let (id, comma) = unsafe { number(body, at, b',') };
         assert!(body[comma + 4] == b'\n', "regions.csv: bad row");
         let [a, b, c] = [1, 2, 3].map(|i| (body[comma + i] - b'A') as usize);
         row(id as usize, (a * 26 + b) * 26 + c);
@@ -295,7 +296,8 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
     let boxes = letters.as_chunks::<4>().0;
     // The region table (see above): the codes that occur, as bits, and the group of each id.
     let last_row = (regions[..regions.len() - PAD - 1].iter()).rposition(|&b| b == b'\n');
-    let ids = 1 + last_row.map_or(0, |p| number(regions, p + 1, b',').0 as usize);
+    // SAFETY: the LF lies before the pad, so the 8 bytes past it end inside the pad.
+    let ids = 1 + last_row.map_or(0, |p| unsafe { number(regions, p + 1, b',') }.0 as usize);
     // SAFETY: `AtomicU8` has the same layout as `u8`, and all-zero bits are a valid 0.
     let by_id = unsafe { Box::<[AtomicU8]>::new_zeroed_slice(ids).assume_init() };
     // The array's pages are mapped in here, on one CPU, before the workers start. memcg charges
@@ -372,9 +374,13 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
                     // or a BOM, so a first byte of 0xEF is a BOM. The id's word already holds
                     // that byte, so the test takes no load, and only after a BOM is the id parsed
                     // twice.
-                    let (mut id, mut comma) = number(data, at, b',');
-                    if data[at] == BOM[0] {
-                        (id, comma) = number(data, at + BOM.len(), b',');
+                    // SAFETY: `at` is below `end`, at most the input's length, so the 8 bytes from
+                    // it, and from the 3 past it after a BOM, end inside the pad.
+                    let (mut id, mut comma) = unsafe { number(data, at, b',') };
+                    // SAFETY: as above. Checked, the byte took two more instructions.
+                    if unsafe { *data.get_unchecked(at) } == BOM[0] {
+                        // SAFETY: as above.
+                        (id, comma) = unsafe { number(data, at + BOM.len(), b',') };
                     }
                     let (name, name_len, note_len, after_note) = text_fields(data, comma + 1);
                     // SAFETY: `text_fields` has read the 64 bytes from `comma + 1` on, its first
@@ -508,14 +514,20 @@ fn merge(group: &mut Group, other: &Group) {
 /// is (`,` or `.`). Shifting the digits to the top of the word turns the missing ones into leading
 /// zeros and drops `stop` and the bytes after it, and three multiplies then join neighbouring
 /// digits into pairs, pairs into fours and fours into the value. Longer fields, such as an id with
-/// leading zeros (§2.1 allows them), take the loop over bytes. The word is always there, because
-/// the [`PAD`] follows the input.
+/// leading zeros (§2.1 allows them), take the loop over bytes.
 ///
 /// It is always inlined, so the id's parse at the start of each record is not a call.
+///
+/// # Safety
+///
+/// The 8 bytes from `at` on lie in `data`. Every caller starts it at most a few bytes past the
+/// input's end, which the [`PAD`] follows, so the read is not checked: its check took about
+/// five instructions per record.
 #[inline(always)]
-fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
+unsafe fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
     const ONES: u64 = u64::from_le_bytes([1; 8]);
-    let word = u64::from_le_bytes(*data[at..].first_chunk().expect("the input is padded"));
+    // SAFETY: the caller keeps the 8 bytes in `data`, and `[u8; 8]` needs no alignment.
+    let word = u64::from_le_bytes(unsafe { *data.as_ptr().add(at).cast() });
     let digits = word.wrapping_sub(ONES * u64::from(b'0'));
     // The lowest set bit marks the first byte below `0`, so the first `stop`. Bits above it
     // can be false, which is why only the lowest one is used.
@@ -560,8 +572,10 @@ fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
 ///
 /// # Safety
 ///
-/// The 16 bytes from `at` on lie in `data`. The record loop knows it from the comma before
-/// them, so the read is not checked again: its check took five instructions per record.
+/// `at` is at most the input's length, `data.len() - PAD`, so the 16 bytes from it on lie in
+/// `data`, and so do the reads of [`region_amount_slow`]. The record loop knows it from the
+/// comma before `at`, so the read is not checked again: its check took five instructions per
+/// record.
 unsafe fn region_amount(data: &[u8], at: usize) -> (u64, i64, usize) {
     // SAFETY: the caller keeps the 16 bytes in `data`, and `[u8; 16]` needs no alignment.
     let bytes: &[u8; 16] = unsafe { &*data.as_ptr().add(at).cast() };
@@ -576,7 +590,8 @@ unsafe fn region_amount(data: &[u8], at: usize) -> (u64, i64, usize) {
     // An empty region id, which §2.2 rules out, passes and parses as 0, as it does in the slow
     // path, so the comma's test is one compare.
     if comma >= 8 || dot.wrapping_sub(comma + 2) >= 5 {
-        return region_amount_slow(data, at);
+        // SAFETY: the caller keeps `at` at most the input's length.
+        return unsafe { region_amount_slow(data, at) };
     }
     let control = ALIGN[(comma << 4 | dot) & 127];
     // SAFETY: the build targets Alder Lake, which has SSSE3 and SSE4.1 (see `.cargo/config.toml`).
@@ -596,13 +611,22 @@ unsafe fn region_amount(data: &[u8], at: usize) -> (u64, i64, usize) {
 
 /// [`region_amount`] for fields that do not fit its window. No record of a generated file takes
 /// it (§2.2), so it is cold and out of line.
+///
+/// # Safety
+///
+/// `at` is at most the input's length, `data.len() - PAD`, as for [`region_amount`].
 #[cold]
 #[inline(never)]
-fn region_amount_slow(data: &[u8], at: usize) -> (u64, i64, usize) {
-    let (region_id, comma) = number(data, at, b',');
+unsafe fn region_amount_slow(data: &[u8], at: usize) -> (u64, i64, usize) {
+    // SAFETY: the caller keeps `at` at most the input's length, so the 8 bytes from it end
+    // inside the pad.
+    let (region_id, comma) = unsafe { number(data, at, b',') };
     // The sign applies to the whole value: -0.75 is -75 cents, not -0 * 100 + 75.
     let negative = data[comma + 1] == b'-';
-    let (units, dot) = number(data, comma + 1 + usize::from(negative), b'.');
+    // SAFETY: the comma is the first byte below `0` in the word from `at`, so at most the pad's
+    // first byte, or a real comma that the loop found. The word starts one byte past it, or two
+    // past it after a real `-`, so at most at the pad's second byte.
+    let (units, dot) = unsafe { number(data, comma + 1 + usize::from(negative), b'.') };
     let cents = (1..=2).fold(units, |c, i| c * 10 + u64::from(data[dot + i] - b'0')) as i64;
     (region_id, if negative { -cents } else { cents }, dot)
 }

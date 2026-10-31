@@ -44,6 +44,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 37 | The merge takes its group from `by_id` without a bounds check, and a letter's thread is picked with `sent.len()` instead of a load through the closure's reference to the thread count | run-0ff0124ce494 | 0.0237 | 12.5 | 80.1 |
 | 38 | The last worker to finish merges the groups, writes the output and ends the process while the others sleep, so no thread ends first, and each worker gives back its name set's entries after its run; and `main` is C's, so the Rust runtime's setup, whose stack-overflow handler gave every thread a signal stack, does not run | run-490c7c238e52 | 0.0235 | 12.1 | 80.3 |
 | 39 | The name's 24 bytes, the region id's and the amount's 16 and the byte after the cents are read without bounds checks, a name set's slot holds its entry above its tag, the quotes are counted with `bzhi`, a CR is told from an LF by its lowest bit, the region id's length takes one compare, and the marking takes its group unchecked | run-d0d0e233e6f7 | 0.0228 | 12.5 | 80.5 |
+| 40 | `number` reads a field's word without a bounds check, as an `unsafe fn` whose six calls each show that the 8 bytes lie in the input or its pad, and the BOM test reads its byte unchecked | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1331,6 +1332,78 @@ interleaved runs:
   +0.24%. As a table of 17 dots by 8 commas indexed with no mask, it added a bounds check.
 - **The dot found by a shift past the byte after the comma**, so that its range check would be
   one compare: instructions −0.02%.
+
+## Step 40: the field's word read unchecked
+
+`number` parses a field from the 8 bytes at its start, read as one word, and checked on every
+call that they lie in `data`. They always do: every caller starts the word at most two bytes
+past the input's end, and the pad is 64 bytes. `number` is now an `unsafe fn` whose contract is
+that the 8 bytes lie in `data`, and each of its six calls says why they do. The change adds no
+line.
+
+- **The id at a record's start**, and the id 3 bytes on after a BOM. The record starts below its
+  run's end, which is at most the input's length. The BOM test reads the record's first byte
+  unchecked for the same reason: with the word's check gone, the compiler checked that byte
+  instead, two instructions per record.
+- **The two fields of `region_amount_slow`.** The region id starts one past the note's comma, at
+  most at the input's length, and the amount one or two bytes past the region id's stop, which
+  is at most the pad's first byte or a comma of the input. `region_amount` and
+  `region_amount_slow` now both require that their start be at most the input's length, which
+  the record loop knows from the comma before it.
+- **A row of the region table**, which starts below the body's end, and **the last row's id**,
+  one past an LF that lies before the pad.
+
+On AC power, `ab.py`, 41 interleaved runs, seven rounds, against step 39: medians 25.01, 24.95,
+25.08, 25.11, 25.09, 25.10 and 25.07 → 24.80, 24.74, 24.73, 24.84, 24.78, 24.83 and 24.77 ms
+(−0.8%, −0.8%, −1.4%, −1.1%, −1.2%, −1.1% and −1.2%). `perf stat`, 20 interleaved runs:
+instructions:u 936.6 → 911.0 M (−2.7%, 282 → 274 per record), cycles:u 566.4 → 560.7 M (−1.0%).
+memory.peak, 40 alternating runs: medians 12.27 → 12.23 MiB. S 393 → 393. Correctness: the gate,
+310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes; the 400 fuzz cases and the
+two long-name sets pass at the default thread count, at 1, 3, 12, 37 and 64 threads, and with
+100-byte rounds at 1, 2, 3, 12 and 64; the 300 tiny seeds pass at 1, 2, 3, 5, 7, 12, 16, 23, 37
+and 64 threads with 100-byte rounds; the six files of edge cases match the reference at the
+default thread count, at 1 and 37 threads, and with 100-byte rounds at 3 and 64; of the wide
+region sets, w2 gives the reference, and w0 and w1 stop with the error as before; 73 inputs cut
+short at every awkward place (inside the id, after one or two bytes of a BOM, inside a quoted
+note, inside the region id and the amount, with and without a CR, and region tables cut short
+in their last row) give the same exit status, panic message and output as step 39; clippy
+reports no warnings.
+
+Where step 39's 282 instructions per record go, from `perf record` of instructions:u with
+PEBS's precise distribution (`:ppp`), 120 runs, one sample per 4,000,037 instructions, each
+charged to its line of the record loop. With `:pp` instead, the samples piled up behind slow
+instructions: the region table's prefetch, one instruction per record, drew 10 per record.
+
+| Part of the record loop | Instructions per record |
+|---|---|
+| `text_fields`, with `text_fields_slow` (3.4) | 60.8 |
+| `region_amount` | 38.0 |
+| `NameSet::read` and `NameSet::insert`, the marking | 33.0 |
+| `number` for the id, and the BOM test | 31.7 |
+| `name_letter`, without its three `crc32`s | 22.0 |
+| `merge` of the record into its group | 18.6 |
+| the batch: its stores, its loop, the group's lookup and its byte in the letter | 17.8 |
+| the letter's four stores into its mailbox | 14.8 |
+| the loop's control, both prefetches and the line end | 11.8 |
+| the post: the owner, the slot and its count | 8.8 |
+| no line in the line tables after inlining: the `crc32`s, reloads of spilled values | 23.8 |
+| the rest: rounds, barrier, setup, tail | 1.0 |
+
+Dropped, against step 39; `ab.py` on AC power, 41 interleaved runs, and `perf stat`, 20
+interleaved runs:
+- **The empty name kept out of the exchange.** At full scale 1.0% of the records have an empty
+  name, whose letter is all zeros, so its hash and its owner are 0, and worker 0 marked about
+  11% more letters than the others. With no worker posting it, and a byte per group, shared and
+  set once, to count it, +4 lines: six rounds from −0.5% to +0.2%, instructions +1.0%, cycles
+  +0.0% and +0.3%. With the branch that sets the byte made cold: three rounds from −0.3% to
+  +0.2%, instructions +0.9%, cycles +0.0%. Not posting it at all, which leaves it out of the
+  counts, as the bound on what balancing worker 0 can gain: three rounds from −0.6% to +0.1%,
+  instructions +0.2%, cycles +0.2%.
+- **A pad of 128 bytes**, so that the 64-byte window of `text_fields` would be read unchecked
+  too: a last record cut short after a BOM puts the id's stop on the pad's third byte, and the
+  window from the byte after it ends 67 bytes into the pad. Alone: instructions −1.46% (4 per
+  record), cycles −0.17%, three rounds 0.0%, 0.0% and −0.3%. With this step's change, against
+  it: instructions −0.77%, cycles −0.02%, seven rounds from −0.2% to +0.2%.
 
 ## Experiments that did not stay
 
