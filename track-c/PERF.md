@@ -872,6 +872,26 @@ of XORs, which keeps the key out of memory but has LLVM build it from four scala
 
 ## Experiments that did not stay
 
+- **48-byte name-set entries** (local, on step 32's code): the key's words for names of up to
+  15 bytes and the 32 bytes of group bits in 48 bytes, with longer names in a side list. M fell
+  on every seed (10 seeds × 11 rounds, per-seed medians −0.33 to −1.02 MB, mean −0.69 MB), but
+  `ab.py` went from 32.88 / 32.04 to 35.28 / 34.47 ms (median / minimum, +7.3%), with
+  instructions 1,415 → 1,512 M, branch misses 2.87 → 3.44 M and L1 misses 11.2 → 13.1 M. A
+  48-byte stride puts half the entries across two cache lines. Step 32's 64-byte entries moved
+  16 bytes off their alignment, so that every entry crosses two lines, cost the same 1.8 M
+  extra L1 misses and +2.9% T with fewer instructions, so most of the loss is the layout itself.
+- **Eight slots probed at once** (local, on step 32's code): the tags of eight slots compared
+  with one AVX2 compare and a `tzcnt`. Branch misses fell from 2.87 to 1.34–1.40 M, but no
+  variant saved cycles. Unaligned groups with a mirrored tail measured 32.95 → 32.69 ms with
+  32 M more instructions and 1.3 M more L1 misses. Aligned groups measured 33.07 → 33.10 ms,
+  and with the hit's entry taken from the register, cycles went 736.3 → 735.8 M. Peeking at a
+  pair of slots with `select_unpredictable` cut branch misses to 2.14 M and cost 2.6% more
+  cycles. The mark loop's mispredicts are partly hidden by the hyperthread sibling, so removing
+  them gains less than their count suggests.
+- **`sent[to]` read once per record** (local, on step 32's code): the four atomic stores of a
+  letter make the compiler reload `sent[to]` five times, each with a bounds check. Reading it
+  into a local first measured slower: medians 33.04 → 33.78 and 33.09 → 33.62 ms (`ab.py`, 40
+  interleaved runs, two rounds).
 - **PGO** (local, turbo off, on step 27's code): a profile from three runs on each of full seeds
   2–4, passed as `-C profile-use`, with every function matching it. `ab.py`, 40 interleaved runs,
   medians / minimums: 36.35 / 35.39 → 37.71 / 36.69 ms and 36.27 / 35.64 → 37.39 / 36.79 ms on
