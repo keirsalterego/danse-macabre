@@ -53,6 +53,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 46 | The input prefetched five lines ahead, `parse` out of line with a pointer for its loop, and the endpoint interner a static | | | | |
 | 47 | 5.8 instructions fewer per line: the probe counts the compare mask's trailing ones, the latency's digits combine in three steps, and their mask is one shifted constant | | | | |
 | 48 | An endpoint table of 16,384 slots instead of 8,192: 1.9% of lines take a second probe instead of 3.9% | | | | |
+| 49 | Three rare paths of the parse marked `std::hint::cold_path`, so its loop keeps its count, its end and its constants in registers | | | | |
 
 ## Step 1: v1
 
@@ -746,6 +747,35 @@ second session, minimums 330.6 → 327.2 M and 313.7 → 321.9 M. A copy moved a
 same: cycles:u 342.1 and 340.3 M against 342.1 and 340.7 M, L1 misses 3.94 M. memory.peak: median
 18.00 → 18.12 MB, and 18.40 → 18.26 MB in an earlier session. S 366 → 366. Gate: 310 pass, 0 fail;
 full seeds 1–7 and 10–12 give the reference hashes; clippy reports no warnings.
+
+## Step 49: three rare paths marked cold
+
+`std::hint::cold_path()` marks a new run, a latency of 8 digits or more and a second probe. Without
+the hints, LLVM's guess at how often each runs kept the loop's record count and its end on the
+stack and rebuilt the LF pattern and two 64-bit constants on every line; with them, those stay in
+registers, and the hot path has two taken branches fewer per line (br_inst_retired.near_taken:u
+40.9 → 34.7 M): 26.0 M instructions fewer, 8.4 per line. Each hint alone, on an earlier form of
+step 48: the second probe −16.7 M, the long latency −3.4 M, the new run −0.1 M; the three together
+−26.0 M. Hints on a large latency, on a line of more than 103 bytes and on a name of 64 bytes or
+more gained nothing.
+
+On AC power (local, P-cores, turbo off), `ab.py`, 61 interleaved runs, four rounds, against step
+48: medians 19.54 → 19.36, 19.60 → 19.41, 19.65 → 19.37 and 19.49 → 19.33 ms (−0.8 to −1.4%),
+minimums 19.03 → 18.49, 18.90 → 18.82, 18.93 → 18.62 and 18.67 → 18.81 ms; timed as the board does,
+41 runs, two rounds, medians 18.49 → 18.25 and 18.36 → 18.14 ms. A copy whose `parse` an
+`#[inline(never)]` on `summarize_hour` moved 0x170 bytes on timed the same: medians 19.35, 19.40,
+19.40 and 19.36 ms, and 18.16 and 18.31 ms. Counters, measured on battery power, so only the counts
+compare (`perf stat`, 40 interleaved runs, two rounds): instructions:u 643.2 → 617.2 M (−4.0%),
+cycles:u medians 340.9 → 334.1 M and 341.7 → 333.3 M (−2.0 to −2.5%), minimums 327.2 → 321.1 M and
+321.9 → 318.0 M, L1-dcache-load-misses:u 3.93 → 3.94 M; the moved copy 333.8 and 333.6 M.
+memory.peak: median 18.12 → 18.17 MB. S 366 → 369. Gate: 310 pass, 0 fail; full seeds 1–7 and 10–12
+give the reference hashes; clippy reports no warnings.
+
+Steps 46 to 49 together, in the same rounds: medians 20.33 → 19.36, 20.23 → 19.41, 20.21 → 19.37
+and 20.25 → 19.33 ms (−4.1 to −4.8%), and 19.07 → 18.25 and 19.09 → 18.14 ms timed as the board
+does. Without the static interner the four steps end level with these, at 19.40, 19.40, 19.44 and
+19.27 ms and at 18.17 and 18.19 ms, with 8.4 M instructions more; the static measured ahead at
+steps 46 and 47, so it stayed.
 
 ## Experiments that did not stay
 

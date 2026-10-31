@@ -375,6 +375,10 @@ fn parse(log: &'static [u8], lines: Range<usize>) -> Chunk {
     assert!(lines.end + LINE <= log.len(), "map_file pads the log");
     // The loop moves a pointer to the line, not an index into `log`: one register fewer.
     let (mut at, end) = (log[lines.start..].as_ptr(), log[lines.end..].as_ptr());
+    // Three rare paths are marked cold: a new run, a latency of 8 digits or more, and a second
+    // probe in the interner. Without the hints, the loop kept the record count and its end on the
+    // stack and built its constants again on every line; with them, they stay in registers: 8
+    // instructions fewer per line (`PERF.md`, step 49).
     while at < end {
         // How well the hardware prefetcher kept the input in L1 depended on where the loop's
         // code landed: a change elsewhere in its function could raise the misses by half
@@ -389,6 +393,7 @@ fn parse(log: &'static [u8], lines: Range<usize>) -> Chunk {
         let lf = line_end(line);
         at = at.wrapping_add(lf + 1);
         if word(line, 5) != current {
+            std::hint::cold_path();
             let hour = hour_index(line).expect("timestamps lie in the 72 hours (§2)");
             chunk.runs.push((hour, count, chunk.large.len()));
             current = word(line, 5);
@@ -475,7 +480,8 @@ fn latency(line: &[u8], lf: usize) -> (u32, usize) {
     let w = word(line, lf - 8);
     let found = !w & 0x1010_1010_1010_1010;
     if found == 0 {
-        // 8 to 10 digits: rare enough for a plain loop.
+        // 8 to 10 digits: rare enough for a plain loop, and marked cold (see [`parse`]).
+        std::hint::cold_path();
         let space = line[..lf].iter().rposition(|&b| b == b' ');
         let space = space.expect("a space precedes the latency");
         let digits = line[space + 1..lf].iter();
@@ -629,6 +635,8 @@ impl<'a> Interner<'a> {
             if found {
                 return id;
             }
+            // A second probe is rare, 1.9% of lines, and marked cold (see [`parse`]).
+            std::hint::cold_path();
             slot = (slot + 1) & (self.slots.len() - 1);
         }
         self.insert(slot, name, window)
