@@ -509,12 +509,11 @@ fn word(bytes: &[u8], at: usize) -> u64 {
 /// seeds 1, 3 and 5, simulated) for 25 million instructions in the parse, 2% of the wall time.
 /// Three dependent multiply-rotate steps, as in rustc's `FxHasher`, cost 21 million more.
 fn hash(name: &[u8], first: u64) -> u64 {
-    let n = name.len();
-    let words = match n {
-        ..8 => first & u64::MAX >> (64 - 8 * n),
-        _ => first ^ word(name, n - 8).rotate_left(42),
+    let words = match name.len() {
+        n @ ..8 => first & u64::MAX >> (64 - 8 * n),
+        n => first ^ word(name, n - 8).rotate_left(42),
     };
-    (words ^ n as u64).wrapping_mul(0x517c_c1b7_2722_0a95)
+    (words ^ name.len() as u64).wrapping_mul(0x517c_c1b7_2722_0a95)
 }
 
 /// A hash table that gives every distinct endpoint name a dense id: 0, 1, 2, and so on.

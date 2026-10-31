@@ -46,6 +46,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 39 | 5 fewer lines with the same machine code: the running sum of the hour's counts as one `for_each`, and a large latency listed and replaced by `LARGE` in one `bool::then` | run-89adcd077219 | 0.0196 | 18.4 | 85.1 |
 | 40 | A plain static executable instead of a static PIE (`relocation-model=static`) | run-ebf9f6a49ad5 | 0.0190 | 17.9 | 85.5 |
 | 41 | 4 fewer lines with the same machine code: the record store on one line, the counting pass without a binding for the endpoint, and each output line's length summed in one statement | run-32182846e438 | 0.0256 | 18.0 | 82.3 |
+| 42 | 1 fewer line with the same machine code: the name hash binds the length in the arms of its `match` | | | | |
 
 ## Step 1: v1
 
@@ -608,8 +609,30 @@ The board's run, run-32182846e438, drew 25.6 ms against 19.0 ms for step 40's id
 In the same push, track D's unchanged code drew 132.6 ms against its usual 122–128 ms: the box
 was slow for that run.
 
+## Step 42: 1 fewer line
+
+`hash` binds the name's length in the arms of its `match` instead of in a `let` before it.
+`.text` is byte-identical to step 41's, and `.rodata` differs only in the line numbers of panic
+locations, so T and M cannot move. S 372 → 371. Gate: 310 pass, 0 fail.
+
 ## Experiments that did not stay
 
+- **Line cuts that moved the hour pass's code** (local, `ab.py`, 40 runs, two rounds): an empty
+  group skipped with `let [_, ..] = group else { continue }`, the hour's buffer used without
+  re-slicing it to the hour, and the network's run lengths taken from a `for` over
+  `(1..).map(|s| 1 << s)`. Each moved the network's code by 14 to 268 bytes, and each cost about
+  3%: medians 19.98 → 20.52–20.58 and 19.93 → 20.53–20.61 ms. A fresh copy of the unchanged
+  binary timed the same as the original (medians 20.20 → 20.28 and 21.06 → 20.57 ms), so it is
+  the code's placement, not its page-cache copy. Setting the network's first partner distance
+  with its run length, one line fewer, moved no permute but measured slower in all four numbers
+  (medians 20.40 → 20.42 and 20.22 → 20.26 ms, minimums 19.68 → 19.80 and 19.79 → 19.83 ms), so
+  it stayed out too.
+- **PGO** (local, turbo off, on step 41's code): a profile from three runs on each of full seeds
+  2–4, passed as `-C profile-use`, with every function matching it. `ab.py`, 61 interleaved runs,
+  medians / minimums: 20.27 / 19.62 → 20.54 / 19.98 ms and 20.03 / 19.55 → 20.26 / 19.75 ms on
+  seed 1; 20.18 / 19.70 → 20.48 / 20.00 ms and 20.34 / 19.75 → 20.66 / 20.13 ms on seed 10, which
+  it was not trained on. `perf stat -r 5`, twice: instructions:u 690 → 662 M, cycles:u 359–361 →
+  370–378 M, branch-misses:u 1.10 → 1.20 M.
 - **Pieces handed out from a shared counter instead of one fixed chunk per thread** (local,
   turbo off, on AC): with 16 pieces per thread the median went 30.68 → 31.54 ms, with 64 pieces
   to 33.78 ms. `perf stat` showed 3.5% more cycles for the same instructions and 11% more dTLB
