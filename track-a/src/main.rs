@@ -190,7 +190,7 @@ fn summarize(log: &[u8], out_path: &Path) {
     // give out as they parse, and the ids in output order.
     let chunks: Vec<OnceLock<Chunk>> = (0..threads).map(|_| OnceLock::new()).collect();
     let hours: Vec<OnceLock<Hour>> = (0..HOURS).map(|_| OnceLock::new()).collect();
-    let (all, sorted) = (Interner::default(), OnceLock::new());
+    let (all, sorted) = (Interner::new(), OnceLock::new());
     let (plan, places, barrier) = (OnceLock::new(), OnceLock::new(), Barrier::new(threads));
     let (taken, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let work = |t: usize| {
@@ -251,9 +251,9 @@ fn summarize(log: &[u8], out_path: &Path) {
             let hours: Vec<&Hour> = hours.iter().map(|h| h.get().expect("summarized")).collect();
             let len = hours.iter().map(|(_, len)| len).sum();
             let mut rest = map_output(out_path, len).unwrap_or_else(|e| panic!("{e}"));
-            let mut place = |&(_, len): &Hour| rest.split_off_mut(..len).expect("lengths add up");
-            let places = hours.into_iter().map(|hour| (hour, place(hour)));
-            Mutex::new(places.enumerate().collect::<Vec<_>>())
+            // The queue hands out the hours in order, each cutting its place from the rest.
+            let mut place = move |len| rest.split_off_mut(..len).expect("lengths add up");
+            Mutex::new(hours.into_iter().map(move |h| (h, place(h.1))).enumerate())
         });
         // The threads format in parallel, taking the next hour from the queue until none is
         // left. Each first frees the rest of its chunk's records, the pages that two runs
@@ -263,7 +263,7 @@ fn summarize(log: &[u8], out_path: &Path) {
         let chunk = chunks[t].get().expect("parsed");
         release(&chunk.records);
         release(&chunk.large);
-        let next = || queue.lock().expect("panics abort").pop();
+        let next = || queue.lock().expect("panics abort").next();
         while let Some((index, ((lines, _), place))) = next() {
             format_hour(index, lines, names, place);
         }
@@ -556,9 +556,12 @@ unsafe impl Sync for Interner<'_> {}
 #[repr(align(64))]
 struct Padded([u8; 64]);
 
-// The tables never grow: lookups index them while other threads add names.
-impl Default for Interner<'_> {
-    fn default() -> Self {
+// `intern` runs once per line. As a call, with its register saves and bounds checks, it cost
+// 9% of all instructions (about 1 ms of wall time), so it is forced inline (`inline_always` is
+// allowed in `Cargo.toml`); `insert` stays out of line.
+impl<'a> Interner<'a> {
+    /// An empty table. The tables never grow: lookups index them while other threads add names.
+    fn new() -> Self {
         Self {
             slots: Box::new([const { AtomicU32::new(0) }; 2 << 12]),
             names: (0..1 << 12).map(|_| OnceLock::new()).collect(),
@@ -569,12 +572,7 @@ impl Default for Interner<'_> {
             count: Mutex::new(0),
         }
     }
-}
 
-// `intern` runs once per line. As a call, with its register saves and bounds checks, it cost
-// 9% of all instructions (about 1 ms of wall time), so it is forced inline (`inline_always` is
-// allowed in `Cargo.toml`); `insert` stays out of line.
-impl<'a> Interner<'a> {
     /// Returns `name`'s id, assigning the next free one if the name is new.
     ///
     /// `window` is 64 bytes that start with `name` and the space after it: the line itself, or a
@@ -635,8 +633,7 @@ impl<'a> Interner<'a> {
         // The spec gives every seed 1,842 endpoints (§2), well below the 4,096 that 12 bits hold.
         assert!(*count < 1 << 12, "over 4,096 distinct endpoints");
         // The name, then the space if there is room for it, then zeros.
-        let mut padded = *window;
-        padded[name.len().min(63) + 1..].fill(0);
+        let padded = std::array::from_fn(|i| if i <= name.len() { window[i] } else { 0 });
         // SAFETY: no slot holds this id yet, so no other thread reads the copy, and only the
         // lock's holder writes one.
         unsafe { (*self.padded[*count].get()).write(Padded(padded)) };

@@ -47,6 +47,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 40 | A plain static executable instead of a static PIE (`relocation-model=static`) | run-ebf9f6a49ad5 | 0.0190 | 17.9 | 85.5 |
 | 41 | 4 fewer lines with the same machine code: the record store on one line, the counting pass without a binding for the endpoint, and each output line's length summed in one statement | run-32182846e438 | 0.0256 | 18.0 | 82.3 |
 | 42 | 1 fewer line with the same machine code: the name hash binds the length in the arms of its `match` | | | | |
+| 43 | 4 fewer lines on cold paths: `Interner::new` instead of an `impl Default`, the format queue as a lazy iterator, and a new name's padded copy from `array::from_fn` | | | | |
 
 ## Step 1: v1
 
@@ -615,8 +616,31 @@ was slow for that run.
 `.text` is byte-identical to step 41's, and `.rodata` differs only in the line numbers of panic
 locations, so T and M cannot move. S 372 → 371. Gate: 310 pass, 0 fail.
 
+## Step 43: 4 fewer lines on cold paths
+
+- The interner's constructor is `Interner::new`, first in its `impl`, instead of an
+  `impl Default` of its own, which only `summarize` called.
+- The format queue is the iterator itself, in its mutex: each `next` cuts the hour's place from
+  the rest of the output as it hands the hour out, so no vector of places is collected first.
+  The hours now go out first to last; `pop` handed them out last to first.
+- `insert` builds a new name's padded copy with `array::from_fn`, which keeps byte `i` of the
+  window for `i <= n`, instead of copying the window and zeroing its tail with `fill`.
+
+The machine code changes in `Interner::insert`, which runs 1,842 times a seed, and in the work
+closure from the format queue on; elsewhere only addresses of constants and stack slots moved.
+`ab.py` against step 41, two rounds of 60 runs: medians 20.15 → 20.10 and 19.99 → 19.85 ms,
+minimums 19.50 → 19.34 and 19.44 → 19.24 ms. memory.peak, 24 alternating runs on seed 1: median
+18.29 → 18.13 MB. S 371 → 367. Gate: 310 pass, 0 fail.
+
 ## Experiments that did not stay
 
+- **No barrier before the output is mapped** (one line fewer: the first thread done with its
+  hours waits for each hour's `OnceLock` instead). On step 39's PIE build, `ab.py` medians went
+  20.92 → 20.44 and 20.80 → 20.31 ms, but phase timestamps put only 20 µs of that in the wait
+  and 0.5 ms in the parse: `Barrier::wait`, left with one caller, was inlined into the work
+  closure, and the parse loop inlined there came out with a different register allocation. On
+  step 41's static build the same change cost 0.6 ms (medians 20.33 → 20.98 and 20.35 → 20.93
+  ms). Not kept.
 - **Line cuts that moved the hour pass's code** (local, `ab.py`, 40 runs, two rounds): an empty
   group skipped with `let [_, ..] = group else { continue }`, the hour's buffer used without
   re-slicing it to the hour, and the network's run lengths taken from a `for` over
