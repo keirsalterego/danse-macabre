@@ -142,14 +142,15 @@ fn parallel<T: Send>(n: usize, work: &(impl Fn(usize) -> T + Sync)) -> Vec<T> {
 
 /// Splits `docs` at `parts - 1` line starts, so every line lands in exactly one chunk.
 fn line_bounds(docs: &[u8], parts: usize) -> Vec<usize> {
-    let mut bounds = vec![0];
-    // The last cut, at `docs.len()`, finds no LF after it and ends there.
-    for i in 1..=parts {
-        let at = docs.len() * i / parts;
-        let newline = docs[at..].iter().position(|&b| b == b'\n');
-        bounds.push(newline.map_or(docs.len(), |p| at + p + 1));
-    }
-    bounds
+    let ends = (1..=parts).map(|i| line_end(docs, docs.len() * i / parts));
+    std::iter::once(0).chain(ends).collect()
+}
+
+/// Where the line that holds byte `at` ends, past its LF. From `docs.len()`, which no line
+/// holds, it finds no LF and returns `docs.len()`.
+fn line_end(docs: &[u8], at: usize) -> usize {
+    let newline = docs[at..].iter().position(|&b| b == b'\n');
+    newline.map_or(docs.len(), |p| at + p + 1)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -510,7 +511,7 @@ impl Check {
 /// contain it, and returns those counts with the number of documents sampled: a cheap estimate
 /// of document frequency. Each of `threads` threads counts a part of the sample.
 fn sample_hits(docs: &[u8], terms: &TermTable, threads: usize) -> (Vec<u32>, usize) {
-    let sample = &docs[..line_bounds(docs, SAMPLE_SHARE)[1]];
+    let sample = &docs[..line_end(docs, docs.len() / SAMPLE_SHARE)];
     let bounds = line_bounds(sample, threads);
     thread::scope(|s| {
         let counters: Vec<_> = (bounds.windows(2))
@@ -534,18 +535,22 @@ fn count_hits(sample: &[u8], terms: &TermTable) -> (Vec<u32>, usize) {
     let mut hits = [0].repeat(terms.len());
     // Per term, the last sampled document counted, so a document counts once.
     let mut counted = vec![usize::MAX; terms.len()];
-    let mut doc = 0;
-    let token = |&mut doc: &mut usize, start, end| {
-        if let Some(key) = key_in(sample, start, end)
-            // A token that is no query term counts at id 0, which no query reads.
-            && let slot = terms.find_from(&key, terms.home(&key))
-            && counted[slot.id() as usize] != doc
-        {
-            counted[slot.id() as usize] = doc;
-            hits[slot.id() as usize] += 1;
-        }
+    // A line's tokens are probed at its end, as in [`scan`], and one past `MAX_TERM` bytes takes
+    // a key that no term has.
+    let (mut doc, mut probes) = (0, Vec::new());
+    let token = |probes: &mut Vec<_>, start, end| {
+        let key = key_in(sample, start, end).unwrap_or([!0; MAX_TERM / 8]);
+        probes.push((key, terms.prefetch(&key)));
     };
-    walk(sample, &mut doc, token, |doc| *doc += 1);
+    walk(sample, &mut probes, token, |probes| {
+        for (key, at) in probes.drain(..) {
+            // A token that is no query term counts at id 0, which no query reads.
+            let id = terms.find_from(&key, at).id() as usize;
+            hits[id] += u32::from(counted[id] != doc);
+            counted[id] = doc;
+        }
+        doc += 1;
+    });
     (hits, doc)
 }
 
@@ -1122,13 +1127,16 @@ impl TermTable {
     /// where its probe ends.
     fn intern(&mut self, key: Key) -> u32 {
         let at = self.position(&key, self.home(&key));
-        if self.slots[at].head == 0 {
-            let long = u32::from(key[1] >> 32 | key[2] | key[3] != 0) * Slot::LONG;
-            let (head, tail, flags) = (key[0], key[1] as u32, (self.keys.len() as u32) << 4 | long);
-            self.slots[at] = Slot { head, tail, flags };
-            self.keys.push(key);
-        }
-        self.slots[at].id()
+        // No branch on whether the term is new, which follows no pattern: the slot is written
+        // and the key pushed either way, and the key dropped again unless the term is new.
+        let (new, n) = (self.slots[at].head == 0, self.keys.len());
+        let id = std::hint::select_unpredictable(new, n as u32, self.slots[at].id());
+        let long = u32::from(key[1] >> 32 | key[2] | key[3] != 0) * Slot::LONG;
+        let (head, tail, flags) = (key[0], key[1] as u32, id << 4 | long);
+        self.slots[at] = Slot { head, tail, flags };
+        self.keys.push(key);
+        self.keys.truncate(n + usize::from(new));
+        id
     }
 
     /// Adds `flags[id]` to the flags of each term `id`. An empty slot, id 0, adds `flags[0]`,

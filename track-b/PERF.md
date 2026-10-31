@@ -32,6 +32,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 25 | The token loop takes no branch on what a token is: a token that is no query term probes to an empty slot, id 0, and a document's new stored terms and BOOL triggers are listed by a store and an add | run-ab97ce51555f | 0.1746 | 43.5 | 72.9 |
 | 26 | A document's term bits are cleared by zeroing their words, a store with no load, and the probe's end test is kept one branch by an empty asm block instead of `black_box`, which sent it through the stack | run-1d7859f315a0 | 0.1682 | 43.2 | 73.3 |
 | 27 | Every thread plans a share of the queries, and the term table's flags are added to every slot, an empty one adding 0, without a test for empty slots | run-fc3b46db2437 | 0.1650 | 41.7 | 73.5 |
+| 28 | The rarity sample probes a line's tokens at its end, as the pass does, and counts without a branch; interning a term takes no branch on whether it is new; the sample's end is found without the other 63 cuts | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -605,6 +606,32 @@ ms, and the pass starts at 16.7–17.2 ms instead of 20.7–21.7. Locally, again
 ms, min 177.18 and 177.43 → 173.36 and 173.27 ms. `perf stat`: user cycles 4.30–4.31 → 4.31 G,
 instructions 8,236 → 8,254 M. memory.peak over ten alternating runs: median 42.5 → 42.0 MB.
 S 740 → 744. Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
+
+## Step 28: the sample and the intern without stalls
+
+Three cuts to the work that runs before the pass:
+
+- **The sample probes as the pass does.** Each sampling thread looked a token up as soon as it
+  found it, so each probe's slot load stalled in turn, and branched on whether the document
+  had counted the term yet. It now collects a line's tokens with a prefetch of each one's home
+  slot, probes them at the line end, as [`scan`] does, and adds `counted != doc`, 0 or 1.
+- **An intern with no branch on a new term.** Half of the 152,904 term occurrences are new
+  terms, at random. The slot is now written either way, with its id or the next one, picked
+  by a conditional move, and the key is pushed, then cut off again unless the term is new.
+- **One line end for the sample.** The sample's end came from `line_bounds(docs, 64)`, which
+  reads around all 64 cuts, faulting in their pages, to use one. `line_end` finds that one.
+
+Timeline over three instrumented runs: the intern 4.7–5.0 → 3.9–4.3 ms, the sample's end 0.3 →
+0.05 ms, the sample 4.8–5.1 → 3.4–4.0 ms (a third run of step 27, slowed by other load, took
+6.5). Locally, against step 27 (alternating runs, `ab.py`, 20 each), three rounds: median
+174.96, 175.52 and 175.31 → 173.39, 173.52 and 173.54 ms, min 174.24, 173.97 and 172.99 →
+172.68, 172.50 and 171.83 ms. `perf stat`: user cycles 4.32–4.34 → 4.34–4.36 G, instructions
+8,254 → 8,263 M, branch misses 20.8 → 20.5 M. memory.peak over eight alternating runs: median
+43.0 → 42.4 MB. S 744 → 746. Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their
+reference hashes.
+
+One probe helper shared by the sample and the pass, a line shorter, changed how the pass's
+loop was compiled and ran 183.8 ms against 175.0 for step 27, so the pass keeps its closure.
 
 ## Experiments that did not stay
 
