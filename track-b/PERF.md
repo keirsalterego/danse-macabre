@@ -33,7 +33,8 @@ Every step from the reference to your final version, each with the live-board ru
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
 Step 24's board run drew 208.5 ms, 1.8% slower than step 23's 204.8 ms, although step 24 ran 2%
-faster locally in three rounds (its section has them). Draws of the same code vary on the board:
+faster locally in three rounds (its section has them). A second run of the step 24 code,
+run-6280980d331c, measured 202.0 ms and 43.5 MB (71.3 points). Draws of the same code vary on the board:
 step 21's machine code measured 216.5 and 217.7 ms (rows 21 and 22).
 
 Local numbers below come from 12 threads on the P-cores (CPUs 0-11, turbo off), full seed 1,
