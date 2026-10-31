@@ -326,48 +326,54 @@ impl Plan {
         let cost = |t: u32| costs[t as usize];
         // A bitset takes a bit per document and a list 16 bits per document holding the term.
         let common = |t: u32| hits[t as usize] as usize * DENSE_SHARE >= sampled.max(1);
-        let mut flags = vec![0; terms.len()];
-        // (trigger term, phrase) and (trigger term, check word) pairs, in query order.
-        let (mut phrases, mut checks) = (Vec::new(), Vec::new());
+        // Each thread plans a share of the queries: its (trigger term, phrase) and (trigger term,
+        // check) pairs and its queries on sets, each in query order.
+        let (phrases, (checks, sets)): (Vec<_>, (Vec<_>, Vec<_>)) = parallel(threads, &|p| {
+            let (mut phrases, mut checks, mut sets, mut cover) = (vec![], vec![], vec![], vec![]);
+            for i in queries.len() * p / threads..queries.len() * (p + 1) / threads {
+                if queries.phrase[i] {
+                    let (offset, &term) = (queries.terms(i).iter().enumerate())
+                        .min_by_key(|&(_, &t)| cost(t))
+                        .expect("the parser rejects a phrase without terms");
+                    phrases.push((term, (i as u32, offset as u32)));
+                    continue;
+                }
+                bool_cover(queries.steps(i), cost, &mut cover);
+                if !cover.iter().any(|&t| common(t))
+                    && let Some(check) = Check::new(i as u32, queries.steps(i), terms.len() as u32)
+                {
+                    for (k, &term) in cover.iter().enumerate() {
+                        // A document holding an earlier cover term was checked from that term.
+                        checks.push((term, check.unless(&cover[..k])));
+                    }
+                    continue;
+                }
+                sets.push(i as u32);
+            }
+            (phrases, (checks, sets))
+        })
+        .into_iter()
+        .unzip();
+        let (phrase_at, phrases) = group(terms.len(), &phrases);
+        let (check_at, checks) = group(terms.len(), &checks);
+        // A term triggers phrases or checks when its group holds any.
+        let has = |at: &[u32], flag| u32::from(at[0] < at[1]) * flag;
+        let flag = |(p, c)| has(p, Slot::PHRASE) | has(c, Slot::BOOL);
+        let groups = phrase_at.windows(2).zip(check_at.windows(2));
+        let mut flags: Vec<_> = groups.map(flag).collect();
         let mut store = vec![Store::None; terms.len()];
         // How many `Store::Bits` rows and `Store::List` lists are numbered so far.
         let mut sizes = [0; 2];
-        let mut sets = Vec::new();
-        let mut cover = Vec::new();
-        for (i, &phrase) in queries.phrase.iter().enumerate() {
-            let query = queries.terms(i);
-            if phrase {
-                let (offset, &term) = (query.iter().enumerate())
-                    .min_by_key(|&(_, &t)| cost(t))
-                    .expect("the parser rejects a phrase without terms");
-                phrases.push((term, (i as u32, offset as u32)));
-                flags[term as usize] |= Slot::PHRASE;
-                continue;
-            }
-            bool_cover(queries.steps(i), cost, &mut cover);
-            if !cover.iter().any(|&t| common(t))
-                && let Some(check) = Check::new(i as u32, queries.steps(i), terms.len() as u32)
-            {
-                for (k, &term) in cover.iter().enumerate() {
-                    // A document holding an earlier cover term was checked from that term.
-                    checks.push((term, check.unless(&cover[..k])));
-                    flags[term as usize] |= Slot::BOOL;
-                }
-                continue;
-            }
-            sets.push(i as u32);
-            for &t in query {
-                if let Store::None = store[t as usize] {
-                    // A common term keeps a bitset row, any other an id list: the next of its kind.
-                    let kind = usize::from(!common(t));
-                    store[t as usize] = [Store::Bits, Store::List][kind](sizes[kind]);
-                    sizes[kind] += 1;
-                    flags[t as usize] |= Slot::STORED;
-                }
+        let sets = sets.concat();
+        for &t in sets.iter().flat_map(|&q| queries.terms(q as usize)) {
+            if let Store::None = store[t as usize] {
+                // A common term keeps a bitset row, any other an id list: the next of its kind.
+                let kind = usize::from(!common(t));
+                store[t as usize] = [Store::Bits, Store::List][kind](sizes[kind]);
+                sizes[kind] += 1;
+                flags[t as usize] |= Slot::STORED;
             }
         }
-        let (phrase_at, phrases) = group(terms.len(), &phrases);
-        let (check_at, checks) = group(terms.len(), &checks);
         terms.mark(&flags);
         Self {
             terms,
@@ -415,18 +421,18 @@ impl Plan {
     }
 }
 
-/// Groups `items` by key, keeping their order within a key: key `k`'s are
-/// `grouped[at[k]..at[k + 1]]`. A counting sort, so it allocates no list per key.
-fn group<T: Copy + Default>(keys: usize, items: &[(u32, T)]) -> (Vec<u32>, Vec<T>) {
+/// Groups the items of `parts`, taken in order, by key, keeping their order within a key: key
+/// `k`'s are `grouped[at[k]..at[k + 1]]`. A counting sort, so it allocates no list per key.
+fn group<T: Copy + Default>(keys: usize, parts: &[Vec<(u32, T)>]) -> (Vec<u32>, Vec<T>) {
     let mut at = vec![0; keys + 1];
-    for &(k, _) in items {
+    for &(k, _) in parts.iter().flatten() {
         at[k as usize + 1] += 1;
     }
     for k in 0..keys {
         at[k + 1] += at[k];
     }
-    let mut grouped = vec![T::default(); items.len()];
-    for &(k, item) in items {
+    let mut grouped = vec![T::default(); at[keys] as usize];
+    for &(k, item) in parts.iter().flatten() {
         grouped[at[k as usize] as usize] = item;
         at[k as usize] += 1;
     }
@@ -718,7 +724,7 @@ impl Tally {
     /// `ids[at[q]..at[q + 1]]`. Each scanning thread groups its own, instead of one big sort
     /// after the pass.
     fn take_first(&mut self) -> (Vec<u32>, Vec<u32>) {
-        group(self.queries.len(), &std::mem::take(&mut self.first))
+        group(self.queries.len(), &[std::mem::take(&mut self.first)])
     }
 }
 
@@ -1125,9 +1131,10 @@ impl TermTable {
         self.slots[at].id()
     }
 
-    /// Adds `flags[id]` to the flags of each term `id`.
+    /// Adds `flags[id]` to the flags of each term `id`. An empty slot, id 0, adds `flags[0]`,
+    /// which is 0: a test for empty slots, which lie at random, would mispredict often.
     fn mark(&mut self, flags: &[u32]) {
-        for slot in self.slots.iter_mut().filter(|slot| slot.head != 0) {
+        for slot in self.slots.iter_mut() {
             slot.flags |= flags[slot.id() as usize];
         }
     }

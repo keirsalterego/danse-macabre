@@ -31,6 +31,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 24 | A document's checks are listed one by one as its BOOL triggers appear, so one loop runs them all instead of one loop per trigger | run-170e5552bd10 | 0.2085 | 42.4 | 71.0 |
 | 25 | The token loop takes no branch on what a token is: a token that is no query term probes to an empty slot, id 0, and a document's new stored terms and BOOL triggers are listed by a store and an add | run-ab97ce51555f | 0.1746 | 43.5 | 72.9 |
 | 26 | A document's term bits are cleared by zeroing their words, a store with no load, and the probe's end test is kept one branch by an empty asm block instead of `black_box`, which sent it through the stack | run-1d7859f315a0 | 0.1682 | 43.2 | 73.3 |
+| 27 | Every thread plans a share of the queries, and the term table's flags are added to every slot, an empty one adding 0, without a test for empty slots | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -581,6 +582,29 @@ Each alone, against step 25 (median of 18 alternating runs): the stores 3.5 ms, 
 `perf stat`: user cycles 4.39–4.44 → 4.31 G, instructions 8,392 → 8,236 M, branch misses 20.8
 → 20.9 M. memory.peak over six alternating runs: median 40.7 → 41.6 MB. S 738 → 740. Gate:
 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
+
+## Step 27: the queries planned on every thread
+
+On seed 1 the pass started about 21 ms into the run, and one thread spent 4.9 ms of that in
+the per-query planning loop: for each of the 50,000 queries, the phrase's trigger term or the
+BOOL query's cover, its checks, or its stored terms.
+
+- **The plan in parallel.** Every thread now plans a share of the queries, as the parse does,
+  and returns its (trigger term, phrase) and (trigger term, check) pairs and its queries on
+  sets, each in query order. `group` reads the parts in order, so each term's phrases and
+  checks come out in the same order as before. A term's PHRASE and BOOL flags follow from the
+  groups (its group is not empty), and one thread still numbers the stored terms in query
+  order, from the queries on sets.
+- **No test for empty slots.** The flags were added to the term table slot by slot, behind a
+  test for an empty slot, which mispredicts often, as empty slots lie at random. An empty slot
+  holds id 0, whose flags are 0, so every slot now takes the add, without the test.
+
+Timeline over three instrumented runs: the loop 4.9 → 1.0–1.1 ms, adding the flags 1.5 → 0.5–0.7
+ms, and the pass starts at 16.7–17.2 ms instead of 20.7–21.7. Locally, against step 26
+(alternating runs, `ab.py`, 18 each), two rounds: median 178.38 and 178.94 → 174.46 and 174.79
+ms, min 177.18 and 177.43 → 173.36 and 173.27 ms. `perf stat`: user cycles 4.30–4.31 → 4.31 G,
+instructions 8,236 → 8,254 M. memory.peak over ten alternating runs: median 40.5 → 40.1 MiB.
+S 740 → 744. Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
 
 ## Experiments that did not stay
 
