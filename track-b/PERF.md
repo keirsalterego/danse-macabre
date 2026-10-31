@@ -33,6 +33,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 26 | A document's term bits are cleared by zeroing their words, a store with no load, and the probe's end test is kept one branch by an empty asm block instead of `black_box`, which sent it through the stack | run-1d7859f315a0 | 0.1682 | 43.2 | 73.3 |
 | 27 | Every thread plans a share of the queries, and the term table's flags are added to every slot, an empty one adding 0, without a test for empty slots | run-fc3b46db2437 | 0.1650 | 41.7 | 73.5 |
 | 28 | The rarity sample probes a line's tokens at its end, as the pass does, and counts without a branch; interning a term takes no branch on whether it is new; the sample's end is found without the other 63 cuts | run-75ef64ef4099 | 0.1643 | 42.2 | 73.5 |
+| 29 | A query on sets adds its window's matches in one vectorized sum instead of a call per word; a term's store is a `u32` code instead of an enum; the terms kept in rows and in lists are listed apart, so adding them takes no branch on which | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -632,6 +633,39 @@ reference hashes.
 
 One probe helper shared by the sample and the pass, a line shorter, changed how the pass's
 loop was compiled and ran 183.8 ms against 175.0 for step 27, so the pass keeps its closure.
+
+## Step 29: the sets path
+
+On seed 1, 1,773 queries run on sets, over 350 bitset rows and 2,787 id lists. Each thread
+flushes a window every 4,096 documents, and the pass adds 9.9 million row bits and 1.9 million
+list entries.
+
+- **One sum per query and window.** The flush handed each of a query's 64 result words to
+  `add_word`, which loaded and stored the query's cell each time, so the 64 calls formed a
+  chain through memory. `add_bits` now records the first matches one by one while the query
+  lacks them, as before, and then counts the whole window in one sum over its words, which the
+  compiler vectorizes: per word a popcount, and the id sum as before ([`bit_index_sum`]).
+- **A `u32` store code.** A term's [`Store`] was an 8-byte enum; it is now a `u32`, `k` for
+  bitset row `k` and `LIST | j` for id list `j`, which halves the per-term array the pass reads
+  for every kept term, and takes 6 lines fewer.
+- **Rows and lists listed apart.** The branch on whether a kept term is a row or a list drew a
+  fifth of the remaining mispredictions (last branch record, by address), as the two kinds
+  follow no pattern. A slot now carries two flags, ROW and LISTED, in place of STORED, and the
+  token loop lists each kind apart by a store and an add, so each loop of adds has one kind.
+  The term id moves up a bit, so the table takes up to 2^27 term occurrences.
+
+Built up on step 28 (median of 18 to 20 alternating runs, rounds against the same step 28
+binary): the `u32` code 173.74 → 172.14 ms; the sum per window on top 172.05 → 168.78; the
+lists apart on top of that 169.72 → 168.34. Locally, against step 28 (alternating runs,
+`ab.py`, 18 to 20 each, with other jobs on the box, load average 4–7), three rounds: median
+173.14, 174.52 and 174.12 → 168.32, 168.92 and 169.58 ms, min 171.99, 172.55 and 172.64 →
+167.31, 167.11 and 167.60 ms. `perf stat`: user cycles 4.30–4.31 → 4.15 G, instructions 8,263
+→ 8,261 M (the sum saves about 310 M, the second list adds as many), branch misses 20.5 →
+18.3–18.4 M. memory.peak over eight alternating runs: median 41.3 → 40.8 MB. S 746 → 745.
+Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
+
+Comparing a phrase's span term by term instead of as slices, which calls `bcmp`, did not
+measure.
 
 ## Experiments that did not stay
 

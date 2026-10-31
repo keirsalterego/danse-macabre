@@ -270,16 +270,12 @@ fn parse_line(line: &[u8], lines: &mut Lines) -> Option<()> {
     Some(())
 }
 
-/// How the corpus pass keeps a term's documents for the queries evaluated on whole sets.
-#[derive(Clone, Copy)]
-enum Store {
-    /// Nothing is kept.
-    None,
-    /// Row `k` of the [`Window`]'s bitsets, one bit per document.
-    Bits(u32),
-    /// List `j` of the window's id lists.
-    List(u32),
-}
+/// How the corpus pass keeps a term's documents for the queries evaluated on whole sets: in row
+/// `k` of the [`Window`]'s bitsets, one bit per document, as `k`; in list `j` of its id lists,
+/// as `LIST | j`; or not at all, as `NO_STORE`. A `u32`, half the cache space of an enum.
+type Store = u32;
+const LIST: Store = 1 << 31;
+const NO_STORE: Store = Store::MAX;
 
 /// What the corpus pass needs to know about each query term.
 struct Plan {
@@ -294,9 +290,9 @@ struct Plan {
     checks: Vec<Check>,
     /// Per term: how its documents are kept.
     store: Vec<Store>,
-    /// The number of `Store::Bits` rows.
+    /// The number of bitset rows.
     rows: usize,
-    /// The number of `Store::List` lists.
+    /// The number of id lists.
     lists: usize,
     /// The queries evaluated on sets ([`Window::flush`]) rather than per document, in file order.
     sets: Vec<u32>,
@@ -362,17 +358,17 @@ impl Plan {
         let flag = |(p, c)| has(p, Slot::PHRASE) | has(c, Slot::BOOL);
         let groups = phrase_at.windows(2).zip(check_at.windows(2));
         let mut flags: Vec<_> = groups.map(flag).collect();
-        let mut store = vec![Store::None; terms.len()];
-        // How many `Store::Bits` rows and `Store::List` lists are numbered so far.
+        let mut store = vec![NO_STORE; terms.len()];
+        // How many bitset rows and id lists are numbered so far.
         let mut sizes = [0; 2];
         let sets = sets.concat();
         for &t in sets.iter().flat_map(|&q| queries.terms(q as usize)) {
-            if let Store::None = store[t as usize] {
+            if store[t as usize] == NO_STORE {
                 // A common term keeps a bitset row, any other an id list: the next of its kind.
                 let kind = usize::from(!common(t));
-                store[t as usize] = [Store::Bits, Store::List][kind](sizes[kind]);
+                store[t as usize] = sizes[kind] + LIST * kind as u32;
                 sizes[kind] += 1;
-                flags[t as usize] |= Slot::STORED;
+                flags[t as usize] |= [Slot::ROW, Slot::LISTED][kind];
             }
         }
         terms.mark(&flags);
@@ -714,15 +710,24 @@ impl Tally {
         }
     }
 
-    /// Records the documents `base + i` for each bit `i` set in `word`, as [`Tally::add`] would
-    /// one by one. Their count is a popcount, and their id sum is `base` times the count plus
-    /// the sum of the set bits' positions ([`bit_index_sum`]).
-    fn add_word(&mut self, q: u32, base: u32, mut word: u64) {
-        while word != 0 && self.queries[q as usize] >> SUM_BITS < SHOWN_IDS as u64 {
-            self.add(q, base + pop(&mut word) as u32);
+    /// Records the documents `start + i` for each bit `i` set in `bits`, as [`Tally::add`] would
+    /// one by one. So it does until the query has its first matches; the rest are counted a
+    /// word at a time, and all words in one sum, which the compiler vectorizes. A word's count
+    /// is a popcount, and its id sum is its first id times the count plus the sum of the set
+    /// bits' positions ([`bit_index_sum`]).
+    fn add_bits(&mut self, q: u32, start: u32, mut bits: [u64; WINDOW]) {
+        let mut i = 0;
+        while i < WINDOW && self.queries[q as usize] >> SUM_BITS < SHOWN_IDS as u64 {
+            if bits[i] != 0 {
+                self.add(q, start + 64 * i as u32 + pop(&mut bits[i]) as u32);
+            }
+            i += usize::from(bits[i] == 0);
         }
-        let n = u64::from(word.count_ones());
-        self.queries[q as usize] += n << SUM_BITS | (u64::from(base) * n + bit_index_sum(word));
+        let cell = |(i, &word): (usize, &u64)| {
+            let n = u64::from(word.count_ones());
+            n << SUM_BITS | ((u64::from(start) + 64 * i as u64) * n + bit_index_sum(word))
+        };
+        self.queries[q as usize] += bits.iter().enumerate().map(cell).sum::<u64>();
     }
 
     /// Takes the first matches out, grouped by query and each in doc order: query `q`'s are
@@ -748,38 +753,25 @@ struct Chunk {
 struct Window {
     /// The window's first document.
     start: u32,
-    /// `Store::Bits` rows: bit `i` of row `k` is set when document `start + i` holds term `k`.
+    /// The bitset rows: bit `i` of row `k` is set when document `start + i` holds row `k`'s term.
     bits: Vec<[u64; WINDOW]>,
-    /// `Store::List` lists: the window's documents that contain the term, ascending, as
+    /// The id lists: the window's documents that contain the list's term, ascending, as
     /// offsets from `start`, which take half the memory of ids.
     lists: Vec<Vec<u16>>,
 }
 
 impl Window {
-    /// Records that `doc` contains a term kept as `store`.
-    fn add(&mut self, store: Store, doc: u32) {
-        let i = (doc - self.start) as usize;
-        match store {
-            Store::Bits(k) => self.bits[k as usize][i / 64] |= 1 << (i % 64),
-            Store::List(j) => self.lists[j as usize].push(i as u16),
-            Store::None => unreachable!("Plan::new flags only stored terms"),
-        }
-    }
-
     /// The window's documents that contain a term kept as `store`, as a bitset. A list is
     /// spread into `scratch` first.
     fn row<'a>(&'a self, store: Store, scratch: &'a mut [u64; WINDOW]) -> &'a [u64; WINDOW] {
-        match store {
-            Store::Bits(k) => &self.bits[k as usize],
-            Store::List(j) => {
-                *scratch = [0; WINDOW];
-                for &i in &self.lists[j as usize] {
-                    scratch[usize::from(i / 64)] |= 1 << (i % 64);
-                }
-                scratch
-            }
-            Store::None => unreachable!("every term of a query on sets has a store"),
+        if store & LIST == 0 {
+            return &self.bits[store as usize];
         }
+        *scratch = [0; WINDOW];
+        for &i in &self.lists[(store ^ LIST) as usize] {
+            scratch[usize::from(i / 64)] |= 1 << (i % 64);
+        }
+        scratch
     }
 
     /// Evaluates every query on sets over the window, strictly left to right (spec §3), adds
@@ -800,9 +792,7 @@ impl Window {
                     Op::Not => pairs.for_each(|(a, &w)| *a &= !w),
                 }
             }
-            for (i, &word) in acc.iter().enumerate() {
-                tally.add_word(q, self.start + 64 * i as u32, word);
-            }
+            tally.add_bits(q, self.start, acc);
         }
         self.bits.fill([0; WINDOW]);
         self.lists.iter_mut().for_each(Vec::clear);
@@ -832,9 +822,10 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
     // triggers, the checks of its distinct BOOL triggers, and the phrases it matched, so none
     // counts twice.
     let (mut terms, mut phrase_at, mut bool_terms) = (Vec::new(), Vec::new(), Vec::new());
-    // Its distinct stored terms and BOOL triggers, in the first `stored` and `bools` entries:
-    // one entry per token, so that keeping a term takes a store and an add, not a branch.
-    let (mut kept, mut triggered) = (Vec::new(), Vec::new());
+    // Its distinct terms kept in rows, in lists, and BOOL triggers, in the first `in_rows`,
+    // `in_lists` and `bools` entries: one entry per token, so that keeping a term takes a store
+    // and an add, not a branch.
+    let (mut rows, mut lists, mut triggered) = (Vec::new(), Vec::new(), Vec::new());
     let mut found = Vec::new();
     // The current doc's tokens as (key, home slot), probed only at the line end: by then every
     // slot load is long under way ([`TermTable::prefetch`]), instead of each stalling in turn.
@@ -846,11 +837,12 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
         probes.push((key, plan.terms.prefetch(&key)));
     };
     walk(text, &mut probes, token, |probes| {
-        if kept.len() < probes.len() {
-            kept.resize(probes.len(), 0);
+        if rows.len() < probes.len() {
+            rows.resize(probes.len(), 0);
+            lists.resize(probes.len(), 0);
             triggered.resize(probes.len(), 0);
         }
-        let (mut stored, mut bools) = (0, 0);
+        let (mut in_rows, mut in_lists, mut bools) = (0, 0, 0);
         // No branch on what a token is, a query term or not, seen in the doc before or not,
         // stored or a BOOL trigger: none of it follows a pattern, so each branch would
         // mispredict often.
@@ -861,8 +853,10 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
             // triggers once per doc.
             let new = std::hint::select_unpredictable(seen[t] & bit == 0, slot.flags, 0);
             seen[t] |= bit;
-            kept[stored] = slot.id();
-            stored += usize::from(new & Slot::STORED != 0);
+            rows[in_rows] = slot.id();
+            in_rows += usize::from(new & Slot::ROW != 0);
+            lists[in_lists] = slot.id();
+            in_lists += usize::from(new & Slot::LISTED != 0);
             triggered[bools] = slot.id();
             bools += usize::from(new & Slot::BOOL != 0);
             if slot.flags & Slot::PHRASE != 0 {
@@ -882,8 +876,12 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
             bool_terms.truncate(bool_terms.len() - 4 + checks.len().min(4));
             bool_terms.extend(checks.skip(4).map(|c| c as u32));
         }
-        for &t in &kept[..stored] {
-            sets.add(plan.store[t as usize], doc);
+        let i = (doc - sets.start) as usize;
+        for &t in &rows[..in_rows] {
+            sets.bits[plan.store[t as usize] as usize][i / 64] |= 1 << (i % 64);
+        }
+        for &t in &lists[..in_lists] {
+            sets.lists[(plan.store[t as usize] ^ LIST) as usize].push(i as u16);
         }
         for &at in &phrase_at {
             for &(q, offset) in plan.phrases(terms[at]) {
@@ -1040,7 +1038,7 @@ struct Slot {
     head: u64,
     /// The low half of `key[1]`, the term's bytes 8 to 11.
     tail: u32,
-    /// The term id times 16, plus `LONG` and the [`Plan`]'s flags for the term.
+    /// The term id times 32, plus `LONG` and the [`Plan`]'s flags for the term.
     flags: u32,
 }
 
@@ -1051,12 +1049,14 @@ impl Slot {
     const PHRASE: u32 = 2;
     /// The term triggers per-document BOOL checks.
     const BOOL: u32 = 4;
-    /// The corpus pass keeps the term's documents ([`Store`]).
-    const STORED: u32 = 8;
+    /// The corpus pass keeps the term's documents in a bitset row ([`Store`]).
+    const ROW: u32 = 8;
+    /// The corpus pass keeps the term's documents in an id list.
+    const LISTED: u32 = 16;
 
     /// The term id.
     fn id(self) -> u32 {
-        self.flags >> 4
+        self.flags >> 5
     }
 }
 
@@ -1082,8 +1082,8 @@ impl TermTable {
     /// The slots sit alone on transparent huge pages and are never freed. The pass reads them
     /// at random, and on 4 KiB pages most of those reads would first walk the page tables.
     fn new(occurrences: usize) -> Self {
-        // A term id times 16 fits in `Slot::flags`.
-        assert!(occurrences < 1 << 28, "queries.txt: too many terms");
+        // A term id times 32 fits in `Slot::flags`.
+        assert!(occurrences < 1 << 27, "queries.txt: too many terms");
         let len = (occurrences * 3 / 2 + 1).next_power_of_two();
         let layout = Layout::from_size_align(size_of::<Slot>() * len, 2 << 20).expect("fits");
         // SAFETY: `len` is at least 1, so the size is nonzero.
@@ -1132,7 +1132,7 @@ impl TermTable {
         let (new, n) = (self.slots[at].head == 0, self.keys.len());
         let id = std::hint::select_unpredictable(new, n as u32, self.slots[at].id());
         let long = u32::from(key[1] >> 32 | key[2] | key[3] != 0) * Slot::LONG;
-        let (head, tail, flags) = (key[0], key[1] as u32, id << 4 | long);
+        let (head, tail, flags) = (key[0], key[1] as u32, id << 5 | long);
         self.slots[at] = Slot { head, tail, flags };
         self.keys.push(key);
         self.keys.truncate(n + usize::from(new));
