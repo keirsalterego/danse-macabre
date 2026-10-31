@@ -919,6 +919,9 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
         for (k, (key, at)) in probes.iter().enumerate() {
             // SAFETY: `at` is the key's home slot, from [`TermTable::prefetch`].
             let slot = unsafe { table.find_from(key, *at) };
+            // The BOOL triggers' loop below reads `check_at`, 303 KB, at random: every token's
+            // entry starts loading here, each trigger's among them (PERF.md, step 44).
+            prefetch(plan.check_at.as_ptr().wrapping_add(slot.id() as usize));
             let (t, bit) = (slot.id() as usize / 64, 1 << (slot.id() % 64));
             // The term's flags if the doc did not hold it yet, else none: a term is kept and
             // triggers once per doc.

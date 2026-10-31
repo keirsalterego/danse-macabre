@@ -48,6 +48,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 41 | 5.5% fewer instructions in the corpus pass: the walk keys and prefetches the tokens itself, into a buffer whose address and count stay in registers; a block's token ends are taken one line at a time, split at its LFs by one mask, so the token loop tests no LF; a line's id is left out at its end instead of tested for at each token; a key is folded in two vector operations instead of four | run-ff1ae2c91791 | 0.1269 | 43.1 | 76.3 |
 | 42 | 7.1% fewer instructions in the corpus pass: the walk's token loop runs in a call of its own per line, so the line end no longer holds the registers it needs, and a key's 32-byte window is tested against a bound held in a register | run-b96f907a19fc | 0.1151 | 41.2 | 77.2 |
 | 43 | A phrase candidate is first tested on one more of the phrase's terms, which the plan keeps beside the trigger, before the phrase's terms are loaded: 97.5% of the candidates stop there | run-b96f907a19fc | 0.1151 | 41.2 | 77.2 |
+| 44 | The line end's token loop prefetches each token's entry of `check_at`, which the BOOL triggers' loop reads at random, one token ahead of that loop | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1148,7 +1149,36 @@ Local, against step 42 (`ab.py`, the rounds of step 42): medians 127.15 and 132.
 124.51 ms, minimums 124.29 and 124.14 → 120.68 and 120.62 ms. memory.peak over 12 alternating
 runs: median 41.45 → 41.80 MB, highest 42.50 → 43.21 MB. S 777 → 782. Gate: 510 pass, 0 fail.
 
+## Step 44: each token's checks prefetched
+
+After step 43, the BOOL triggers' loop at a line's end stalled on its load of `check_at[t]`, the
+start of the trigger's range of checks: a 303 KB array read at random, 3.9% of the cycle samples.
+The line end's token loop, which finds each token's slot in the term table, now prefetches that
+token's entry, so it has started to load by the time the triggers' loop reads it. The same
+prefetch did not pay on step 41 (see below); since step 42 the token loop runs in a call of its
+own and no longer spills for it.
+
+Against step 43 (`perf stat -r 5`, three rounds): instructions 5,339.3 → 5,412.1 M, cycles 2,909,
+2,909 and 2,912 → 2,832, 2,893 and 2,863 M, branch misses 15.47 → 15.46 M.
+
+Local, against step 43 (`ab.py`, 41 alternating runs, four rounds, the first two on a build that
+differs only in line numbers): medians 122.97, 122.00, 121.81 and 121.81 → 121.92, 121.03, 121.53
+and 120.87 ms, minimums 120.28, 120.95, 120.08 and 120.67 → 119.65, 119.76, 119.83 and 119.23 ms.
+memory.peak over 8 alternating runs: median 41.88 → 42.38 MB, highest 43.71 → 43.15 MB. S 782 →
+783. Gate: 510 pass, 0 fail.
+
 ## Experiments that did not stay
+
+- **After step 43, the prefetch for BOOL triggers only** (local, seed 1). The token loop
+  prefetched the entry of a token with the BOOL flag and entry 0 otherwise, picked by
+  `select_unpredictable`: instructions 5,412.1 → 5,557.2 M, cycles 2,891 and 2,893 → 2,913 and
+  2,876 M against prefetching every token's entry, for 2 more lines.
+
+- **After step 43, bounds on two other targets** (local, seed 1, `perf stat -r 5`). Skipping the
+  loop that sets the rows' bits saved 10 M cycles of 2,909, 0.35%; skipping the flushes of
+  windowed bits, `bit_index_sum` among them, saved 16 M, 0.55%. Neither was taken further. A
+  probe that stops at a non-term token's occupied home slot would need a bit set by `intern`;
+  at +3 to 4 instructions per token against about 2.5 M fewer mispredicts it was not tried.
 
 - **After step 41, the line end as a call of its own** (local, seed 1). `walk` called its
   callback through a helper that is never inlined, so that the token loop would have the
