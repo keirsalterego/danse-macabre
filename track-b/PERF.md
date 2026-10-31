@@ -23,7 +23,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 16 | The query and check cells are written when allocated, so the pass's first store to a page no longer replaces the shared zero page and interrupts every core | run-6afbb627903d | 0.2343 | 42.0 | 69.2 |
 | 17 | Each thread drops its chunk's pages of the corpus mapping when its pass ends, instead of the exit unmapping all of them on one core after the output is written | run-bfce9886b69d | 0.2354 | 43.4 | 69.2 |
 | 18 | A term table slot holds a term's first 12 bytes instead of 8, so a token of 9 to 12 bytes no longer loads its term's key from a second array | run-e847cb4a493b | 0.2208 | 41.8 | 69.9 |
-| 19 | 99 fewer code lines: the cold code and the term table simplified (no doubling), the walk's bit pops in one helper; the key-mask table aligned to a cache line | | | | |
+| 19 | 99 fewer code lines: the cold code and the term table simplified (no doubling), the walk's bit pops in one helper; the key-mask table aligned to a cache line | run-74f2276732d6 | 0.2241 | 42.9 | 70.1 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -385,6 +385,9 @@ apart from the walk and `steps`; the rest is code placement, which alone moves a
 itself, and with every function aligned to 64 bytes the cold cuts and step 17 ran the same
 cycles. memory.peak over 12 alternating runs: median 43.1 → 42.8 MB. S 857 → 758. Gate: 510
 pass, 0 fail.
+
+On the board, run-74f2276732d6 measured 0.2241 s, in a run where track A drew 22.9 ms and
+track C 38.4 ms, slow draws for both (their usual draws are about 19 and 35 ms).
 
 ## Experiments that did not stay
 
