@@ -49,7 +49,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 42 | 1 fewer line with the same machine code: the name hash binds the length in the arms of its `match` | run-a6b1091911cb | 0.0192 | 18.7 | 85.4 |
 | 43 | 4 fewer lines on cold paths: `Interner::new` instead of an `impl Default`, the format queue as a lazy iterator, and a new name's padded copy from `array::from_fn` | run-a6b1091911cb | 0.0192 | 18.7 | 85.4 |
 | 44 | 4 fewer lines in `summarize`: a chunk's start found through a one-line `newline` closure, and the format loop as one `for_each` over the queue | run-a6b1091911cb | 0.0192 | 18.7 | 85.4 |
-| 45 | 2 fewer lines with the same machine code: the build stage mounts its sources instead of copying them, and `insert` stays out of line by `#[cold]` alone | | | | |
+| 45 | 2 fewer lines with the same machine code: the build stage mounts its sources instead of copying them, and `insert` stays out of line by `#[cold]` alone | run-379b43c0200f | 0.0189 | 18.7 | 85.5 |
 
 ## Step 1: v1
 
