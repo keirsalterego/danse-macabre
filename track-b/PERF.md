@@ -38,7 +38,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 31 | The token loop writes a document's term ids and its kept rows, lists and BOOL triggers into four runs of one slice, and its seen bits, without bounds checks, so its registers no longer spill | run-ea58cfb946e5 | 0.1483 | 42.1 | 74.6 |
 | 32 | 1 fewer line with the same binary: the build stage mounts its sources instead of copying them | run-ced2f9ec7167 | 0.1491 | 41.1 | 74.6 |
 | 33 | A document's checks are added in one `Tally` method that takes no branch on a check's result: the queries of the checks that the document is one of the first matches of are moved to the front of its list of checks, and only those go on to the first-match counts | run-94e224675c5a | 0.1455 | 41.3 | 74.8 |
-| 34 | The term lookups take no bounds checks: the probe reads the slots unchecked from a key's home slot on, the prefetches take pointers, and the token loop holds the term table and the seen bits as locals | | | | |
+| 34 | The term lookups take no bounds checks: the probe reads the slots unchecked from a key's home slot on, the prefetches take pointers, and the token loop holds the term table and the seen bits as locals | run-401b90111691 | 0.1618 | 40.5 | 73.7 |
+| 35 | 11% fewer instructions in the corpus pass: a document's checks are written to a slice sized once and evaluated without bounds checks, the tokenizer picks the start of a token carried over from the previous block once per block, a key's window takes one bounds check and its hash two words, phrases are compared inline, and a long key's mark rides in its slot's tail | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -801,6 +802,60 @@ term table of 4-slot buckets, one 64-byte line each, with a key's home slot at t
 bucket and the key compared with all four slots in two AVX2 compares, kept the linear probe only
 for long keys and for misses in a bucket whose last slot is taken, 0.9% of lookups: branch
 misses 16.9 → 12.4 M, but instructions 7,257 → 7,697 M and user cycles 3.70 → 3.85 G.
+
+The board's run of this step, run-401b90111691, drew 161.8 ms, against 145.5 ms for step 33's:
+a slow draw. In the same run, track C's unchanged code drew 48.4 ms, against its usual 29 to
+31 ms.
+
+## Step 35: fewer instructions in the corpus pass
+
+After step 34 the pass ran 6,980 M instructions on seed 1, about 189 per token, at close to the
+core's limit of instructions per cycle, with no single hot spot: the probe took about 16% of the
+cycles, the key and its hash 10%, the checks 9%, the BOOL triggers 6%, and the rest was spread
+over the tokenizer, the seen bits, the rows and lists, and the phrases. So this step cuts
+instructions wherever the machine code showed reloads, bounds checks or tests it did not need.
+
+- **The checks unchecked.** [`Tally::add_checks`] is an `unsafe fn` whose indices are a
+  document's checks, so it reads each check and its cell, and writes the first-match queries,
+  without the three bounds checks that took 6 of its 33 instructions per check.
+- **The triggered checks in a slice sized once.** Each term triggers once per document and no
+  two terms share a check, so a document has at most all the checks: their indices go into a
+  slice of that length plus 4, allocated once per thread, at a cursor, instead of a `Vec` that
+  tested its capacity and was truncated once per trigger. The term's range of checks is read
+  from a local slice of `check_at`, whose address stays in a register; so are the slices of the
+  stores and rows that the rows and lists loops index.
+- **The carried token picked once per block.** A token still open at a block's end closes at
+  the next block's first end. [`walk`] picked its start with a conditional move at every end;
+  it now picks the start that the block's first end closes once per block, by a conditional
+  move, and each end takes the next start with no test.
+- **A key in fewer steps.** `key_in` takes the token's 32-byte window with one bounds check
+  instead of two, and `key_hash` folds two words instead of four. A key of 16 bytes or less
+  hashes as before, since its last two words are zero, so their slots do not move.
+- **Phrases compared inline.** A phrase's terms are compared with the document's in a loop
+  that ORs their differences, instead of a call to `memcmp` per candidate, which also reloaded
+  three registers after each call.
+- **The long-key test in the tail.** No letter or digit has the top bit of a byte, so a slot's
+  `tail` keeps in its top bit whether the term runs past 12 bytes, and the probe's compare of
+  `head` and `tail` covers it: the `LONG` flag and its test at each probe step are gone.
+
+Measured on battery with the power-saver profile (EPP `power`), so no wall times: `perf stat`
+counts only, battery, not comparable with the steps before. Built up on step 34, instructions:
+the long-key mark in the tail 6,980 → 6,962 M; `add_checks` unchecked 6,823 M; the local slices
+for the rows and lists 6,826 M, with user cycles 24–54 M lower in two rounds; phrases inline
+6,751 M, with branch misses 17.0 → 17.6 M; the checks in a sized slice 6,556 M, branch misses
+16.6 M; the window with one bounds check 6,444 M; the two-word hash 6,370 M; the carried token
+picked once per block 6,179 M.
+
+Against step 34 (`perf stat -r 3`, three alternating rounds; battery, not comparable): user
+cycles 3,661–3,672 → 3,361–3,391 M, instructions 6,980 → 6,178 M, branch misses 16.9 → 16.6 M.
+memory.peak over five alternating runs: median 42.2 → 41.5 MB. S 751 → 761. Gate: 510 pass, 0
+fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
+
+Peeling the carried token out of the loop behind a branch cut instructions to 6,259 M but added
+0.6 M branch misses, as whether a block starts inside a token follows no pattern; peeling only
+the block's first end, with the conditional move kept there, cut them to 6,332 M. Writing the
+rest of a range of more than four checks through a `zip` added 120 M instructions; writing it
+at an offset from the cursor, one line shorter, added 8.5 M and 0.1 M branch misses.
 
 ## Experiments that did not stay
 

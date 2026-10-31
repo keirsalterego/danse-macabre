@@ -411,11 +411,6 @@ impl Plan {
     fn phrases(&self, t: u32) -> &[(u32, u32)] {
         &self.phrases[self.phrase_at[t as usize] as usize..self.phrase_at[t as usize + 1] as usize]
     }
-
-    /// The indices of the per-document checks that term `t` triggers.
-    fn check_range(&self, t: u32) -> Range<usize> {
-        self.check_at[t as usize] as usize..self.check_at[t as usize + 1] as usize
-    }
 }
 
 /// Groups the items of `parts`, taken in order, by key, keeping their order within a key: key
@@ -594,9 +589,9 @@ fn walk<S>(
     mut on_token: impl FnMut(&mut S, usize, usize),
     mut on_line_end: impl FnMut(&mut S),
 ) {
-    // 1 when the byte before the block is a token byte; the start of a token that runs on past
-    // the block; where the current line starts.
-    let (mut prev_bit, mut open, mut line_start) = (0, None, 0);
+    // 1 when the byte before the block is a token byte; then, the start of the token that runs
+    // on past the block; where the current line starts.
+    let (mut prev_bit, mut open, mut line_start) = (0, 0, 0);
     // The last block, short of 64 bytes, padded with zero bytes, which are separators.
     let (mut padded, tail) = ([0; 64], chunk.as_chunks::<64>().1);
     padded[..tail.len()].copy_from_slice(tail);
@@ -606,10 +601,19 @@ fn walk<S>(
         let (token, lf) = unsafe { classify(block) };
         let prev = token << 1 | prev_bit;
         let (mut starts, mut ends, mut lfs) = (token & !prev, !token & prev, lf);
+        // The start of the token that the block's next end closes: the one open since an
+        // earlier block, if any, else the block's first start. It is picked once per block, by
+        // a conditional move, as whether a token runs on follows no pattern, so that the loop
+        // below takes no test on it.
+        let first = base + starts.trailing_zeros() as usize;
+        let mut next = std::hint::select_unpredictable(prev_bit != 0, open, first);
+        starts =
+            std::hint::select_unpredictable(prev_bit != 0, starts, starts & starts.wrapping_sub(1));
         prev_bit = token >> 63;
         while ends != 0 {
             let end = base + pop(&mut ends);
-            let start = open.take().unwrap_or_else(|| base + pop(&mut starts));
+            let start = std::mem::replace(&mut next, base + starts.trailing_zeros() as usize);
+            starts &= starts.wrapping_sub(1);
             while lfs != 0 && base + (lfs.trailing_zeros() as usize) < start {
                 line_start = base + pop(&mut lfs) + 1;
                 on_line_end(state);
@@ -618,9 +622,8 @@ fn walk<S>(
                 on_token(state, start, end);
             }
         }
-        if starts != 0 {
-            open = Some(base + starts.trailing_zeros() as usize);
-        }
+        // The start of the token the block ends in, if it ends in one (`prev_bit`).
+        open = next;
         while lfs != 0 {
             line_start = base + pop(&mut lfs) + 1;
             on_line_end(state);
@@ -703,16 +706,25 @@ impl Tally {
     /// overwrite the front of `todo`, and only those then go on to the first matches. A
     /// method, so the compiler knows that the stores to the cells and to `todo` leave `self`
     /// alone.
-    fn add_checks(&mut self, checks: &[Check], todo: &mut [u32], seen: &[u64], doc: u32) {
+    ///
+    /// # Safety
+    ///
+    /// Every index in `todo` is below `checks.len()`.
+    unsafe fn add_checks(&mut self, checks: &[Check], todo: &mut [u32], seen: &[u64], doc: u32) {
+        // A cell per check ([`Tally::new`]), so a check's index is its cell's.
+        let cells = &mut self.checks[..checks.len()];
         let (add, mut firsts) = (1 << SUM_BITS | u64::from(doc), 0);
         for i in 0..todo.len() {
             let c = todo[i] as usize;
+            // SAFETY: `c < checks.len()`, as the caller ensures, the length of `cells` too.
+            let (check, cell) = unsafe { (checks.get_unchecked(c), cells.get_unchecked_mut(c)) };
             // SAFETY: the binary targets alderlake (.cargo/config.toml), which has AVX2.
-            let hit = unsafe { checks[c].matches(seen) };
+            let hit = unsafe { check.matches(seen) };
             // A conditional move: the compiler makes a product with `hit` a branch.
-            self.checks[c] += std::hint::select_unpredictable(hit, add, 0);
-            todo[firsts] = checks[c].q;
-            firsts += usize::from(hit && self.checks[c] >> SUM_BITS <= SHOWN_IDS as u64);
+            *cell += std::hint::select_unpredictable(hit, add, 0);
+            // SAFETY: `firsts <= i < todo.len()`, as `firsts` moves on at most once per check.
+            unsafe { *todo.get_unchecked_mut(firsts) = check.q };
+            firsts += usize::from(hit && *cell >> SUM_BITS <= SHOWN_IDS as u64);
         }
         for &q in &todo[..firsts] {
             if usize::from(self.shown[q as usize]) < SHOWN_IDS {
@@ -832,9 +844,13 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
     let mut seen = vec![0u64; (plan.terms.len() + 1).div_ceil(64)];
     // The token loop below reads the words of `seen` without bounds checks.
     assert!(64 * seen.len() > plan.terms.len());
-    // The positions of the current doc's phrase triggers, the checks of its distinct BOOL
-    // triggers, and the phrases it matched, so none counts twice.
-    let (mut phrase_at, mut bool_terms, mut found) = (Vec::new(), Vec::new(), Vec::new());
+    // The positions of the current doc's phrase triggers, and the phrases it matched, so none
+    // counts twice.
+    let (mut phrase_at, mut found) = (Vec::new(), Vec::new());
+    // The checks of the current doc's BOOL triggers, from the start: each term triggers once per
+    // doc, and no two terms share a check, so they are at most all the checks, plus 4, as a
+    // trigger's four writes below may run past its own.
+    let mut todo = vec![0; plan.checks.len() + 4];
     // For the current doc's `n` tokens, four runs of `n` entries: each token's term id (0 for
     // the rest), then the doc's distinct terms kept in rows, in lists, and BOOL triggers, up to
     // the cursors `rows`, `lists` and `bools`. Keeping a term takes a store and an add, not a
@@ -886,24 +902,33 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
         }
         probes.clear();
         let terms = &kept[..n];
+        // As locals, their addresses stay in registers across the stores to `todo`.
+        let (check_at, checks, cells) = (&plan.check_at[..], &plan.checks[..], &tally.checks[..]);
+        let mut triggered = 0;
         for &t in &kept[3 * n..bools] {
+            // Term `t` triggers the checks `checks[check_at[t]..check_at[t + 1]]`.
+            let range = check_at[t as usize] as usize..check_at[t as usize + 1] as usize;
             // Start loading its checks and their cells now, to use below.
-            let checks = plan.check_range(t);
-            prefetch(plan.checks.as_ptr().wrapping_add(checks.start));
-            prefetch(tally.checks.as_ptr().wrapping_add(checks.start));
-            // Four indices written at once, then cut to the range's length: a loop
-            // per trigger would mispredict its exit, as the lengths follow no pattern.
-            let start = checks.start as u32;
-            bool_terms.extend_from_slice(&[start, start + 1, start + 2, start + 3]);
-            bool_terms.truncate(bool_terms.len() - 4 + checks.len().min(4));
-            bool_terms.extend(checks.skip(4).map(|c| c as u32));
+            prefetch(checks.as_ptr().wrapping_add(range.start));
+            prefetch(cells.as_ptr().wrapping_add(range.start));
+            // Four indices written at once, the cursor then moved on by the range's length: a
+            // loop per trigger would mispredict its exit, as the lengths follow no pattern.
+            let start = range.start as u32;
+            todo[triggered..triggered + 4].copy_from_slice(&[0, 1, 2, 3].map(|i| start + i));
+            triggered += range.len().min(4);
+            for c in range.skip(4) {
+                todo[triggered] = c as u32;
+                triggered += 1;
+            }
         }
-        let i = (doc - sets.start) as usize;
+        // As locals, their addresses stay in registers across the stores below.
+        let (i, store) = ((doc - sets.start) as usize, &plan.store[..]);
+        let bits = &mut sets.bits[..];
         for &t in &kept[n..rows] {
-            sets.bits[plan.store[t as usize] as usize][i / 64] |= 1 << (i % 64);
+            bits[store[t as usize] as usize][i / 64] |= 1 << (i % 64);
         }
         for &t in &kept[2 * n..lists] {
-            sets.lists[(plan.store[t as usize] ^ LIST) as usize].push(i as u16);
+            sets.lists[(store[t as usize] ^ LIST) as usize].push(i as u16);
         }
         for &at in &phrase_at {
             for &(q, offset) in plan.phrases(terms[at]) {
@@ -911,14 +936,18 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
                 // `terms` holds this doc only, so a match never spans two docs (spec §3).
                 let start = at.checked_sub(offset as usize);
                 let span = start.and_then(|s| terms.get(s..s + phrase.len()));
-                if span == Some(phrase) && !found.contains(&q) {
+                // Compared inline, with no branch per term: phrases are short, and a call to
+                // `memcmp` costs more than the compare.
+                let differ = |s: &[u32]| s.iter().zip(phrase).fold(0, |d, (a, b)| d | (a ^ b));
+                if span.is_some_and(|span| differ(span) == 0) && !found.contains(&q) {
                     found.push(q);
                     tally.add(q, doc);
                 }
             }
         }
-        tally.add_checks(&plan.checks, &mut bool_terms, seen, doc);
-        bool_terms.clear();
+        // SAFETY: each index in `todo[..triggered]` lies in a term's range of checks, below the
+        // check count.
+        unsafe { tally.add_checks(checks, &mut todo[..triggered], seen, doc) };
         // Every set bit is one of the doc's terms, so zeroing their words clears `seen`: a store
         // with no load, so tokens that share a word, as all misses do, do not wait on each other.
         for &t in terms {
@@ -1013,7 +1042,9 @@ fn key(token: &[u8]) -> Option<Key> {
 /// zeroed buffer first would call `memcpy` and then stall the load that reads the buffer
 /// back, once per token.
 fn key_in(chunk: &[u8], start: usize, end: usize) -> Option<Key> {
-    match chunk[start..].first_chunk() {
+    // One bounds check for the start and the 32 bytes from it, where `chunk[start..]` took two.
+    let window = chunk.get(start..start + MAX_TERM);
+    match window.and_then(<[u8]>::first_chunk) {
         Some(window) => (end - start <= MAX_TERM).then(|| fold(window, end - start)),
         None => key(&chunk[start..end]), // within 32 bytes of the chunk's end
     }
@@ -1042,10 +1073,12 @@ fn fold(window: &[u8; MAX_TERM], len: usize) -> Key {
     })
 }
 
-/// Multiplicative hash of the exclusive or of a key's words, one multiply rather than one per
-/// word. Slots come from its top bits, which depend on every word.
+/// Multiplicative hash of the exclusive or of a key's first two words, one multiply rather than
+/// one per word. Slots come from its top bits, which depend on both words. A key of 16 bytes or
+/// less hashes as it would on all four words, which are zero past its end; longer tokens are
+/// rare, and those whose first 16 bytes agree share a home slot, told apart by the probe.
 fn key_hash(key: &Key) -> u64 {
-    (key.iter().fold(0, |hash, &word| hash ^ word)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    (key[0] ^ key[1]).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 /// One slot of a [`TermTable`]: a term's first 12 bytes, its id and what the corpus pass does
@@ -1055,27 +1088,33 @@ struct Slot {
     /// `key[0]`, the term's first 8 bytes; 0 marks an empty slot, as a term's first byte is
     /// never zero.
     head: u64,
-    /// The low half of `key[1]`, the term's bytes 8 to 11.
+    /// [`Slot::tail`] of the term's key: its bytes 8 to 11, and whether it runs past 12 bytes.
     tail: u32,
-    /// The term id times 32, plus `LONG` and the [`Plan`]'s flags for the term.
+    /// The term id times 16, plus the [`Plan`]'s flags for the term.
     flags: u32,
 }
 
 impl Slot {
-    /// The term runs past 12 bytes, so `head` and `tail` alone do not identify it.
-    const LONG: u32 = 1;
     /// The term triggers phrase checks.
-    const PHRASE: u32 = 2;
+    const PHRASE: u32 = 1;
     /// The term triggers per-document BOOL checks.
-    const BOOL: u32 = 4;
+    const BOOL: u32 = 2;
     /// The corpus pass keeps the term's documents in a bitset row ([`Store`]).
-    const ROW: u32 = 8;
+    const ROW: u32 = 4;
     /// The corpus pass keeps the term's documents in an id list.
-    const LISTED: u32 = 16;
+    const LISTED: u32 = 8;
 
     /// The term id.
     fn id(self) -> u32 {
-        self.flags >> 5
+        self.flags >> 4
+    }
+
+    /// The `tail` of a slot holding `key`: the key's bytes 8 to 11, plus, in the top bit, which no
+    /// letter or digit has, whether the key runs past 12 bytes. A token holds no zero byte, so
+    /// it does exactly when its byte 12 is set. With that bit, a key that shares a term's first
+    /// 12 bytes matches its `head` and `tail` only when both or neither run past them.
+    fn tail(key: &Key) -> u32 {
+        key[1] as u32 | u32::from(key[1] >> 32 != 0) << 31
     }
 }
 
@@ -1101,8 +1140,8 @@ impl TermTable {
     /// The slots sit alone on transparent huge pages and are never freed. The pass reads them
     /// at random, and on 4 KiB pages most of those reads would first walk the page tables.
     fn new(occurrences: usize) -> Self {
-        // A term id times 32 fits in `Slot::flags`.
-        assert!(occurrences < 1 << 27, "queries.txt: too many terms");
+        // A term id times 16 fits in `Slot::flags`.
+        assert!(occurrences < 1 << 28, "queries.txt: too many terms");
         // 2 slots or more, so that the shift in [`TermTable::home`] stays below 64.
         let len = (occurrences * 3 / 2 + 1).next_power_of_two().max(2);
         let layout = Layout::from_size_align(size_of::<Slot>() * len, 2 << 20).expect("fits");
@@ -1159,8 +1198,7 @@ impl TermTable {
         // and the key pushed either way, and the key dropped again unless the term is new.
         let (new, n) = (self.slots[at].head == 0, self.keys.len());
         let id = std::hint::select_unpredictable(new, n as u32, self.slots[at].id());
-        let long = u32::from(key[1] >> 32 | key[2] | key[3] != 0) * Slot::LONG;
-        let (head, tail, flags) = (key[0], key[1] as u32, id << 5 | long);
+        let (head, tail, flags) = (key[0], Slot::tail(&key), id << 4);
         self.slots[at] = Slot { head, tail, flags };
         self.keys.push(key);
         self.keys.truncate(n + usize::from(new));
@@ -1182,14 +1220,13 @@ impl TermTable {
     /// `at` is below the slot count, as [`TermTable::home`] is.
     unsafe fn position(&self, key: &Key, mut at: usize) -> usize {
         let mask = self.slots.len() - 1;
-        let long = key[1] >> 32 | key[2] | key[3] != 0;
+        let (long, tail) = (key[1] >> 32 != 0, Slot::tail(key));
         loop {
             // SAFETY: `at` starts below the slot count, as the caller ensures, and wraps at it.
             let slot = unsafe { self.slots.get_unchecked(at) };
             // No `&&`: whether a token is a query term follows no pattern, so the probe takes one
             // branch, mostly taken, ending at the term or an empty slot; long keys take one more.
-            let mut found = (slot.head ^ key[0]) | u64::from(slot.tail ^ key[1] as u32) == 0;
-            found &= (slot.flags & Slot::LONG != 0) == long;
+            let mut found = (slot.head ^ key[0]) | u64::from(slot.tail ^ tail) == 0;
             if found & long {
                 found = self.keys[slot.id() as usize] == *key;
             }
