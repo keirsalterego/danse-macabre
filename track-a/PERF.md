@@ -56,6 +56,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 49 | Three rare paths of the parse marked `std::hint::cold_path`, so its loop keeps its count, its end and its constants in registers | run-7eca9cefcfac | 0.0186 | 18.2 | 85.8 |
 | 50 | Sorting networks unrolled level by level, and a network of 128 values instead of selection for groups of 65 to 128 values | run-9a8d6161d86a | 0.0235 | 18.0 | 83.2 |
 | 51 | 6 fewer lines at the same speed: the parse's intrinsics from the file's one wildcard import, and the interner's padded copies zeroed in its static | run-b35557b63892 | 0.0180 | 18.8 | 85.9 |
+| 52 | Endpoint names hashed with the CPU's CRC32C instruction instead of a multiply: 9.2 M instructions fewer | | | | |
 
 ## Step 1: v1
 
@@ -831,6 +832,29 @@ rounds (three of 41 runs, four of 61), medians 19.25 → 19.12, 19.16 → 19.11,
 
 The board drew 18.0 ms at 18.8 MB for it in run-b35557b63892, and 19.5 ms for the same code in
 run-dbba1dbc4ea4.
+
+## Step 52: a CRC32C name hash
+
+`hash` mixes the name's length with its first and last 8-byte windows through SSE4.2's CRC32C
+instruction, `_mm_crc32_u64`, instead of rotating the last window, combining it with the first by
+XOR and multiplying: the length is the CRC's starting state, and each window is one step, so a name
+of under 8 bytes takes one step and a longer name two. The interner takes its slot from the CRC's
+top 14 bits, 18 to 31. LLVM knows the CRC to be under 2^32, so the probe still needs no bounds
+check. In a simulation of the 16,384-slot table, 1.9–2.5% of lines take a second probe instead of
+1.9–2.3% (seeds 1, 3 and 5), and 2.2–3.0% with the CRC's low 14 bits. Seed 1's share grows most,
+1.9 → 2.5%, and its branch-misses:u with it, by 0.02 M.
+
+Local, AC power, turbo off. `perf stat`, 30 interleaved runs: instructions:u 600.9 → 591.7 M
+(−1.5%), cycles:u median 328.8 → 324.1 M (−1.4%), branch-misses:u 0.898 → 0.916 M,
+L1-dcache-load-misses:u 3.95 → 3.98 M. `ab.py`, 61 interleaved runs, four rounds: medians
+19.01 → 18.84, 18.92 → 18.78, 19.06 → 18.85 and 19.24 → 19.20 ms; seven earlier rounds of builds
+with the same `.text` as steps 51 and 52 (three of 41 runs, four of 61): 19.12 → 18.97,
+19.11 → 18.86, 18.96 → 18.80, 19.03 → 18.96, 19.05 → 18.85, 19.03 → 18.87 and 19.62 → 19.04 ms.
+memory.peak, three batches of alternating rounds on seeds 1, 2, 3, 5, 7, 10 and 11 (3, 8 and 10
+rounds): medians 18.21 → 18.41, 18.27 → 18.37 and 18.26 → 18.16 MB, where two more builds with the
+same `.text` as the two drew 18.24 and 18.21 MB: noise, as the hash allocates nothing. S 373 → 372.
+Gate: 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes; clippy reports no
+warnings.
 
 ## Experiments that did not stay
 

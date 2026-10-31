@@ -522,25 +522,29 @@ fn word(bytes: &[u8], at: usize) -> u64 {
 /// equal names always hash equal. Two different names of one length that agree on both windows
 /// would only share a probe sequence: the interner still compares the bytes.
 ///
-/// The last window is rotated away from the first and combined with XOR, and one multiply mixes
-/// the result, whose top bits then depend on every bit (the interner indexes by them). A middle
-/// window as well saved few second probes (3.1–3.4% of lines took one, against 3.6–4.7% now;
-/// seeds 1, 3 and 5, simulated) for 25 million instructions in the parse, 2% of the wall time.
-/// Three dependent multiply-rotate steps, as in rustc's `FxHasher`, cost 21 million more.
+/// The mixing is SSE4.2's CRC32C instruction, which folds 8 bytes into a 32-bit state in one step:
+/// the state starts as the length, and each window is one step. Before, the last window was rotated
+/// and combined with the first by XOR, and one multiply mixed the result: 9.2 million instructions
+/// more in the parse, for about as many second probes (1.9–2.3% of lines took one, against 1.9–2.5%
+/// now; seeds 1, 3 and 5, simulated). With that multiply, a middle window as well saved few second
+/// probes (3.1–3.4% of lines, against 3.6–4.7% with two, at 8,192 slots) for 25 million
+/// instructions in the parse, 2% of the wall time, and three dependent multiply-rotate steps, as in
+/// rustc's `FxHasher`, cost 21 million more.
 fn hash(name: &[u8], first: u64) -> u64 {
-    let words = match name.len() {
-        n @ ..8 => first & u64::MAX >> (64 - 8 * n),
-        n => first ^ word(name, n - 8).rotate_left(42),
-    };
-    (words ^ name.len() as u64).wrapping_mul(0x517c_c1b7_2722_0a95)
+    match name.len() {
+        // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has SSE4.2.
+        n @ ..8 => unsafe { _mm_crc32_u64(n as u64, first & u64::MAX >> (64 - 8 * n)) },
+        // SAFETY: the same.
+        n => unsafe { _mm_crc32_u64(_mm_crc32_u64(n as u64, first), word(name, n - 8)) },
+    }
 }
 
 /// A hash table that gives every distinct endpoint name a dense id: 0, 1, 2, and so on.
 ///
 /// It uses open addressing with linear probing. A name's hash picks a slot, and on a collision
 /// we try the next slot until we find the name or an empty slot. The table has 16,384 slots, so
-/// with the 1,842 endpoints of a seed it is about an eighth full. Of seed 1's lines, 8.2% would
-/// need a second probe, each a mispredicted branch, at half full, 3.9% at a quarter and 1.9% at
+/// with the 1,842 endpoints of a seed it is about an eighth full. Of seed 1's lines, 7.7% would
+/// need a second probe, each a mispredicted branch, at half full, 4.0% at a quarter and 2.5% at
 /// an eighth (simulated). It never grows: ids have 12 bits in a record, so a table takes at most
 /// 4,096 names, and at that it is a quarter full and probes still end.
 ///
@@ -613,8 +617,9 @@ impl<'a> Interner<'a> {
     /// that was worth 0.8 ms.
     #[inline(always)]
     fn intern(&self, name: &'a [u8], hash: u64, window: &[u8; 64]) -> u32 {
-        // The top 14 bits, one of 16,384 slots: they are the ones that every hashed bit reaches.
-        let mut slot = (hash >> 50) as usize;
+        // The top 14 of the CRC's 32 bits, one of 16,384 slots. With the low 14, 2.2–3.0% of lines
+        // took a second probe instead of 1.9–2.5% (seeds 1, 3 and 5, simulated).
+        let mut slot = (hash >> 18) as usize;
         while let Some(id) = self.slots[slot].load(Acquire).checked_sub(1) {
             let found = if name.len() < 64 {
                 // SAFETY: the copy was written before `id` went into the slot, and never again.
@@ -629,7 +634,7 @@ impl<'a> Interner<'a> {
             if found {
                 return id;
             }
-            // A second probe is rare, 1.9% of lines, and marked cold (see [`parse`]).
+            // A second probe is rare, about 2% of lines, and marked cold (see [`parse`]).
             std::hint::cold_path();
             slot = (slot + 1) & (self.slots.len() - 1);
         }
