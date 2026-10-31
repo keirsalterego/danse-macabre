@@ -959,7 +959,8 @@ slow draw: locally, step 56's binary ran a median of 18.84 ms against step 53's 
 interleaved runs), and in the same run track D's unchanged code drew 127.8 ms, against 122 to 127.
 A second run of the same code, run-e31417916add (commit e7e0423, which changed only PERF.md files),
 drew 17.65 ms, 18.6 MB and 86.3 points, and a third, run-2b07a12535b3 (commit 1534f22, which
-changed only track B), 17.33 ms, 18.8 MB and 86.5 points.
+changed only track B), 17.33 ms, 18.8 MB and 86.5 points, and a fourth, run-63683fcc0a53 (commit
+f073734, which changed only track C), 17.26 ms, 18.2 MB and 86.7 points.
 
 ## Experiments that did not stay
 
