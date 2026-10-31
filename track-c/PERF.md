@@ -42,6 +42,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 35 | The region id and the amount parse together in one SSE vector, the name and the note come from one mask of quotes and commas whose prefix XOR marks the quoted bytes, the name hash is CRC32, the name set's key stays in one AVX2 register, and a letter's slot is read unchecked | run-6252826712db | 0.0252 | 12.9 | 79.3 |
 | 36 | The record batch holds each letter by reference, in an order whose loads are forwarded from their stores, and the group goes into its letter as one byte | run-5a15a73439c1 | 0.0246 | 12.5 | 79.7 |
 | 37 | The merge takes its group from `by_id` without a bounds check, and a letter's thread is picked with `sent.len()` instead of a load through the closure's reference to the thread count | run-0ff0124ce494 | 0.0237 | 12.5 | 80.1 |
+| 38 | The last worker to finish merges the groups, writes the output and ends the process while the others sleep, so no thread ends first, and each worker gives back its name set's entries after its run; and `main` is C's, so the Rust runtime's setup, whose stack-overflow handler gave every thread a signal stack, does not run | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1163,6 +1164,92 @@ Dropped, against step 36 unless noted; `ab.py` on AC power, 41 interleaved runs,
   and keeping its check takes more lines.
 - **The letter made after the region id and the amount**, on top of both changes: instructions
   −0.31%, cycles +0.42%.
+
+## Step 38: the last worker writes the output, with no runtime setup
+
+Step 37's workers returned their groups, and the main thread merged them, wrote the output and
+exited once every worker's thread had ended. On an instrumented copy of step 35 (local, P-cores,
+µs after the fork, medians of 21 interleaved runs), the workers passed the last barrier at 23,520
+and had all given back their runs by 24,007, but the last thread ended only at 24,773: a thread
+that ends unmaps its signal stack and has glibc drop its stack's pages, each call takes the
+address space's lock, and so the twelve ended one after another. The merge, the format and the
+write took 405 µs more, and the exit 646.
+
+Now no worker returns. Each puts its groups in `parts`, and the last one to get there merges the
+others into its own, writes the output and calls `exit`, while the others sleep in
+`thread::park` until the exit ends them. Threads killed asleep cost the exit about 0.3 ms that
+threads already ended did not (629 against 343 µs from the `exit` call to the wait's return), less
+than half of what ending them took. Under gdb on the E-cores (4 threads), a run makes 4 `munmap`
+and 10 `sigaltstack` calls instead of 10 and 14. Since `join` never returns, its mailboxes and
+region table are never freed either.
+
+Each worker also gives back its name set's entries, 6.4 MB in all at full scale, with
+`madvise(MADV_DONTNEED)` on the whole pages inside them, after its run. The exit used to unmap
+them on one thread: from the `exit` call to the wait's return took 1,064 µs without this and 629
+µs with it, while the twelve calls, in parallel, took about 127 µs. From the last barrier to the
+wait's return, the tail took 2,289 µs on step 35, 1,689 µs with the last worker writing, and
+1,446 µs with the name sets given back too (with their slots, see below; 21 runs each). On step
+36 it took 2,496 µs before and 1,541 µs after (25 runs). The name set itself is still never
+freed (step 33).
+
+`ab.py` against step 37, 41 interleaved runs, four rounds: medians 26.09, 26.26, 26.37 and 26.10
+→ 25.66, 25.64, 25.69 and 25.57 ms (−1.6%, −2.4%, −2.6% and −2.0%). memory.peak does not move,
+as every page goes back after the peak: in a user scope on the P-cores, 80 alternating runs,
+medians 12.31 → 12.33 MiB, and the highest of 5 runs by resampling 12.79 → 12.68 MiB; in the
+harness's container on the E-cores (4 threads), 50 alternating runs, 10.52 → 10.48 MiB. S 387 →
+391. Correctness: the gate, 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes;
+the 400 fuzz cases and the two long-name sets pass at the default thread count, at 1, 3, 12, 37
+and 64 threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300 tiny seeds pass at 1, 2,
+3, 5, 7, 12, 16, 23, 37 and 64 threads with 100-byte rounds; the six files of edge cases match the
+reference at the default thread count, at 1 and 37 threads, and with 100-byte rounds at 3 and 64;
+of the wide region sets, w2 gives the reference, and w0 and w1, with more than 255 countries,
+stop with the error as step 37 does; clippy reports no warnings.
+
+`main` is now C's `main`, named with `#[unsafe(no_mangle)]` under `#![no_main]`, so the setup
+that the standard library runs before a Rust `main` does not run. That setup installs a handler
+for stack overflows, and while it is installed, every spawned thread maps and protects the pages
+of a signal stack of its own as it starts, two calls that take the address space's lock for
+writing while the main thread is still spawning. Under gdb on the E-cores (4 threads), a run
+makes 22 `mmap` and 9 `mprotect` calls instead of 27 and 14, and `sigaltstack` is not linked at
+all. `std::env::args` still works, because glibc hands the arguments to the standard library's
+initializer before `main`. A stack overflow now ends the process with SIGSEGV and no message, and
+SIGPIPE keeps its default action, which a program that writes one file never meets. The binary
+is 122 KiB smaller. `ab.py` against the change above alone, 41 interleaved runs, four rounds:
+25.66, 25.64, 25.69 and 25.57 → 25.36, 25.46, 25.44 and 25.37 ms (−1.2%, −0.7%, −1.0% and
+−0.8%), and against step 37 −2.8%, −3.0%, −3.5% and −2.8%. memory.peak: 12.33 → 12.23 MiB in the
+user scope (80 runs; highest of 5, 12.68 → 12.73), 10.48 → 10.52 MiB in the container (50 runs).
+S 391 → 393. The same checks pass, with the same results.
+
+Dropped, against step 35 unless noted; instrumented timelines on the P-cores, medians of 21
+interleaved runs (25 on step 36), or `ab.py`, 41 interleaved runs, four rounds:
+- **The name set freed** after the run instead of its entries given back (on step 36): `ab.py`
+  26.51, 26.52, 26.53 and 26.49 ms against 25.80, 25.88, 25.81 and 25.88 ms, +0.67 ms. `munmap`
+  takes the address space's lock for writing, so the workers' calls ran one at a time.
+- **The slots given back too**, the set's other table, 64 KiB per worker (on step 36): the tail
+  1,489 against 1,541 µs, 52 µs for three more lines.
+- **The region table and the mailboxes given back**, each worker its share after one more
+  barrier, with the threads still ending as before: the tail 1,817 against 2,289 µs, no better
+  than the name sets alone, 1,810 µs. With the last worker writing, the region table alone (on
+  step 36): 1,474 against 1,489 µs.
+- **The sleeping workers spinning** instead (on step 36): the tail 1,491 against 1,489 µs.
+- **The main thread as worker 0**, after it spawned the others (on step 36): the tail 1,509
+  against 1,489 µs.
+- **The sleeping workers ending their threads with a raw `exit(2)`**: the standard library of
+  Rust 1.99 then panics, "threads should not terminate unexpectedly".
+- **The join's mailboxes and region table leaked** when it returned, instead of freed: the tail
+  2,056 against 2,408 µs. The last worker's exit now gives that with no line.
+- **The region table mapped in by worker 0** before its step 0, instead of by the main thread
+  before the spawn: the last worker's rounds started at 2,143 against 2,043 µs.
+- **`MADV_SEQUENTIAL` or `MADV_RANDOM` on the input mapping**: the last worker's rounds started at
+  2,116 and 2,113 against 2,043 µs, and the walls stayed within the noise.
+- **The region table mapped in by the main thread after the spawn** instead of before it, so
+  that its 0.2 ms would overlap the threads' start (on step 36 with no runtime setup): `ab.py`
+  25.44, 25.55, 25.54 and 25.60 → 25.49, 25.66, 25.69 and 25.67 ms, for three more lines.
+- **One malloc arena for all threads** (`mallopt(M_ARENA_MAX, 1)`, on step 36 with no runtime
+  setup): 30.00, 30.27, 30.23 and 30.21 ms, +4.7 ms.
+- **glibc's `M_MMAP_THRESHOLD` left at its default**, two lines fewer (on this step): memory.peak
+  12.20 → 12.38 MiB (medians, 80 alternating runs in a user scope), and the highest of 5 runs
+  12.63 → 13.14 MiB by resampling.
 
 ## Experiments that did not stay
 

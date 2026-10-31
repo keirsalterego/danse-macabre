@@ -80,6 +80,8 @@
 //! [`region_amount`]: a field past them takes a slower path. Records outside the §2.1 grammar are
 //! not validated.
 
+#![no_main]
+
 use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering, Ordering::Relaxed};
 use std::{fs::write, io::Write, ops::Range, os::fd::AsRawFd, path::Path, thread, time::Duration};
@@ -145,7 +147,15 @@ const EMPTY: Group = [0, 0, 0, 0, 0, 0, i64::MAX, i64::MIN];
 /// Reads `<data_dir>/regions.csv` and `<data_dir>/records.csv` and writes
 /// `<out_dir>/aggregates.txt`. The directories come from the first two arguments and default to
 /// `/data` and `/out`, where the harness mounts them.
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+///
+/// This is C's `main`, called with no Rust runtime set up before it (`#![no_main]`). That setup
+/// installs a handler for stack overflows, and with it every spawned thread maps and protects the
+/// pages of a signal stack of its own, two calls that take the address space's lock while the
+/// other threads start. Without it the runs took 0.1 to 0.3 ms less (PERF.md, step 38). The
+/// arguments still come from `std::env::args`, which glibc hands to the standard library before
+/// `main`.
+#[unsafe(no_mangle)]
+extern "C" fn main() -> ! {
     // Transparent huge pages would charge a whole 2 MB page to a buffer that uses a few 4 KB
     // pages of it, such as the mailboxes, of which the rounds touch a few percent. If the call
     // fails, only that is lost, so its result is not checked.
@@ -160,12 +170,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = std::env::args().nth(1).unwrap_or("/data".into());
     let out = Path::new(&std::env::args().nth(2).unwrap_or("/out".into())).join("aggregates.txt");
     let threads = thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let file = |name| map_file(&Path::new(&data_dir).join(name));
-    let (groups, codes) = join(file("records.csv")?, file("regions.csv")?, threads);
-    write(&out, format_output(&groups, &codes)).map_err(|e| format!("{}: {e}", out.display()))?;
-    // Exit without running destructors: freeing the name sets would only add to the timed
-    // wall. `fs::write` keeps no user-space buffer, so every byte is already written.
-    std::process::exit(0)
+    let file = |name| map_file(&Path::new(&data_dir).join(name)).expect("a readable input");
+    join(file("records.csv"), file("regions.csv"), threads, &out)
 }
 
 /// Maps the whole file, followed by [`PAD`] zero bytes, and hands it out as one byte slice for
@@ -196,14 +202,11 @@ fn map_file(path: &Path) -> Result<&'static [u8], String> {
     Ok(unsafe { std::slice::from_raw_parts(ptr, len + PAD) })
 }
 
-/// Runs `work(i)` for each `i` in `0..n`, each on a thread of its own, and returns the results
-/// in order of `i`.
-fn parallel<T: Send>(n: usize, work: &(impl Fn(usize) -> T + Sync)) -> Vec<T> {
-    thread::scope(|s| {
-        let threads: Vec<_> = (0..n).map(|i| s.spawn(move || work(i))).collect();
-        // A panic aborts the process, so `join` never returns an error.
-        threads.into_iter().map(|t| t.join().unwrap()).collect()
-    })
+/// Runs `work(i)` for each `i` in `0..n`, each on a thread of its own. No call returns: the last
+/// worker to finish ends the process, which also ends the others (see [`join`]).
+fn parallel(n: usize, work: &(impl Fn(usize) + Sync)) -> ! {
+    thread::scope(|s| (0..n).for_each(|i| _ = s.spawn(move || work(i))));
+    unreachable!("the last worker ends the process")
 }
 
 /// Calls `row` with (region id, code) for each row of `regions.csv` that starts in the given one
@@ -230,12 +233,11 @@ fn region_rows(csv: &[u8], share: usize, shares: usize, mut row: impl FnMut(usiz
 }
 
 /// Parses every record of `data`, the file and its [`PAD`], joins it to its group by the
-/// `regions` table, and returns the [`Group`]s and the country codes in bytewise order, where
-/// `codes[k]` is group k + 1.
+/// `regions` table, writes the lines of [`format_output`] to `out` and ends the process.
 ///
-/// This is a parallel map-reduce. Each thread aggregates one run of whole records, and the
-/// partial groups are merged at the end. Distinct names are split between the threads by hash,
-/// so each name has one owner that counts it, and the threads hand names to their owners in
+/// This is a parallel map-reduce. Each thread aggregates one run of whole records, and the thread
+/// that finishes last merges the partial groups. Distinct names are split between the threads by
+/// hash, so each name has one owner that counts it, and the threads hand names to their owners in
 /// rounds.
 ///
 /// Splitting a CSV in parallel is hard, because an LF inside a quoted field looks exactly like a
@@ -274,7 +276,7 @@ fn region_rows(csv: &[u8], share: usize, shares: usize, mut row: impl FnMut(usiz
 /// have arrived, and round r is step r + 2. Zeroed memory this big comes as fresh pages from the
 /// kernel, mapped in only when first written, so the mailbox pages that no round fills cost
 /// nothing.
-fn join(data: &[u8], regions: &[u8], threads: usize) -> (Vec<Group>, Vec<[u8; 3]>) {
+fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
     let len = data.len() - PAD;
     let body = 1 + data.iter().position(|&b| b == b'\n').expect("a header");
     // After an LF, a digit or a BOM, whose first byte is 0xEF.
@@ -305,14 +307,16 @@ fn join(data: &[u8], regions: &[u8], threads: usize) -> (Vec<Group>, Vec<[u8; 3]
     unsafe { madvise(std::ptr::without_provenance(at), end - at, 23) };
     let seen = zeroed(CODES.div_ceil(64));
     let present = || (0..CODES).filter(|&c| seen[c / 64].load(Relaxed) >> (c % 64) & 1 == 1);
+    let parts = std::sync::Mutex::new(Vec::new());
     // The hot loop, one run per worker `me`. The fields come in a fixed order, so the state is
     // simply the position in the record. [`number`] parses the id from one word, [`text_fields`]
     // skips the name and the note while counting their escapes, and [`region_amount`] parses the
     // region id and the amount from one vector. In each round the
     // worker parses about [`ROUND_BYTES`] of its records and posts each record's name to the
     // worker that owns it, waits at the barrier for all workers, and then marks the names posted
-    // to it in its own [`NameSet`]. After the last round it gives its run's pages back.
-    let parts = parallel(threads, &|me| {
+    // to it in its own [`NameSet`]. After the last round it gives its pages back, and the last
+    // worker to finish writes the output.
+    parallel(threads, &|me| {
         // Step 0 of the region table: the codes of this thread's share of the rows.
         let mut mine = [0u64; CODES.div_ceil(64)];
         region_rows(regions, me, threads, |_, c| mine[c / 64] |= 1 << (c % 64));
@@ -418,12 +422,13 @@ fn join(data: &[u8], regions: &[u8], threads: usize) -> (Vec<Group>, Vec<[u8; 3]
                 names.read(mail(mailbox(half, from, me)), data, &mut groups);
             }
         }
-        // The run's pages go back to the kernel with `madvise(MADV_DONTNEED)`. At exit the kernel
-        // unmaps every page of the input on one thread, inside the timed window (an explicit
-        // `munmap` of the 200 MB took 2.8 ms), so each worker drops its own run here, in
-        // parallel. Every worker is done parsing by the last barrier; dropping pages earlier
-        // would slow the threads still parsing, because it makes the kernel flush every thread's
-        // TLB.
+        // The run's pages go back to the kernel with `madvise(MADV_DONTNEED)`, and then the name
+        // set's entries. At exit the kernel unmaps every page left on one thread, inside the timed
+        // window: the input's took 2.8 ms (an explicit `munmap`), and the 6.4 MB of entries 0.4 ms
+        // (PERF.md, step 38), so each worker drops its own here, in parallel. Every worker is done
+        // parsing by the last barrier, and with its name set after its last round; dropping pages
+        // earlier would slow the threads still parsing, because it makes the kernel flush every
+        // thread's TLB. The set is at its largest here, so memory.peak has counted its pages.
         let page = bounds[me] & !4095;
         // SAFETY: `data` is the read-only file mapping from [`map_file`], which starts a page,
         // and the range, rounded out to whole pages, stays inside the file's pages. A dropped
@@ -431,19 +436,31 @@ fn join(data: &[u8], regions: &[u8], threads: usize) -> (Vec<Group>, Vec<[u8; 3]
         // owner still compares, maps the same bytes from the file, so the call is only advice
         // and its result is ignored. Advice 4 is `MADV_DONTNEED`.
         unsafe { madvise(data[page..].as_ptr(), bounds[me + 1] - page, 4) };
-        // The name set is never freed: the process exits right after the join, and the exit
-        // unmaps the set's pages with all the others. Freed here, each worker's `munmap` calls
-        // stopped every other worker for a TLB flush. The set is at its largest here, so
-        // memory.peak has counted its pages already.
-        std::mem::forget(names);
-        groups
-    });
-    let code = |c: usize| [c / 676, c / 26 % 26, c % 26].map(|c| b'A' + c as u8);
-    let codes: Vec<_> = present().map(code).collect();
-    let (group_count, mut groups) = (codes.len() + 1, vec![EMPTY; codes.len() + 1]);
-    // Every part holds `group_count` groups, so the flattened parts go through them in turn.
-    (parts.iter().flatten().enumerate()).for_each(|(i, p)| merge(&mut groups[i % group_count], p));
-    (groups, codes)
+        let (at, len) = (names.lines.as_ptr().addr(), size_of_val(&*names.lines));
+        let start = std::ptr::without_provenance(at.next_multiple_of(4096));
+        // SAFETY: the range is the whole pages inside the entries, which hold no other buffer's
+        // bytes, and no entry is read again. The set itself is never freed: its `munmap` calls,
+        // one worker at a time under the address space's lock, made the runs 0.7 ms slower.
+        unsafe { madvise(start, (at + len).saturating_sub(start.addr()) & !4095, 4) };
+        // The last worker to get here merges the groups, writes the output and ends the process,
+        // which ends the other workers too. Workers that returned instead would end their
+        // threads first, in calls that took 0.8 ms for all of them (PERF.md, step 38). Nothing is
+        // freed, since the exit unmaps it all, and `fs::write` keeps no user-space buffer.
+        // A panic aborts the process, so the lock is never poisoned.
+        let mut all = parts.lock().unwrap();
+        if all.len() + 1 < threads {
+            all.push(groups);
+            drop(all);
+            // Asleep until the end. A spurious wakeup would only end this thread early.
+            return thread::park();
+        }
+        let code = |c: usize| [c / 676, c / 26 % 26, c % 26].map(|c| b'A' + c as u8);
+        let codes: Vec<_> = present().map(code).collect();
+        // Every part numbers its groups as `groups` does, so the parts merge into it pairwise.
+        (all.iter()).for_each(|part| (groups.iter_mut().zip(part)).for_each(|(g, p)| merge(g, p)));
+        write(out, format_output(&groups, &codes)).expect("a writable output directory");
+        std::process::exit(0)
+    })
 }
 
 /// Arrives at the barrier that `arrived` counts, and waits until `all` workers have arrived.
