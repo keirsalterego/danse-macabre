@@ -43,6 +43,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 36 | The record batch holds each letter by reference, in an order whose loads are forwarded from their stores, and the group goes into its letter as one byte | run-5a15a73439c1 | 0.0246 | 12.5 | 79.7 |
 | 37 | The merge takes its group from `by_id` without a bounds check, and a letter's thread is picked with `sent.len()` instead of a load through the closure's reference to the thread count | run-0ff0124ce494 | 0.0237 | 12.5 | 80.1 |
 | 38 | The last worker to finish merges the groups, writes the output and ends the process while the others sleep, so no thread ends first, and each worker gives back its name set's entries after its run; and `main` is C's, so the Rust runtime's setup, whose stack-overflow handler gave every thread a signal stack, does not run | run-490c7c238e52 | 0.0235 | 12.1 | 80.3 |
+| 39 | The name's 24 bytes, the region id's and the amount's 16 and the byte after the cents are read without bounds checks, a name set's slot holds its entry above its tag, the quotes are counted with `bzhi`, a CR is told from an LF by its lowest bit, the region id's length takes one compare, and the marking takes its group unchecked | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1250,6 +1251,86 @@ interleaved runs (25 on step 36), or `ab.py`, 41 interleaved runs, four rounds:
 - **glibc's `M_MMAP_THRESHOLD` left at its default**, two lines fewer (on this step): memory.peak
   12.20 → 12.38 MiB (medians, 80 alternating runs in a user scope), and the highest of 5 runs
   12.63 → 13.14 MiB by resampling.
+
+## Step 39: 23 instructions fewer per record
+
+Eight changes in the record loop and the name set, none of which adds a line. They came, as step
+37's did, from reading the loop's machine code next to a `perf record` of its user-mode
+instructions over 40 runs, each sample charged to its line. Each count below is `perf stat`'s
+instructions:u, 20 interleaved runs, on step 37's code with none or some of the other changes,
+against the same code without that change.
+
+Step 37 kept the loop's other bounds checks, since a malformed last record can put a stop of the
+parse at the end of the input. Three of them, though, read near a position that an earlier
+check or the parse has already bounded, well inside the pad's 64 bytes, so they can never fail.
+Each function now has that as the `# Safety` contract of its read, and each call says why it
+holds:
+
+- **The name's 24 bytes.** `text_fields` has just read the 64 bytes from the name's field on, its
+  first window, with a checked read, and the name starts there or one byte later, past its
+  quote, so `name_letter`'s 24 bytes lie in that window. 4 instructions per record (−1.3%).
+- **The region id's and the amount's 16 bytes.** `region_amount` reads from one past the comma
+  that ends the note. A mask of commas finds only commas, and the 64 bytes of the pad are zeros,
+  so that comma is a byte of the input, and the 16 bytes past it end inside the pad at the
+  latest. 5 instructions per record (−1.6%).
+- **The byte after the cents**, the CR or the LF. `region_amount` puts the dot at most 13 bytes
+  past the comma's next byte, and `region_amount_slow` at most at the pad's second byte, so the
+  byte 3 past the dot lies in the pad at the latest. 3 instructions per record (−1.0%).
+
+The check that stays is the window's: a last record with no comma after its id puts the id's
+stop on the pad's first byte, and the window from the byte after it would end one byte past the
+pad.
+
+Five smaller ones:
+
+- **A CR told from an LF by its lowest bit.** CR is 0x0D and LF 0x0A, and the byte after the
+  cents is one of them or, after the last record, the pad's 0 (§2.1). One instruction per record
+  (−0.33%).
+- **The region id's length checked with one compare.** The fast path took region ids of 1 to 7
+  digits as `comma.wrapping_sub(1) < 7`. An empty region id, which §2.2 rules out, now takes it
+  too and parses as 0, as it does in the slow path, so `comma < 8` is enough. One instruction per
+  record (−0.34%).
+- **The quotes counted with `bzhi`.** The quotes before a comma were counted as `quotes & ((1 <<
+  i) - 1)`. The compiler does not know that `i` is below 64, so it masked the count first;
+  `_bzhi_u64` takes any count. 2 instructions per record (−0.63%).
+- **A slot's entry above its tag.** A slot held its entry's number in its low 24 bits and 8 bits
+  of the name's hash on top, so the probe masked it once for each. With the number on top, one
+  shift takes it out and the tag compares as the low byte. 2.3 instructions per record (−0.77%).
+- **The marking's group unchecked.** After the barrier, the distinct count indexed `groups` with
+  the group that the letter's poster took from `by_id`, which holds 0 or a number below
+  `group_count`, the length of every worker's `groups`, since all count the same codes. One
+  instruction per record (−0.33%). Step 37 dropped this change, which then took one more line;
+  with the word and the bit taken in one `let`, it takes none.
+
+Together, on AC power, `ab.py`, 41 interleaved runs, five rounds, against step 38: medians 25.64,
+25.65, 25.60, 25.50 and 25.58 → 25.05, 25.07, 24.97, 24.93 and 25.06 ms (−2.3%, −2.3%, −2.5%,
+−2.2% and −2.0%). `perf stat`, 20 interleaved runs: instructions:u 1014.4 → 936.8 M (−7.6%, 306
+→ 282 per record), cycles:u 583.8 → 569.8 M (−2.4%). On step 37's code the same changes took
+1011.2 → 947.0 M instructions (−6.3%) and 582.6 → 567.7 M cycles (−2.6%), and in seven rounds of
+`ab.py` against step 37, −1.7% to −2.7%. Cycles fall by less than instructions: many of the
+instructions cut were a compare and a branch that never jumps, which the core fuses into one
+operation. memory.peak, 40 alternating runs: medians 12.36 → 12.33 MiB. S 393 → 393.
+Correctness: the gate, 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes; the
+400 fuzz cases and the two long-name sets pass at the default thread count, at 1, 3, 12, 37 and
+64 threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300 tiny seeds pass at 1, 2, 3,
+5, 7, 12, 16, 23, 37 and 64 threads with 100-byte rounds; the six files of edge cases match the
+reference at the default thread count, at 1 and 37 threads, and with 100-byte rounds at 3 and 64;
+of the wide region sets, w2 gives the reference, and w0 and w1, with more than 255 countries,
+stop with the error as step 38 does; clippy reports no warnings.
+
+Dropped, on step 37's code; `ab.py` on AC power, 41 interleaved runs, and `perf stat`, 20
+interleaved runs:
+- **The probe's slot read unchecked**: one instruction per record fewer (−0.32%), but cycles
+  +0.44%, and `ab.py` +0.1% and +0.6% against step 37; on top of the CR's bit, the `bzhi`, the
+  slot's layout and the marking's group, +0.3%, +0.2% and +0.5% against them.
+- **The letter posted before the region id and the amount are parsed**, on top of those four:
+  instructions −0.34%, cycles +2.3%. **The letter made after them**, which step 37 dropped too,
+  again on top of those four: instructions +0.35%, cycles +0.63%.
+- **The shuffle controls indexed by `dot << 3 | comma`**, which one `lea` could compute, instead
+  of `comma << 4 | dot`: the compiler shifted and ORed all the same, instructions −0.00%, cycles
+  +0.24%. As a table of 17 dots by 8 commas indexed with no mask, it added a bounds check.
+- **The dot found by a shift past the byte after the comma**, so that its range check would be
+  one compare: instructions −0.02%.
 
 ## Experiments that did not stay
 

@@ -114,9 +114,11 @@ const LONG: u64 = 0xFFFF;
 /// 24 bytes of ones, then 24 zeros. The 24 bytes from `24 - len` on are the mask that keeps the
 /// first `len` bytes of a name (see [`name_letter`]).
 const KEEP: [[u8; 24]; 2] = [[!0; 24], [0; 24]];
-/// The low 24 bits of a slot: its entry's index plus 1, so that 0 is an empty slot. The top 8
-/// bits are bits 20 to 27 of the name's hash, so a probe that passes a different name usually
-/// skips its entry without loading it.
+/// The largest entry number a slot holds. A slot's top 24 bits are its entry's index plus 1, so
+/// that 0 is an empty slot, and its low 8 bits are bits 20 to 27 of the name's hash, so a probe
+/// that passes a different name usually skips its entry without loading it. With the number on
+/// top, one shift takes it out and the bits compare as a byte: with the bits on top, a mask for
+/// each took one more instruction per probe and one more per letter.
 const ENTRY: u32 = (1 << 24) - 1;
 
 unsafe extern "C" {
@@ -375,14 +377,25 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
                         (id, comma) = number(data, at + BOM.len(), b',');
                     }
                     let (name, name_len, note_len, after_note) = text_fields(data, comma + 1);
-                    let letter = name_letter(data, name);
-                    let (region_id, cents, dot) = region_amount(data, after_note);
+                    // SAFETY: `text_fields` has read the 64 bytes from `comma + 1` on, its first
+                    // window, and the name starts there or one byte later, past its quote.
+                    let letter = unsafe { name_letter(data, name) };
+                    // SAFETY: `after_note` is one past a comma of the input. The 64 bytes of the
+                    // pad are zeros, so the comma lies before them, and the 16 bytes from it on
+                    // lie in `data`.
+                    let (region_id, cents, dot) = unsafe { region_amount(data, after_note) };
                     let byte = by_id.as_ptr().wrapping_add(region_id as usize);
                     // SAFETY: a prefetch reads nothing the program sees, and never faults.
                     unsafe { _mm_prefetch::<_MM_HINT_T0>(byte.cast()) };
                     // Past the CR if any, then the LF. Only the last record may end at end of
-                    // file instead (§2.1), which leaves `at` past the end and stops the loop.
-                    at = dot + 4 + usize::from(data[dot + 3] == b'\r');
+                    // file instead (§2.1), which leaves `at` past the end and stops the loop. CR
+                    // is 0x0D and LF 0x0A, so the byte's lowest bit tells them apart, with one
+                    // instruction fewer than a compare with CR.
+                    // SAFETY: `region_amount` puts the dot at most 13 bytes past `after_note`,
+                    // and `region_amount_slow` at most at the pad's second byte. `after_note` is
+                    // at most the input's length (see above), so the byte 3 past the dot lies in
+                    // the pad at the latest. Checked, the read took three more instructions.
+                    at = dot + 4 + usize::from(unsafe { *data.get_unchecked(dot + 3) } & 1);
                     // The thread count as `sent.len()`: `threads`, read through the closure's
                     // reference to it, took one more load per record.
                     let to = ((u64::from(letter[3] as u32) * sent.len() as u64) >> 32) as usize;
@@ -544,8 +557,14 @@ fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
 /// Two parses of one word each took dependent shifts, multiplies and branches for each field;
 /// this runs 34 fewer instructions per record (PERF.md, step 35). Fields that §2.1 allows past
 /// those bounds, such as a region id with leading zeros, take [`region_amount_slow`].
-fn region_amount(data: &[u8], at: usize) -> (u64, i64, usize) {
-    let bytes: &[u8; 16] = data[at..].first_chunk().expect("the input is padded");
+///
+/// # Safety
+///
+/// The 16 bytes from `at` on lie in `data`. The record loop knows it from the comma before
+/// them, so the read is not checked again: its check took five instructions per record.
+unsafe fn region_amount(data: &[u8], at: usize) -> (u64, i64, usize) {
+    // SAFETY: the caller keeps the 16 bytes in `data`, and `[u8; 16]` needs no alignment.
+    let bytes: &[u8; 16] = unsafe { &*data.as_ptr().add(at).cast() };
     // SAFETY: the build targets Alder Lake, which has SSE2 (see `.cargo/config.toml`), and the
     // load reads the 16 bytes of `bytes`. `loadu` needs no alignment.
     let window = unsafe { _mm_loadu_si128(bytes.as_ptr().cast()) };
@@ -554,7 +573,9 @@ fn region_amount(data: &[u8], at: usize) -> (u64, i64, usize) {
     let stops = digits.cast_unsigned() ^ 0x1_FFFF;
     let comma = stops.trailing_zeros() as usize;
     let dot = (stops & !(3 << comma)).trailing_zeros() as usize;
-    if comma.wrapping_sub(1) >= 7 || dot.wrapping_sub(comma + 2) >= 5 {
+    // An empty region id, which §2.2 rules out, passes and parses as 0, as it does in the slow
+    // path, so the comma's test is one compare.
+    if comma >= 8 || dot.wrapping_sub(comma + 2) >= 5 {
         return region_amount_slow(data, at);
     }
     let control = ALIGN[(comma << 4 | dot) & 127];
@@ -636,7 +657,10 @@ fn text_fields(data: &[u8], at: usize) -> (Range<usize>, i64, i64, usize) {
         return text_fields_slow(data, at);
     }
     let second = rest.trailing_zeros() as usize;
-    let before = |i: usize| (quotes & ((1 << i) - 1)).count_ones() as usize;
+    // `bzhi` keeps the bits below `i`. As `(1 << i) - 1` the count was first masked to 63, since
+    // the compiler does not know that `first` is below 64: two more instructions per record.
+    // SAFETY: the build targets Alder Lake, which has BMI2 (see `.cargo/config.toml`).
+    let before = |i: usize| unsafe { _bzhi_u64(quotes, i as u32) }.count_ones() as usize;
     let (q1, q2) = ((quotes & 1) as usize, (quotes >> (first + 1) & 1) as usize);
     let (in_name, in_both) = (before(first), before(second));
     let name_len = (first - in_name / 2 - q1) as i64;
@@ -716,9 +740,15 @@ fn byte_mask(data: &[u8], at: usize, byte: u8) -> u64 {
 /// so names that differ only by trailing spaces, such as `Betts` and `Betts `, differ from the
 /// first step. For a long name it covers the first 24 bytes, which is enough to pick an owner,
 /// and the owner compares long names in full.
-fn name_letter(data: &[u8], Range { start, end }: Range<usize>) -> [u64; 4] {
+///
+/// # Safety
+///
+/// The 24 bytes from `start` on lie in `data`. The record loop knows it from the window of
+/// [`text_fields`], so the read is not checked again: its check took four instructions per record.
+unsafe fn name_letter(data: &[u8], Range { start, end }: Range<usize>) -> [u64; 4] {
     let len = end - start;
-    let bytes: &[u8; 24] = data[start..].first_chunk().expect("the input is padded");
+    // SAFETY: the caller keeps the 24 bytes in `data`, and `[u8; 24]` needs no alignment.
+    let bytes: &[u8; 24] = unsafe { &*data.as_ptr().add(start).cast() };
     let keep = &KEEP.as_flattened()[24 - len.min(24)..];
     let word = |b: &[u8], i| u64::from_le_bytes(b.as_chunks().0[i]);
     let words: [u64; 3] = std::array::from_fn(|i| word(bytes, i) & word(keep, i));
@@ -749,7 +779,7 @@ struct Line([u64; 8]);
 /// names are equal exactly when their unescaped values are. The empty quoted name `""` and the
 /// empty unquoted name both arrive as an empty slice, so they are one name, as spec §3 asks.
 struct NameSet {
-    /// The entry of each name, with 8 bits of its hash on top (see [`ENTRY`]), or 0.
+    /// The entry of each name, with 8 bits of its hash below it (see [`ENTRY`]), or 0.
     slots: Vec<u32>,
     lines: Vec<Line>,
 }
@@ -787,23 +817,26 @@ impl NameSet {
             // SAFETY: as above, and the load reads the 32 bytes of `letter`.
             let key = unsafe { _mm256_and_si256(_mm256_loadu_si256(letter.as_ptr().cast()), keep) };
             let (mask, hash) = (self.slots.len() - 1, d as u32);
-            let (mut slot, tag) = (hash as usize & mask, (hash >> 20) << 24);
+            let (mut slot, tag) = (hash as usize & mask, (hash >> 20) as u8);
             // The probe ends at the entry's line rather than its index: `holds` has checked
             // that index, and the index taken out of the loop was checked once more.
             let line = loop {
                 let found = self.slots[slot];
-                match (found & ENTRY) as usize {
+                match (found >> 8) as usize {
                     0 => break self.insert(slot, tag, key),
-                    e if found & !ENTRY == tag && self.holds(e - 1, key, data) => {
+                    e if found as u8 == tag && self.holds(e - 1, key, data) => {
                         // SAFETY: see `holds`.
                         break unsafe { self.lines.get_unchecked_mut(e - 1) };
                     }
                     _ => slot = (slot + 1) & mask,
                 }
             };
-            let word = &mut line.0[4 + group / 64];
-            groups[group][5] += i64::from(*word >> (group % 64) & 1 == 0);
-            *word |= 1 << (group % 64);
+            let (word, bit) = (&mut line.0[4 + group / 64], 1 << (group % 64));
+            // SAFETY: the group is the byte that the letter's poster took from `by_id`, 0 or a
+            // number below `group_count`. Every worker counts the same codes, so that is the
+            // length of `groups` here too (see [`join`]).
+            unsafe { groups.get_unchecked_mut(group)[5] += i64::from(*word & bit == 0) }
+            *word |= bit;
         }
     }
 
@@ -832,12 +865,12 @@ impl NameSet {
     ///
     /// Cold, because inlined into [`NameSet::read`] it spilled the key of every letter.
     #[cold]
-    fn insert(&mut self, slot: usize, tag: u32, key: __m256i) -> &mut Line {
+    fn insert(&mut self, slot: usize, tag: u8, key: __m256i) -> &mut Line {
         assert!(self.lines.len() < ENTRY as usize, "over 2^24 names");
         // SAFETY: `__m256i` and `[u64; 4]` are both 32 bytes, and every bit pattern is valid.
         let [a, b, c, d]: [u64; 4] = unsafe { std::mem::transmute(key) };
         self.lines.push(Line([a, b, c, d, 0, 0, 0, 0]));
-        self.slots[slot] = tag | self.lines.len() as u32;
+        self.slots[slot] = (self.lines.len() as u32) << 8 | u32::from(tag);
         if 4 * self.lines.len() > 3 * self.slots.len() {
             self.slots = vec![0; 2 * self.slots.len()];
             let mask = self.slots.len() - 1;
@@ -846,7 +879,7 @@ impl NameSet {
                 while self.slots[slot] != 0 {
                     slot = (slot + 1) & mask;
                 }
-                self.slots[slot] = (line.0[3] as u32 >> 20) << 24 | (entry + 1) as u32;
+                self.slots[slot] = ((entry + 1) as u32) << 8 | (line.0[3] as u32 >> 20 & 255);
             }
         }
         self.lines.last_mut().expect("an entry was just pushed")
