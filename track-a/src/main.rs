@@ -397,9 +397,7 @@ fn parse<'a>(log: &'a [u8], lines: Range<usize>, endpoints: &Interner<'a>) -> Ch
         // SAFETY: each line moves `i` on by at least MIN_LINE bytes, malformed or not, since
         // `line_end` starts looking at byte MIN_LINE - 1, so `count` stays below the length the
         // records were given.
-        unsafe {
-            *chunk.records.get_unchecked_mut(count) = id << 20 | error << 19 | micros;
-        }
+        unsafe { *chunk.records.get_unchecked_mut(count) = id << 20 | error << 19 | micros };
         count += 1;
     }
     chunk.records.truncate(count);
@@ -687,9 +685,8 @@ fn summarize_hour(runs: &[Run], order: &Order, names: &[&[u8]], buffer: &mut [u3
     let (mut start, mut errors) = (vec![0u32; names.len() + 1], vec![0u32; names.len()]);
     for &(records, _) in runs {
         for &r in records {
-            let e = (r >> 20) as usize;
-            start[e] += 1;
-            errors[e] += r >> 19 & 1;
+            start[(r >> 20) as usize] += 1;
+            errors[(r >> 20) as usize] += r >> 19 & 1;
         }
     }
     (1..start.len()).for_each(|e| start[e] += start[e - 1]);
@@ -707,16 +704,15 @@ fn summarize_hour(runs: &[Run], order: &Order, names: &[&[u8]], buffer: &mut [u3
         release(records);
     }
     let (mut lines, mut len) = (Vec::with_capacity(order.wait().len()), 0);
-    // The number of decimal digits `put_number` writes for `value`.
-    let digits = |value: u64| value.checked_ilog10().map_or(1, |log| log as usize + 1);
+    // The bytes `put_number` writes for `value`: a space and its decimal digits.
+    let width = |&value: &u64| 1 + value.checked_ilog10().map_or(1, |log| log as usize + 1);
     for &e in order.wait() {
         let group = &mut buffer[start[e] as usize..start[e + 1] as usize];
         if !group.is_empty() {
             let [p50, p95, p99] = percentiles(group);
             let line = [e as u32, group.len() as u32, p50, p95, p99, errors[e]];
-            // The label and its space, the name, six numbers that each follow a space, and the LF.
-            let numbers: usize = numbers(&line).iter().map(|&value| 1 + digits(value)).sum();
-            len += 21 + names[e].len() + numbers + 1;
+            // The six numbers, the label and its space, the name, and the LF.
+            len += numbers(&line).iter().map(width).sum::<usize>() + 21 + names[e].len() + 1;
             lines.push(line);
         }
     }
