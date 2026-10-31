@@ -38,6 +38,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 31 | The hours sorted by size with each hour's size computed once (`sort_by_cached_key`) | run-c441864672ce | 0.0195 | 21.1 | 84.5 |
 | 32 | Hours summarized smallest first, the smallest few last, into a latency buffer of untouched zero pages | run-13fb10f4c6ee | 0.0196 | 19.1 | 84.9 |
 | 33 | One endpoint table that all threads share while they parse, instead of one per thread merged after it | run-9e334b5f00fa | 0.0190 | 18.9 | 85.3 |
+| 34 | The padded copies allocated uninitialized, not zeroed, and each list of large latencies reserved once | | | | |
 
 ## Step 1: v1
 
@@ -452,6 +453,39 @@ seed 2: median 21.77 → 21.13 ms, minimum 21.30 → 20.49 ms. `perf stat` (10 r
 loads and bounds-checks an id for each record, twice, and the merge and the per-thread inserts
 are gone. S 378 → 381. Gate: 310 pass, 0 fail (full seeds 1–7 and 10–12, 300 tiny seeds).
 Seeds 1–3, 15 runs each on 12, 4 and 2 CPUs: all 135 outputs match the reference hash.
+
+## Step 34: two buffers the allocator had filled
+
+A copy of `/proc/self/smaps` at the barrier after the parse (local, seed 1, two runs) counted
+13,312–13,324 KiB of anonymous memory, 12,144 KiB of it records. Two parts of the rest needed
+no memory:
+
+- The padded copies. `Box::new_zeroed_slice` gets a block aligned to 64 bytes from
+  `posix_memalign` and then writes zeros over it, so all 256 KiB of the table were in memory,
+  though the 1,842 copies fill 115 KiB. The table now holds `MaybeUninit` entries and comes from
+  `Box::new_uninit_slice`, whose pages take memory only as copies are written: 260 → 116 KiB.
+- The lists of large latencies. Each grew by doubling inside its thread's malloc arena, and
+  every buffer it outgrew stayed there. Reserved like the records, with room for a large
+  latency on every line, a list is a mapping of its own whose untouched pages cost nothing. The
+  thread arenas went from 424–436 to 96 KiB, the main heap from 308–312 to 148 KiB.
+
+At the barrier: 13,312–13,324 → 13,020 KiB. Local, turbo off: memory.peak, 20 alternating runs,
+median 17.66 → 17.36 MiB on seed 1; 10 each on seed 2, 17.58 → 17.38 MiB. `ab.py`, 61
+interleaved runs, two rounds on seed 1: medians 21.46 → 21.43 and 21.48 → 21.52 ms, minimums
+21.01 → 21.02 and 21.02 → 21.05 ms. S 381 → 382. Gate: 310 pass, 0 fail (full seeds 1–7 and
+10–12, 300 tiny seeds).
+
+The peak is still the start of the hour pass. In the same probe as step 33, anonymous memory
+rises by 1.1 MiB within 0.2 ms of it, as every worker writes its first latency buffer while
+the records are all still there, and memory.current tops out 1.4–1.8 MiB above the end of the
+parse. Tried and dropped, medians of memory.peak over 20 alternating runs, local, turbo off:
+
+- Hours smallest first all the way, without moving the smallest to the end: 0.26–0.32 MiB
+  lower, but `ab.py` median 21.50 → 21.72 ms (+1.0%, 61 runs).
+- The 12 smallest hours first and the next 12 last: 0.14 MiB higher than the kept order.
+- Each hour's lines released once formatted (1 line): in the probe the end of the output falls
+  from 16.6–17.0 MiB (step 33) to 14.3–14.7 MiB, but the hour pass still sets the peak (17.47
+  against 17.42 MiB without it).
 
 ## Experiments that did not stay
 

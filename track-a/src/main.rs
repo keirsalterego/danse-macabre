@@ -229,8 +229,9 @@ fn summarize(log: &[u8], out_path: &Path) {
             // a proper prefix sorts first, which is exactly the order the spec asks for (§4).
             // Comparing the copies saves reading 1,842 names from all over the input; only names
             // that agree on 64 bytes compare in full.
-            // SAFETY: no thread writes a padded copy after the barrier.
-            let padded = |id: usize| unsafe { &(*all.padded[id].get()).0 };
+            // SAFETY: every id below `names.len()` had its copy written before the barrier, and
+            // no thread writes one after it.
+            let padded = |id: usize| unsafe { &(*all.padded[id].get()).assume_init_ref().0 };
             order.sort_unstable_by_key(|&id| (padded(id), all.names[id].get()));
             let _ = sorted.set(order);
         }
@@ -366,8 +367,11 @@ fn parse<'a>(log: &'a [u8], lines: Range<usize>, endpoints: &Interner<'a>) -> Ch
     // run.
     let (mut chunk, mut count, mut current, mut i) = (Chunk::default(), 0, 0, lines.start);
     // Every line takes at least MIN_LINE bytes. The records start out zero, which costs nothing
-    // until a page is written, and the unused tail is cut off at the end.
+    // until a page is written, and the unused tail is cut off at the end. The large latencies
+    // get the same room, so their list never grows: each step of growth left the old buffer
+    // behind in the thread's malloc arena, where it stayed in memory to the end.
     chunk.records = vec![0; lines.len() / MIN_LINE + 1];
+    chunk.large = Vec::with_capacity(lines.len() / MIN_LINE + 1);
     assert!(lines.end + LINE <= log.len(), "map_file pads the log");
     while i < lines.end {
         // SAFETY: i < lines.end, so the LINE bytes from i lie inside `log` (asserted above).
@@ -537,7 +541,7 @@ struct Interner<'a> {
     names: Box<[OnceLock<&'a [u8]>]>,
     /// Id → the name and the space after it, zero-padded to 64 bytes, for [`same_name`]. A name of
     /// 64 bytes or more has no room for the space and keeps only its first 64 bytes.
-    padded: Box<[std::cell::UnsafeCell<Padded>]>,
+    padded: Box<[std::cell::UnsafeCell<std::mem::MaybeUninit<Padded>>]>,
     /// How many names have an id; the lock that adding a name takes.
     count: Mutex<usize>,
 }
@@ -558,9 +562,10 @@ impl Default for Interner<'_> {
         Self {
             slots: Box::new([const { AtomicU32::new(0) }; 2 << 12]),
             names: (0..1 << 12).map(|_| OnceLock::new()).collect(),
-            // SAFETY: zero bytes are a valid `Padded`. Fresh pages of zeros, they take memory
-            // only once a copy is written to them.
-            padded: unsafe { Box::new_zeroed_slice(1 << 12).assume_init() },
+            // SAFETY: a `MaybeUninit` needs no initialization. A zeroed block aligned to 64 bytes
+            // would be written with zeros by the allocator; this one takes memory only as copies
+            // are written to it.
+            padded: unsafe { Box::new_uninit_slice(1 << 12).assume_init() },
             count: Mutex::new(0),
         }
     }
@@ -584,8 +589,8 @@ impl<'a> Interner<'a> {
         while let Some(id) = self.slots[slot].load(Acquire).checked_sub(1) {
             let found = if name.len() < 64 {
                 // SAFETY: the copy was written before `id` went into the slot, and never again.
-                let known = unsafe { &(*self.padded[id as usize].get()).0 };
-                same_name(window, known, name.len())
+                let known = unsafe { (*self.padded[id as usize].get()).assume_init_ref() };
+                same_name(window, &known.0, name.len())
             } else {
                 self.names[id as usize].get() == Some(&name)
             };
@@ -619,7 +624,7 @@ impl<'a> Interner<'a> {
         padded[name.len().min(63) + 1..].fill(0);
         // SAFETY: no slot holds this id yet, so no other thread reads the copy, and only the
         // lock's holder writes one.
-        unsafe { *self.padded[*count].get() = Padded(padded) };
+        unsafe { (*self.padded[*count].get()).write(Padded(padded)) };
         let _ = self.names[*count].set(name);
         *count += 1;
         self.slots[slot].store(*count as u32, Release);
