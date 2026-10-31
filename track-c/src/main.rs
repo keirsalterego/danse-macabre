@@ -338,8 +338,13 @@ fn join(data: &[u8], regions: &[u8], threads: usize) -> (Vec<Group>, Vec<[u8; 3]
         let mut names = NameSet::new(len / 2048 / threads);
         let mut sent = vec![0; threads];
         // The batch of the record loop (see below). Zeroed at the start of every batch, it took
-        // seven more instructions per four records.
-        let mut batch = [(0, 0, 0, 0, 0, 0); 4];
+        // seven more instructions per four records. An entry holds its record's letter by
+        // reference, so the group's store takes no second bounds check. The compiler lays out a
+        // tuple as it likes, and in this order the id, the amount and the name's length, which
+        // the merge puts in one vector, lie apart, so each is loaded from its own store. Side by
+        // side, two of them were loaded as one, which cannot be forwarded from two stores, so it
+        // waited for both to reach the cache, 0.44 to 0.64 M times per run (PERF.md, step 36).
+        let mut batch = [(0, 0, 0, 0, 0, &boxes[0]); 4];
         for round in 0..rounds {
             let half = round % 2;
             (sent.iter_mut().enumerate()).for_each(|(to, s)| *s = mailbox(half, me, to) * MAILBOX);
@@ -382,18 +387,21 @@ fn join(data: &[u8], regions: &[u8], threads: usize) -> (Vec<Group>, Vec<[u8; 3]
                     let sent = unsafe { sent.get_unchecked_mut(to) };
                     let slot = *sent;
                     (0..4).for_each(|i| boxes[slot][i].store(letter[i], Relaxed));
-                    batch[parsed] = (region_id, slot, id, cents, name_len, note_len);
+                    batch[parsed] = (id, region_id, cents, note_len, name_len, &boxes[slot]);
                     *sent = slot + 1;
                     parsed += 1;
                 }
-                for &(region_id, top, id, cents, name_len, note_len) in &batch[..parsed] {
+                for &(id, region_id, cents, note_len, name_len, top) in &batch[..parsed] {
                     // Records also reference ids past the table's largest (§2.2), so the lookup
                     // is bounds-checked; those ids are unmatched like the holes inside the table.
                     let group = by_id.get(region_id as usize).map_or(0, |&g| g as usize);
-                    // The group goes into the top 16 bits of the letter's last word, `top`,
-                    // which no one reads before the barrier.
-                    let top = &boxes[top][3];
-                    top.store(top.load(Relaxed) | (group as u64) << 48, Relaxed);
+                    // The group goes into byte 30 of the letter, bits 48 to 55 of its last word,
+                    // which `name_letter` left 0. Storing the byte alone takes one instruction and
+                    // no load, where the OR into the word took three.
+                    let byte = std::ptr::from_ref(top).cast_mut().cast::<u8>();
+                    // SAFETY: the byte is inside the letter's atomics, writable through a shared
+                    // reference, and no other thread reads or writes them before the barrier.
+                    unsafe { byte.add(30).write(group as u8) };
                     let record = [1, id as i64, cents, name_len, note_len, 0, cents, cents];
                     merge(&mut groups[group], &record);
                 }
@@ -673,9 +681,9 @@ fn byte_mask(data: &[u8], at: usize, byte: u8) -> u64 {
     u64::from(half(0).cast_unsigned()) | u64::from(half(32).cast_unsigned()) << 32
 }
 
-/// A letter for the name at `start..end` of `data`, without its group, which the poster adds to
-/// the top 16 bits: the name's bytes as three little-endian words zero-padded to 24 bytes, then
-/// its 32-bit hash with its length above it. A name longer than that travels as its start and
+/// A letter for the name at `start..end` of `data`, without its group, which the poster writes
+/// to byte 30: the name's bytes as three little-endian words zero-padded to 24 bytes, then its
+/// 32-bit hash with its length above it. A name longer than that travels as its start and
 /// end offsets instead, with [`LONG`] as length.
 ///
 /// The three words come from one fixed-size read past the name's start, masked to its length,

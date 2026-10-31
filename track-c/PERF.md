@@ -40,6 +40,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 33 | The join's threads build the region table themselves, in two steps behind the round barrier, instead of on a pool of its own followed by two serial passes, with its pages mapped in on one CPU first; and the name sets are never freed | run-45ab2da93bdb | 0.0291 | 12.2 | 78.7 |
 | 34 | The amount parses as one number in cents, every number finds its stop as its first byte below `0`, the BOM test reads the id's word, a letter's stores read `sent[to]` once, the batch is made once per worker, and the input is prefetched 448 bytes ahead | run-91b80b654f7a | 0.0269 | 12.2 | 79.4 |
 | 35 | The region id and the amount parse together in one SSE vector, the name and the note come from one mask of quotes and commas whose prefix XOR marks the quoted bytes, the name hash is CRC32, the name set's key stays in one AVX2 register, and a letter's slot is read unchecked | run-6252826712db | 0.0252 | 12.9 | 79.3 |
+| 36 | The record batch holds each letter by reference, in an order whose loads are forwarded from their stores, and the group goes into its letter as one byte | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1052,6 +1053,65 @@ noted:
 The board's run, run-6252826712db, drew 25.2 ms against 27.2 ms for step 34's second run,
 run-835b63d0f252, and 26.9 ms for its first: −6 to −7%, less than the −10% measured here, while
 the 61 more lines cost about as many points as 5% of T.
+
+## Step 36: the batch's loads forwarded from its stores
+
+The record loop stores each record's fields into the batch of four and loads them back for the
+merge once the batch is parsed. In step 35's code the compiler had put two of them, the id and
+the amount, side by side, and loaded them as one 16-byte vector. A load that spans two stores
+still in the store buffer cannot take its bytes from them, so it waits until both reach the
+cache: `ld_blocks.store_forward` counted 0.44 to 0.64 M such loads per run, almost all in the
+merge. Three changes, none of which adds a line:
+
+- **The batch's fields in another order.** A tuple's layout is the compiler's choice. In this
+  order the id, the amount and the name's length, the three values that the merge puts into one
+  vector with the count, lie apart, so each is loaded on its own: store-forward blocks 0.44 M →
+  3.3 k per run. Alone it built the vector from three loads instead of two: instructions +1.4%,
+  `ab.py` +0.7%.
+- **The group as one byte.** The group went into the letter's last word with a load, an OR and a
+  store. One byte store now writes byte 30, bits 48 to 55, which `name_letter` leaves 0. With the
+  new order, `ab.py` −0.2% to −1.1% against step 35 in six rounds.
+- **The letter by reference.** The batch holds a reference to the record's letter instead of its
+  slot, so the group's store takes no second bounds check or address computation.
+
+On AC power, `ab.py`, 41 interleaved runs, two rounds, against step 35: medians 26.99 and 27.01
+→ 26.39 and 26.54 ms (−2.2% and −1.7%), minimums 26.24 and 26.13 → 25.89 and 25.92 ms; three
+earlier sessions of the same code measured −2.4%, −1.6% and −2.2%. `perf stat`, 20 interleaved
+runs: instructions:u 1055.2 → 1024.6 M (−2.9%, 318 → 309 per record), cycles:u 599.9 → 590.1 M
+(−1.6%). memory.peak, 15 alternating runs: medians 12.55 → 12.36 MiB. S 387 → 387. Correctness:
+the gate, 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes; the 400 fuzz
+cases and the two long-name sets pass at the default thread count, at 1, 3, 12, 37 and 64
+threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300 tiny seeds pass at 1, 2, 3, 5,
+7, 12, 16, 23, 37 and 64 threads with 100-byte rounds; the six files of edge cases match the
+reference at the default thread count, at 1 and 37 threads, and with 100-byte rounds at 3 and 64;
+clippy reports no warnings.
+
+Where step 35's slots go, top-down at level 2 (`perf stat --topdown`, P-cores): retiring 54%
+(light operations 51.2%, heavy 2.7%), bad speculation 8.6% (branch mispredicts 8.3%), frontend
+11.6% (latency 8.4%, bandwidth 3.2%) and backend 24.8% (core 17.0%, memory 7.8%). Of the 1.83 M
+branch misses per run, 94% are in `NameSet::read` and 86% at one branch, the tag compare of the
+probe: with the slots half full, a letter passes half a slot of other names on average before
+its own, and each such pass is a likely miss.
+
+Dropped, against the code before them; `ab.py` on AC power, 41 interleaved runs, two rounds, and
+`perf stat`, 20 interleaved runs:
+- **The letter as one AVX2 vector**, from one 32-byte load and one AND, and posted with one
+  32-byte store, with its three words taken out of the vector for the hash: instructions −5.7%,
+  but cycles +1.4% (on battery power) and `ab.py` +1.3% and +1.4%; with the group stored as one
+  byte, +0.9% and +0.5%. Top-down: frontend latency 8.4 → 9.6 to 11.1% of the slots. Step 32's
+  letter posted right after its name went the same way.
+- **One text path for every record**, the loop over 64-byte blocks that 2% of the records take,
+  which saves 18 lines (387 → 369): instructions +13.9%, cycles +5.0%.
+- **Non-temporal prefetches** (on battery power, `perf stat` only): of the input, cycles +4.7%; of
+  the region table, +2.4%; of both, +7.2%.
+- **Batches of 6 and 8 records** instead of 4, on this step's code, three rounds: 6 0.0% to
+  +0.1%, 8 −0.1% to −0.7%. Batches of 3, before the byte store and the reference: +1.6% and
+  +1.8%.
+- **The distinct names counted from the bits after the last round** (not built): the marking's
+  test and count are already one `bts` and one `sbb` on the group's count, and a pass over the
+  bits would visit every set bit, 0.9 per letter, since 89.8% of the records add a pair.
+- **The merge as vectors** (not built): the compiler already adds the record's first four fields
+  to its group with one AVX2 add.
 
 ## Experiments that did not stay
 
