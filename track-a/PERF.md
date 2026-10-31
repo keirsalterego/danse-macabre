@@ -717,9 +717,8 @@ line. `.text` is byte-identical to step 44's, and `.rodata` differs only in the 
 - **Per-thread `MADV_POPULATE_READ` of each chunk before parsing** (local only, measured under
   heavy load from other jobs, so only indicative): 80.5 → 80.1 ms. Not kept.
 - **Loops on 64-byte boundaries** (`-C llvm-args=-align-loops=64`, as track B builds; local,
-  on step 45's code): `ab.py`, 40 interleaved runs, medians / minimums 20.19 / 19.31 →
-  20.80 / 20.22 ms. A second round was noisy, with medians near 25 ms for both builds, and its
-  minimum still rose, 19.82 → 20.18 ms. The output hash is unchanged.
+  on step 45's code): `ab.py`, 40 interleaved runs, two rounds, medians / minimums 20.22 / 19.46
+  → 20.87 / 20.22 ms and 20.37 / 19.61 → 20.99 / 20.35 ms. The output hash is unchanged.
 
 ## Profile notes
 
