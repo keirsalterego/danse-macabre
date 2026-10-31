@@ -992,6 +992,8 @@ over 8 alternating runs: median 41.1 → 41.1 MB. S 762 → 763. Gate: 510 pass,
 The board measured steps 37 and 38 together, in run-5de0cb146d0e, on a slow box: 144.5 ms at
 41.4 MB, while track C's unchanged code drew 45.9 ms in the same run, against 25.2 ms in the one
 before, and track D's 147.7 ms, against 122 to 132 ms.
+A second run of the same code, run-0ea6dd17c4d2 (with track C's step 36), drew 129.1 ms at
+39.6 MB.
 
 ## Experiments that did not stay
 
