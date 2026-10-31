@@ -193,7 +193,8 @@ fn summarize(log: &'static [u8], out_path: &Path) {
     let (plan, places, barrier) = (OnceLock::new(), OnceLock::new(), Barrier::new(threads));
     let (taken, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let work = |t: usize| {
-        let _ = chunks[t].set(parse(log, start(t)..start(t + 1)));
+        // SAFETY: every chunk ends by `len`, LINE bytes before the end of `log`.
+        let _ = chunks[t].set(unsafe { parse(log, start(t)..start(t + 1)) });
         // One thread, the barrier's leader, plans the hour pass while the others wait.
         if barrier.wait().is_leader() {
             let mut runs: Vec<Vec<Run>> = vec![Vec::new(); HOURS];
@@ -359,8 +360,13 @@ const LARGE: u32 = (1 << 19) - 1;
 ///
 /// The function stays out of line. Inlined into the work closure, whose stack frame is aligned
 /// to 32 bytes, the loop lost `rbp` to the frame pointer and kept more of its values on the stack.
+///
+/// # Safety
+///
+/// `lines` must end at least [`LINE`] bytes before the end of `log`, as the padding that
+/// [`map_file`] maps after the file provides: the loop reads LINE bytes from each line's start.
 #[inline(never)]
-fn parse(log: &'static [u8], lines: Range<usize>) -> Chunk {
+unsafe fn parse(log: &'static [u8], lines: Range<usize>) -> Chunk {
     // A run lasts while the timestamp's bytes 5 to 12, `MM-DDTHH`, stay the same, so most lines
     // compare those 8 bytes and decode nothing. No line's bytes are all zero, so line 0 starts a
     // run.
@@ -371,7 +377,6 @@ fn parse(log: &'static [u8], lines: Range<usize>) -> Chunk {
     // behind in the thread's malloc arena, where it stayed in memory to the end.
     chunk.records = vec![0; lines.len() / MIN_LINE + 1];
     chunk.large = Vec::with_capacity(lines.len() / MIN_LINE + 1);
-    assert!(lines.end + LINE <= log.len(), "map_file pads the log");
     // The loop moves a pointer to the line, not an index into `log`: one register fewer.
     let (mut at, end) = (log[lines.start..].as_ptr(), log[lines.end..].as_ptr());
     // Three rare paths are marked cold: a new run, a latency of 8 digits or more, and a second
@@ -387,7 +392,7 @@ fn parse(log: &'static [u8], lines: Range<usize>) -> Chunk {
         unsafe { _mm_prefetch::<_MM_HINT_T0>(at.wrapping_add(384).cast()) };
         // SAFETY: the same.
         unsafe { _mm_prefetch::<_MM_HINT_T0>(at.wrapping_add(448).cast()) };
-        // SAFETY: at < end, so the LINE bytes from `at` lie inside `log` (asserted above).
+        // SAFETY: at < end, so the LINE bytes from `at` lie inside `log` (see `# Safety`).
         let line: &[u8; LINE] = unsafe { &*at.cast() };
         let lf = line_end(line);
         at = at.wrapping_add(lf + 1);
@@ -457,16 +462,17 @@ fn equal_mask(a: &[u8; 64], b: &[u8; 64]) -> u64 {
     u64::from(low.cast_unsigned()) | u64::from(high.cast_unsigned()) << 32
 }
 
-/// Returns the hour index `0..72` of a line's timestamp, or `None` outside the span.
+/// Returns the hour index `0..72` of a line's timestamp, or `None` for a day outside the span.
 ///
 /// The timestamp is fixed-width, so we read the month and day, and the hour digits, straight
 /// from their offsets instead of parsing a date. The span starts at 18:00 on the first of the
 /// [`DAYS`], so the index is `day × 24 + hour − 18`. For example `2026-11-01T00:...` is index
-/// 30.
+/// 30. An hour of those days outside the span, which the spec rules out (§2), gives no index in
+/// `0..72`, or the subtraction overflows; either way the program stops, at the latest at the plan's
+/// index into the hours.
 fn hour_index(line: &[u8]) -> Option<usize> {
     let day = DAYS.iter().position(|day| day.as_bytes() == &line[5..10])?;
-    let hour = day * 24 + usize::from(line[11] - b'0') * 10 + usize::from(line[12] - b'0');
-    hour.checked_sub(18).filter(|&hour| hour < HOURS)
+    Some(day * 24 + usize::from(line[11] - b'0') * 10 + usize::from(line[12] - b'0') - 18)
 }
 
 /// Returns the latency that ends at `lf`, and the index of the space before it, which is at
@@ -660,8 +666,8 @@ impl<'a> Interner<'a> {
             drop(count);
             return self.intern(name, hash(name, word(window, 0)), window);
         }
-        // The spec gives every seed 1,842 endpoints (§2), well below the 4,096 that 12 bits hold.
-        assert!(*count < 1 << 12, "over 4,096 distinct endpoints");
+        // The spec gives every seed 1,842 endpoints (§2), well below the 4,096 that 12 bits hold:
+        // the index of the 4,097th name's copy would stop the program.
         // The name, then the space if there is room for it, then zeros.
         let padded = std::array::from_fn(|i| if i <= name.len() { window[i] } else { 0 });
         // SAFETY: no slot holds this id yet, so no other thread reads the copy, and only the

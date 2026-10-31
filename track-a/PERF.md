@@ -59,6 +59,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 52 | Endpoint names hashed with the CPU's CRC32C instruction instead of a multiply: 9.2 M instructions fewer | run-3367489cfd2c | 0.0176 | 18.6 | 86.3 |
 | 53 | 9 fewer lines in the hour pass at the same speed: the large latency taken in `unwrap_or_else`, empty groups filtered out, the three selections in one `map`, the chunk's two releases in one | run-3367489cfd2c | 0.0176 | 18.6 | 86.3 |
 | 54 | The latency's space bounded with `assert_unchecked`, so reading the status and ending the name take no bounds checks: 9.8 M instructions fewer | | | | |
+| 55 | 3 fewer lines: `parse` an `unsafe fn` whose contract is the padding its `assert!` checked, and two range checks left to the indexes behind them | | | | |
 
 ## Step 1: v1
 
@@ -902,6 +903,29 @@ before step 53 went in, the same change ran instructions:u 591.5 → 581.8 M and
 pointer form under "Experiments that did not stay"). memory.peak, eight alternating rounds on seeds
 1, 2, 3, 5, 7, 10 and 11: median 18.26 → 18.30 MB, noise, as the change allocates nothing.
 S 363 → 364. Gate: 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes; clippy
+reports no warnings.
+
+## Step 55: 3 fewer lines
+
+`parse` becomes an `unsafe fn`. Its `# Safety` section states what its `assert!` checked: its lines
+end at least `LINE` bytes before the end of the log, as the padding from `map_file` provides. The
+one call says why that holds: every chunk ends by `len`, `LINE` bytes before the end.
+
+Two checks of input the spec rules out go to the indexes behind them. `hour_index` no longer checks
+the hour against the span: an hour of the span's days outside it now stops the run at the plan's
+index into the hours instead of at the parse's `expect`. `Interner::insert` no longer asserts that a
+4,097th name has no room: the index of its padded copy stops the run instead. Tried with hand-made
+logs, each run ends with "index out of bounds" and writes no output: a line at 17:00 on the first
+day, one at 18:00 on the last, and 4,100 distinct endpoints. A day outside the span still ends at
+the `expect`.
+
+Local, AC power, turbo off. `perf stat`, 30 interleaved runs, against step 54: instructions:u
+585.39 → 585.41 M, cycles:u median 322.2 → 320.6 M. `ab.py`, 61 interleaved runs, fourteen rounds:
+medians 18.76 → 18.78, 18.77 → 18.76, 18.80 → 18.80, 18.79 → 18.99, 18.70 → 18.88, 18.84 → 18.83,
+18.85 → 18.88, 18.82 → 18.73, 18.84 → 18.78, 18.83 → 18.74, 18.80 → 18.73, 18.76 → 18.76 and
+18.76 → 18.73 ms, and 23.94 → 23.67 ms in a round on a busy box: no change. `.text`, `.data` and
+`.bss` keep their sizes, `.rodata` loses 96 bytes of panic messages, and no allocation changes.
+S 364 → 361. Gate: 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes; clippy
 reports no warnings.
 
 ## Experiments that did not stay
