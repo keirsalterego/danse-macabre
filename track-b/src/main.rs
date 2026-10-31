@@ -696,17 +696,28 @@ impl Tally {
         }
     }
 
-    /// Records that `doc` matches check `c` of query `q` when `hit`, without a branch on
-    /// `hit` in the common case: a check past its first matches only adds to its cell.
-    fn add_check(&mut self, c: usize, q: u32, doc: u32, hit: bool) {
-        let cell = &mut self.checks[c];
-        // A conditional move: `hit` follows no pattern, and the compiler makes a product with
-        // it a branch.
-        *cell += std::hint::select_unpredictable(hit, 1 << SUM_BITS | u64::from(doc), 0);
-        let shown = &mut self.shown[q as usize];
-        if hit && *cell >> SUM_BITS <= SHOWN_IDS as u64 && usize::from(*shown) < SHOWN_IDS {
-            *shown += 1;
-            self.first.push((q, doc));
+    /// Records which of the checks `todo`, indices into `checks`, `doc` matches, given `seen`,
+    /// with no branch on a check's result: it follows no pattern, and it comes at the end of a
+    /// chain of loads. The queries of the checks that `doc` is one of the first matches of
+    /// overwrite the front of `todo`, and only those then go on to the first matches. A
+    /// method, so the compiler knows that the stores to the cells and to `todo` leave `self`
+    /// alone.
+    fn add_checks(&mut self, checks: &[Check], todo: &mut [u32], seen: &[u64], doc: u32) {
+        let (add, mut firsts) = (1 << SUM_BITS | u64::from(doc), 0);
+        for i in 0..todo.len() {
+            let c = todo[i] as usize;
+            // SAFETY: the binary targets alderlake (.cargo/config.toml), which has AVX2.
+            let hit = unsafe { checks[c].matches(seen) };
+            // A conditional move: the compiler makes a product with `hit` a branch.
+            self.checks[c] += std::hint::select_unpredictable(hit, add, 0);
+            todo[firsts] = checks[c].q;
+            firsts += usize::from(hit && self.checks[c] >> SUM_BITS <= SHOWN_IDS as u64);
+        }
+        for &q in &todo[..firsts] {
+            if usize::from(self.shown[q as usize]) < SHOWN_IDS {
+                self.shown[q as usize] += 1;
+                self.first.push((q, doc));
+            }
         }
     }
 
@@ -903,11 +914,8 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
                 }
             }
         }
-        for c in bool_terms.drain(..) {
-            let check = &plan.checks[c as usize];
-            // SAFETY: the binary targets alderlake (.cargo/config.toml), which has AVX2.
-            tally.add_check(c as usize, check.q, doc, unsafe { check.matches(&seen) });
-        }
+        tally.add_checks(&plan.checks, &mut bool_terms, &seen, doc);
+        bool_terms.clear();
         // Every set bit is one of the doc's terms, so zeroing their words clears `seen`: a store
         // with no load, so tokens that share a word, as all misses do, do not wait on each other.
         for &t in terms {

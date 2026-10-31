@@ -37,6 +37,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 30 | A plain static executable (`crt-static` and `relocation-model=static`) instead of a dynamically linked PIE | run-4654d088e3bb | 0.1615 | 41.1 | 73.7 |
 | 31 | The token loop writes a document's term ids and its kept rows, lists and BOOL triggers into four runs of one slice, and its seen bits, without bounds checks, so its registers no longer spill | run-ea58cfb946e5 | 0.1483 | 42.1 | 74.6 |
 | 32 | 1 fewer line with the same binary: the build stage mounts its sources instead of copying them | | | | |
+| 33 | A document's checks are added in one `Tally` method that takes no branch on a check's result: the queries of the checks that the document is one of the first matches of are moved to the front of its list of checks, and only those go on to the first-match counts | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -732,6 +733,37 @@ read-only. `harness/dockerfile_check.py` accepts a bind mount of the context, an
 built track A's Dockerfile with the same mount (its step 45). A local `docker build
 --network=none` gives a binary byte-identical to step 31's, so T and M cannot move. S 746 →
 745.
+
+## Step 33: the first matches without a branch on a check's result
+
+After step 31, `Tally::add_check` still took a branch on each check's result: step 11 made the
+add to the cell a conditional move, but recording a first match (`hit`, the check's count at most
+`SHOWN_IDS`, and its query's count below `SHOWN_IDS`) branched on `hit` first. A check's result
+follows no pattern and comes at the end of a chain of loads, the check's terms and then the
+gather of their words of `seen`, so the branch resolved late and often missed.
+
+[`Tally::add_checks`] now takes all of a document's triggered checks. For each, it adds to the
+cell with a conditional move as before, writes the check's query at a cursor over the front of
+the list of checks, and moves the cursor on when the check matched and is within its first
+`SHOWN_IDS` matches, so no branch depends on the result. A second loop then records the first
+matches from the queries before the cursor: 678 K of the 16.9 M checks evaluated reach it, and
+502 K are recorded. It is a method so that LLVM knows the stores to the cells and to the list
+leave `self` alone, and keeps the addresses of its vectors in registers.
+
+Local, against step 31 (`ab.py`, 20 alternating runs, load average 2–6), four rounds: medians
+156.66, 157.64, 157.21 and 156.48 → 152.23, 152.33, 153.10 and 152.11 ms, minimums 155.37,
+155.21, 155.82 and 155.02 → 151.04, 151.06, 150.88 and 150.80 ms. `perf stat`: user cycles 3.82
+→ 3.69 G, instructions 7,338 → 7,257 M, branch misses 18.1 → 16.9 M. memory.peak over five
+alternating runs: median 41.3 → 41.3 MB. S 745 → 750. Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10
+and 12 match their reference hashes.
+
+Moving the loop into the method alone, with the branch on `hit` kept, cut instructions to
+7,202–7,270 M but left branch misses at 18.1 M and user cycles at 3.79–3.82 G, inlined or not.
+Writing every check's (query, document) into the spare capacity of the first-match list and
+adding to its length only for a first match cut branch misses to 16.3 M but added 121 M
+instructions, for 3.81 G cycles. A single compare of the cell against a limit that is 0 on a
+miss became two branches again, with 22.9 M misses and 4.03 G cycles; held in a register by an
+empty `asm!` block, it stayed one compare, but the misses stayed at 18.1 M.
 
 ## Experiments that did not stay
 
