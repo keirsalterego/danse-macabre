@@ -26,6 +26,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 19 | 99 fewer code lines: the cold code and the term table simplified (no doubling), the walk's bit pops in one helper; the key-mask table aligned to a cache line | run-74f2276732d6 | 0.2241 | 42.9 | 70.1 |
 | 20 | The rarity sample is the corpus's first 1/64 (4,005 documents on seed 1) instead of its first 1,000 documents, each thread counting a part | run-75d28a617cc4 | 0.2158 | 42.8 | 70.5 |
 | 21 | 35 fewer code lines: one helper runs and joins each set of threads, the intern loop drops its prefetch, the output adds each query's cells once; every loop starts on a 64-byte boundary | run-f0c533c66a88 | 0.2165 | 42.9 | 70.6 |
+| 22 | 8 fewer code lines in code that runs once, with the same machine code | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -454,6 +455,20 @@ Locally, against step 20 (alternating runs, 41 and 61 each): median 226.00 and 2
 and 225.80 ms, min 224.90 and 225.00 → 224.32 and 224.15 ms. memory.peak over 10 and 16
 alternating runs: medians 42.95 and 42.74 → 43.61 and 42.93 MB. S 771 → 736. Gate: 510 pass,
 0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
+
+## Step 22: 8 fewer lines, the same machine code
+
+Four spots in code that runs once, written so that rustfmt keeps them on fewer lines:
+
+- In `answer_all`, the chain that reads each chunk's first id and the check on the document
+  count each put their receiver in parentheses, so each is a one-call chain that fits on one
+  line (−5).
+- `bit_index_sum` names its per-mask closure, `weight` (−1).
+- `TermTable::new` binds the empty `keys` first, so the struct literal fits on one line (−2).
+
+Checks: the built binary's `.text` and `.rodata` are byte for byte those of step 21, and only
+88 bytes of `.data.rel.ro` differ (the line numbers in panic locations), so T and memory are
+unchanged. S 736 → 728. Gate: 510 pass, 0 fail.
 
 ## Experiments that did not stay
 

@@ -115,16 +115,11 @@ fn answer_all(query_text: &[u8], docs: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     let bounds = line_bounds(docs, threads);
     // Line `i` holds id `i` (spec §2.1), so the id at a chunk's first line numbers all of its
     // lines, and the id after the last line is the number of documents.
-    let firsts = (bounds.iter())
-        .map(|&at| id_at(docs, at))
-        .collect::<Result<Vec<_>, _>>()?;
+    let firsts = (bounds.iter().map(|&at| id_at(docs, at))).collect::<Result<Vec<_>, _>>()?;
     // A query's id sum over a chunk stays below the square of the document count.
     // shortcut: 2^20 or more documents stop here; the spec's full scale has 250,000. Widen the
     // cells to u128 if a corpus that large must run.
-    if firsts
-        .last()
-        .is_some_and(|&n| u64::from(n).pow(2) >> SUM_BITS != 0)
-    {
+    if (firsts.last()).is_some_and(|&n| u64::from(n).pow(2) >> SUM_BITS != 0) {
         return Err("docs.txt: too many documents".into());
     }
     let chunks = parallel(threads, &|c| {
@@ -932,9 +927,8 @@ const HAS: [u64; 6] = [
 /// The sum of the positions of the set bits in `word`: each set bit of mask `k` ([`HAS`])
 /// adds `2^k`.
 fn bit_index_sum(word: u64) -> u64 {
-    (HAS.iter().enumerate())
-        .map(|(k, &mask)| u64::from((word & mask).count_ones()) << k)
-        .sum()
+    let weight = |(k, &mask): (usize, &u64)| u64::from((word & mask).count_ones()) << k;
+    HAS.iter().enumerate().map(weight).sum()
 }
 
 /// Starts loading the cache line that holds `item` into L1.
@@ -1060,10 +1054,8 @@ impl TermTable {
             block.write_bytes(0, layout.size());
             std::slice::from_raw_parts_mut(block.cast(), len)
         };
-        Self {
-            slots,
-            keys: Vec::new(),
-        }
+        let keys = Vec::new();
+        Self { slots, keys }
     }
 
     fn len(&self) -> usize {
