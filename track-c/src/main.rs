@@ -212,13 +212,6 @@ fn map_file(path: &Path) -> Result<&'static [u8], String> {
     Ok(unsafe { std::slice::from_raw_parts(ptr, len + PAD) })
 }
 
-/// Runs `work(i)` for each `i` in `0..n`, each on a thread of its own. No call returns: the last
-/// worker to finish ends the process, which also ends the others (see [`join`]).
-fn parallel(n: usize, work: &(impl Fn(usize) + Sync)) -> ! {
-    thread::scope(|s| (0..n).for_each(|i| _ = s.spawn(move || work(i))));
-    unreachable!("the last worker ends the process")
-}
-
 /// Calls `row` with (region id, code) for each row of `regions.csv` that starts in the given one
 /// of `shares` even shares of the file, where the code is the country as a number below
 /// [`CODES`].
@@ -274,13 +267,13 @@ fn region_rows(csv: &[u8], share: usize, shares: usize, mut row: impl FnMut(usiz
 /// # The exchange
 ///
 /// The workers hand each name to the worker that owns it through mailboxes, `[half][from][to]`,
-/// of [`MAILBOX`] letters of two words each (see [`name_letter`]), and `counts` says how many
-/// letters each holds this round. There are two sets of mailboxes, one per parity of the round.
-/// In round r a worker posts into set r % 2, which nobody reads at that time: the set was last
-/// read in round r - 2, and every worker finished reading it before it arrived at the barrier of
-/// round r - 1, which the poster has passed. So one barrier per round is enough. The letters are
-/// atomics only so that safe code can share them; every access is `Relaxed`, a plain load or
-/// store, and the barrier orders them.
+/// of [`MAILBOX`] letters of two words each (see [`name_letter`]), and `ends` says where the
+/// letters in each end this round, as the index of the letter after them. There are two sets of
+/// mailboxes, one per parity of the round. In round r a worker posts into set r % 2, which nobody
+/// reads at that time: the set was last read in round r - 2, and every worker finished reading
+/// it before it arrived at the barrier of round r - 1, which the poster has passed. So one
+/// barrier per round is enough. The letters are atomics only so that safe code can share them;
+/// every access is `Relaxed`, a plain load or store, and the barrier orders them.
 ///
 /// Every worker takes part in every round, as many as the longest run needs, so the barrier
 /// only counts arrivals: the barrier that ends step k is passed once `threads` × (k + 1) workers
@@ -298,9 +291,9 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
     // SAFETY: `AtomicU64` has the same layout as `u64`, and all-zero bits are a valid 0.
     let zeroed = |len| unsafe { Box::<[AtomicU64]>::new_zeroed_slice(len).assume_init() };
     let letters = zeroed(2 * threads * threads * MAILBOX * 2);
-    let (counts, arrived) = (zeroed(2 * threads * threads), AtomicU64::new(0));
+    let (ends, arrived) = (zeroed(2 * threads * threads), AtomicU64::new(0));
     let mailbox = |half: usize, from: usize, to: usize| (half * threads + from) * threads + to;
-    let mail = |mb: usize| &letters[mb * MAILBOX * 2..][..counts[mb].load(Relaxed) as usize * 2];
+    let mail = |mb: usize| &letters[mb * MAILBOX * 2..ends[mb].load(Relaxed) as usize * 2];
     let boxes = letters.as_chunks::<2>().0;
     // The region table (see above): the codes that occur, as bits, and the group of each id.
     let last_row = (regions[..regions.len() - PAD - 1].iter()).rposition(|&b| b == b'\n');
@@ -328,7 +321,7 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
     // worker that owns it, waits at the barrier for all workers, and then marks the names posted
     // to it in its own [`NameSet`]. After the last round it gives its pages back, and the last
     // worker to finish writes the output.
-    parallel(threads, &|me| {
+    let work = |me: usize| {
         // Step 0 of the region table: the codes of this thread's share of the rows.
         let mut mine = [0u64; CODES.div_ceil(64)];
         region_rows(regions, me, threads, |_, c| mine[c / 64] |= 1 << (c % 64));
@@ -427,8 +420,7 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
                     // no other thread reads or writes them before the barrier.
                     unsafe { std::ptr::write(boxes[slot].as_ptr().cast_mut().cast(), letter) };
                     batch[parsed] = (id, region_id, cents, note_len, name_len, &boxes[slot]);
-                    *sent = slot + 1;
-                    parsed += 1;
+                    (*sent, parsed) = (slot + 1, parsed + 1);
                 }
                 for &(id, region_id, cents, note_len, name_len, top) in &batch[..parsed] {
                     // Records also reference ids past the table's largest (§2.2), so the lookup
@@ -448,13 +440,10 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
                 }
             }
             for (to, &next) in sent.iter().enumerate() {
-                let mb = mailbox(half, me, to);
-                counts[mb].store((next - mb * MAILBOX) as u64, Relaxed);
+                ends[mailbox(half, me, to)].store(next as u64, Relaxed);
             }
             barrier(&arrived, (round + 3) * threads);
-            for from in 0..threads {
-                names.read(mail(mailbox(half, from, me)), &mut groups);
-            }
+            (0..threads).for_each(|from| names.read(mail(mailbox(half, from, me)), &mut groups));
         }
         // The run's pages go back to the kernel with `madvise(MADV_DONTNEED)`, and then the name
         // set's entries. At exit the kernel unmaps every page left on one thread, inside the timed
@@ -495,7 +484,11 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
         (all.iter()).for_each(|part| (groups.iter_mut().zip(part)).for_each(|(g, p)| merge(g, p)));
         write(out, format_output(&groups, &codes)).expect("a writable output directory");
         std::process::exit(0)
-    })
+    };
+    // One thread per worker. The scope never ends: the last worker to finish ends the process,
+    // which also ends the others.
+    thread::scope(|s| (0..threads).for_each(|me| _ = s.spawn(move || work(me))));
+    unreachable!("the last worker ends the process")
 }
 
 /// Arrives at the barrier that `arrived` counts, and waits until `all` workers have arrived.
@@ -593,11 +586,9 @@ unsafe fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
 /// comma before `at`, so the read is not checked again: its check took five instructions per
 /// record.
 unsafe fn region_amount(data: &[u8], at: usize) -> (u64, i64, usize) {
-    // SAFETY: the caller keeps the 16 bytes in `data`, and `[u8; 16]` needs no alignment.
-    let bytes: &[u8; 16] = unsafe { &*data.as_ptr().add(at).cast() };
     // SAFETY: the build targets Alder Lake, which has SSE2 (see `.cargo/config.toml`), and the
-    // load reads the 16 bytes of `bytes`. `loadu` needs no alignment.
-    let window = unsafe { _mm_loadu_si128(bytes.as_ptr().cast()) };
+    // caller keeps the 16 bytes from `at` in `data`. `loadu` needs no alignment.
+    let window = unsafe { _mm_loadu_si128(data.as_ptr().add(at).cast()) };
     // SAFETY: as above.
     let digits = unsafe { _mm_movemask_epi8(_mm_cmpgt_epi8(window, _mm_set1_epi8(b'/' as i8))) };
     let stops = digits.cast_unsigned() ^ 0x1_FFFF;
@@ -617,8 +608,7 @@ unsafe fn region_amount(data: &[u8], at: usize) -> (u64, i64, usize) {
         let pairs = _mm_maddubs_epi16(aligned, _mm_set1_epi16((1 << 8) + 10));
         let fours = _mm_madd_epi16(pairs, _mm_set1_epi32((1 << 16) + 100));
         let fours = _mm_packus_epi32(fours, fours);
-        let both = _mm_madd_epi16(fours, _mm_set1_epi32((1 << 16) + 10000));
-        _mm_cvtsi128_si64(both).cast_unsigned()
+        _mm_cvtsi128_si64(_mm_madd_epi16(fours, _mm_set1_epi32((1 << 16) + 10000))).cast_unsigned()
     };
     let negative = stops >> (comma + 1) & 1 == 1;
     let cents = (both >> 32).cast_signed() * if negative { -1 } else { 1 };
@@ -632,7 +622,6 @@ unsafe fn region_amount(data: &[u8], at: usize) -> (u64, i64, usize) {
 ///
 /// `at` is at most the input's length, `data.len() - PAD`, as for [`region_amount`].
 #[cold]
-#[inline(never)]
 unsafe fn region_amount_slow(data: &[u8], at: usize) -> (u64, i64, usize) {
     // SAFETY: the caller keeps `at` at most the input's length, so the 8 bytes from it end
     // inside the pad.
@@ -652,18 +641,15 @@ unsafe fn region_amount_slow(data: &[u8], at: usize) -> (u64, i64, usize) {
 /// puts a zero there. Byte j < 8 takes byte j + comma - 8, which right-aligns the region id in
 /// the low half. Bytes 8 to 13 take j + dot - 14, the amount's sign and integer digits, and bytes
 /// 14 and 15 take j + dot - 13, its cents, which skips the dot. A byte whose source lies before
-/// its field stays 0x80. SSE shifts bytes only by constants, so each layout needs a control of
+/// its field is 0x80. SSE shifts bytes only by constants, so each layout needs a control of
 /// its own, and as vectors the controls are 16-byte aligned, so none straddles two cache lines.
 static ALIGN: [__m128i; 128] = {
-    let mut table = [[0x80; 16]; 128];
-    let mut i = 0;
+    let (mut table, mut i) = ([[0; 16]; 128], 0);
     while i < 128 * 16 {
         let (comma, dot, j) = (i >> 8, i >> 4 & 15, i & 15);
         // The source plus 14, which keeps it from going below 0, and its field's start plus 14.
-        let [from, start] = [[j + comma + 6, 14], [j + dot + j / 14, comma + 15]][j / 8];
-        if from >= start {
-            table[i >> 4][j] = (from - 14) as u8;
-        }
+        let [src, start] = [[j + comma + 6, 14], [j + dot + j / 14, comma + 15]][j / 8];
+        table[i >> 4][j] = if src >= start { (src - 14) as u8 } else { 0x80 };
         i += 1;
     }
     // SAFETY: `__m128i` is 16 bytes, and every bit pattern is a valid one.
@@ -713,7 +699,6 @@ fn text_fields(data: &[u8], at: usize) -> (Range<usize>, i64, i64, usize) {
 /// time, with the parity of the quotes carried from each block to the next. About 2% of the
 /// records come here, so it is cold and out of line.
 #[cold]
-#[inline(never)]
 fn text_fields_slow(data: &[u8], at: usize) -> (Range<usize>, i64, i64, usize) {
     // The commas that end the name and the note, each with the number of quotes before it.
     let (mut ends, mut found, mut block, mut odd, mut seen) = ([[0; 2]; 2], 0, at, 0, 0);

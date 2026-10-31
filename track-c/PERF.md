@@ -46,6 +46,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 39 | The name's 24 bytes, the region id's and the amount's 16 and the byte after the cents are read without bounds checks, a name set's slot holds its entry above its tag, the quotes are counted with `bzhi`, a CR is told from an LF by its lowest bit, the region id's length takes one compare, and the marking takes its group unchecked | run-d0d0e233e6f7 | 0.0228 | 12.5 | 80.5 |
 | 40 | `number` reads a field's word without a bounds check, as an `unsafe fn` whose six calls each show that the 8 bytes lie in the input or its pad, and the BOM test reads its byte unchecked | run-d1b2c0ca269e | 0.0240 | 12.2 | 80.1 |
 | 41 | A name is known by a 128-bit hash of its bytes, three AES rounds: a letter is 16 bytes instead of 32 and is posted with one store, and a name set's entry is 40 bytes instead of 64, 64 bits of the hash beside the name's group bits | run-65f94ca68a16 | 0.0226 | 11.5 | 81.1 |
+| 42 | 13 fewer lines at the same speed: `region_amount` and `ALIGN` written shorter, the cold paths without `#[inline(never)]`, the mailboxes read in one `for_each` and published by their ends, and `parallel` written into `join` | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1446,6 +1447,29 @@ memory.peak, 80 alternating runs: median 12.34 → 10.88 MiB, expected highest o
 the reference hashes; the fuzz and thread-count suite, 3,000 cases, and the 30 edge-case files
 pass; of the wide region sets, w2 gives the reference, and w0 and w1 stop with the error as
 before; clippy reports no warnings.
+
+## Step 42: 13 fewer lines
+
+Seven of the cuts leave the machine code as it was (the `.text` section's sha256 is step 41's):
+
+- `region_amount` loads its window from `data` directly and returns the `madd`'s sum as it
+  comes, with no temporaries; its two SAFETY comments are one.
+- `ALIGN` sets each control byte with one `if`/`else`, the table and its index in one `let`.
+- `text_fields_slow` and `region_amount_slow` keep `#[cold]` and drop `#[inline(never)]`, as
+  `long_letter` does: LLVM keeps cold functions out of line either way.
+
+Six change it, so they were timed:
+
+- The per-round mailbox reads are one `(0..threads).for_each(…)`.
+- A mailbox publishes its end, `sent[to]`, instead of its count, so the reader slices up to it
+  with no multiply and subtract.
+- The slot and the parsed count are bumped in one assignment.
+- `parallel`, used once, is written into `join`.
+
+Local, against step 41 (`ab.py`, 41 interleaved runs on the P-cores): the six together, medians
+23.59 and 23.67 → −0.21% and −0.30%, and in a third round 23.69 → 23.62 ms, minimums 23.30 →
+23.02 ms. Each alone: from +0.04% to −1.10%. S 381 → 368. Gate: 310 pass, 0 fail; clippy reports
+no warnings.
 
 ## Experiments that did not stay
 
