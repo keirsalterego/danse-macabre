@@ -1090,6 +1090,10 @@ two rounds: medians 135.79 and 135.36 → 132.35 and 131.44 ms, minimums 133.76 
 129.75 and 130.03 ms. memory.peak over 8 alternating runs: median 41.42 → 40.71 MB, highest
 42.97 → 42.06 MB. S 774 → 763 (on step 39's code, 769 → 758). Gate: 510 pass, 0 fail.
 
+The board ran steps 40 and 41 together, run-ff1ae2c91791 (commit f17de2c), 126.9 ms; a second run of
+the same code, run-9f07c5db9176 (commit ca86ea9, which changed only track C), drew 124.4 ms, 42.7 MB
+and 76.5 points.
+
 ## Experiments that did not stay
 
 - **After step 39, each token's range of checks prefetched** (local, seed 1). The BOOL triggers'

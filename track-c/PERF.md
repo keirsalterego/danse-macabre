@@ -44,7 +44,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 37 | The merge takes its group from `by_id` without a bounds check, and a letter's thread is picked with `sent.len()` instead of a load through the closure's reference to the thread count | run-0ff0124ce494 | 0.0237 | 12.5 | 80.1 |
 | 38 | The last worker to finish merges the groups, writes the output and ends the process while the others sleep, so no thread ends first, and each worker gives back its name set's entries after its run; and `main` is C's, so the Rust runtime's setup, whose stack-overflow handler gave every thread a signal stack, does not run | run-490c7c238e52 | 0.0235 | 12.1 | 80.3 |
 | 39 | The name's 24 bytes, the region id's and the amount's 16 and the byte after the cents are read without bounds checks, a name set's slot holds its entry above its tag, the quotes are counted with `bzhi`, a CR is told from an LF by its lowest bit, the region id's length takes one compare, and the marking takes its group unchecked | run-d0d0e233e6f7 | 0.0228 | 12.5 | 80.5 |
-| 40 | `number` reads a field's word without a bounds check, as an `unsafe fn` whose six calls each show that the 8 bytes lie in the input or its pad, and the BOM test reads its byte unchecked | | | | |
+| 40 | `number` reads a field's word without a bounds check, as an `unsafe fn` whose six calls each show that the 8 bytes lie in the input or its pad, and the BOM test reads its byte unchecked | run-d1b2c0ca269e | 0.0240 | 12.2 | 80.1 |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1404,6 +1404,9 @@ interleaved runs:
   window from the byte after it ends 67 bytes into the pad. Alone: instructions −1.46% (4 per
   record), cycles −0.17%, three rounds 0.0%, 0.0% and −0.3%. With this step's change, against
   it: instructions −0.77%, cycles −0.02%, seven rounds from −0.2% to +0.2%.
+
+The board's run, run-d1b2c0ca269e (commit ca86ea9), drew 24.0 ms, a slow draw: step 39's code drew
+22.8 ms in its own run, and this step runs 0.8–1.4% faster locally.
 
 ## Experiments that did not stay
 
