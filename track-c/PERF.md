@@ -46,7 +46,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 39 | The name's 24 bytes, the region id's and the amount's 16 and the byte after the cents are read without bounds checks, a name set's slot holds its entry above its tag, the quotes are counted with `bzhi`, a CR is told from an LF by its lowest bit, the region id's length takes one compare, and the marking takes its group unchecked | run-d0d0e233e6f7 | 0.0228 | 12.5 | 80.5 |
 | 40 | `number` reads a field's word without a bounds check, as an `unsafe fn` whose six calls each show that the 8 bytes lie in the input or its pad, and the BOM test reads its byte unchecked | run-d1b2c0ca269e | 0.0240 | 12.2 | 80.1 |
 | 41 | A name is known by a 128-bit hash of its bytes, three AES rounds: a letter is 16 bytes instead of 32 and is posted with one store, and a name set's entry is 40 bytes instead of 64, 64 bits of the hash beside the name's group bits | run-65f94ca68a16 | 0.0226 | 11.5 | 81.1 |
-| 42 | 13 fewer lines at the same speed: `region_amount` and `ALIGN` written shorter, the cold paths without `#[inline(never)]`, the mailboxes read in one `for_each` and published by their ends, and `parallel` written into `join` | | | | |
+| 42 | 13 fewer lines at the same speed: `region_amount` and `ALIGN` written shorter, the cold paths without `#[inline(never)]`, the mailboxes read in one `for_each` and published by their ends, and `parallel` written into `join` | run-d7d23764cf12 | 0.0219 | 11.4 | 81.6 |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1470,6 +1470,9 @@ Local, against step 41 (`ab.py`, 41 interleaved runs on the P-cores): the six to
 23.59 and 23.67 → −0.21% and −0.30%, and in a third round 23.69 → 23.62 ms, minimums 23.30 →
 23.02 ms. Each alone: from +0.04% to −1.10%. S 381 → 368. Gate: 310 pass, 0 fail; clippy reports
 no warnings.
+
+The board ran step 41's code a second time in run-13fb3e0130ce (commit c9d5326, which changed only
+PERF.md): 21.49 ms, 11.4 MB and 81.65 points.
 
 ## Experiments that did not stay
 
