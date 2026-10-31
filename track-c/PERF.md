@@ -34,7 +34,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 27 | A plain static executable instead of a static PIE (`relocation-model=static`) | run-a8bc41aa5aa0 | 0.0340 | 12.5 | 77.1 |
 | 28 | A record's name and note take their quotes from one 64-byte mask, built by AVX2 compares at the name's start, where each quote cost a 32-byte scan | run-4dc3f93575f3 | 0.0319 | 12.5 | 77.7 |
 | 29 | `NameSet::read` takes each letter with plain loads and its group as a byte, and `insert` is cold, so marking a name runs 17 fewer instructions per record | run-c02fb16de73f | 0.0312 | 12.5 | 77.8 |
-| 30 | 5 fewer lines, three of them with the same machine code: the name set's insert builds its entry in the push and its marking loop takes the group and the key in one statement, `main` writes the output in one line and reads each directory with `nth`, and `merge` sets the min and the max in one assignment | | | | |
+| 30 | 5 fewer lines, three of them with the same machine code: the name set's insert builds its entry in the push and its marking loop takes the group and the key in one statement, `main` writes the output in one line and reads each directory with `nth`, and `merge` sets the min and the max in one assignment | run-3ce10275f327 | 0.0310 | 12.2 | 78.1 |
+| 31 | 1 fewer line with the same binary: the Dockerfile's build stage mounts its sources instead of copying them | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -831,6 +832,16 @@ adapter, which sits in front of the worker, so the worker's code moves by 16 byt
 that build measured 0.26–0.52 ms slower than the same build without it, in three rounds. Also
 dropped: the rehash's probe as one `find` over `hash..`, 2 lines, which clippy's
 `maybe_infinite_iter` flags.
+
+## Step 31: the sources mounted, not copied
+
+The Dockerfile's build stage mounts its context (`RUN --mount=type=bind,target=/src`) instead of
+copying it with `COPY . .`, and cargo builds into `--target-dir /out`, since the mount is
+read-only; track A does the same since its step 45. `harness/dockerfile_check.py` accepts a bind
+mount of the context, and every builder that builds us is BuildKit: Depot, the board's rootless
+BuildKit fallback and final scoring's `docker build`. A local `docker build --network=none` of
+the old and the new Dockerfile gave binaries byte-identical to each other and to a cargo build of
+step 30, so T and M cannot move. S 308 → 307. Gate: 310 pass, 0 fail.
 
 ## Experiments that did not stay
 
