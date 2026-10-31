@@ -36,15 +36,11 @@
 //! Memory stays at a few arrays per thread: per query a count, an id sum and the first
 //! matches, and per kept term one window's documents. Numbers: PERF.md.
 
-use std::alloc::Layout;
-use std::error::Error;
-use std::fs::File;
-use std::io::Write;
-use std::num::NonZeroUsize;
-use std::ops::Range;
-use std::os::fd::AsRawFd;
-use std::path::Path;
-use std::thread;
+// The AVX2 intrinsics of `classify` and the prefetch of `prefetch`.
+use std::{
+    alloc::Layout, arch::x86_64::*, error::Error, fs::File, io::Write, num::NonZeroUsize,
+    ops::Range, os::fd::AsRawFd, path::Path, thread,
+};
 
 /// Documents tokenized up front to estimate how rare each query term is.
 const SAMPLE_DOCS: usize = 1000;
@@ -62,14 +58,14 @@ const WINDOW: usize = 64;
 const _: () = assert!(64 * WINDOW <= 1 << 16);
 
 unsafe extern "C" {
+    /// libc's `mmap(2)`, used with `PROT_READ` (1) and `MAP_PRIVATE` (2) in [`map_file`]. The
+    /// standard library already links libc, so declaring the functions costs no dependency.
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    /// glibc's `mallopt(3)`, used once, with `M_MMAP_THRESHOLD` (-3).
     fn mallopt(param: i32, value: i32) -> i32;
+    /// libc's `madvise(2)`, with `MADV_HUGEPAGE` (14) and [`MADV_DONTNEED`].
     fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
 }
-const PROT_READ: i32 = 1;
-const MAP_PRIVATE: i32 = 2;
-const M_MMAP_THRESHOLD: i32 = -3;
-const MADV_HUGEPAGE: i32 = 14;
 const MADV_DONTNEED: i32 = 4;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -77,20 +73,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     // then stay resident after they are freed. Fixed, every block of 128 KiB or more goes back
     // to the kernel when freed, such as each thread's first matches once they are grouped.
     // SAFETY: no other thread exists yet, and mallopt takes no pointers.
-    unsafe { mallopt(M_MMAP_THRESHOLD, 128 << 10) };
+    unsafe { mallopt(-3, 128 << 10) }; // M_MMAP_THRESHOLD
     let mut args = std::env::args().skip(1);
     let data_dir = args.next().unwrap_or_else(|| "/data".into());
-    let out_dir = args.next().unwrap_or_else(|| "/out".into());
-    let data = Path::new(&data_dir);
-    let queries = map_file(&data.join("queries.txt"))?;
-    let docs = map_file(&data.join("docs.txt"))?;
-    let parts = answer_all(queries, docs)?;
-    let out_path = Path::new(&out_dir).join("results.txt");
-    let mut out = File::create(&out_path).map_err(|e| format!("{}: {e}", out_path.display()))?;
-    for part in &parts {
-        out.write_all(part)
-            .map_err(|e| format!("{}: {e}", out_path.display()))?;
-    }
+    let out = Path::new(&args.next().unwrap_or_else(|| "/out".into())).join("results.txt");
+    let file = |name| map_file(&Path::new(&data_dir).join(name));
+    let parts = answer_all(file("queries.txt")?, file("docs.txt")?)?;
+    let mut results = File::create(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    (parts.iter()).try_for_each(|part| results.write_all(part))?;
     // Exit without running destructors: freeing the posting lists would only add to the timed
     // wall. `File` keeps no user-space buffer, so every byte is already written.
     std::process::exit(0)
@@ -98,26 +88,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 /// Maps the whole file read-only. The page cache is pre-warmed, so this copies nothing and
 /// charges almost nothing to our memory cgroup, unlike reading it into the heap.
-fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
-    let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let len = usize::try_from(file.metadata()?.len())?;
-    if len == 0 {
-        return Ok(&[]); // mmap rejects a zero length
-    }
-    // SAFETY: a new read-only private mapping of an open fd; the kernel picks the address.
-    let ptr = unsafe {
-        mmap(
-            std::ptr::null_mut(),
-            len,
-            PROT_READ,
-            MAP_PRIVATE,
-            file.as_raw_fd(),
-            0,
-        )
-    };
+fn map_file(path: &Path) -> Result<&'static [u8], String> {
+    let err = |e| format!("{}: {e}", path.display());
+    let file = File::open(path).map_err(err)?;
+    let len = file.metadata().map_err(err)?.len() as usize;
+    // SAFETY: a new read-only private mapping of an open fd; the kernel picks the address. An
+    // empty file maps one byte past its end, never read, as mmap rejects a zero length.
+    let ptr = unsafe { mmap(std::ptr::null_mut(), len.max(1), 1, 2, file.as_raw_fd(), 0) };
     if ptr.addr() == usize::MAX {
-        let err = std::io::Error::last_os_error();
-        return Err(format!("mmap {}: {err}", path.display()).into());
+        return Err(err(std::io::Error::last_os_error()));
     }
     // SAFETY: the mapping holds `len` readable bytes and is never unmapped, so it outlives every
     // borrow. /data is mounted read-only, so the bytes cannot change under us.
@@ -190,6 +169,9 @@ enum Op {
     Not,
 }
 
+/// A query term with the operator that joins it to the terms before it ([`Queries::ops`]).
+type Step = (Op, u32);
+
 /// The queries of `queries.txt` in file order, their terms in flat arrays. Duplicate lines stay
 /// separate queries, since each one gets its own output line.
 #[derive(Default)]
@@ -215,10 +197,9 @@ impl Queries {
         &self.terms[self.at[q] as usize..self.at[q + 1] as usize]
     }
 
-    /// Query `q`'s terms, each with the operator that joins it.
-    fn steps(&self, q: usize) -> impl Iterator<Item = (Op, u32)> {
-        let ops = &self.ops[self.at[q] as usize..self.at[q + 1] as usize];
-        ops.iter().copied().zip(self.terms(q).iter().copied())
+    /// Query `q`'s terms, each with the operator that joins it. The zip ends with the terms.
+    fn steps(&self, q: usize) -> impl Iterator<Item = Step> {
+        (self.ops[self.at[q] as usize..].iter().copied()).zip(self.terms(q).iter().copied())
     }
 }
 
@@ -272,48 +253,38 @@ fn parse_lines(text: &[u8]) -> Result<Lines, String> {
         let line = line.strip_suffix(b"\n").unwrap_or(line);
         let terms = lines.keys.len();
         if parse_line(line, &mut lines).is_none() {
-            let line = String::from_utf8_lossy(line);
-            return Err(format!("queries.txt: not a query: {line}"));
+            return Err(format!("queries.txt: not a query: {}", line.escape_ascii()));
         }
         lines.lens.push((lines.keys.len() - terms) as u32);
     }
     Ok(lines)
 }
 
+/// The BOOL operators by name (spec §2.3).
+const OPS: [(&[u8], Op); 3] = [(b"AND", Op::And), (b"OR", Op::Or), (b"NOT", Op::Not)];
+
 /// Appends the query on `line` to `lines`, or returns `None` if the line is not one.
 fn parse_line(line: &[u8], lines: &mut Lines) -> Option<()> {
     // Rejecting anything but `[a-z0-9]{1,32}` keeps a term from matching a token that differs
     // from it only in case, which the case-folding key would otherwise allow, and keeps every
-    // term within one `Key`.
+    // term within one `Key`. An empty term's key is all zeros, an empty slot's mark.
     let mut push = |op, term: &[u8]| {
-        let valid = (1..=MAX_TERM).contains(&term.len())
-            && term
-                .iter()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
-        lines.keys.push(key(term).filter(|_| valid)?);
+        let lower = term.iter().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9'));
+        lines.keys.push(key(term).filter(|k| lower && k[0] != 0)?);
         lines.ops.push(op);
         Some(())
     };
-    let phrase = line
-        .strip_prefix(b"PHRASE \"")
-        .and_then(|r| r.strip_suffix(b"\""));
+    let phrase = (line.strip_prefix(b"PHRASE \"")).and_then(|r| r.strip_suffix(b"\""));
     if let Some(words) = phrase {
-        for term in words.split(|&b| b == b' ') {
-            push(Op::Or, term)?;
-        }
+        (words.split(|&b| b == b' ')).try_for_each(|term| push(Op::Or, term))?;
     } else {
         // Terms sit at even positions and operators at odd ones, so a term spelled `and` is an
         // ordinary word and `AND` there is malformed.
         let mut words = line.strip_prefix(b"BOOL ")?.split(|&b| b == b' ');
         push(Op::Or, words.next()?)?;
         while let Some(op) = words.next() {
-            let op = match op {
-                b"AND" => Op::And,
-                b"OR" => Op::Or,
-                b"NOT" => Op::Not,
-                _ => return None,
-            };
-            push(op, words.next()?)?;
+            let (_, op) = OPS.iter().find(|(name, _)| *name == op)?;
+            push(*op, words.next()?)?;
         }
     }
     lines.phrase.push(phrase.is_some());
@@ -442,21 +413,15 @@ impl Plan {
 /// so the cheaper of the running cover and `t` alone will do. `OR t` adds `S(t)`, so `t`
 /// joins the cover. `NOT t` only removes documents, so the cover stands. For
 /// `estate OR surety AND bail` that is `{estate, surety}` or `{bail}`, whichever costs less.
-fn bool_cover(
-    steps: impl Iterator<Item = (Op, u32)>,
-    cost: impl Fn(u32) -> u64,
-    cover: &mut Vec<u32>,
-) {
+fn bool_cover(steps: impl Iterator<Item = Step>, cost: impl Fn(u32) -> u64, cover: &mut Vec<u32>) {
     cover.clear();
     for (op, term) in steps {
-        match op {
-            Op::And if cost(term) < cover.iter().map(|&t| cost(t)).sum() => {
-                cover.clear();
-                cover.push(term);
-            }
-            Op::Or => cover.push(term),
-            Op::And | Op::Not => {}
+        if op == Op::And && cost(term) < cover.iter().map(|&t| cost(t)).sum() {
+            cover.clear();
+        } else if op != Op::Or {
+            continue;
         }
+        cover.push(term);
     }
     cover.sort_unstable();
     cover.dedup();
@@ -465,14 +430,12 @@ fn bool_cover(
 impl Plan {
     /// The phrases that term `t` triggers, as (query index, position of `t` in the phrase).
     fn phrases(&self, t: u32) -> &[(u32, u32)] {
-        let t = t as usize;
-        &self.phrases[self.phrase_at[t] as usize..self.phrase_at[t + 1] as usize]
+        &self.phrases[self.phrase_at[t as usize] as usize..self.phrase_at[t as usize + 1] as usize]
     }
 
     /// The indices of the per-document checks that term `t` triggers.
     fn check_range(&self, t: u32) -> Range<usize> {
-        let t = t as usize;
-        self.check_at[t] as usize..self.check_at[t + 1] as usize
+        self.check_at[t as usize] as usize..self.check_at[t as usize + 1] as usize
     }
 }
 
@@ -521,14 +484,12 @@ impl Check {
     ///
     /// Bit `x` of `HAS[j]` is set when input `x` holds `terms[j]`, so applying the operators
     /// to those masks evaluates the query on all 64 inputs at once.
-    fn new(q: u32, steps: impl Iterator<Item = (Op, u32)>, pad: u32) -> Option<Self> {
+    fn new(q: u32, steps: impl Iterator<Item = Step>, pad: u32) -> Option<Self> {
         let (mut terms, mut n, mut table) = ([pad; CHECK_TERMS], 0, 0);
         for (op, t) in steps {
             let j = terms[..n].iter().position(|&u| u == t).unwrap_or(n);
-            if j == n {
-                *terms.get_mut(n)? = t;
-                n += 1;
-            }
+            *terms.get_mut(j)? = t;
+            n = n.max(j + 1);
             table = match op {
                 Op::And => table & HAS[j],
                 Op::Or => table | HAS[j],
@@ -540,10 +501,8 @@ impl Check {
 
     /// This check, matching only documents that hold none of `skip`.
     fn unless(mut self, skip: &[u32]) -> Self {
-        for (j, t) in self.terms.iter().enumerate() {
-            if skip.contains(t) {
-                self.table &= !HAS[j];
-            }
+        for (j, _) in (self.terms.iter().enumerate()).filter(|(_, t)| skip.contains(t)) {
+            self.table &= !HAS[j];
         }
         self
     }
@@ -580,25 +539,17 @@ fn sample_hits(docs: &[u8], terms: &TermTable) -> (Vec<u32>, usize) {
 }
 
 /// The id of the line that starts at `at`, or the number of documents when `at` is the end of
-/// `docs`. Line `i` holds id `i` (spec §2.1), so the ids of the lines after it follow by
-/// counting.
+/// `docs`: the last line's id plus one. Line `i` holds id `i` (spec §2.1), so the ids of the
+/// lines after it follow by counting. An empty `docs.txt` stops here with an error: its lines
+/// end in LF (spec §2.1), so it holds at least one.
 fn id_at(docs: &[u8], at: usize) -> Result<u32, String> {
-    if at == docs.len() {
-        let Some(body) = docs.strip_suffix(b"\n") else {
-            return Ok(0); // an empty docs.txt
-        };
-        let last_line = body
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map_or(0, |lf| lf + 1);
-        return Ok(id_at(docs, last_line)? + 1);
+    if at == docs.len() && at > 0 {
+        let lf = docs[..at - 1].iter().rposition(|&b| b == b'\n');
+        return Ok(id_at(docs, lf.map_or(0, |lf| lf + 1))? + 1);
     }
     let digits = docs[at..].iter().take_while(|b| b.is_ascii_digit()).count();
     if digits == 0 || docs.get(at + digits) != Some(&b'\t') {
-        let start = String::from_utf8_lossy(&docs[at..docs.len().min(at + 40)]);
-        return Err(format!(
-            "docs.txt: no id and TAB at the line starting {start:?}"
-        ));
+        return Err(format!("docs.txt: no id and TAB at byte {at}"));
     }
     Ok((docs[at..at + digits].iter()).fold(0, |id, &digit| id * 10 + u32::from(digit - b'0')))
 }
@@ -630,33 +581,24 @@ fn walk<S>(
     mut on_token: impl FnMut(&mut S, usize, usize),
     mut on_line_end: impl FnMut(&mut S),
 ) {
-    let mut prev_bit = 0; // 1 when the byte before the block is a token byte
-    let mut open = None; // the start of a token that runs on past the block
-    let mut line_start = 0;
-    let mut padded = [0; 64]; // zero bytes are separators
+    // 1 when the byte before the block is a token byte; the start of a token that runs on past
+    // the block; where the current line starts.
+    let (mut prev_bit, mut open, mut line_start) = (0, None, 0);
+    // The last block, short of 64 bytes, padded with zero bytes, which are separators.
+    let (mut padded, tail) = ([0; 64], chunk.as_chunks::<64>().1);
+    padded[..tail.len()].copy_from_slice(tail);
     for base in (0..chunk.len()).step_by(64) {
-        let block = if let Some(block) = chunk[base..].first_chunk() {
-            block
-        } else {
-            padded[..chunk.len() - base].copy_from_slice(&chunk[base..]);
-            &padded
-        };
+        let block = chunk[base..].first_chunk().unwrap_or(&padded);
         // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
         let (token, lf) = unsafe { classify(block) };
         let prev = token << 1 | prev_bit;
         let (mut starts, mut ends, mut lfs) = (token & !prev, !token & prev, lf);
         prev_bit = token >> 63;
         while ends != 0 {
-            let end = base + ends.trailing_zeros() as usize;
-            ends &= ends - 1;
-            let start = open.take().unwrap_or_else(|| {
-                let start = base + starts.trailing_zeros() as usize;
-                starts &= starts - 1;
-                start
-            });
+            let end = base + pop(&mut ends);
+            let start = open.take().unwrap_or_else(|| base + pop(&mut starts));
             while lfs != 0 && base + (lfs.trailing_zeros() as usize) < start {
-                line_start = base + lfs.trailing_zeros() as usize + 1;
-                lfs &= lfs - 1;
+                line_start = base + pop(&mut lfs) + 1;
                 on_line_end(state);
             }
             if start != line_start {
@@ -667,11 +609,15 @@ fn walk<S>(
             open = Some(base + starts.trailing_zeros() as usize);
         }
         while lfs != 0 {
-            line_start = base + lfs.trailing_zeros() as usize + 1;
-            lfs &= lfs - 1;
+            line_start = base + pop(&mut lfs) + 1;
             on_line_end(state);
         }
     }
+}
+
+/// Clears the lowest set bit of `bits`, which is not 0, and returns its position.
+fn pop(bits: &mut u64) -> usize {
+    std::mem::replace(bits, *bits & (*bits - 1)).trailing_zeros() as usize
 }
 
 /// Returns `(token, lf)` for a 64-byte block: bit `i` of `token` is set when `block[i]` is a
@@ -683,10 +629,6 @@ fn walk<S>(
 /// top bit of each byte's 0x00 or 0xFF result into one bit.
 #[target_feature(enable = "avx2")]
 fn classify(block: &[u8; 64]) -> (u64, u64) {
-    use std::arch::x86_64::{
-        _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_min_epu8, _mm256_movemask_epi8,
-        _mm256_or_si256, _mm256_set1_epi8, _mm256_sub_epi8,
-    };
     let (mut token, mut lf) = (0, 0);
     for offset in [0, 32] {
         // SAFETY: the 32-byte unaligned load lies inside the 64-byte block.
@@ -761,8 +703,7 @@ impl Tally {
     /// the sum of the set bits' positions ([`bit_index_sum`]).
     fn add_word(&mut self, q: u32, base: u32, mut word: u64) {
         while word != 0 && self.queries[q as usize] >> SUM_BITS < SHOWN_IDS as u64 {
-            self.add(q, base + word.trailing_zeros());
-            word &= word - 1;
+            self.add(q, base + pop(&mut word) as u32);
         }
         let n = u64::from(word.count_ones());
         self.queries[q as usize] += n << SUM_BITS | (u64::from(base) * n + bit_index_sum(word));
@@ -1007,7 +948,6 @@ fn bit_index_sum(word: u64) -> u64 {
 
 /// Starts loading the cache line that holds `item` into L1.
 fn prefetch<T>(item: &T) {
-    use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
     // SAFETY: a prefetch never faults or changes memory.
     unsafe { _mm_prefetch::<_MM_HINT_T0>(std::ptr::from_ref(item).cast()) };
 }
@@ -1038,17 +978,14 @@ fn key_in(chunk: &[u8], start: usize, end: usize) -> Option<Key> {
 
 /// Lowercases the first `len` bytes of `window`, all letters and digits, and zeroes the rest.
 fn fold(window: &[u8; MAX_TERM], len: usize) -> Key {
-    // `len` bytes of 0xFF, then zeros, are `ONES[MAX_TERM - len..]`.
-    const ONES: [u8; 2 * MAX_TERM] = {
-        let mut ones = [0; 2 * MAX_TERM];
-        let mut i = 0;
-        while i < MAX_TERM {
-            ones[i] = 0xFF;
-            i += 1;
-        }
-        ones
-    };
-    let mask: &[u8; MAX_TERM] = ONES[MAX_TERM - len..]
+    // Flattened, `ONES` is 32 bytes of 0xFF then 32 zeros, so `len` bytes of 0xFF, then zeros,
+    // start at `MAX_TERM - len`. On one 64-byte cache line, that 32-byte load never splits
+    // across two; unaligned, the table sat wherever the rest of the constants left it, and a
+    // split load per token cost up to 1% of the run.
+    #[repr(align(64))]
+    struct Line([[u8; MAX_TERM]; 2]);
+    const ONES: Line = Line([[0xFF; MAX_TERM], [0; MAX_TERM]]);
+    let mask: &[u8; MAX_TERM] = ONES.0.as_flattened()[MAX_TERM - len..]
         .first_chunk()
         .expect("len <= MAX_TERM");
     std::array::from_fn(|i| {
@@ -1097,27 +1034,11 @@ impl Slot {
     }
 }
 
-/// `len` empty slots on their own transparent huge pages, never freed. The pass reads the term
-/// table at random, and on 4 KiB pages most of those reads would first walk the page tables.
-fn huge_slots(len: usize) -> &'static mut [Slot] {
-    let layout = Layout::from_size_align(size_of::<Slot>() * len, 2 << 20).expect("fits");
-    // SAFETY: `len` is a power of two, so the size is nonzero.
-    let block = unsafe { std::alloc::alloc(layout) };
-    assert!(!block.is_null(), "out of memory");
-    // SAFETY: `block` holds `layout.size()` bytes, aligned for slots, and an all-zero slot is
-    // empty; the advice changes no data.
-    unsafe {
-        madvise(block, layout.size(), MADV_HUGEPAGE);
-        block.write_bytes(0, layout.size());
-        std::slice::from_raw_parts_mut(block.cast(), len)
-    }
-}
-
 /// Open-addressing map from query term to its [`Slot`]. A probe compares a slot's `head` and
 /// `tail` with the token's first 12 bytes; only a term longer than 12 bytes, rare among tokens,
 /// then loads the rest of its key. So most tokens cost one memory access here, whether or not
-/// they are query terms. It doubles at half load, so it assumes nothing about how many distinct
-/// terms the queries use.
+/// they are query terms. It holds 3 slots per 2 term occurrences or more, so it is at most two
+/// thirds full whatever share of the occurrences are distinct terms.
 struct TermTable {
     /// The slot count is a power of two.
     slots: &'static mut [Slot],
@@ -1126,13 +1047,30 @@ struct TermTable {
 }
 
 impl TermTable {
-    /// An empty table with a slot per term occurrence, rounded up to a power of two: it only
-    /// doubles when more than half of `occurrences` are distinct terms.
+    /// An empty table for the terms of `occurrences` term occurrences: 3 slots per 2, plus one,
+    /// rounded up to a power of two. A probe for a key that is no term stops at an empty slot,
+    /// and there is always one. For the spec's 150,000 or so occurrences, of which about half
+    /// are distinct terms, that is 262,144 slots, at most 29% full.
+    ///
+    /// The slots sit alone on transparent huge pages and are never freed. The pass reads them
+    /// at random, and on 4 KiB pages most of those reads would first walk the page tables.
     fn new(occurrences: usize) -> Self {
         // A term id times 16 fits in `Slot::flags`.
         assert!(occurrences < 1 << 28, "queries.txt: too many terms");
+        let len = (occurrences * 3 / 2 + 1).next_power_of_two();
+        let layout = Layout::from_size_align(size_of::<Slot>() * len, 2 << 20).expect("fits");
+        // SAFETY: `len` is at least 1, so the size is nonzero.
+        let block = unsafe { std::alloc::alloc(layout) };
+        assert!(!block.is_null(), "out of memory");
+        // SAFETY: `block` holds `layout.size()` bytes, aligned for slots, and an all-zero slot
+        // is empty; the advice changes no data.
+        let slots = unsafe {
+            madvise(block, layout.size(), 14); // MADV_HUGEPAGE
+            block.write_bytes(0, layout.size());
+            std::slice::from_raw_parts_mut(block.cast(), len)
+        };
         Self {
-            slots: huge_slots(occurrences.next_power_of_two()),
+            slots,
             keys: Vec::new(),
         }
     }
@@ -1160,37 +1098,17 @@ impl TermTable {
         at
     }
 
+    /// The id of the term whose key this is. A new term takes the next id and the free slot
+    /// where its probe ends.
     fn intern(&mut self, key: Key) -> u32 {
         let at = self.position(&key, self.home(&key));
-        if self.slots[at].head != 0 {
-            return self.slots[at].id();
+        if self.slots[at].head == 0 {
+            let long = u32::from(key[1] >> 32 | key[2] | key[3] != 0) * Slot::LONG;
+            let (head, tail, flags) = (key[0], key[1] as u32, (self.keys.len() as u32) << 4 | long);
+            self.slots[at] = Slot { head, tail, flags };
+            self.keys.push(key);
         }
-        self.keys.push(key);
-        if self.keys.len() * 2 <= self.slots.len() {
-            self.place(self.keys.len() - 1, at);
-        } else {
-            // Rebuilt from the keys in id order, which reads them sequentially; each new slot
-            // is prefetched 16 keys ahead.
-            // shortcut: the old table is never freed, which costs memory only when more than
-            // half the term occurrences are distinct terms.
-            self.slots = huge_slots(self.slots.len() * 2);
-            for id in 0..self.keys.len() {
-                if let Some(ahead) = self.keys.get(id + 16) {
-                    self.prefetch(ahead);
-                }
-                let key = &self.keys[id];
-                self.place(id, self.position(key, self.home(key)));
-            }
-        }
-        self.keys.len() as u32 - 1
-    }
-
-    /// Puts term `id` into the free slot `at`.
-    fn place(&mut self, id: usize, at: usize) {
-        let key = &self.keys[id];
-        let long = u32::from(key[1] >> 32 | key[2] | key[3] != 0) * Slot::LONG;
-        let (head, tail, flags) = (key[0], key[1] as u32, (id as u32) << 4 | long);
-        self.slots[at] = Slot { head, tail, flags };
+        self.slots[at].id()
     }
 
     /// Adds `flags[id]` to the flags of each term `id`.

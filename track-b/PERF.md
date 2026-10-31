@@ -23,6 +23,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 16 | The query and check cells are written when allocated, so the pass's first store to a page no longer replaces the shared zero page and interrupts every core | run-6afbb627903d | 0.2343 | 42.0 | 69.2 |
 | 17 | Each thread drops its chunk's pages of the corpus mapping when its pass ends, instead of the exit unmapping all of them on one core after the output is written | run-bfce9886b69d | 0.2354 | 43.4 | 69.2 |
 | 18 | A term table slot holds a term's first 12 bytes instead of 8, so a token of 9 to 12 bytes no longer loads its term's key from a second array | run-e847cb4a493b | 0.2208 | 41.8 | 69.9 |
+| 19 | 99 fewer code lines: the cold code and the term table simplified (no doubling), the walk's bit pops in one helper; the key-mask table aligned to a cache line | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -344,6 +345,46 @@ Locally, against step 17: user cycles 5.85–5.89 → 5.68–5.70 G over five ro
 each, five rounds: median 237.3, 237.9, 237.8, 237.2 and 237.1 → 229.8, 229.8, 230.6, 229.5 and
 229.5 ms (−3.2%). memory.peak over six interleaved runs: median 41.2 → 41.0 MiB (the table is
 the same size). S 852 → 857. Gate: 510 pass, 0 fail.
+
+## Step 19: 99 fewer lines
+
+K weighs S with an exponent of 0.15 against T's 0.5, so at B's numbers one code line is worth
+about as much as 0.035% of T. This step only cuts lines, except for one alignment.
+
+- **Pure restructurings.** One `use std::{...}` with `arch::x86_64::*` for the intrinsics
+  (clippy's `wildcard_imports` allowed in Cargo.toml) replaces nine `use` lines and the two
+  inside `classify` and `prefetch`: the machine code is byte-identical. The libc constants sit
+  at their calls, named in comments, except `MADV_DONTNEED`. `fold` builds `ONES` from two
+  32-byte arrays. `bool_cover` fits its signature on one line through a `Step` alias.
+- **Cold code.** `main` maps both files through one closure and writes the parts with one
+  `try_for_each`. `map_file` maps an empty file as one byte past its end instead of a special
+  case. `id_at` reports a bad line by its byte offset; an empty `docs.txt` now stops with that
+  error, as spec §2.1 has every line end in an LF. The parser looks operators up in a
+  three-entry table. `Check::new`, `Check::unless`, the plan's accessors and `Queries::steps`
+  each lose a line or two.
+- **The term table never doubles.** It is sized once at 3 slots per 2 term occurrences, plus
+  one, rounded up to a power of two, so it is at most two thirds full whatever the queries
+  hold, and a probe always meets an empty slot. On the seeds that is the same 262,144 slots as
+  before (152,904 occurrences, 75,747 distinct terms on seed 1), so the pass is unchanged. The
+  rebuild, `place` and `huge_slots` go into `intern` and `new`.
+- **The walk.** `pop` clears and returns the lowest set bit, and the last partial block is
+  padded once before the loop, so each block is `first_chunk().unwrap_or(&padded)`.
+- **The key-mask table on one cache line** (+2 lines). A token's mask is a 32-byte load from
+  `ONES` at offset `32 - len`. The table had byte alignment and sat wherever the other
+  constants left it: at offset 59 of a cache line at steps 17 and 18, where only tokens of 28
+  bytes or more split the load. These cuts moved it, to offset 11 on step 17's code, where
+  every token of 10 bytes or fewer split it (split loads 44.3 → 78.4 M, the run 0.7 ms
+  slower), and to offset 43 on step 18's (tokens of 12 bytes or more, 42.0 → 43.2 M). Aligned,
+  no token splits it, and no later change to the constants can move it.
+
+Locally, against step 18 (alternating runs, 61 each, twice): median 229.8 and 229.7 → 230.1 and
+229.9 ms, min 228.3 and 227.9 → 228.8 and 227.8 ms. `perf stat`: user cycles 5,694 → 5,695 M,
+instructions 8,687 → 8,739 M (the walk), split loads 42.0 → 42.2 M. The hot code is the same
+apart from the walk and `steps`; the rest is code placement, which alone moves a run by up to
+0.6% here: step 17 with one no-op `assert!` added to `main` ran 1.35 ms slower than step 17
+itself, and with every function aligned to 64 bytes the cold cuts and step 17 ran the same
+cycles. memory.peak over 12 alternating runs: median 43.1 → 42.8 MB. S 857 → 758. Gate: 510
+pass, 0 fail.
 
 ## Experiments that did not stay
 
