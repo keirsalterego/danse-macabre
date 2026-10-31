@@ -57,6 +57,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 50 | Sorting networks unrolled level by level, and a network of 128 values instead of selection for groups of 65 to 128 values | run-9a8d6161d86a | 0.0235 | 18.0 | 83.2 |
 | 51 | 6 fewer lines at the same speed: the parse's intrinsics from the file's one wildcard import, and the interner's padded copies zeroed in its static | run-b35557b63892 | 0.0180 | 18.8 | 85.9 |
 | 52 | Endpoint names hashed with the CPU's CRC32C instruction instead of a multiply: 9.2 M instructions fewer | | | | |
+| 53 | 9 fewer lines in the hour pass at the same speed: the large latency taken in `unwrap_or_else`, empty groups filtered out, the three selections in one `map`, the chunk's two releases in one | | | | |
 
 ## Step 1: v1
 
@@ -855,9 +856,66 @@ rounds): medians 18.21 → 18.41, 18.27 → 18.37 and 18.26 → 18.16 MB, where 
 same `.text` as the two drew 18.24 and 18.21 MB: noise, as the hash allocates nothing. S 373 → 372.
 Gate: 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes; clippy reports no
 warnings.
+## Step 53: 9 fewer lines in the hour pass
+
+Four rewrites in the hour pass and the work closure's tail:
+
+- The scatter takes a record's latency bits unless they hold `LARGE`, and the next large latency
+  in `unwrap_or_else` when they do, instead of a four-line `match`: 3 lines.
+- `summarize_hour` takes only the endpoints with lines from the order, with a `filter`, instead of
+  wrapping the loop's body in an `if`: 2 lines.
+- The three selections of a large group are one `map` over (start, rank) pairs, each selecting in
+  the suffix that starts at the rank before: 3 lines.
+- The work closure frees its chunk's records and large latencies in one `map`: 1 line.
+
+With the `filter` or the `map`, LLVM no longer inlines `percentiles` into the work closure. It
+becomes a function of its own, 21.7 KB with the networks, and the work closure is inlined into
+`fan_out` instead. Either rewrite alone, and both together, run the same 3.6 M instructions:u
+more, so that is the cost of the new layout, and it costs no cycles: `perf stat`, 10 interleaved
+rounds of 3 runs, instructions:u 598.8 → 602.4 M, cycles:u median 330.0 → 330.4 M.
+`#[inline(always)]` on `percentiles`, one line back, moved `summarize_hour` out of line instead
+and timed the same.
+
+`ab.py`, 61 interleaved runs, eight rounds against step 51: medians 19.03 → 18.94,
+18.91 → 18.84, 19.01 → 19.04, 19.02 → 18.98, 19.05 → 19.00, 19.04 → 19.03, 19.06 → 18.96 and
+19.11 → 19.01 ms (−0.3% on average), minimums 18.53 → 18.32, 18.39 → 18.35, 18.27 → 18.45,
+18.41 → 18.37, 18.49 → 18.40, 18.65 → 18.54, 18.65 → 18.53 and 18.53 → 18.31 ms. memory.peak,
+five alternating rounds on seeds 1, 2, 3, 5, 7, 10 and 11, three times: medians 18.17 → 18.28,
+18.05 → 18.09 and 18.29 → 18.23 MB, from the same allocations. S 373 → 364. Gate: 310 pass,
+0 fail; full seeds 1–7 and 10–12 give the reference hashes; clippy reports no warnings.
 
 ## Experiments that did not stay
 
+- **Selection for every group, without the networks** (local, turbo off, on step 50's code):
+  `percentiles` with only its three selections, and `sort_network`, `merge`, `stage` and their
+  wildcard import deleted, S 379 → 334. `ab.py`, 61 interleaved runs: median 19.06 → 20.84 ms
+  (+9.3%). `perf stat`, 4 interleaved rounds of 3 runs: instructions:u 598.9 → 649.8 M, cycles:u
+  +12.8%. The 45 lines are worth about 3.6% of T. Not kept.
+- **The count pass as one `flat_map` over the runs** (local, turbo off): 2 lines fewer than the
+  nested loops. As a `for` over the `flat_map`, it ran 9.2 M instructions:u more (598.9 →
+  608.1 M), because `next` checks for the end of the inner slice at every record. As `for_each`,
+  which folds each run's slice in a loop of its own, it ran the same instructions but measured
+  slower on step 53's code: `ab.py`, 101 interleaved runs, four rounds, medians 19.03 → 19.14,
+  19.06 → 19.06, 18.77 → 18.87 and 18.99 → 19.02 ms (+0.3%), and +0.2% in eight rounds of 61
+  runs beside step 51, more than the 0.16% its 2 lines are worth. Not kept.
+- **Counts and errors in one `u64` per endpoint** (local, turbo off, on step 50's code): one
+  read-modify-write per record in the count pass instead of two, with the errors in the upper
+  half: 13.6 M instructions:u more, and no fewer cycles. **Unchecked indexing in the count pass
+  and the scatter**: instructions:u −6.3%, cycles:u −1.1%, and no change in `ab.py`. Both passes
+  wait on memory, not on instructions. Not kept.
+- **Freeing more before the exit** (local, turbo off, on step 50's code). At `exit`, the kernel
+  still unmaps 11.2 MB of output mapping, about 4 MB of heap, mostly the hours' lines in 12 malloc
+  arenas, and 0.7 MB of page tables, on one thread inside the timed window: phase timestamps put
+  0.75 ms between `exit` and the parent's `wait`, against about 0.2 ms for an idle 12-thread
+  process. Alone, it unmaps about 99 ns per output page and 250 ns per heap page; 12 threads
+  unmapping in parallel took 190 to 437 ns per page each, and every call interrupts the other
+  threads to flush their TLBs. Releasing each hour's lines and its place in the output once it was
+  formatted: medians +0.40 ms; its place only, +0.44 ms; its lines only, +0.18 ms. Each thread
+  releasing its share of the output after its share of the input: −0.03 to −0.09 ms, about what
+  its 3 to 4 lines cost; with the formatted lines released too, +0.07 to +0.11 ms. Finished
+  threads spinning until the last one calls `exit`, instead of returning: +0.08 ms. The format
+  queue in largest-first order: no change; with the finished hours' output released through a
+  shared cursor as well: +0.04 to +0.06 ms. Not kept.
 - **`put_number` inlined, with its eight- to ten-digit path in a `#[cold]` function** (local, turbo
   off, on step 49's code and on step 50's). `put_number` writes a value of eight digits or more by
   calling itself for the leading digits. That call keeps it out of line, and every call, however

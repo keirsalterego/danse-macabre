@@ -260,8 +260,7 @@ fn summarize(log: &'static [u8], out_path: &Path) {
         // the input waits until the end, because freeing pages interrupts every other thread to
         // flush its TLB, which cost 3 ms in the hour pass.
         let chunk = chunks[t].get().expect("parsed");
-        release(&chunk.records);
-        release(&chunk.large);
+        let _ = [&chunk.records, &chunk.large].map(|v| release(v));
         std::iter::from_fn(|| queue.lock().expect("panics abort").next())
             .for_each(|(index, ((lines, _), place))| format_hour(index, lines, names, place));
         release(&log[len * t / threads..len * (t + 1) / threads]);
@@ -715,27 +714,22 @@ fn summarize_hour(runs: &[Run], order: &Order, names: &[&[u8]], buffer: &mut [u3
     for &(records, large) in runs {
         let mut large = large.iter();
         for &r in records {
-            let e = (r >> 20) as usize;
+            let (e, small) = ((r >> 20) as usize, Some(r & LARGE).filter(|&v| v < LARGE));
             start[e] -= 1;
-            buffer[start[e] as usize] = match r & LARGE {
-                LARGE => *large.next().expect("one large latency per LARGE record"),
-                small => small,
-            };
+            buffer[start[e] as usize] = small.unwrap_or_else(|| *large.next().expect("parsed"));
         }
         release(records);
     }
     let (mut lines, mut len) = (Vec::with_capacity(order.wait().len()), 0);
     // The bytes `put_number` writes for `value`: a space and its decimal digits.
     let width = |&value: &u64| 1 + value.checked_ilog10().map_or(1, |log| log as usize + 1);
-    for &e in order.wait() {
+    for &e in order.wait().iter().filter(|&&e| start[e] < start[e + 1]) {
         let group = &mut buffer[start[e] as usize..start[e + 1] as usize];
-        if !group.is_empty() {
-            let [p50, p95, p99] = percentiles(group);
-            let line = [e as u32, group.len() as u32, p50, p95, p99, errors[e]];
-            // The six numbers, the label and its space, the name, and the LF.
-            len += numbers(&line).iter().map(width).sum::<usize>() + 21 + names[e].len() + 1;
-            lines.push(line);
-        }
+        let [p50, p95, p99] = percentiles(group);
+        let line = [e as u32, group.len() as u32, p50, p95, p99, errors[e]];
+        // The six numbers, the label and its space, the name, and the LF.
+        len += numbers(&line).iter().map(width).sum::<usize>() + 21 + names[e].len() + 1;
+        lines.push(line);
     }
     (lines, len)
 }
@@ -763,11 +757,8 @@ fn percentiles(group: &mut [u32]) -> [u32; 3] {
         33..=64 => unsafe { sort_network::<8>(group, at) },
         // SAFETY: as above.
         65..=128 => unsafe { sort_network::<16>(group, at) },
-        _ => {
-            let p50 = *group.select_nth_unstable(i50).1;
-            let p95 = *group[i50..].select_nth_unstable(i95 - i50).1;
-            [p50, p95, *group[i95..].select_nth_unstable(i99 - i95).1]
-        }
+        _ => [(0, i50), (i50, i95), (i95, i99)]
+            .map(|(f, i)| *group[f..].select_nth_unstable(i - f).1),
     }
 }
 
