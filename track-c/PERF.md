@@ -1165,6 +1165,33 @@ the 61 more lines cost about as many points as 5% of T.
   that: 63.44 ms in the second session. Both are within that build's spread across sessions,
   63.4–64.5 ms.
 - **A longer spin before parking**, 20,000 spins instead of 2,000: 59.71 against 59.44 ms.
+- **One name table shared by all parsers, with 4-byte letters** (local, on step 35's code). Each
+  parser looked its record's name up in one lock-free table of 262,144 slots, each an id plus one
+  and 6 bits of the hash, with a 32-byte key per id. A key was written before a `Release` CAS put
+  its id in a slot, and lookups read the slots with `Acquire`. A new name's id was its owner's
+  next local index, from one atomic counter per owner, times the thread count plus the owner. A
+  letter was then 4 bytes, the local index and the group, and each owner kept a row of 256 bits
+  per name it owns, about 270 KB per owner.
+  - `ab.py`, 41 interleaved runs, two rounds, medians / minimums: 26.83 / 26.26 → 37.53 / 36.52
+    ms and 27.21 / 26.33 → 38.00 / 36.58 ms (+40%). With each name's slot prefetched as soon as
+    its hash was known and probed after the region id and the amount, as step 7 did, in a second
+    session: 26.60 / 25.81 → 35.92 / 35.43 ms and 26.58 / 25.91 → 35.92 / 35.19 ms (+35%).
+    Rounds of 512 KiB, which 4-byte letters allow at one mailbox page each: 35.87–36.06 ms.
+  - `perf stat`, 15 interleaved runs: instructions 1055.3 → 1078.9 M (+2.2%), cycles 601.7 →
+    867.6 M (+44%), L2 misses 2.52 → 7.36 M. Without the marking, the lookup and its letter
+    alone ran 408 M cycles more than step 35 with no name work at all, where all of step 35's
+    letters and marking cost 228 M. In a profile of one run, a third of the cycles sat on two
+    loads: the key's (25% of the samples) and the slot's (11%).
+  - The whole table, 1 MB of slots and 3.2 MB of keys, is every core's working set, while a
+    P-core's L2 holds 1.25 MB and the two owners on a core take 1.2 MB of step 35's name sets.
+    Step 35's 32-byte letters cost bandwidth, but they stream through the mailboxes in order;
+    the shared table costs two random loads per record that miss L2. Both run about 1.75
+    instructions per cycle, so even with every miss hidden, 2.2% more instructions could not
+    have made it faster.
+  - memory.peak, 12 alternating runs: medians 12.58 → 13.21 MiB; S 387 → 427, untrimmed. The
+    measured build's table did not grow, so it was checked on full seeds 1–7 and 10–12, which
+    give the reference hashes; a build that sizes the table from an upper bound passes the gate
+    (310 pass, 0 fail).
 
 ## Profile notes
 
