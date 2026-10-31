@@ -64,7 +64,7 @@ unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     /// glibc's `mallopt(3)`, used once, with `M_MMAP_THRESHOLD` (-3).
     fn mallopt(param: i32, value: i32) -> i32;
-    /// libc's `madvise(2)`, with `MADV_HUGEPAGE` (14) and [`MADV_DONTNEED`].
+    /// libc's `madvise(2)`, with `MADV_HUGEPAGE` (14), `MADV_COLLAPSE` (25) and [`MADV_DONTNEED`].
     fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
 }
 const MADV_DONTNEED: i32 = 4;
@@ -1139,7 +1139,10 @@ impl TermTable {
     /// are distinct terms, that is 262,144 slots, at most 29% full.
     ///
     /// The slots sit alone on transparent huge pages and are never freed. The pass reads them
-    /// at random, and on 4 KiB pages most of those reads would first walk the page tables.
+    /// at random, and on 4 KiB pages most of those reads would first walk the page tables. If
+    /// the first writes found no free huge page, `MADV_COLLAPSE` asks again, now compacting
+    /// memory if it must, whatever the sysfs THP settings say; a kernel before 6.1 or without
+    /// THP refuses it, harmlessly.
     fn new(occurrences: usize) -> Self {
         // A term id times 16 fits in `Slot::flags`.
         assert!(occurrences < 1 << 28, "queries.txt: too many terms");
@@ -1150,10 +1153,11 @@ impl TermTable {
         let block = unsafe { std::alloc::alloc(layout) };
         assert!(!block.is_null(), "out of memory");
         // SAFETY: `block` holds `layout.size()` bytes, aligned for slots, and an all-zero slot
-        // is empty; the advice changes no data.
+        // is empty; neither advice changes any data.
         let slots = unsafe {
             madvise(block, layout.size(), 14); // MADV_HUGEPAGE
             block.write_bytes(0, layout.size());
+            madvise(block, layout.size(), 25); // MADV_COLLAPSE
             std::slice::from_raw_parts_mut(block.cast(), len)
         };
         let (lens, keys) = (vec![0], vec![[0; MAX_TERM / 8]; occurrences + 1]);

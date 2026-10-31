@@ -41,6 +41,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 34 | The term lookups take no bounds checks: the probe reads the slots unchecked from a key's home slot on, the prefetches take pointers, and the token loop holds the term table and the seen bits as locals | run-401b90111691 | 0.1618 | 40.5 | 73.7 |
 | 35 | 11% fewer instructions in the corpus pass: a document's checks are written to a slice sized once and evaluated without bounds checks, the tokenizer picks the start of a token carried over from the previous block once per block, a key's window takes one bounds check and its hash two words, phrases are compared inline, and a long key's mark rides in its slot's tail | run-8bf61f0fec95 | 0.1313 | 43.3 | 75.9 |
 | 36 | The serial start about 2.2 ms shorter: the intern prefetches 16 keys ahead and keeps each term's length and only the long terms' keys, a term's cost is computed where the planning reads it, the sample keeps each term's count and last document in one cell, and the term table's flags are collected in bytes | run-ce4c2e1d13c6 | 0.1342 | 42.8 | 75.7 |
+| 37 | The term table's huge pages asked for again: once the table is written, `MADV_COLLAPSE` collapses its 4 KiB pages into huge pages if its faults found no free one | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -896,12 +897,12 @@ In the round that timed both, the pass started at 14.24 ms for step 35 and 12.06
 step; over three rounds each, at 14.24–14.86 and 12.06–12.50 ms, and the pass itself took
 118.8–121.6 and 119.5–119.8 ms.
 
-Local, against step 35 (`ab.py`, 20 alternating runs, CPUs 12-15, on AC), two rounds: medians
+Local, against step 35 (`ab.py`, 20 alternating runs on the P-cores, on AC), two rounds: medians
 139.93 and 140.59 → 137.99 and 138.03 ms, minimums 138.94 and 138.95 → 135.71 and 136.54 ms.
 `perf stat` on CPUs 12-15: instructions 6,080 → 6,090 M, page faults 11,949 → 10,560; on the
 P-cores, page faults 19,235 → 16,669. memory.peak over 12 alternating runs on the P-cores:
-median 42.3 → 41.4 MB. S 761 → 761. Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match
-their reference hashes.
+median 42.3 → 41.4 MB. S 761 → 761. Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their
+reference hashes.
 
 The grouping's arrays written when allocated, as tried after step 17, took the checks' grouping
 from 1.27 to 1.32 ms, with 10,564 page faults against 10,560. The prefetch 8 or 32 places on:
@@ -919,6 +920,49 @@ in the same run, track C's unchanged code drew 60.1 ms, against its usual 27 ms.
 A second run of the same commit, run-fa751616d535, drew 169.1 ms and 39.9 MB, while track C's
 unchanged code drew its usual 27.2 ms in it, so this draw was slow for B alone.
 A third, run-ab34f37502a1, drew 131.2 ms and 42.6 MB.
+
+## Step 37: the term table's huge pages asked for again
+
+On the board, B's wall time follows its memory.peak. Step 36 drew 134.2 ms at 42.8 MB, 169.1 ms
+at 39.9 MB and 131.2 ms at 42.6 MB, and step 34 drew 161.8 ms at 40.5 MB, the lowest memory of
+steps 30 to 36. A run whose blocks get no transparent huge pages takes less memory, as nothing
+is rounded up to 2 MiB, and its random reads into the term table walk the page tables.
+
+Locally, step 36 run with THP off for the process (`prctl(PR_SET_THP_DISABLE)`, which `execve`
+keeps), on the P-cores, medians of four runs with and four without: cycles 3,514 → 3,726 M
+(+6.0%), instructions 6,336 → 6,339 M, dTLB load misses 2.5 → 22.3 M, page faults 16,644 →
+17,664, memory.peak 41.5 → 39.1 MB. Sampled without THP (`mem_inst_retired.stlb_miss_loads`),
+58% of the loads that miss the STLB are the prefetches of each token's home slot, and 22% the
+BOOL triggers' prefetches of their checks and cells. With THP, 2.0 M remain, 45% of them at the
+checks' prefetch: the checks take 1.6 MB, too little for a huge page.
+
+- **The collapse.** Once the table is written, `madvise(MADV_COLLAPSE)` (Linux 6.1 on) collapses
+  its 4 KiB pages into huge pages if its faults found no free one, synchronously, with direct
+  compaction if needed, whatever the sysfs THP settings say (`madvise(2)`). Where the faults got
+  huge pages, the call returned in 33–172 µs in three runs. With THP off while the table is
+  written and back on before the call, the collapse took 1.38–1.48 ms and gave back the counts
+  with THP: cycles 3,521 M, dTLB load misses 2.50 M, memory.peak 41.1 MB. With THP off for the
+  whole process, it fails and changes nothing: cycles 3,736 M.
+
+In 12 alternating runs each, neither step 36 nor this step lost the table's huge pages on this
+machine, although 5% of its THP faults since boot fell back to 4 KiB pages and 91% of its direct
+compactions failed (`/proc/vmstat`). So the collapse helps where the faults could not, or did
+not try to, compact memory, and costs a fraction of a millisecond elsewhere.
+
+Local, against step 36 (`ab.py`, 20 alternating runs on the P-cores, on AC, load average 4–6),
+six rounds: medians 139.16, 137.95, 137.61, 138.70, 138.55 and 137.73 → 138.67, 138.71, 138.53,
+138.27, 138.88 and 137.75 ms, minimums 136.68, 136.40, 136.31, 136.48, 137.41 and 136.07 →
+136.86, 136.79, 137.34, 136.68, 137.12 and 136.98 ms: no change beyond the noise. memory.peak
+over 8 alternating runs: median 42.2 → 41.1 MB. S 761 → 762. Gate: 510 pass, 0 fail; seeds 2, 3,
+7, 10 and 12 match their reference hashes.
+
+A table of half the slots, 131,072, at most 58% full, took the dTLB load misses without THP from
+22.3 to 13.7 M, but its longer probes took 4.3% more instructions: cycles 3,726 → 4,175 M
+without THP and 3,514 → 3,983 M with it. Prefaulting the table with `MADV_POPULATE_WRITE`
+instead of the stores goes through the same faults, so it gets huge pages no more often. Not
+built: a second, small table for the commonest terms, probed first. In the first 16 MB of seed
+1, the 4,096 commonest query terms are 64% of the tokens, so those probes would stay on a few
+dozen pages, but every other token would probe both tables.
 
 ## Experiments that did not stay
 
