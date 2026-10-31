@@ -41,6 +41,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 34 | The amount parses as one number in cents, every number finds its stop as its first byte below `0`, the BOM test reads the id's word, a letter's stores read `sent[to]` once, the batch is made once per worker, and the input is prefetched 448 bytes ahead | run-91b80b654f7a | 0.0269 | 12.2 | 79.4 |
 | 35 | The region id and the amount parse together in one SSE vector, the name and the note come from one mask of quotes and commas whose prefix XOR marks the quoted bytes, the name hash is CRC32, the name set's key stays in one AVX2 register, and a letter's slot is read unchecked | run-6252826712db | 0.0252 | 12.9 | 79.3 |
 | 36 | The record batch holds each letter by reference, in an order whose loads are forwarded from their stores, and the group goes into its letter as one byte | run-5a15a73439c1 | 0.0246 | 12.5 | 79.7 |
+| 37 | The merge takes its group from `by_id` without a bounds check, and a letter's thread is picked with `sent.len()` instead of a load through the closure's reference to the thread count | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1112,6 +1113,56 @@ Dropped, against the code before them; `ab.py` on AC power, 41 interleaved runs,
   bits would visit every set bit, 0.9 per letter, since 89.8% of the records add a pair.
 - **The merge as vectors** (not built): the compiler already adds the record's first four fields
   to its group with one AVX2 add.
+
+## Step 37: a bounds check and a load fewer per record
+
+Two changes in the record loop. Neither adds a line. Both came from reading the loop's machine
+code next to a `perf record` of its user-mode instructions over 40 runs, with each sample charged
+to its line:
+
+- **The group's index unchecked.** The merge indexed `groups` with the group read from `by_id`,
+  and the compiler compared it with the length of `groups` first, two instructions per record.
+  The check can never fail, whatever the input: step 1 writes into `by_id` only the number of a
+  code that occurs, which is below `group_count`, the length of `groups`, every other byte stays
+  0, and an id past the table maps to 0. Alone: instructions −0.66%, cycles −0.80%.
+- **The thread count as `sent.len()`.** A letter goes to the thread given by its hash times the
+  thread count, shifted down by 32. The worker's closure holds `threads` by reference, so the
+  multiply waited on two loads, one after the other: the reference from the stack, then the count
+  through it. `sent` holds one mailbox position per thread, so its length is the same count, and
+  the multiply now reads it from the stack in one load. On top of the first change: instructions
+  −0.65%, cycles −0.47%.
+
+On AC power, `ab.py`, 41 interleaved runs, four rounds, against step 36: medians 26.35, 26.50,
+26.41 and 26.29 → 26.19, 26.30, 26.41 and 26.19 ms (−0.6%, −0.8%, 0.0% and −0.4%). Six earlier
+rounds of the same machine code, built before the comments were written, measured −0.2% to
+−1.0%. `perf stat`, 20 interleaved runs: instructions:u 1024.4 → 1011.1 M (−1.3%, 309 → 305 per
+record), cycles:u 586.2 → 581.3 M (−0.8%). memory.peak, 15 alternating runs: medians 12.36 →
+12.39 MiB. S 387 → 387. Correctness: the gate, 310 pass, 0 fail; full seeds 1–7 and 10–12 give
+the reference hashes; the 400 fuzz cases and the two long-name sets pass at the default thread
+count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300
+tiny seeds pass at 1, 2, 3, 5, 7, 12, 16, 23, 37 and 64 threads with 100-byte rounds; the six
+files of edge cases match the reference at the default thread count, at 1 and 37 threads, and
+with 100-byte rounds at 3 and 64; clippy reports no warnings.
+
+The loop's other bounds checks stay. Each guards a read at a stop found by the parse before it,
+and a malformed last record can put such a stop at the end of the input, where the read would
+run past the padding.
+
+Dropped, against step 36 unless noted; `ab.py` on AC power, 41 interleaved runs, and `perf stat`,
+20 interleaved runs:
+- **The name set's tables as local slices** in `NameSet::read`, taken again after each insert, so
+  that the probe would not load the slots' address and length through `self` for every letter:
+  instructions +1.1%, cycles +2.6%, `ab.py` +2.1% and +2.6%.
+- **The group unchecked in the marking too**, the distinct count after the barrier, which takes
+  one more line: instructions −1.0%, but cycles −0.6% and −0.8%, no better than the merge's
+  change alone, and in three rounds of `ab.py` with both, +0.3%, −0.2% and +1.0% against it.
+- **The id's word read unchecked** (`perf stat` only): with every read of `number` unchecked,
+  which is not sound, instructions −1.85% but cycles −0.45%, against the merge's change alone.
+  Only the reads at a record's start can be shown in bounds for any input. The slow amount parse
+  also calls `number`, from stops that a malformed last record can put at the end of the input,
+  and keeping its check takes more lines.
+- **The letter made after the region id and the amount**, on top of both changes: instructions
+  −0.31%, cycles +0.42%.
 
 ## Experiments that did not stay
 

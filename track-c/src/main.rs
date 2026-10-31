@@ -379,11 +379,12 @@ fn join(data: &[u8], regions: &[u8], threads: usize) -> (Vec<Group>, Vec<[u8; 3]
                     // Past the CR if any, then the LF. Only the last record may end at end of
                     // file instead (§2.1), which leaves `at` past the end and stops the loop.
                     at = dot + 4 + usize::from(data[dot + 3] == b'\r');
-                    let to = ((u64::from(letter[3] as u32) * threads as u64) >> 32) as usize;
+                    // The thread count as `sent.len()`: `threads`, read through the closure's
+                    // reference to it, took one more load per record.
+                    let to = ((u64::from(letter[3] as u32) * sent.len() as u64) >> 32) as usize;
                     // Read once, because the four stores made the compiler load `sent[to]` again
                     // for each, and unchecked, which saves its bounds check.
-                    // SAFETY: the hash is below 2^32, so `to` is below `threads`, the length of
-                    // `sent`.
+                    // SAFETY: the hash is below 2^32, so `to` is below `sent.len()`.
                     let sent = unsafe { sent.get_unchecked_mut(to) };
                     let slot = *sent;
                     (0..4).for_each(|i| boxes[slot][i].store(letter[i], Relaxed));
@@ -403,7 +404,9 @@ fn join(data: &[u8], regions: &[u8], threads: usize) -> (Vec<Group>, Vec<[u8; 3]
                     // reference, and no other thread reads or writes them before the barrier.
                     unsafe { byte.add(30).write(group as u8) };
                     let record = [1, id as i64, cents, name_len, note_len, 0, cents, cents];
-                    merge(&mut groups[group], &record);
+                    // SAFETY: `by_id` holds 0 or a number from step 1, below `group_count`, the
+                    // length of `groups`. The bounds check took two instructions per record.
+                    merge(unsafe { groups.get_unchecked_mut(group) }, &record);
                 }
             }
             for (to, &next) in sent.iter().enumerate() {
