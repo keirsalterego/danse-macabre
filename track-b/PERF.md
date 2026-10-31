@@ -38,6 +38,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 31 | The token loop writes a document's term ids and its kept rows, lists and BOOL triggers into four runs of one slice, and its seen bits, without bounds checks, so its registers no longer spill | run-ea58cfb946e5 | 0.1483 | 42.1 | 74.6 |
 | 32 | 1 fewer line with the same binary: the build stage mounts its sources instead of copying them | run-ced2f9ec7167 | 0.1491 | 41.1 | 74.6 |
 | 33 | A document's checks are added in one `Tally` method that takes no branch on a check's result: the queries of the checks that the document is one of the first matches of are moved to the front of its list of checks, and only those go on to the first-match counts | run-94e224675c5a | 0.1455 | 41.3 | 74.8 |
+| 34 | The term lookups take no bounds checks: the probe reads the slots unchecked from a key's home slot on, the prefetches take pointers, and the token loop holds the term table and the seen bits as locals | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -765,8 +766,57 @@ instructions, for 3.81 G cycles. A single compare of the cell against a limit th
 miss became two branches again, with 22.9 M misses and 4.03 G cycles; held in a register by an
 empty `asm!` block, it stayed one compare, but the misses stayed at 18.1 M.
 
+## Step 34: the term lookups without bounds checks
+
+After step 33 each token's lookup still checked bounds: [`TermTable::position`] checked each
+slot it probed, `find_from` checked the index that `position` returned, and `prefetch` took a
+reference, which cost a check to make, for each token's home slot and each BOOL trigger's
+checks and cells. The token loop also reached the term table and `seen` through the closure's
+captured references, so it reloaded their addresses after its stores.
+
+- **The probe unchecked.** `position` and `find_from` are `unsafe fn`s that take a slot index,
+  as [`TermTable::home`] gives one: it shifts the hash down to the slot count's bits, and the
+  probe wraps at the count. The table has 2 slots or more, so that the shift stays below 64.
+- **Prefetches by pointer.** `prefetch` takes a raw pointer, made with `wrapping_add`: a
+  prefetch of any address is harmless.
+- **The table and `seen` as locals.** The token loop takes `plan.terms` and a slice of `seen`
+  once per document. Step 31 found the slice alone did not measure, for 81 M fewer instructions;
+  with the table, it cut 99 M.
+
+Built up on step 33 (`perf stat`): the prefetches by pointer, instructions 7,257 → 7,220 M; the
+probe unchecked as well, 7,079 M, user cycles 3.69 → 3.66 G; the table and `seen` as locals,
+6,980 M and 3.56–3.64 G. Branch misses stayed at 16.8–16.9 M. `ab.py`, 18 alternating runs, two
+rounds, step 33 / the probe unchecked / all three: medians 152.84 / 151.19 / 150.65 and 152.63 /
+150.84 / 150.26 ms, minimums 150.77 / 149.93 / 149.18 and 151.52 / 149.94 / 149.35 ms.
+
+Local, against step 33 (`ab.py`, 20 alternating runs, load average 3–5), three rounds: medians
+153.42, 153.74 and 152.45 → 151.11, 151.83 and 151.14 ms, minimums 151.91, 152.08 and 151.64 →
+149.87, 148.39 and 149.27 ms. `perf stat`: user cycles 3.69 → 3.56–3.65 G, instructions 7,257 →
+6,980 M, branch misses 16.9 → 16.8 M. memory.peak over five alternating runs: median 41.9 → 41.6
+MB. S 750 → 751. Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
+
+Splitting the token loop in two, all of a document's lookups first and then the rest from their
+flags, added 185 M instructions and 0.4 M branch misses, for 3.65 G cycles against 3.64 G. A
+term table of 4-slot buckets, one 64-byte line each, with a key's home slot at the start of a
+bucket and the key compared with all four slots in two AVX2 compares, kept the linear probe only
+for long keys and for misses in a bucket whose last slot is taken, 0.9% of lookups: branch
+misses 16.9 → 12.4 M, but instructions 7,257 → 7,697 M and user cycles 3.70 → 3.85 G.
+
 ## Experiments that did not stay
 
+- **After step 33, on the serial parts** (local, a build with timestamps, seed 1). The pass
+  starts at 15.4 ms: parsing the queries takes 7.7 ms, of which interning 3.4, the sample 3.5,
+  planning the queries 2.9 and marking the term table 1.1 ms. The threads' passes run 129.5 to
+  131.6 ms. At its end, a thread spends 0.3–1.1 ms dropping its pages of the corpus, 0.5–0.75
+  ms on its last window flush, 0.3–1.25 ms freeing its sets, 0.2–0.9 ms merging its cells and
+  1.3–2.3 ms grouping its first matches. Formatting takes about 1.9 ms, the frees after it 1.3
+  ms and the write 0.5 ms. None of these changes paid:
+  - The intern loop's prefetch 16 terms ahead (dropped at step 21) put back, or 8 or 32 ahead:
+    interning took about 0.35 ms less, for 3 more lines.
+  - The queries, plan and chunks leaked instead of freed after formatting, as after step 17:
+    three rounds of 20 runs, medians −0.96, +0.10 and −1.80 ms.
+  - Nothing freed at the end of a thread's pass: median 152.28 → 152.27 ms, memory.peak 41.4 →
+    50.8 MB.
 - **PGO** (local, turbo off, on step 31's code): a profile from three runs on each of full seeds
   2–4, passed as `-C profile-use`, with every function matching it. `ab.py`, 16 interleaved runs,
   medians / minimums: 161.21 / 157.44 → 168.09 / 160.76 ms and 158.09 / 155.53 → 161.43 / 159.20 ms

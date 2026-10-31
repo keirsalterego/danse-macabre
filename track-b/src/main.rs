@@ -541,7 +541,8 @@ fn count_hits(sample: &[u8], terms: &TermTable) -> (Vec<u32>, usize) {
     walk(sample, &mut probes, token, |probes| {
         for (key, at) in probes.drain(..) {
             // A token that is no query term counts at id 0, which no query reads.
-            let id = terms.find_from(&key, at).id() as usize;
+            // SAFETY: `at` is the key's home slot, from [`TermTable::prefetch`].
+            let id = unsafe { terms.find_from(&key, at) }.id() as usize;
             hits[id] += u32::from(counted[id] != doc);
             counted[id] = doc;
         }
@@ -852,11 +853,13 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
         let n = probes.len();
         kept.resize(kept.len().max(4 * n), 0);
         let (kept, mut rows, mut lists, mut bools) = (&mut kept[..4 * n], n, 2 * n, 3 * n);
+        let (table, seen) = (&plan.terms, &mut seen[..]);
         // No branch on what a token is, a query term or not, new in the doc or not, kept in a
         // row or a list, or a BOOL trigger: none of it follows a pattern. Phrase triggers keep
         // their branch below: pushing them without one lost on step 9 (PERF.md, experiments).
         for (k, (key, at)) in probes.iter().enumerate() {
-            let slot = plan.terms.find_from(key, *at);
+            // SAFETY: `at` is the key's home slot, from [`TermTable::prefetch`].
+            let slot = unsafe { table.find_from(key, *at) };
             let (t, bit) = (slot.id() as usize / 64, 1 << (slot.id() % 64));
             // The term's flags if the doc did not hold it yet, else none: a term is kept and
             // triggers once per doc.
@@ -886,8 +889,8 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
         for &t in &kept[3 * n..bools] {
             // Start loading its checks and their cells now, to use below.
             let checks = plan.check_range(t);
-            prefetch(&plan.checks[checks.start]);
-            prefetch(&tally.checks[checks.start]);
+            prefetch(plan.checks.as_ptr().wrapping_add(checks.start));
+            prefetch(tally.checks.as_ptr().wrapping_add(checks.start));
             // Four indices written at once, then cut to the range's length: a loop
             // per trigger would mispredict its exit, as the lengths follow no pattern.
             let start = checks.start as u32;
@@ -914,7 +917,7 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
                 }
             }
         }
-        tally.add_checks(&plan.checks, &mut bool_terms, &seen, doc);
+        tally.add_checks(&plan.checks, &mut bool_terms, seen, doc);
         bool_terms.clear();
         // Every set bit is one of the doc's terms, so zeroing their words clears `seen`: a store
         // with no load, so tokens that share a word, as all misses do, do not wait on each other.
@@ -985,10 +988,11 @@ fn bit_index_sum(word: u64) -> u64 {
     HAS.iter().enumerate().map(weight).sum()
 }
 
-/// Starts loading the cache line that holds `item` into L1.
-fn prefetch<T>(item: &T) {
+/// Starts loading the cache line that holds `item` into L1. A pointer, so that callers need no
+/// bounds check: a prefetch of any address is harmless.
+fn prefetch<T>(item: *const T) {
     // SAFETY: a prefetch never faults or changes memory.
-    unsafe { _mm_prefetch::<_MM_HINT_T0>(std::ptr::from_ref(item).cast()) };
+    unsafe { _mm_prefetch::<_MM_HINT_T0>(item.cast()) };
 }
 
 /// A token's bytes, ASCII-lowercased and zero-padded to `MAX_TERM`, as little-endian words.
@@ -1099,9 +1103,10 @@ impl TermTable {
     fn new(occurrences: usize) -> Self {
         // A term id times 32 fits in `Slot::flags`.
         assert!(occurrences < 1 << 27, "queries.txt: too many terms");
-        let len = (occurrences * 3 / 2 + 1).next_power_of_two();
+        // 2 slots or more, so that the shift in [`TermTable::home`] stays below 64.
+        let len = (occurrences * 3 / 2 + 1).next_power_of_two().max(2);
         let layout = Layout::from_size_align(size_of::<Slot>() * len, 2 << 20).expect("fits");
-        // SAFETY: `len` is at least 1, so the size is nonzero.
+        // SAFETY: `len` is at least 2, so the size is nonzero.
         let block = unsafe { std::alloc::alloc(layout) };
         assert!(!block.is_null(), "out of memory");
         // SAFETY: `block` holds `layout.size()` bytes, aligned for slots, and an all-zero slot
@@ -1121,11 +1126,18 @@ impl TermTable {
 
     /// The slot of the query term whose key this is, given `at = self.home(key)`, or else the
     /// empty slot where its probe ends, whose id, 0, is no term's.
-    fn find_from(&self, key: &Key, at: usize) -> Slot {
-        self.slots[self.position(key, at)]
+    ///
+    /// # Safety
+    ///
+    /// `at` is below the slot count, as [`TermTable::home`] is.
+    unsafe fn find_from(&self, key: &Key, at: usize) -> Slot {
+        // SAFETY: `at` is below the slot count, as the caller ensures, and so is the index
+        // `position` returns.
+        unsafe { *self.slots.get_unchecked(self.position(key, at)) }
     }
 
-    /// Where the probe for `key` starts.
+    /// Where the probe for `key` starts: below the slot count, a power of two of 2 or more, as
+    /// the hash is shifted down to the count's bits.
     fn home(&self, key: &Key) -> usize {
         (key_hash(key) >> (64 - self.slots.len().trailing_zeros())) as usize
     }
@@ -1134,14 +1146,15 @@ impl TermTable {
     /// overlaps other work until [`TermTable::find_from`] needs it.
     fn prefetch(&self, key: &Key) -> usize {
         let at = self.home(key);
-        prefetch(&self.slots[at]);
+        prefetch(self.slots.as_ptr().wrapping_add(at));
         at
     }
 
     /// The id of the term whose key this is. A new term takes the next id and the free slot
     /// where its probe ends.
     fn intern(&mut self, key: Key) -> u32 {
-        let at = self.position(&key, self.home(&key));
+        // SAFETY: a home slot is below the slot count.
+        let at = unsafe { self.position(&key, self.home(&key)) };
         // No branch on whether the term is new, which follows no pattern: the slot is written
         // and the key pushed either way, and the key dropped again unless the term is new.
         let (new, n) = (self.slots[at].head == 0, self.keys.len());
@@ -1163,11 +1176,16 @@ impl TermTable {
     }
 
     /// The slot holding `key`, or the empty slot where it belongs, probing linearly from `at`.
-    fn position(&self, key: &Key, mut at: usize) -> usize {
+    ///
+    /// # Safety
+    ///
+    /// `at` is below the slot count, as [`TermTable::home`] is.
+    unsafe fn position(&self, key: &Key, mut at: usize) -> usize {
         let mask = self.slots.len() - 1;
         let long = key[1] >> 32 | key[2] | key[3] != 0;
         loop {
-            let slot = &self.slots[at];
+            // SAFETY: `at` starts below the slot count, as the caller ensures, and wraps at it.
+            let slot = unsafe { self.slots.get_unchecked(at) };
             // No `&&`: whether a token is a query term follows no pattern, so the probe takes one
             // branch, mostly taken, ending at the term or an empty slot; long keys take one more.
             let mut found = (slot.head ^ key[0]) | u64::from(slot.tail ^ key[1] as u32) == 0;
