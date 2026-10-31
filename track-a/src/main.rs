@@ -55,7 +55,7 @@
 //!
 //! Every step's measurements are in `PERF.md`.
 
-use std::arch::x86_64::*; // the AVX2 intrinsics of the sorting network
+use std::arch::x86_64::*; // the intrinsics of the sorting network, `equal_mask` and the parse
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::{Barrier, Mutex, OnceLock, atomic::AtomicU32, atomic::AtomicUsize};
 use std::{fs::File, io::Write, ops::Range, os::fd::AsRawFd, path::Path, ptr::null_mut, thread};
@@ -229,7 +229,7 @@ fn summarize(log: &'static [u8], out_path: &Path) {
             // that agree on 64 bytes compare in full.
             // SAFETY: every id below `names.len()` had its copy written before the barrier, and
             // no thread writes one after it.
-            let padded = |id: usize| unsafe { &(*all.padded[id].get()).assume_init_ref().0 };
+            let padded = |id: usize| unsafe { &(*all.padded[id].get()).0 };
             order.sort_unstable_by_key(|&id| (padded(id), all.names[id].get()));
             let _ = sorted.set(order);
         }
@@ -362,7 +362,6 @@ const LARGE: u32 = (1 << 19) - 1;
 /// to 32 bytes, the loop lost `rbp` to the frame pointer and kept more of its values on the stack.
 #[inline(never)]
 fn parse(log: &'static [u8], lines: Range<usize>) -> Chunk {
-    use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
     // A run lasts while the timestamp's bytes 5 to 12, `MM-DDTHH`, stay the same, so most lines
     // compare those 8 bytes and decode nothing. No line's bytes are all zero, so line 0 starts a
     // run.
@@ -449,11 +448,10 @@ fn line_end(line: &[u8; LINE]) -> usize {
 /// ([`Interner::intern`]).
 #[target_feature(enable = "avx2")]
 fn equal_mask(a: &[u8; 64], b: &[u8; 64]) -> u64 {
-    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8 as equal, _mm256_movemask_epi8 as mask};
     // SAFETY: 64 bytes are two 256-bit vectors, and any bits make a valid vector.
     let [a, b]: [[__m256i; 2]; 2] = unsafe { std::mem::transmute([*a, *b]) };
-    let low = mask(equal(a[0], b[0])).cast_unsigned();
-    u64::from(low) | u64::from(mask(equal(a[1], b[1])).cast_unsigned()) << 32
+    let [low, high] = [0, 1].map(|i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(a[i], b[i])));
+    u64::from(low.cast_unsigned()) | u64::from(high.cast_unsigned()) << 32
 }
 
 /// Returns the hour index `0..72` of a line's timestamp, or `None` outside the span.
@@ -562,7 +560,7 @@ struct Interner<'a> {
     /// Id → the name and the space after it, zero-padded to 64 bytes, for the probes of
     /// [`Interner::intern`]. A name of 64 bytes or more has no room for the space and keeps only
     /// its first 64 bytes.
-    padded: [std::cell::UnsafeCell<std::mem::MaybeUninit<Padded>>; 1 << 12],
+    padded: [std::cell::UnsafeCell<Padded>; 1 << 12],
     /// How many names have an id; the lock that adding a name takes.
     count: Mutex<usize>,
 }
@@ -572,11 +570,18 @@ struct Interner<'a> {
 // only through an id loaded from a slot with `Acquire`, or after the parse.
 unsafe impl Sync for Interner<'_> {}
 
-/// The endpoints' interner. As a static, its tables lie at fixed addresses, and a probe loads
-/// no pointer to them first: 3 instructions fewer per line. A `OnceLock` starts out nonzero, so
-/// the tables take 426 KB of `.data` in the binary instead of `.bss`; a page of it is read in only
-/// when touched, like the heap pages the tables took before.
-static ENDPOINTS: Interner<'static> = Interner::new();
+/// The endpoints' interner, empty at the start. Its tables never grow: lookups index them while
+/// other threads add names. As a static, they lie at fixed addresses, and a probe loads no pointer
+/// to them first: 3 instructions fewer per line. A `OnceLock` starts out nonzero, so the tables
+/// take 426 KB of `.data` in the binary instead of `.bss`; a page of it is read in only when
+/// touched, like the heap pages the tables took before. Being in `.data` anyway, the padded copies
+/// start out as zeros at no cost, rather than uninitialized.
+static ENDPOINTS: Interner<'static> = Interner {
+    slots: [const { AtomicU32::new(0) }; 4 << 12],
+    names: [const { OnceLock::new() }; 1 << 12],
+    padded: [const { std::cell::UnsafeCell::new(Padded([0; 64])) }; 1 << 12],
+    count: Mutex::new(0),
+};
 
 /// A padded copy, aligned to one cache line. The allocator aligns the table to 16 bytes, so
 /// each copy used to span two lines, and every probe loaded both: 16% of the L1 misses.
@@ -587,17 +592,6 @@ struct Padded([u8; 64]);
 // 9% of all instructions (about 1 ms of wall time), so it is forced inline (`inline_always` is
 // allowed in `Cargo.toml`); `insert` stays out of line.
 impl<'a> Interner<'a> {
-    /// An empty table. The tables never grow: lookups index them while other threads add names.
-    const fn new() -> Self {
-        Self {
-            slots: [const { AtomicU32::new(0) }; 4 << 12],
-            names: [const { OnceLock::new() }; 1 << 12],
-            // SAFETY: the copies are `MaybeUninit`, which needs no initialization.
-            padded: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
-            count: Mutex::new(0),
-        }
-    }
-
     /// Returns `name`'s id, assigning the next free one if the name is new.
     ///
     /// `window` is 64 bytes that start with `name` and the space after it: the line itself, or a
@@ -626,8 +620,7 @@ impl<'a> Interner<'a> {
                 // SAFETY: the copy was written before `id` went into the slot, and never again.
                 // An id in a slot is below the count of names, which `insert` keeps within the
                 // 4,096 copies, so the index needs no check.
-                let known =
-                    unsafe { (*self.padded.get_unchecked(id as usize).get()).assume_init_ref() };
+                let known = unsafe { &*self.padded.get_unchecked(id as usize).get() };
                 // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
                 unsafe { equal_mask(window, &known.0) }.trailing_ones() as usize > name.len()
             } else {
@@ -663,7 +656,7 @@ impl<'a> Interner<'a> {
         let padded = std::array::from_fn(|i| if i <= name.len() { window[i] } else { 0 });
         // SAFETY: no slot holds this id yet, so no other thread reads the copy, and only the
         // lock's holder writes one.
-        unsafe { (*self.padded[*count].get()).write(Padded(padded)) };
+        unsafe { *self.padded[*count].get() = Padded(padded) };
         let _ = self.names[*count].set(name);
         *count += 1;
         self.slots[slot].store(*count as u32, Release);

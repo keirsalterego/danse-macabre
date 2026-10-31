@@ -55,6 +55,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 48 | An endpoint table of 16,384 slots instead of 8,192: 1.9% of lines take a second probe instead of 3.9% | run-7eca9cefcfac | 0.0186 | 18.2 | 85.8 |
 | 49 | Three rare paths of the parse marked `std::hint::cold_path`, so its loop keeps its count, its end and its constants in registers | run-7eca9cefcfac | 0.0186 | 18.2 | 85.8 |
 | 50 | Sorting networks unrolled level by level, and a network of 128 values instead of selection for groups of 65 to 128 values | run-9a8d6161d86a | 0.0235 | 18.0 | 83.2 |
+| 51 | 6 fewer lines at the same speed: the parse's intrinsics from the file's one wildcard import, and the interner's padded copies zeroed in its static | | | | |
 
 ## Step 1: v1
 
@@ -813,6 +814,20 @@ The board's run, run-9a8d6161d86a, drew 23.5 ms, a slow draw: in the same run, t
 code drew 60.1 ms, against its usual 27 ms, and track D's 135.9 ms, against 122 to 127 ms.
 A second run of the same commit, run-65986567a603, drew 17.9 ms, and a third, run-148a82d5f70d,
 17.6 ms.
+
+## Step 51: 6 fewer lines
+
+`parse` and `equal_mask` lose their own `use std::arch` lines: the wildcard import that step 50 put
+at the top of the file brings in the same intrinsics, and `equal_mask` names them in full, with its
+two halves in one `map`. The interner's padded copies are `UnsafeCell<Padded>` instead of
+`UnsafeCell<MaybeUninit<Padded>>` and start out as zeros, written in the static's initializer, so
+`Interner::new` goes, and with it the two `assume_init_ref` calls and the `unsafe` block that made
+the uninitialized array. The static is in `.data` anyway, since a `OnceLock` starts out nonzero, and
+`.data` keeps its size. `.text` and `.data` are byte-identical to step 50's, and `.rodata` differs
+only in the line numbers of panic locations, so T and M cannot move: `ab.py`, seven interleaved
+rounds (three of 41 runs, four of 61), medians 19.25 → 19.12, 19.16 → 19.11, 19.03 → 18.96,
+19.06 → 19.03, 18.99 → 19.05, 19.06 → 19.03 and 19.69 → 19.62 ms. S 379 → 373. Gate: 310 pass,
+0 fail.
 
 ## Experiments that did not stay
 
