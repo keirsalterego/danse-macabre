@@ -111,7 +111,9 @@ fn answer_all(query_text: &[u8], docs: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     }
     let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
     let (queries, terms) = parse_queries(query_text, threads)?;
-    let plan = Plan::new(&queries, terms, docs, threads);
+    // The plan and the chunks are never freed: the process exits once the output is written
+    // ([`main`]), and the exit unmaps their blocks faster than freeing did (PERF.md, step 38).
+    let plan = std::mem::ManuallyDrop::new(Plan::new(&queries, terms, docs, threads));
     let bounds = line_bounds(docs, threads);
     // Line `i` holds id `i` (spec §2.1), so the id at a chunk's first line numbers all of its
     // lines, and the id after the last line is the number of documents.
@@ -122,10 +124,10 @@ fn answer_all(query_text: &[u8], docs: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     if (firsts.last()).is_some_and(|&n| u64::from(n).pow(2) >> SUM_BITS != 0) {
         return Err("docs.txt: too many documents".into());
     }
-    let chunks = parallel(threads, &|c| {
+    let chunks = std::mem::ManuallyDrop::new(parallel(threads, &|c| {
         let (text, ids) = (&docs[bounds[c]..bounds[c + 1]], firsts[c]..firsts[c + 1]);
         scan(text, ids, &queries, &plan)
-    });
+    }));
     let range = |t| queries.len() * t / threads..queries.len() * (t + 1) / threads;
     Ok(parallel(threads, &|t| format_range(range(t), &chunks)))
 }
@@ -981,19 +983,22 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
 
 /// Formats the answers to queries `range`, in order (spec §4).
 fn format_range(range: Range<usize>, chunks: &[Chunk]) -> Vec<u8> {
-    let mut out = Vec::new();
+    // `format_into` writes a number's digits alone, without the machinery of `write!`.
+    let (mut out, mut digits) = (Vec::new(), std::fmt::NumBuffer::new());
     for q in range {
         // The id sums of all chunks together stay below `2^SUM_BITS`, as each one does
         // ([`answer_all`]), so the cells add up without a carry into the count.
         let cell: u64 = chunks.iter().map(|c| c.tally.queries[q]).sum();
         let (count, sum) = (cell >> SUM_BITS, cell & ((1 << SUM_BITS) - 1));
-        write!(out, "{count} {sum}").expect("writing to a Vec cannot fail");
         // Chunks hold ascending ids, so the first chunks' first matches are the smallest.
         let shown = (chunks.iter()).flat_map(|c| &c.ids[c.at[q] as usize..c.at[q + 1] as usize]);
-        for id in shown.take(SHOWN_IDS) {
-            write!(out, " {id}").expect("writing to a Vec cannot fail");
+        let ids = shown.take(SHOWN_IDS).map(|&id| u64::from(id));
+        for n in [count, sum].into_iter().chain(ids) {
+            out.extend_from_slice(n.format_into(&mut digits).as_bytes());
+            out.push(b' ');
         }
-        out.push(b'\n');
+        // The line's last space becomes its LF.
+        *out.last_mut().expect("a line holds two numbers") = b'\n';
     }
     out
 }

@@ -42,6 +42,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 35 | 11% fewer instructions in the corpus pass: a document's checks are written to a slice sized once and evaluated without bounds checks, the tokenizer picks the start of a token carried over from the previous block once per block, a key's window takes one bounds check and its hash two words, phrases are compared inline, and a long key's mark rides in its slot's tail | run-8bf61f0fec95 | 0.1313 | 43.3 | 75.9 |
 | 36 | The serial start about 2.2 ms shorter: the intern prefetches 16 keys ahead and keeps each term's length and only the long terms' keys, a term's cost is computed where the planning reads it, the sample keeps each term's count and last document in one cell, and the term table's flags are collected in bytes | run-ce4c2e1d13c6 | 0.1342 | 42.8 | 75.7 |
 | 37 | The term table's huge pages asked for again: once the table is written, `MADV_COLLAPSE` collapses its 4 KiB pages into huge pages if its faults found no free one | | | | |
+| 38 | No frees once the output is formatted, as the plan and the chunks are `ManuallyDrop`, and the output's numbers written by `format_into` instead of `write!` | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -963,6 +964,30 @@ instead of the stores goes through the same faults, so it gets huge pages no mor
 built: a second, small table for the commonest terms, probed first. In the first 16 MB of seed
 1, the 4,096 commonest query terms are 64% of the tokens, so those probes would stay on a few
 dozen pages, but every other token would probe both tables.
+
+## Step 38: no frees after the output, and its numbers without `write!`
+
+After the pass, a run of step 36 spent 3.6 ms more (local, on AC, a build with timestamps, the
+P-cores, medians of 8 runs): formatting took 1.83 ms on every thread, the frees when
+`answer_all` returned 1.14 ms, and writing the file 0.63 ms. Step 37 changes nothing there.
+
+- **No frees after formatting.** The plan and the chunks are `ManuallyDrop`, so `answer_all` no
+  longer unmaps their blocks before it returns: the process exits once the output is written
+  ([`main`]), which already left the output itself unfreed. The frees: 1.14 → 0.06 ms, for the
+  queries, still dropped. After step 33 the same leak, plan, chunks and queries, measured −0.96,
+  +0.10 and −1.80 ms in three rounds of 20 runs, too noisy to keep it.
+
+- **Numbers by `format_into`.** `format_into`, with a `NumBuffer`, writes a number's digits
+  without the formatting machinery of `write!`. Each number goes out followed by a space, and
+  the line's last space becomes its LF: formatting 1.83 → 1.44 ms.
+
+In the timing build, a run took 135.65 → 134.14 ms (median of 8).
+
+Local, against step 37 (`ab.py`, 20 alternating runs on the P-cores, on AC, load average 4–6),
+four rounds: medians 138.53, 138.27, 138.88 and 137.75 → 137.86, 138.38, 139.08 and 137.15 ms,
+minimums 137.34, 136.68, 137.12 and 136.98 → 135.85, 136.61, 137.15 and 136.31 ms. memory.peak
+over 8 alternating runs: median 41.1 → 41.1 MB. S 762 → 763. Gate: 510 pass, 0 fail; seeds 2, 3,
+7, 10 and 12 match their reference hashes.
 
 ## Experiments that did not stay
 
