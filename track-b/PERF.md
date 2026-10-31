@@ -34,6 +34,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 27 | Every thread plans a share of the queries, and the term table's flags are added to every slot, an empty one adding 0, without a test for empty slots | run-fc3b46db2437 | 0.1650 | 41.7 | 73.5 |
 | 28 | The rarity sample probes a line's tokens at its end, as the pass does, and counts without a branch; interning a term takes no branch on whether it is new; the sample's end is found without the other 63 cuts | run-75ef64ef4099 | 0.1643 | 42.2 | 73.5 |
 | 29 | A query on sets adds its window's matches in one vectorized sum instead of a call per word; a term's store is a `u32` code instead of an enum; the terms kept in rows and in lists are listed apart, so adding them takes no branch on which | run-575e79713710 | 0.1623 | 43.1 | 73.7 |
+| 30 | A plain static executable (`crt-static` and `relocation-model=static`) instead of a dynamically linked PIE | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -668,6 +669,19 @@ Comparing a phrase's span term by term instead of as slices, which calls `bcmp`,
 measure.
 
 A second run of the step 29 code, run-2d06517dbcd4, measured 160.2 ms and 42.2 MB (73.8 points).
+
+## Step 30: a plain static executable
+
+`.cargo/config.toml` adds `-C target-feature=+crt-static` and `-C relocation-model=static`, so the
+binary is a plain static executable at a fixed address, with no dynamic loader and no
+position-independent code. In track A the same change ran 3.9% fewer cycles, with half the iTLB
+misses; here the gain is smaller. A static PIE alone measured nothing at step 14 (experiments
+below).
+
+Local, turbo off: `ab.py` against step 29, 16 interleaved runs, five rounds: medians 168.49 →
+168.05, 169.05 → 168.17, 169.66 → 168.04, 168.57 → 167.54 and 168.25 → 168.58 ms, minimums
+167.37 → 165.93, 167.15 → 166.76, 167.45 → 166.86, 167.84 → 166.44 and 167.50 → 166.34 ms.
+S unchanged at 745. Gate: 510 pass, 0 fail.
 
 ## Experiments that did not stay
 
