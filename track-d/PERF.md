@@ -405,8 +405,24 @@ and 3.555 → 3.442 G, task-clock 1,458 → 1,384 ms and 1,487 → 1,440 ms. `ab
 against step 15, medians (minimums): 31 runs, 132.43 → 130.56 ms (130.38 → 126.92); 41 runs,
 135.63 → 130.98 (128.91 → 126.39); 41 runs, 133.52 → 130.68 (128.87 → 126.43); and on a first
 build, 31 runs twice, 131.09 → 127.92 and 132.38 → 128.69. memory.peak cannot move, as `push`
-runs only in the queries. S 441 → 442. Gate: 512 pass, 0 fail (full seeds 1–12 and every tiny
+runs only in the queries, and did not: 6 alternating runs, median 67.90 → 67.89 MB, highest
+68.17 → 68.22. S 441 → 442. Gate: 512 pass, 0 fail (full seeds 1–12 and every tiny
 seed).
+
+## After step 16: where memory.peak comes from, and label changes that did not pay
+
+Four query-side changes and one build-side change, each measured against step 16 (or step 15
+where noted). None paid, so the code is step 16's. Rows in the table below.
+
+Where memory.peak comes from, read from the cgroup at phase marks (seed 1, 12 threads, 3
+runs, peak 66,044–66,516 KiB): it is reached at the end of pass 3's first direction. Then both
+edge arrays (38.15 MiB), both place arrays (19.07 MiB) and the forward rows (3.32 MiB, written as
+4 KB pages by all 12 threads) are live at once, with about 4.4 MiB on top: the process and its
+wrapper, page tables (520 KiB), slab, and the memory cgroup's per-CPU charge batches. The
+queries top out lower, at about 62,100 KiB (an earlier `memory.current` trace), with 12 threads'
+label tables grown to 32,768 or 65,536 buckets. So a cut to the labels alone cannot move M until
+the build peak falls by about 4.4 MiB. It also explains the measured peaks below: u16 labels
+save 2–3 MB in the queries and nothing in the peak.
 
 ## Tried and reverted (local, turbo off, no run ID)
 
@@ -466,3 +482,9 @@ between rows.
 | The side with the smaller queue top advanced instead of the side with the shorter queue, while both tops are below 2^32 (on step 14) | `ab.py`, 21 runs: median 133.19 → 138.99 ms, min 129.42 → 134.71 ms | Equal radii settle more nodes than equal frontiers on this graph |
 | The node hash without its multiply: the id as it is, and its low 7 bits copied to the top for hashbrown's tag (on step 14) | `ab.py`, 31 runs: median 130.96 → 146.39 ms | The tag then repeats the slot's own low bits, so any label whose home is the same slot matches it, and a miss loads a bucket far more often |
 | The edge back to the parent left out with no branch: the parent rides in the queue entry, and a compare over the 8 copied edges moves its edge last and drops it (on step 15) | `ab.py`, 31 runs: median 131.53 → 135.38 ms. Branch misses 18.9 → 17.0 M, but instructions 5.15 → 5.20 G and cycles 3.36 → 3.44 G | The parent's label is a cache hit, so its relaxation was cheap; the compare and the wider queue entries cost more |
+| Labels as `u16` distances, keys packed to 2-byte alignment so a bucket takes 6 bytes, longer labels behind a `u16::MAX` in the second map (on step 16) | `ab.py`, 31 runs, two rounds: medians 128.02 → 127.34 and 128.47 → 129.36 ms, minimums 126.56 → 125.93 and 125.85 → 126.20. `perf stat` on step 15: cycles −1.2%, instructions +0.6%, L1 misses +1.8%. memory.peak, 6 runs: median 67.89 → 67.62 MB, highest 68.17 → 68.10 | A tie in time, and the label memory it saves sits below the build peak |
+| One label table per thread for both sides, `[u32; 2]` per node, so the relaxation reads the other side's label from the same bucket instead of a second lookup (on step 16) | `ab.py`, 31 runs, three rounds: medians 127.38 → 131.05, 128.02 → 130.70, 128.47 → 131.54 ms. `perf stat`: instructions 4.994 → 4.977 G, but cycles 3.063 → 3.156 G and L2 load misses 3.55 → 4.65 M | The joint table holds both searches' nodes in 12-byte buckets, 128 Ki of them for the big queries, and that misses L2 more often than the saved lookup gained |
+| The same joint table with `[u16; 2]`, 8-byte buckets (on step 16) | `ab.py`, 31 runs, two rounds: medians 128.02 → 128.64 and 128.47 → 130.07 ms. memory.peak, 6 runs: median 67.89 → 67.75 MB, highest 68.17 → 67.81 | Still slower; the memory sits below the build peak |
+| Labels in a dense `u32` array per search, 2^21 slots, reset through a list of touched nodes (on step 15) | `ab.py`, 11 runs: median 131.04 → 243.08 ms | 24 arrays of 8 MiB written in full on first use, about 200 MB of page faults and zeroing |
+| `#[inline(always)]` on `Search::step` (on step 15) | `perf stat`, 5 runs: cycles 3.137 → 3.111 G (−0.8%), instructions +0.8% | Below `push`'s gain, which step 16 took |
+| The forward CSR built first, then the reverse one by transposing it, so the two place arrays are never live together (on step 15) | memory.peak, 6 runs: median 67.78 → 64.88 MB, highest 67.97 → 65.52. `ab.py`, 31 runs: median 130.61 → 137.06 ms, min 128.61 → 135.52. Build 34.5 → 42.7 ms (forward count 9.1, fault 3.6, scatter 10.9, sort 3.2; reverse count 3.1, fault 1.6, scatter 5.4, sort 3.5) | 2.9 MB saved for 6.5 ms: the queries' own peak, about 64–65 MB, then caps the saving, and the second scatter costs more than pass 2 saves |
