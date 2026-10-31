@@ -1169,6 +1169,40 @@ memory.peak over 8 alternating runs: median 41.88 → 42.38 MB, highest 43.71 �
 
 ## Experiments that did not stay
 
+- **After step 44, the serial parts and the tail** (local, seed 1, turbo on, so a run takes
+  about 69 ms; `ab.py`, 41 alternating runs, two rounds, medians, step 44 first). A build with
+  timestamps (6 to 10 runs, ms since `main`): the plan is ready at 6.6–9.2, the walks end over a
+  spread of 3–5 ms (62.0–68.7), and after its walk a thread spends 0.30–0.40 ms dropping its
+  pages, 0.67–0.79 on its last flush and freeing its window (0.40–0.51 of it the frees), 0.25–0.48
+  merging its cells and 1.18–1.47 grouping its first matches; formatting takes 0.78–0.96 ms,
+  spawns included, and the write 0.40–0.45. In 3 of its first 6 runs two scanning threads ended 15–28
+  ms after the others, as if they had shared a CPU. On CPUs 0, 2, 4, 6, 8 and 10 alone (6
+  threads, one per core) a run takes 77.18 ms against 70.42 on all 12. None of these paid:
+  - Each parse thread starting a thread of its own that reads a byte per page of a twelfth of
+    the corpus while the terms are interned: 71.23 and 69.87 → 71.28 and 69.63 ms.
+  - The last window flushed over the words its documents fill only (the flush 0.2 ms): 69.55 and
+    69.80 → 69.53 and 69.66 ms.
+  - Each scanning thread pinned to a CPU of its own (`sched_setaffinity`): 69.78 and 70.13 →
+    69.96 and 70.01 ms (means 70.49 and 72.14 → 70.18 and 71.07).
+  - The answers formatted by the scanning threads after a barrier, instead of new threads:
+    69.21 and 69.37 → 69.17 and 69.48 ms. With the two above: 69.34 and 69.38 → 69.07 and 69.14
+    ms, −0.35%, for about 20 more lines.
+  - Every parse thread interning its own terms into the shared table, claiming an empty slot by
+    a compare-and-swap of its flags and taking ids from one atomic counter: interning 2.0 → 4.4
+    ms, as that counter's cache line moves between cores at each new term, and the plan 0.6 ms
+    slower with ids in no file order: 69.78 and 69.64 → 72.86 and 72.23 ms.
+  - `DENSE_SHARE` 16, 48, 64 and 128 instead of 32: 16 +3.0 ms and 128 +1.4 ms; 64 −0.14, −0.60
+    and −0.62 ms, but memory.peak median 40.1 → 42.0 MB over five runs; 48 −0.94, −0.66, −0.69
+    and −0.76 ms in four rounds (−1.1%), but 40.1 → 40.95 MB over ten (+2.1%), about even at the
+    board's exchange rates. With 48 for which queries run on sets and 32 for which terms keep a
+    row, or the other way round: −0.11 ms each. `WINDOW` 32 or 128: +0.26 and +0.09 ms; 32 with
+    `DENSE_SHARE` 48: −0.23 ms. `SAMPLE_SHARE` 32 or 128: +0.68 and +0.10 ms.
+  - A second prefetch per BOOL trigger, of the last byte of its checks, as a 40-byte check ends
+    on the next cache line half the time: 69.30 and 69.11 → 70.02 and 69.83 ms.
+  - Without the drop of each chunk's corpus pages (step 17): 68.77 → 70.37 ms, so it still pays.
+    The exit itself, from just before `exit` until the parent sees the process end, takes 1.14
+    ms (median of 15, min 0.92).
+
 - **After step 43, the prefetch for BOOL triggers only** (local, seed 1). The token loop
   prefetched the entry of a token with the BOOL flag and entry 0 otherwise, picked by
   `select_unpredictable`: instructions 5,412.1 → 5,557.2 M, cycles 2,891 and 2,893 → 2,913 and
