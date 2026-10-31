@@ -46,9 +46,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 39 | 5 fewer lines with the same machine code: the running sum of the hour's counts as one `for_each`, and a large latency listed and replaced by `LARGE` in one `bool::then` | run-89adcd077219 | 0.0196 | 18.4 | 85.1 |
 | 40 | A plain static executable instead of a static PIE (`relocation-model=static`) | run-ebf9f6a49ad5 | 0.0190 | 17.9 | 85.5 |
 | 41 | 4 fewer lines with the same machine code: the record store on one line, the counting pass without a binding for the endpoint, and each output line's length summed in one statement | run-32182846e438 | 0.0256 | 18.0 | 82.3 |
-| 42 | 1 fewer line with the same machine code: the name hash binds the length in the arms of its `match` | | | | |
-| 43 | 4 fewer lines on cold paths: `Interner::new` instead of an `impl Default`, the format queue as a lazy iterator, and a new name's padded copy from `array::from_fn` | | | | |
-| 44 | 4 fewer lines in `summarize`: a chunk's start found through a one-line `newline` closure, and the format loop as one `for_each` over the queue | | | | |
+| 42 | 1 fewer line with the same machine code: the name hash binds the length in the arms of its `match` | run-a6b1091911cb | 0.0192 | 18.7 | 85.4 |
+| 43 | 4 fewer lines on cold paths: `Interner::new` instead of an `impl Default`, the format queue as a lazy iterator, and a new name's padded copy from `array::from_fn` | run-a6b1091911cb | 0.0192 | 18.7 | 85.4 |
+| 44 | 4 fewer lines in `summarize`: a chunk's start found through a one-line `newline` closure, and the format loop as one `for_each` over the queue | run-a6b1091911cb | 0.0192 | 18.7 | 85.4 |
 | 45 | 2 fewer lines with the same machine code: the build stage mounts its sources instead of copying them, and `insert` stays out of line by `#[cold]` alone | | | | |
 
 ## Step 1: v1
@@ -645,6 +645,7 @@ its stack slots before the hour pass. `ab.py`, 40 interleaved runs, two rounds: 
 20.20 → 20.07 and 20.16 → 20.12 ms against step 43 (step 41's code: 20.25 and 20.25 ms in the
 same rounds). memory.peak, 24 alternating runs on seed 1: median 18.13 MB for both; on seeds 3, 7
 and 11, 8 runs each, within 0.02 MB of step 41. S 367 → 363. Gate: 310 pass, 0 fail.
+The board measured steps 42 to 44 together, pushed as one, in run-a6b1091911cb: 19.2 ms.
 
 ## Step 45: 2 fewer lines
 

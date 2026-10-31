@@ -33,7 +33,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 26 | The long-name compare out of line, so the probe for every other name stops paying for its bounds checks | run-8378d5c7581d | 0.0334 | 12.6 | 77.2 |
 | 27 | A plain static executable instead of a static PIE (`relocation-model=static`) | run-a8bc41aa5aa0 | 0.0340 | 12.5 | 77.1 |
 | 28 | A record's name and note take their quotes from one 64-byte mask, built by AVX2 compares at the name's start, where each quote cost a 32-byte scan | run-4dc3f93575f3 | 0.0319 | 12.5 | 77.7 |
-| 29 | `NameSet::read` takes each letter with plain loads and its group as a byte, and `insert` is cold, so marking a name runs 17 fewer instructions per record | | | | |
+| 29 | `NameSet::read` takes each letter with plain loads and its group as a byte, and `insert` is cold, so marking a name runs 17 fewer instructions per record | run-c02fb16de73f | 0.0312 | 12.5 | 77.8 |
 | 30 | 5 fewer lines, three of them with the same machine code: the name set's insert builds its entry in the push and its marking loop takes the group and the key in one statement, `main` writes the output in one line and reads each directory with `nth`, and `merge` sets the min and the max in one assignment | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
