@@ -34,6 +34,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 27 | A plain static executable instead of a static PIE (`relocation-model=static`) | run-a8bc41aa5aa0 | 0.0340 | 12.5 | 77.1 |
 | 28 | A record's name and note take their quotes from one 64-byte mask, built by AVX2 compares at the name's start, where each quote cost a 32-byte scan | run-4dc3f93575f3 | 0.0319 | 12.5 | 77.7 |
 | 29 | `NameSet::read` takes each letter with plain loads and its group as a byte, and `insert` is cold, so marking a name runs 17 fewer instructions per record | | | | |
+| 30 | 5 fewer lines, three of them with the same machine code: the name set's insert builds its entry in the push and its marking loop takes the group and the key in one statement, `main` writes the output in one line and reads each directory with `nth`, and `merge` sets the min and the max in one assignment | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -796,6 +797,40 @@ seeds 1–7 and 10–12 give the reference hashes; the 400 fuzz cases pass at th
 count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300
 tiny seeds pass at 1, 3, 12 and 64 threads with 100-byte rounds; 40 generated sets of names
 pass at 1–4 CPUs; clippy reports no warnings.
+
+## Step 30: 5 fewer lines
+
+Cuts on step 29 in the name set, `merge` and `main`. Three leave the machine code as it was:
+`.text` is byte-identical to step 29's binary, and `.rodata` differs only in the line numbers of
+`src/main.rs` panic locations (`tools/rodiff.py`).
+
+- `NameSet::insert` takes its key as four words, `[a, b, c, d]`, and builds the entry inside its
+  `push`.
+- `NameSet::read` takes each letter as its four words and the group and the key from them in one
+  statement.
+- `main` imports `fs::write`, so the output's write and its error fit one line.
+
+Two change the machine code:
+
+- `main` reads each directory as `std::env::args().nth(i)`, with no iterator kept for the two.
+  Only `main`'s code changes, and the code after it moves.
+- `merge` sets the min and the max in one assignment, which swaps two stores in the record loop.
+  Step 21 dropped this cut because the machine code changed; it measured the same here.
+
+`ab.py` against step 29, 101 interleaved runs per build, three rounds, medians: step 29 33.48,
+33.57 and 33.77 ms; the three identical cuts 33.66, 33.50 and 33.86 ms, which is the spread of
+the same code; with `merge` 33.58, 33.53 and 33.72 ms; with `nth` 33.50, 33.45 and 33.70 ms; all
+five 33.48, 33.55 and 33.59 ms. Two rounds of 40 runs, step 29 against all five: 34.86 → 34.78
+and 37.90 → 36.99 ms, on a busy machine. S 313 → 308. Gate: 310 pass, 0 fail; clippy reports no
+warnings; a missing input directory, a missing output directory and no arguments stop with the
+same errors as before.
+
+Dropped: `format_output` building each line with one `format!` and collecting the lines, 3
+lines. With no `write!` into a `Vec<u8>` left, the binary loses the drop glue of `io::Write`'s
+adapter, which sits in front of the worker, so the worker's code moves by 16 bytes; on step 28
+that build measured 0.26–0.52 ms slower than the same build without it, in three rounds. Also
+dropped: the rehash's probe as one `find` over `hash..`, 2 lines, which clippy's
+`maybe_infinite_iter` flags.
 
 ## Experiments that did not stay
 

@@ -79,7 +79,7 @@
 use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch, _mm256_cmpeq_epi8, _mm256_loadu_si256};
 use std::arch::x86_64::{_mm256_movemask_epi8, _mm256_set1_epi8};
 use std::sync::atomic::{AtomicU64, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
-use std::{fs::File, io::Write, ops::Range, os::fd::AsRawFd, path::Path, thread, time::Duration};
+use std::{fs::write, io::Write, ops::Range, os::fd::AsRawFd, path::Path, thread, time::Duration};
 
 /// The UTF-8 byte order mark, U+FEFF. At the start of the file or of a record it is skipped, and
 /// anywhere else it is data (spec §2.1).
@@ -151,15 +151,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // from a malloc arena and grew there by copying: a 20 MiB peak instead of 14.
     // SAFETY: the call takes plain integers and only changes malloc's policy.
     unsafe { mallopt(-3, 64 << 10) }; // M_MMAP_THRESHOLD
-    let mut args = std::env::args().skip(1);
-    let data_dir = args.next().unwrap_or_else(|| "/data".into());
-    let out = Path::new(&args.next().unwrap_or_else(|| "/out".into())).join("aggregates.txt");
+    let data_dir = std::env::args().nth(1).unwrap_or("/data".into());
+    let out = Path::new(&std::env::args().nth(2).unwrap_or("/out".into())).join("aggregates.txt");
     let threads = thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let file = |name| map_file(&Path::new(&data_dir).join(name));
     let (by_id, codes) = parse_regions(file("regions.csv")?, threads);
     let groups = join(file("records.csv")?, &by_id, codes.len() + 1, threads);
-    std::fs::write(&out, format_output(&groups, &codes))
-        .map_err(|e| format!("{}: {e}", out.display()))?;
+    write(&out, format_output(&groups, &codes)).map_err(|e| format!("{}: {e}", out.display()))?;
     // Exit without running destructors: freeing the name sets would only add to the timed
     // wall. `fs::write` keeps no user-space buffer, so every byte is already written.
     std::process::exit(0)
@@ -176,7 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// pad. Anonymous memory reads as zeros, and so does the rest of the file's last page.
 fn map_file(path: &Path) -> Result<&'static [u8], String> {
     let err = |e| format!("{e}: {}", path.display());
-    let file = File::open(path).map_err(err)?;
+    let file = std::fs::File::open(path).map_err(err)?;
     let len = file.metadata().map_err(err)?.len() as usize;
     // SAFETY: fresh memory at an address the kernel picks overlaps no memory we already use.
     // PROT_READ (1), MAP_PRIVATE | MAP_ANONYMOUS (0x22).
@@ -406,8 +404,7 @@ fn join(data: &[u8], by_id: &[u8], group_count: usize, threads: usize) -> Vec<Gr
 /// way, as a group of one, so there is one place that knows how fields combine.
 fn merge(group: &mut Group, other: &Group) {
     (0..6).for_each(|i| group[i] += other[i]);
-    group[6] = group[6].min(other[6]);
-    group[7] = group[7].max(other[7]);
+    [group[6], group[7]] = [group[6].min(other[6]), group[7].max(other[7])];
 }
 
 /// Parses the decimal digits from `at` up to the `stop` byte, and returns the value and the
@@ -589,12 +586,11 @@ impl NameSet {
         // to its mailbox again until every worker has passed the next barrier (see [`join`]).
         let letters: &[[u64; 4]] =
             unsafe { std::slice::from_raw_parts(letters.as_ptr().cast(), letters.len() / 4) };
-        for &letter in letters {
+        for &[a, b, c, d] in letters {
             // A group fits in a byte (see [`parse_regions`]), so the bit's word is one of four
-            // with no bounds check.
-            let group = (letter[3] >> 48) as u8 as usize;
-            // The key is the letter without its group: the hash and the length, 48 bits.
-            let key = [letter[0], letter[1], letter[2], letter[3] & ((1 << 48) - 1)];
+            // with no bounds check. The key is the letter without its group: the hash and the
+            // length, 48 bits.
+            let (group, key) = ((d >> 48) as u8 as usize, [a, b, c, d & ((1 << 48) - 1)]);
             let (mask, hash) = (self.slots.len() - 1, key[3] as u32);
             let (mut slot, tag) = (hash as usize & mask, (hash >> 20) << 24);
             let entry = loop {
@@ -619,16 +615,15 @@ impl NameSet {
         held == key || held[3] == key[3] && key[3] >> 32 == LONG && same_text(held, &key, data)
     }
 
-    /// Appends an entry with this key and no groups, puts it in the empty `slot` with its `tag`,
-    /// and returns its index. When the entries fill three quarters of the slots, the slots
-    /// double and every entry is placed again, so every probe ends at an empty slot.
+    /// Appends an entry with the key `[a, b, c, d]` and no groups, puts it in the empty `slot`
+    /// with its `tag`, and returns its index. When the entries fill three quarters of the slots,
+    /// the slots double and every entry is placed again, so every probe ends at an empty slot.
     ///
     /// Cold, because inlined into [`NameSet::read`] it spilled the key of every letter.
     #[cold]
-    fn insert(&mut self, slot: usize, tag: u32, key: [u64; 4]) -> usize {
+    fn insert(&mut self, slot: usize, tag: u32, [a, b, c, d]: [u64; 4]) -> usize {
         assert!(self.lines.len() < ENTRY as usize, "over 2^24 names");
-        let line = Line([key[0], key[1], key[2], key[3], 0, 0, 0, 0]);
-        self.lines.push(line);
+        self.lines.push(Line([a, b, c, d, 0, 0, 0, 0]));
         self.slots[slot] = tag | self.lines.len() as u32;
         if 4 * self.lines.len() > 3 * self.slots.len() {
             self.slots = vec![0; 2 * self.slots.len()];
