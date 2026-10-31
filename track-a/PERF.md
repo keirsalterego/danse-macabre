@@ -50,10 +50,10 @@ Every step from the reference to your final version, each with the live-board ru
 | 43 | 4 fewer lines on cold paths: `Interner::new` instead of an `impl Default`, the format queue as a lazy iterator, and a new name's padded copy from `array::from_fn` | run-a6b1091911cb | 0.0192 | 18.7 | 85.4 |
 | 44 | 4 fewer lines in `summarize`: a chunk's start found through a one-line `newline` closure, and the format loop as one `for_each` over the queue | run-a6b1091911cb | 0.0192 | 18.7 | 85.4 |
 | 45 | 2 fewer lines with the same machine code: the build stage mounts its sources instead of copying them, and `insert` stays out of line by `#[cold]` alone | run-379b43c0200f | 0.0189 | 18.7 | 85.5 |
-| 46 | The input prefetched five lines ahead, `parse` out of line with a pointer for its loop, and the endpoint interner a static | | | | |
-| 47 | 5.8 instructions fewer per line: the probe counts the compare mask's trailing ones, the latency's digits combine in three steps, and their mask is one shifted constant | | | | |
-| 48 | An endpoint table of 16,384 slots instead of 8,192: 1.9% of lines take a second probe instead of 3.9% | | | | |
-| 49 | Three rare paths of the parse marked `std::hint::cold_path`, so its loop keeps its count, its end and its constants in registers | | | | |
+| 46 | The input prefetched five lines ahead, `parse` out of line with a pointer for its loop, and the endpoint interner a static | run-7eca9cefcfac | 0.0186 | 18.2 | 85.8 |
+| 47 | 5.8 instructions fewer per line: the probe counts the compare mask's trailing ones, the latency's digits combine in three steps, and their mask is one shifted constant | run-7eca9cefcfac | 0.0186 | 18.2 | 85.8 |
+| 48 | An endpoint table of 16,384 slots instead of 8,192: 1.9% of lines take a second probe instead of 3.9% | run-7eca9cefcfac | 0.0186 | 18.2 | 85.8 |
+| 49 | Three rare paths of the parse marked `std::hint::cold_path`, so its loop keeps its count, its end and its constants in registers | run-7eca9cefcfac | 0.0186 | 18.2 | 85.8 |
 
 ## Step 1: v1
 
@@ -776,6 +776,10 @@ and 20.25 → 19.33 ms (−4.1 to −4.8%), and 19.07 → 18.25 and 19.09 → 18
 does. Without the static interner the four steps end level with these, at 19.40, 19.40, 19.44 and
 19.27 ms and at 18.17 and 18.19 ms, with 8.4 M instructions more; the static measured ahead at
 steps 46 and 47, so it stayed.
+
+Steps 46 to 49 reached the board in one push. Its run, run-7eca9cefcfac, measured 18.6 ms and
+18.2 MB, against 18.8 and 19.1 ms for step 45's code in its last two runs (run-6e4daa8e2dbc,
+run-8a8f22b6a3dc).
 
 ## Experiments that did not stay
 
