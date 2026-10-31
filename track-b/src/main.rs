@@ -284,9 +284,9 @@ struct Plan {
     /// The query terms, each with the [`Slot`] flags that say what the pass does with it.
     terms: TermTable,
     /// Term `t` triggers the phrases `phrases[phrase_at[t]..phrase_at[t + 1]]`, each as (query
-    /// index, position of the term in the phrase).
+    /// index, position of the term in the phrase, position and id of another of its terms).
     phrase_at: Vec<u32>,
-    phrases: Vec<(u32, u32)>,
+    phrases: Vec<(u32, u32, u32, u32)>,
     /// Term `t` triggers the per-document checks `checks[check_at[t]..check_at[t + 1]]`, which
     /// sit on huge pages of their own ([`huge`]), as the pass reads them at random.
     check_at: Vec<u32>,
@@ -326,10 +326,14 @@ impl Plan {
             let (mut phrases, mut checks, mut sets, mut cover) = (vec![], vec![], vec![], vec![]);
             for i in queries.len() * p / threads..queries.len() * (p + 1) / threads {
                 if queries.phrase[i] {
-                    let (offset, &term) = (queries.terms(i).iter().enumerate())
+                    let phrase = queries.terms(i);
+                    let (offset, &term) = (phrase.iter().enumerate())
                         .min_by_key(|&(_, &t)| cost(t))
                         .expect("the parser rejects a phrase without terms");
-                    phrases.push((term, (i as u32, offset as u32)));
+                    // The term that [`scan`] tests first: the first, or the second if the trigger is
+                    // the first and the phrase has one.
+                    let other = usize::from(offset == 0).min(phrase.len() - 1);
+                    phrases.push((term, (i as u32, offset as u32, other as u32, phrase[other])));
                     continue;
                 }
                 bool_cover(queries.steps(i), cost, &mut cover);
@@ -414,8 +418,9 @@ fn bool_cover(steps: impl Iterator<Item = Step>, cost: impl Fn(u32) -> u64, cove
 }
 
 impl Plan {
-    /// The phrases that term `t` triggers, as (query index, position of `t` in the phrase).
-    fn phrases(&self, t: u32) -> &[(u32, u32)] {
+    /// The phrases that term `t` triggers, as (query index, position of `t` in the phrase,
+    /// position and id of another of its terms).
+    fn phrases(&self, t: u32) -> &[(u32, u32, u32, u32)] {
         &self.phrases[self.phrase_at[t as usize] as usize..self.phrase_at[t as usize + 1] as usize]
     }
 }
@@ -595,39 +600,45 @@ fn id_at(docs: &[u8], at: usize) -> Result<u32, String> {
 /// A line starts with its id, digits that look like a token, so a line's first token is left
 /// out: document text only begins after the TAB.
 fn walk(chunk: &[u8], terms: &TermTable, mut on_line_end: impl FnMut(&[(Key, usize)])) {
-    // 1 when the byte before the block is a token byte; then, the start of the token that runs
-    // on past the block.
-    let (mut prev_bit, mut open) = (0, 0);
-    // The last block, short of 64 bytes, padded with zero bytes, which are separators.
     let (mut padded, tail) = ([0; 64], chunk.as_chunks::<64>().1);
     padded[..tail.len()].copy_from_slice(tail);
-    // The current line's first `n` tokens. Each block takes a slice with room for 32 more, the
-    // most that one block ends, so that the slice's address and `n` stay in registers: a `Vec`
-    // pushed per token was reloaded and stored after each push (PERF.md, step 41).
-    let (mut probes, mut n) = (Vec::new(), 0);
-    for base in (0..chunk.len()).step_by(64) {
-        probes.resize(probes.len().max(n + 32), ([0; MAX_TERM / 8], 0));
-        let probes = &mut probes[..];
-        let block = chunk[base..].first_chunk().unwrap_or(&padded);
-        // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
-        let (token, lf) = unsafe { classify(block) };
-        let prev = token << 1 | prev_bit;
-        let (mut starts, mut ends, mut lfs) = (token & !prev, !token & prev, lf);
-        // The start of the token that the block's next end closes: the one open since an
-        // earlier block, if any, else the block's first start. It is picked once per block, by
-        // a conditional move, as whether a token runs on follows no pattern, so that the loop
-        // below takes no test on it.
-        let first = base + starts.trailing_zeros() as usize;
-        let mut next = std::hint::select_unpredictable(prev_bit != 0, open, first);
-        starts =
-            std::hint::select_unpredictable(prev_bit != 0, starts, starts & starts.wrapping_sub(1));
-        prev_bit = token >> 63;
-        // A token never spans an LF, so the ends up to the block's first LF, the LF's own bit
-        // included, close the tokens of the line it ends; then come the next LF's, and after
-        // the last LF the rest. Without an LF, `lfs ^ (lfs - 1)` takes all of them. So the token
-        // loop tests no LF, and the line end has one call site, where it is inlined (PERF.md,
-        // step 41).
+    // Before the first block: block -1, which holds nothing.
+    let at = (0usize.wrapping_sub(64), 0, 0, 0, 0, 0);
+    let (mut tokens, mut probes) = (Tokens { chunk, padded, at }, Vec::new());
+    while let Some(n) = tokens.line(terms, &mut probes) {
+        on_line_end(probes.get(1..n).unwrap_or_default());
+    }
+}
+
+/// Where [`walk`] is in its chunk.
+struct Tokens<'a> {
+    chunk: &'a [u8],
+    /// The last block, short of 64 bytes, padded with zero bytes, which are separators.
+    padded: [u8; 64],
+    /// The current block's offset in `chunk`; its token starts, token ends and LFs not taken
+    /// yet; the start of the token that its next end closes; and 1 when its last byte is a token
+    /// byte.
+    at: (usize, u64, u64, u64, usize, u64),
+}
+
+impl Tokens<'_> {
+    /// Writes the next line's tokens to `probes`, each as its key and home slot, and returns
+    /// their count, or `None` past the last line. A call per line, never inlined: inlined into
+    /// [`scan`]'s loop, the token loop kept 4 of its values on the stack, as the line end's held
+    /// the registers (PERF.md, step 42).
+    #[inline(never)]
+    fn line(&mut self, terms: &TermTable, probes: &mut Vec<(Key, usize)>) -> Option<usize> {
+        let (chunk, mut n) = (self.chunk, 0);
+        let (mut base, mut starts, mut ends, mut lfs, mut next, mut prev_bit) = self.at;
         loop {
+            // Room for 32 more tokens, the most that one block ends, so that the slice's address
+            // and `n` stay in registers: a `Vec` pushed per token was reloaded and stored after
+            // each push (PERF.md, step 41).
+            probes.resize(probes.len().max(n + 32), ([0; MAX_TERM / 8], 0));
+            let room = &mut probes[..];
+            // A token never spans an LF, so the ends up to the block's next LF, the LF's own bit
+            // included, close the line's tokens. Without an LF, `lfs ^ (lfs - 1)` takes all of
+            // them. So the token loop tests no LF (PERF.md, step 41).
             let upto = lfs ^ lfs.wrapping_sub(1);
             let mut line = ends & upto;
             ends &= !upto;
@@ -637,20 +648,35 @@ fn walk(chunk: &[u8], terms: &TermTable, mut on_line_end: impl FnMut(&[(Key, usi
                 starts &= starts.wrapping_sub(1);
                 // A token past `MAX_TERM` bytes takes a key of 0xFF bytes, which no term has.
                 let key = key_in(chunk, start, end).unwrap_or([!0; MAX_TERM / 8]);
-                // SAFETY: `n` has grown by at most one per end since the block's start, where
-                // `probes` held 32 entries more than `n`, and a block holds at most 32 ends, as
-                // each follows a token byte.
-                *unsafe { probes.get_unchecked_mut(n) } = (key, terms.prefetch(&key));
+                // SAFETY: `n` has grown by at most one per end since `room` held 32 entries more
+                // than `n`, and those ends lie in one block, which holds at most 32, as each
+                // follows a token byte.
+                *unsafe { room.get_unchecked_mut(n) } = (key, terms.prefetch(&key));
                 n += 1;
             }
-            if lfs == 0 {
+            if lfs != 0 {
+                lfs &= lfs - 1;
                 break;
             }
-            lfs &= lfs - 1;
-            on_line_end(probes.get(1..std::mem::take(&mut n)).unwrap_or_default());
+            base = base.wrapping_add(64);
+            // Past the end of `chunk`, which ends in LF, no line is left.
+            let block = chunk.get(base..)?.first_chunk().unwrap_or(&self.padded);
+            // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
+            let (token, lf) = unsafe { classify(block) };
+            let prev = token << 1 | prev_bit;
+            (starts, ends, lfs) = (token & !prev, !token & prev, lf);
+            // The start of the token that the block's next end closes: the one open since an
+            // earlier block, if any, which `next` holds, else the block's first start. It is
+            // picked once per block, by a conditional move, as whether a token runs on follows no
+            // pattern, so that the loop above takes no test on it.
+            let (first, carry) = (base + starts.trailing_zeros() as usize, prev_bit != 0);
+            next = std::hint::select_unpredictable(carry, next, first);
+            starts =
+                std::hint::select_unpredictable(carry, starts, starts & starts.wrapping_sub(1));
+            prev_bit = token >> 63;
         }
-        // The start of the token the block ends in, if it ends in one (`prev_bit`).
-        open = next;
+        self.at = (base, starts, ends, lfs, next, prev_bit);
+        Some(n)
     }
 }
 
@@ -947,10 +973,15 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
             sets.lists[(store[t as usize] ^ LIST) as usize].push(i as u16);
         }
         for &at in &phrase_at {
-            for &(q, offset) in plan.phrases(terms[at]) {
-                let phrase = queries.terms(q as usize);
+            for &(q, offset, other, term) in plan.phrases(terms[at]) {
                 // `terms` holds this doc only, so a match never spans two docs (spec §3).
                 let start = at.checked_sub(offset as usize);
+                // 98% of the candidates match no phrase, and one more of its terms rules out most
+                // of them before its terms are loaded: 2.5% get past it (PERF.md, step 43).
+                if start.and_then(|s| terms.get(s + other as usize)) != Some(&term) {
+                    continue;
+                }
+                let phrase = queries.terms(q as usize);
                 let span = start.and_then(|s| terms.get(s..s + phrase.len()));
                 // Compared inline, with no branch per term: phrases are short, and a call to
                 // `memcmp` costs more than the compare.
@@ -1061,12 +1092,14 @@ fn key(token: &[u8]) -> Option<Key> {
 /// zeroed buffer first would call `memcpy` and then stall the load that reads the buffer
 /// back, once per token.
 fn key_in(chunk: &[u8], start: usize, end: usize) -> Option<Key> {
-    // One bounds check for the start and the 32 bytes from it, where `chunk[start..]` took two.
-    let window = chunk.get(start..start + MAX_TERM);
-    match window.and_then(<[u8]>::first_chunk) {
-        Some(window) => (end - start <= MAX_TERM).then(|| fold(window, end - start)),
-        None => key(&chunk[start..end]), // within 32 bytes of the chunk's end
+    // One test for the start and the 32 bytes from it, against a bound that stays in a register:
+    // `chunk.get(start..start + MAX_TERM)` also tested whether the sum wraps around.
+    if start < chunk.len().saturating_sub(MAX_TERM - 1) {
+        // SAFETY: `start + MAX_TERM <= chunk.len()`, as just tested.
+        let window = unsafe { &*chunk.as_ptr().add(start).cast::<[u8; MAX_TERM]>() };
+        return (end - start <= MAX_TERM).then(|| fold(window, end - start));
     }
+    key(&chunk[start..end]) // within 32 bytes of the chunk's end
 }
 
 /// Lowercases the first `len` bytes of `window`, all letters and digits, and zeroes the rest.

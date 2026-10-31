@@ -46,6 +46,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 39 | The per-document checks on huge pages of their own, as the term table's slots are, through one helper; the rarity sample summed as each thread's part comes in instead of after the last; the plan's counting sort puts its items in from the back, so the starts need no rotation | run-8d0c750cfc9c | 0.1277 | 42.9 | 76.2 |
 | 40 | The plan's checks grouped on a thread of their own while the main thread groups the phrases, flags the terms, numbers the stores and marks the term table; a term's BOOL flag comes from the checks it keys, not from their groups | run-ff1ae2c91791 | 0.1269 | 43.1 | 76.3 |
 | 41 | 5.5% fewer instructions in the corpus pass: the walk keys and prefetches the tokens itself, into a buffer whose address and count stay in registers; a block's token ends are taken one line at a time, split at its LFs by one mask, so the token loop tests no LF; a line's id is left out at its end instead of tested for at each token; a key is folded in two vector operations instead of four | run-ff1ae2c91791 | 0.1269 | 43.1 | 76.3 |
+| 42 | 7.1% fewer instructions in the corpus pass: the walk's token loop runs in a call of its own per line, so the line end no longer holds the registers it needs, and a key's 32-byte window is tested against a bound held in a register | | | | |
+| 43 | A phrase candidate is first tested on one more of the phrase's terms, which the plan keeps beside the trigger, before the phrase's terms are loaded: 97.5% of the candidates stop there | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1094,7 +1096,70 @@ The board ran steps 40 and 41 together, run-ff1ae2c91791 (commit f17de2c), 126.9
 the same code, run-9f07c5db9176 (commit ca86ea9, which changed only track C), drew 124.4 ms, 42.7 MB
 and 76.5 points.
 
+## Step 42: the walk's token loop in a call of its own
+
+After step 41, the walk's token loop, inlined into `scan`'s loop together with the line end,
+kept four of its values on the stack: the block's token starts, the hash's shift, the slots'
+address and the chunk's address. It loaded them at every token and stored the starts back, 38
+instructions per token, as the line end's values held the registers across the whole loop
+nest.
+
+- **A call per line.** `Tokens::line` runs the token loop up to the next line end, never
+  inlined, and returns the line's token count; the walk keeps the block's state between lines
+  (its offset, its token starts, token ends and LFs not taken yet, the next token's start, and
+  whether it ends in a token), 250,000 calls on seed 1. In a function of its own, the token loop
+  keeps every value in a register: 31 instructions per token, none of them a stack access.
+- **The window's bound in a register.** `chunk.get(start..start + MAX_TERM)` also tested whether
+  `start + MAX_TERM` wraps around. LLVM had ruled that out while the block's offset came from a
+  loop over the chunk, but not once it comes from the walk's state: 6 instructions per token
+  for the test. `key_in` now tests `start < chunk.len() - 31` (saturating), against a bound
+  computed once: 2 instructions.
+- The walk ends where the next block would start past the chunk, which ends in LF, so it needs
+  no test of its own for the last line.
+
+Built up on step 41 (`perf stat -r 5`): the call per line, instructions 5,796.0 → 5,517.0 M,
+cycles 3,182 → 3,070 M; the bound in a register, 5,373.9 M, and cycles 3,109 → 2,997 M in that
+round; as committed, 5,382.2 M. Against step 41, two rounds: instructions 5,796.0 → 5,382.2 M,
+cycles 3,132 and 3,135 → 2,961 and 2,972 M, branch misses 16.28 → 16.32 M.
+
+Local, against step 41 (`ab.py`, 41 alternating runs on the P-cores, on AC, load average 4.7–7.7
+with a browser taking half of one P-core, so the minimums are the steadier figures), two rounds:
+medians 132.05 and 137.28 → 127.15 and 132.88 ms, minimums 129.20 and 129.46 → 124.29 and
+124.14 ms. memory.peak over 8 alternating runs: median 41.25 → 40.71 MB, highest 42.02 → 41.94
+MB. S 763 → 777. Gate: 510 pass, 0 fail.
+
+## Step 43: a phrase candidate tested on one more term first
+
+After step 42, the phrase triggers of seed 1's documents led to 1,028,628 (trigger, phrase)
+candidates, of which 19,427 match, 1.9%. Each loaded its phrase's bounds and terms from
+`Queries`, two arrays read at random, and compared the terms in a loop whose length varies: 4.1%
+of the cycle samples and 5% of the mispredicted branches.
+
+The plan now keeps, beside each phrase's query and the trigger's position in it, the position
+and id of one more of its terms: the first, or the second when the trigger is the first. The
+pass compares that term with the document's term at the same place, which its own list of
+terms holds, and loads the phrase only when they agree: for 25,843 candidates, 2.5%. The plan's
+phrase entries take 16 bytes instead of 8, 304 KB in all.
+
+Against step 42 (`perf stat -r 5`, two rounds): instructions 5,382.2 → 5,339.3 M, cycles 2,961
+and 2,972 → 2,875 and 2,877 M, branch misses 16.32 → 15.48 M.
+
+Local, against step 42 (`ab.py`, the rounds of step 42): medians 127.15 and 132.88 → 125.81 and
+124.51 ms, minimums 124.29 and 124.14 → 120.68 and 120.62 ms. memory.peak over 12 alternating
+runs: median 41.45 → 41.80 MB, highest 42.50 → 43.21 MB. S 777 → 782. Gate: 510 pass, 0 fail.
+
 ## Experiments that did not stay
+
+- **After step 41, the line end as a call of its own** (local, seed 1). `walk` called its
+  callback through a helper that is never inlined, so that the token loop would have the
+  registers: instructions 5,796 → 6,538 M, cycles 3,172 → 3,345 M, as the line end then reads
+  everything it captures through the closure, again after each store.
+
+- **After step 42, a write pointer instead of the token count** (local, seed 1). The token loop
+  bumped a pointer, and the count came from its offset after each block: instructions 5,382.2 →
+  5,358.7 M, cycles 2,992 → 3,018 M, and `ab.py`, 41 alternating runs, two rounds, medians 129.04
+  and 131.86 against 129.11 and 127.90 ms, minimums 123.38 and 124.63 against 124.79 and 124.89
+  ms, for 2 more lines.
 
 - **After step 39, each token's range of checks prefetched** (local, seed 1). The BOOL triggers'
   loop stalled on its load of `check_at[t]`, a 303 KB array read at random: 4.4% of all cycle
