@@ -266,21 +266,19 @@ fn summarize(log: &'static [u8], out_path: &Path) {
         // The output is complete once the last thread gets here: skip joining the others.
         (done.fetch_add(1, Relaxed) + 1 == threads).then(|| std::process::exit(0));
     };
-    thread::scope(|s| fan_out(s, 0..threads, &work));
-}
-
-/// Runs `work(t)` for every `t` in `ts`, each on its own thread, the first on this one.
-///
-/// Each thread hands the upper half of its numbers to a new thread until it keeps just one, so
-/// the last of twelve threads starts after four spawns instead of eleven. A spawn took about
-/// 50 µs, and every thread parses an equal share, so the last to start was the last to finish.
-fn fan_out<'s, F: Fn(usize) + Sync>(s: &'s thread::Scope<'s, '_>, ts: Range<usize>, work: &'s F) {
-    if ts.len() > 1 {
-        let mid = ts.start + ts.len() / 2;
-        s.spawn(move || fan_out(s, mid..ts.end, work));
-        return fan_out(s, ts.start..mid, work);
-    }
-    work(ts.start);
+    // Thread 0 spawns one helper, which spawns the others one after another and then works as
+    // thread 1 (with a single hardware thread, it does nothing). Thread 0 thus starts after one
+    // spawn and has the interner to itself for about 0.3 ms, in which it adds about half the
+    // names. A tree of spawns started threads in bursts while most names were still new: 700 of
+    // the 1,858 inserts waited for the lock instead of about 300, and the parse took 4% longer
+    // (`PERF.md`, step 57). Each thread gets its own copy of `work`, which only holds references.
+    thread::scope(|s| {
+        s.spawn(move || {
+            (2..threads).for_each(|t| drop(s.spawn(move || work(t))));
+            (threads > 1).then(|| work(1));
+        });
+        work(0);
+    });
 }
 
 /// Gives the memory pages that lie entirely inside `items` back to the kernel, with

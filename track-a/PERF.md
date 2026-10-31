@@ -61,6 +61,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 54 | The latency's space bounded with `assert_unchecked`, so reading the status and ending the name take no bounds checks: 9.8 M instructions fewer | run-c0db6c54d9a4 | 0.0225 | 18.0 | 83.8 |
 | 55 | 3 fewer lines: `parse` an `unsafe fn` whose contract is the padding its `assert!` checked, and two range checks left to the indexes behind them | run-c0db6c54d9a4 | 0.0225 | 18.0 | 83.8 |
 | 56 | 6 fewer lines at the same speed: a line's six numbers written in one `map`, the format queue built without collecting the hours, the latencies placed in the whole buffer, the two counters on one line | run-c0db6c54d9a4 | 0.0225 | 18.0 | 83.8 |
+| 57 | Threads started one after another by one helper instead of by a tree, so that fewer of them wait for the interner's lock at once: 2 fewer lines | | | | |
 
 ## Step 1: v1
 
@@ -962,8 +963,81 @@ drew 17.65 ms, 18.6 MB and 86.3 points, and a third, run-2b07a12535b3 (commit 15
 changed only track B), 17.33 ms, 18.8 MB and 86.5 points, and a fourth, run-63683fcc0a53 (commit
 f073734, which changed only track C), 17.26 ms, 18.2 MB and 86.7 points.
 
+## Step 57: threads started by one helper
+
+Since step 14 the threads started as a tree: each handed the upper half of its numbers to a new
+thread until it kept one, so the last of twelve started after four spawns. Now thread 0 spawns one
+helper, which spawns threads 2 to 11 one after another and then works as thread 1. `fan_out` goes,
+and each thread gets its own copy of the work closure, which holds only references. With one
+hardware thread, the helper spawns nothing and does no work.
+
+The last thread starts no sooner: phase timestamps (41 runs, two rounds) put its start 1.38 and
+1.45 ms after the fork with the tree and at 1.48 and 1.49 ms with the helper. But each thread's
+parse took 8.53 and 8.51 ms instead of 8.91 and 8.86 (medians), and the last parse ended at 9.98 and
+9.94 ms instead of 10.21 and 10.19. The difference is the interner's lock: a thread that finds it
+taken spins briefly and then sleeps. A build that counts inserts found the lock taken at 700 and 712
+of a run's 1,858 inserts with the tree, and at 336 and 248 of about 1,850 with the helper (means of
+20 runs, twice). All inserts came in the first 1.4 ms, while the threads still met new names. With
+the helper, thread 0 starts after one spawn instead of three and has the table to itself for about
+0.3 ms, in which it adds about half the names; with the tree, three more threads started while it
+had added fewer than a third. In two runs of a build that timestamps each thread's progress,
+thread 0 took 0.62 and 1.19 ms over its first 4,096 lines with the tree, against 0.29 and 0.31 ms
+with the helper.
+
+Local, AC power, turbo off, on step 56's code. `perf stat -r 20`, twice: context switches 494 → 268
+and 467 → 271. `perf stat`, 30 interleaved runs: instructions:u 585.53 → 585.52 M, cycles:u
+321.4 → 318.5 M, cycles:k 113.6 → 112.0 M. `ab.py`, 61 interleaved runs, eight rounds: medians
+18.71 → 18.48, 18.75 → 18.60, 18.67 → 18.38, 18.75 → 18.49, 18.59 → 18.39, 18.80 → 18.56,
+18.83 → 18.52 and, under outside load, 23.30 → 22.91 ms: −0.24 ms (−1.3%) on average over the first
+seven. The same code before its comment was written, whose panic messages name other lines, measured
+−0.26 ms on average in eight more rounds. memory.peak, alternating rounds on seeds 1, 2, 3, 5, 7, 10
+and 11, medians: 18.26 → 18.51, 18.40 → 18.48, 18.27 → 18.47 and 18.32 → 18.42 MB in four, six, ten
+and ten rounds, and for the same code before its comment 18.18 → 18.18, 18.40 → 18.42 and
+18.32 → 18.41 MB in three of them: about 0.1 MB more, worth about 0.2% of T, though every allocation
+is the same. S 355 → 353. Gate: 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference
+hashes; clippy reports no warnings.
+
 ## Experiments that did not stay
 
+- **Other ways to start the threads** (local, AC power, turbo off, on step 56's code; `ab.py`, 61
+  interleaved runs, medians against step 56). All eleven spawned by thread 0, 3 lines fewer than
+  step 57: +0.24 to +0.45 ms in six rounds (+1.7%), since thread 0 began its own parse only after
+  eleven spawns. A helper that only spawns, with thread 0 working meanwhile, so that 13 threads run
+  for a moment, also 3 lines fewer: −0.24 to +0.57 ms in six rounds, −0.01 ms on average. The helper
+  spawning threads 11 down to 2: −0.28 ms on average in eight rounds, and two helpers that spawn
+  half of the threads each, 2 lines more: −0.26 ms, against −0.26 ms for step 57's helper in the
+  same rounds, so the order made no difference beyond the noise. Not kept.
+- **The interner's lock taken by spinning** (local, AC power, turbo off, on step 56's code):
+  `try_lock` in a loop with `spin_loop` instead of `lock`, which spins briefly and then sleeps.
+  `ab.py`, 61 interleaved runs, six rounds: medians +0.74 to +1.00 ms with the tree, and +0.05 to
+  +0.16 ms with step 57's helper against the helper alone. Not kept.
+- **The output written with `pwrite`** (local, AC power, turbo off, on step 56's code). With the
+  file's size set as now, every thread opened the file for itself and wrote its hours through a
+  `BufWriter` of 16 or 64 KB, seeking to each hour's place: no page faults on the output and nothing
+  to unmap at exit, which phase timestamps put at 0.55 ms between `exit` and the parent's `wait`,
+  against 0.74 and 0.79 ms. But tmpfs takes the file's lock for every write, so the threads' writes
+  queued behind each other: formatting took 3.30 and 3.32 ms per thread instead of 1.60 and 1.62
+  (64 KB buffers, 41 runs, two rounds). `ab.py`, 61 interleaved runs, six rounds: medians +1.43 to
+  +1.62 ms with 64 KB buffers (+8.1%) and +1.63 to +2.13 ms with 16 KB (+9.4%). memory.peak, four
+  alternating rounds on seeds 1, 2, 3, 5, 7, 10 and 11: median 18.18 → 18.39 MB. Not kept.
+- **The latency's digits masked from the space itself** (local, AC power, turbo off, on step 55's
+  code and on step 56's): `latency` keeps the digits above the last space with
+  `0x0F0F_0F0F_0F0F_0F00 << (8 * last_space)` instead of
+  `0x0F0F_0F0F_0F0F_0F0F << (8 * (last_space + 1))`: the mask's lowest byte is already zero, so the
+  shift needs no `+ 1`. On step 55's code, one instruction fewer per line, instructions:u
+  583.6 → 580.3 M, but cycles:u 318.3 → 320.7 M (`perf stat`, 40 interleaved runs). `ab.py`, 61
+  interleaved runs, medians against step 55: +0.02, +0.02, 0, +0.03, −0.07, +0.02, −0.06, +0.03,
+  +0.02 and −0.03 ms (ten rounds); against step 56: +0.07, −0.08, +0.18, −0.03, −0.03 and +0.23 ms
+  (six rounds). Not kept.
+- **The last hours handed out largest first** (local, AC power, turbo off, on step 57's code). The
+  plan's order ends with the `threads` smallest hours, smallest first; reversed, 1 line more, a
+  worker that frees up early takes the larger of them, as in largest-first scheduling. `ab.py`, 61
+  interleaved runs, seven rounds and an eighth under outside load left out: medians −0.11 to
+  +0.03 ms, −0.04 ms on average. Phase timestamps (41 runs, two rounds) put the hour pass, from the
+  plan to the barrier, at 4.25 and 4.21 ms against 4.23 and 4.24, and the spread of the workers'
+  last hour ends at 0.27 and 0.24 ms against 0.28 and 0.28: the tail is set by the size of the last
+  hours, not their order. The last 24 hours largest first, 2 lines more: −0.01 to +0.03 ms. Not
+  kept.
 - **The records written through a pointer** (local, AC power, turbo off, on step 52's code). The
   parse writes each record at `get_unchecked_mut(count)` and counts up. A pointer that moves up one
   record per line, with a closure that turns it back into a count for the runs and the final length,
