@@ -919,6 +919,39 @@ runs).
 
 ## Experiments that did not stay
 
+- **A structural index of the records** (local, on step 32's code), to break the chain between
+  records: each record's start waits on the id's comma, the name's and the note's closing
+  quotes, the region id, the sign, the amount's dot and the CR test, about 80 cycles. Two
+  shapes, both with the reference hashes on full seeds 1 and 2 and the 300 tiny seeds, and both
+  slower:
+  - Two stages per 4 KiB of a round, after simdjson. AVX2 compares of each 64 bytes with `"`,
+    `,` and LF, the bytes inside quotes as the prefix XOR of the quote mask (one PCLMULQDQ
+    against all ones, carried from block to block), and every comma and LF outside them
+    written to a buffer, eight positions at a time with no branch per position. The record
+    loop then took five positions per record, so no record waited on the one before. `ab.py`,
+    40 interleaved runs, two rounds, medians / minimums 32.73 / 32.15 → 37.02 / 36.20 ms and
+    32.99 / 32.09 → 37.04 / 36.00 ms (+12–13%). `perf stat -r 10` on the P-cores, twice:
+    instructions 1.414 → 1.941 G, IPC per thread 1.75–1.87 → 2.15–2.20, branch misses
+    2.87 → 1.93 M. The record loop was not tuned (each field's quotes were counted by a loop),
+    but the index alone took about 90 instructions per 64-byte block, about 85 per record.
+  - Each record's end from one compare: step 32's parser, plus one 32-byte compare with LF
+    right after the note, which gives the next record's start, so the region id, the sign, the
+    amount and the CR test leave the chain; the amount's dot stays the fallback when no LF lies
+    in those 32 bytes. 33.10 / 32.35 → 33.78 / 33.17 ms and 33.18 / 31.80 → 34.12 / 33.13 ms
+    (+2.1–2.8%); instructions 1.416 → 1.450 G, 10 more per record; IPC per thread
+    1.82 → 1.80; branch misses 2.87 → 2.92 M.
+  - Without hyperthreads, 6 threads on CPUs 0, 2, …, 10 and 30 interleaved runs, both win:
+    45.99 / 44.19 ms for step 32, 45.00 / 42.76 ms for the two stages and 43.70 / 41.59 ms for
+    the compare. A thread alone does wait on the chain, but with 12 threads its sibling fills
+    those cycles, two threads at 1.75–1.87 instructions per cycle each, so the instruction
+    count decides T.
+  - The full per-record window, masks over the 128 bytes from each record's start with the
+    k-th comma or LF taken by `pdep`, was not built: by an estimate from its compares, mask
+    moves and 128-bit bit walks it runs 20–30 more instructions per record than step 32, more
+    than the compare that already lost. On full seed 1, 41% of records are longer than 64 bytes
+    and 0.06% longer than 96. A 64-byte mask misses the note's closing quote for 11.2% of
+    records when it starts at the record and for 2.2% when it starts at the name, as step 28's
+    does. The region id, the amount and the terminator never take more than 17 bytes.
 - **48-byte name-set entries** (local, on step 32's code): the key's words for names of up to
   15 bytes and the 32 bytes of group bits in 48 bytes, with longer names in a side list. M fell
   on every seed (10 seeds × 11 rounds, per-seed medians −0.33 to −1.02 MB, mean −0.69 MB), but
