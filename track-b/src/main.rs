@@ -1144,7 +1144,7 @@ struct Slot {
     head: u64,
     /// [`Slot::tail`] of the term's key: its bytes 8 to 11, and whether it runs past 12 bytes.
     tail: u32,
-    /// The term id times 16, plus the [`Plan`]'s flags for the term.
+    /// The term id times 32, plus the [`Plan`]'s flags for the term and [`Slot::MORE`].
     flags: u32,
 }
 
@@ -1157,18 +1157,22 @@ impl Slot {
     const ROW: u32 = 4;
     /// The corpus pass keeps the term's documents in an id list.
     const LISTED: u32 = 8;
+    /// A term whose home slot this is lies further on, so a probe from here must go on past a
+    /// slot that holds another term ([`TermTable::find_from`]).
+    const MORE: u32 = 16;
 
     /// The term id.
     fn id(self) -> u32 {
-        self.flags >> 4
+        self.flags >> 5
     }
 
     /// The `tail` of a slot holding `key`: the key's bytes 8 to 11, plus, in the top bit, which no
-    /// letter or digit has, whether the key runs past 12 bytes. A token holds no zero byte, so
-    /// it does exactly when its byte 12 is set. With that bit, a key that shares a term's first
-    /// 12 bytes matches its `head` and `tail` only when both or neither run past them.
+    /// letter or digit has, whether the key runs past 12 bytes. Each of a key's bytes has bit 5
+    /// set ([`fold`]), so it does exactly when bit 5 of its byte 12, bit 37 of `key[1]`, is set,
+    /// which one shift moves to the top bit. With that bit, a key that shares a term's first 12
+    /// bytes matches its `head` and `tail` only when both or neither run past them.
     fn tail(key: &Key) -> u32 {
-        key[1] as u32 | u32::from(key[1] >> 32 != 0) << 31
+        key[1] as u32 | (key[1] >> 6) as u32 & 1 << 31
     }
 }
 
@@ -1223,8 +1227,8 @@ impl TermTable {
     ///
     /// The slots sit on huge pages of their own ([`huge`]), as the pass reads them at random.
     fn new(occurrences: usize) -> Self {
-        // A term id times 16 fits in `Slot::flags`.
-        assert!(occurrences < 1 << 28, "queries.txt: too many terms");
+        // A term id times 32 fits in `Slot::flags`.
+        assert!(occurrences < 1 << 27, "queries.txt: too many terms");
         // 2 slots or more, so that the shift in [`TermTable::home`] stays below 64.
         let len = (occurrences * 3 / 2 + 1).next_power_of_two().max(2);
         let (lens, keys) = (vec![0], vec![[0; MAX_TERM / 8]; occurrences + 1]);
@@ -1237,16 +1241,32 @@ impl TermTable {
         self.lens.len()
     }
 
-    /// The slot of the query term whose key this is, given `at = self.home(key)`, or else the
-    /// empty slot where its probe ends, whose id, 0, is no term's.
+    /// The slot of the query term whose key this is, given `at = self.home(key)`, or else a slot
+    /// with the flags of an empty one, 0, whose id is no term's. Inlined, as both callers' token
+    /// loops run it; not inlined, the pass ran 22% more instructions (PERF.md, step 45).
     ///
     /// # Safety
     ///
     /// `at` is below the slot count, as [`TermTable::home`] is.
+    #[inline(always)]
     unsafe fn find_from(&self, key: &Key, at: usize) -> Slot {
-        // SAFETY: `at` is below the slot count, as the caller ensures, and so is the index
+        // SAFETY: `at` is below the slot count, as the caller ensures.
+        let slot = unsafe { *self.slots.get_unchecked(at) };
+        // A token whose home slot holds another term is no query term unless the slot has
+        // `MORE`, which an empty slot never has: 29% of the tokens that are no term found their
+        // home slot taken, and each of them mispredicted the probe's first test.
+        let found = self.holds(&slot, key);
+        let mut stop = u8::from(found) | u8::from(slot.flags & Slot::MORE == 0);
+        // SAFETY: the asm block is empty; it keeps the test one branch, as in `position`.
+        unsafe { asm!("/* {} */", inout(reg_byte) stop, options(pure, nomem)) };
+        if stop != 0 {
+            let flags = std::hint::select_unpredictable(found, slot.flags, 0);
+            return Slot { flags, ..slot };
+        }
+        let next = (at + 1) & (self.slots.len() - 1);
+        // SAFETY: the slot count is a power of two, so `next` is below it, as is the index
         // `position` returns.
-        unsafe { *self.slots.get_unchecked(self.position(key, at)) }
+        unsafe { *self.slots.get_unchecked(self.position(key, next)) }
     }
 
     /// Where the probe for `key` starts: below the slot count, a power of two of 2 or more, as
@@ -1268,15 +1288,18 @@ impl TermTable {
     /// seldom waits.
     fn intern(&mut self, keys: &[Key], i: usize) -> u32 {
         keys.get(i + 16).map(|ahead| self.prefetch(ahead));
-        let key = keys[i];
+        let (key, home) = (keys[i], self.home(&keys[i]));
         // SAFETY: a home slot is below the slot count.
-        let at = unsafe { self.position(&key, self.home(&key)) };
+        let at = unsafe { self.position(&key, home) };
         // No branch on whether the term is new, which follows no pattern: the slot is written
         // and the length pushed either way, and the length dropped again unless the term is new.
         let (new, n) = (self.slots[at].head == 0, self.lens.len());
         let id = std::hint::select_unpredictable(new, n as u32, self.slots[at].id());
-        let (head, tail, flags) = (key[0], Slot::tail(&key), id << 4);
+        // A term met again keeps its `MORE`; a new one's slot was empty.
+        let more = self.slots[at].flags & Slot::MORE;
+        let (head, tail, flags) = (key[0], Slot::tail(&key), id << 5 | more);
         self.slots[at] = Slot { head, tail, flags };
+        self.slots[home].flags |= u32::from(at != home) * Slot::MORE;
         // A key's length is its count of nonzero bytes.
         self.lens
             .push(key.iter().map(|w| 8 - w.leading_zeros() as u8 / 8).sum());
@@ -1295,6 +1318,19 @@ impl TermTable {
         }
     }
 
+    /// Whether `slot` holds `key`. No `&&`: whether a token is a query term follows no pattern,
+    /// so a probe takes one branch, mostly taken, ending at the term or an empty slot; long keys
+    /// take one more.
+    fn holds(&self, slot: &Slot, key: &Key) -> bool {
+        let found = (slot.head ^ key[0]) | u64::from(slot.tail ^ Slot::tail(key)) == 0;
+        let long = key[1] & 1 << 37 != 0;
+        if found & long {
+            // SAFETY: `keys` holds an entry per term occurrence and one more, so past every id.
+            return unsafe { self.keys.get_unchecked(slot.id() as usize) } == key;
+        }
+        found
+    }
+
     /// The slot holding `key`, or the empty slot where it belongs, probing linearly from `at`.
     ///
     /// # Safety
@@ -1302,16 +1338,10 @@ impl TermTable {
     /// `at` is below the slot count, as [`TermTable::home`] is.
     unsafe fn position(&self, key: &Key, mut at: usize) -> usize {
         let mask = self.slots.len() - 1;
-        let (long, tail) = (key[1] >> 32 != 0, Slot::tail(key));
         loop {
             // SAFETY: `at` starts below the slot count, as the caller ensures, and wraps at it.
             let slot = unsafe { self.slots.get_unchecked(at) };
-            // No `&&`: whether a token is a query term follows no pattern, so the probe takes one
-            // branch, mostly taken, ending at the term or an empty slot; long keys take one more.
-            let mut found = (slot.head ^ key[0]) | u64::from(slot.tail ^ tail) == 0;
-            if found & long {
-                found = self.keys[slot.id() as usize] == *key;
-            }
+            let found = self.holds(slot, key);
             // Hidden from the optimizer, the test stays one branch: LLVM would split it in two,
             // the first of which mispredicts on every token that is no query term.
             let mut stop = u8::from(slot.head == 0) | u8::from(found);

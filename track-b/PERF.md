@@ -49,6 +49,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 42 | 7.1% fewer instructions in the corpus pass: the walk's token loop runs in a call of its own per line, so the line end no longer holds the registers it needs, and a key's 32-byte window is tested against a bound held in a register | run-b96f907a19fc | 0.1151 | 41.2 | 77.2 |
 | 43 | A phrase candidate is first tested on one more of the phrase's terms, which the plan keeps beside the trigger, before the phrase's terms are loaded: 97.5% of the candidates stop there | run-b96f907a19fc | 0.1151 | 41.2 | 77.2 |
 | 44 | The line end's token loop prefetches each token's entry of `check_at`, which the BOOL triggers' loop reads at random, one token ahead of that loop | run-0f0011884453 | 0.1166 | 42.4 | 77.1 |
+| 45 | A token whose home slot holds another term stops there unless the slot is marked as the home of a term stored further on; a key's long bit is its byte 12's bit 5, moved by one shift | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1167,7 +1168,61 @@ and 120.87 ms, minimums 120.28, 120.95, 120.08 and 120.67 → 119.65, 119.76, 11
 memory.peak over 8 alternating runs: median 41.88 → 42.38 MB, highest 43.71 → 43.15 MB. S 782 →
 783. Gate: 510 pass, 0 fail.
 
+## Step 45: the probe stops at a taken home slot
+
+After step 44, `perf record` on seed 1 (turbo off): 15.46 M mispredicted branches, `tma_bad_speculation`
+17.1% of the slots, and 22% of those mispredicts on the probe's first test, the one branch that
+ends a probe at the term or an empty slot. A count of where each token's probe ends: of the
+7.56 M tokens that are no query term, 5.39 M found their home slot empty and 2.17 M found it
+taken (1.33 M one slot on, 0.49 M two, 0.35 M three or more); of the 28.72 M term tokens, 27.63 M
+found their term at home and 1.08 M further on. So the 3.25 M probes that went on past their
+home slot mispredicted, and two thirds of them belonged to tokens that are no term at all.
+
+- **`Slot::MORE`.** `intern` sets it on a term's home slot when it stores the term further on,
+  and a term met again keeps it. At the home slot, [`TermTable::find_from`] stops when the slot
+  holds the key or has no `MORE`, in one branch, as the probe's own test is, and returns flags
+  of 0, the empty slot's, when it stopped at another term. An empty slot has no `MORE`, so that
+  test also stops at it. Only a slot that is some displaced term's home sends a probe on: 4.5%
+  of the slots at the table's 29% load, instead of 29%. A slot's flags hold the term id times
+  32 now, so a term id stays below 2^27.
+- **`#[inline(always)]`.** With its first slot peeled off the loop, `find_from` was no longer
+  inlined into the pass or the sample: instructions 5,412 → 6,629 M, cycles 2,900 → 3,150 M.
+  Cargo.toml allows clippy's `inline_always` for it, which costs no line.
+- **The long bit in one shift.** `Slot::tail` set its top bit from `key[1] >> 32 != 0`, six
+  instructions per token. A key's every byte has bit 5 set ([`fold`]), so bit 37 of `key[1]` is
+  set exactly when the key runs past 12 bytes, and `(key[1] >> 6) as u32 & 1 << 31` moves it
+  into place; the long test is that bit too, and the long key's load takes no bounds check.
+
+`perf stat -r 5`, interleaved, two rounds, step 44 → `MORE` → both: instructions 5,412.1 →
+5,466.2 → 5,360.1 M, cycles 2,902 and 2,897 → 2,811 and 2,804 → 2,778 and 2,784 M, branch misses
+15.46 → 12.56 → 12.57 M. Hashing the key's first word only, instead of the XOR of two, would save
+another 72 M instructions, but put more terms off their home slot: branch misses 12.57 → 12.74
+M and cycles 2,747 → 2,763 M, so it did not stay.
+
+Local, against step 44 (`ab.py`, 41 alternating runs on the P-cores, turbo off), `MORE` alone,
+two rounds: medians 120.83 and 120.27 → 117.71 and 117.45 ms, minimums 118.79 and 118.76 →
+116.47 and 116.14 ms. Then step 44, `MORE` alone and both, two rounds: medians 120.62 and 120.62
+→ 117.33 and 117.42 → 116.42 and 116.37 ms, minimums 118.63 and 119.33 → 116.19 and 116.09 →
+115.47 and 114.82 ms. As committed (a build that differs only in line numbers), against step 44,
+two more rounds under a higher load: medians 123.80 and 123.09 → 119.52 and 118.77 ms, minimums
+121.34 and 120.32 → 117.37 and 116.13 ms. memory.peak over 6 alternating runs: median 39.1 → 39.9 MB, highest 40.9 →
+40.0 MB, with the same allocations. S 783 → 800. Gate: 510 pass, 0 fail.
+
 ## Experiments that did not stay
+
+- **After step 44, where the time goes at turbo off** (local, seed 1, builds with timestamps,
+  12 runs, in ms since `main`). The walks start at 10.5–12.7 ms and end over a spread of 2.2–4
+  ms (104.4–112.1 ms); in one run of twelve one thread ended 5 ms after the rest, which turbo on
+  showed in half the runs (below). After its walk, a thread spends 0.35–0.95 ms dropping its
+  pages, 0.5–0.8 ms on its last flush, 0.1–1.2 ms freeing its window, 0.15–1.25 ms merging its
+  cells (the free included) and 1.2–3.1 ms grouping its 120,700 or so first matches, of which
+  0–1.1 ms is allocating `ids`, 0.1–1.2 ms allocating `at`, 0.15–0.36 ms counting and 0.8–1.6
+  ms placing them, page faults on `ids` included: about 3.5–5 ms in all, whose spread is mostly
+  the frees and allocations queueing on the address space's lock. Formatting then takes
+  1.3–1.8 ms and the write 0.5–0.7 ms. `perf record` with the kernel's samples: 5.3% of all
+  cycles run in the kernel, two thirds of them in page faults, half of those on the corpus
+  mapping. Not taken further: the work is the same on every thread, so only a dynamic handout
+  of the corpus would win back the walks' spread, about 1.3 ms above their mean.
 
 - **After step 44, the serial parts and the tail** (local, seed 1, turbo on, so a run takes
   about 69 ms; `ab.py`, 41 alternating runs, two rounds, medians, step 44 first). A build with
