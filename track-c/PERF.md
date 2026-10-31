@@ -32,6 +32,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 25 | A name's letter masked to its length by a 24-byte window of a constant, and each letter posted at a running index into its owner's mailbox | run-b89d1be25a5e | 0.0348 | 12.5 | 76.9 |
 | 26 | The long-name compare out of line, so the probe for every other name stops paying for its bounds checks | run-8378d5c7581d | 0.0334 | 12.6 | 77.2 |
 | 27 | A plain static executable instead of a static PIE (`relocation-model=static`) | run-a8bc41aa5aa0 | 0.0340 | 12.5 | 77.1 |
+| 28 | A record's name and note take their quotes from one 64-byte mask, built by AVX2 compares at the name's start, where each quote cost a 32-byte scan | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -738,6 +739,38 @@ Local, turbo off: `ab.py` against step 26, 40 interleaved runs, five rounds: med
 36.47, 36.65 → 36.49, 37.50 → 36.60, 36.47 → 36.17 and 36.61 → 36.53 ms, minimums 35.92 → 35.57,
 35.83 → 35.86, 35.53 → 35.73, 35.61 → 35.60 and 35.85 → 35.56 ms. The third round ran on a busy
 machine (means 49.9 and 45.5 ms). S unchanged at 299. Gate: 310 pass, 0 fail.
+
+## Step 28: a record's quotes from one mask
+
+`text_field` jumped from quote to quote, and each jump compared the next 32 bytes with `"` and
+branched on what it found: a name and a note took at least two such scans, and every `""` one
+more. Now the hot loop compares the 64 bytes from a record's name with `"` once, two AVX2
+compares packed into one 64-bit mask (`quotes`), and both fields take their quotes from that
+mask, lowest first, with `tzcnt`. An escaped quote is two neighbouring bits, cleared together,
+and the closing quote is one whose next bit is clear. On full seed 1 the 64 bytes hold the
+name's and the note's closing quotes for 97.8% of records (from the name's start to the note's
+closing quote: median 37 bytes, 99th percentile 65). A field that runs past the mask moves it
+on, to its last bit's quote when that bit is set, because the byte after that quote lies past
+the mask and could be its pair. `PAD` grows from 32 to 64 bytes, so the 64-byte read
+always fits.
+
+The compares are written with intrinsics. As a loop over the 64 bytes, or as two calls of the
+32-byte loop that step 6 used, the compare stayed scalar once inlined into the worker, at about
+2.9 G instructions in all, and as a closure it was called out of line twice per record.
+
+`perf stat -r 10`, twice: instructions:u 1.536 → 1.501 G (11 fewer per record), cycles:u
+0.839 → 0.767 G, branch misses 3.71 → 2.87 M. S 299 → 311. `ab.py` against step 27, 40
+interleaved runs, medians / minimums: 36.45 / 35.38 → 33.79 / 33.13 ms and
+36.22 / 35.34 → 33.79 / 33.24 ms; the same source on step 26's static PIE build, against step
+26: 36.40 / 35.72 → 34.10 / 33.20, 36.60 / 35.68 → 34.28 / 33.20,
+36.99 / 35.75 → 34.41 / 33.43 and 36.39 / 35.77 → 34.16 / 33.44 ms. memory.peak, alternating
+rounds: against step 27 (8 rounds) medians 12.82 → 12.89 MB, means 12.98 → 12.77 MB; against
+step 26 (10 rounds) medians 13.54 → 12.51 MB, means 13.18 → 12.72 MB; all inside this
+machine's spread of 11.7–14.0 MB, and no allocation changed. Correctness: the gate, 310 pass,
+0 fail; full seeds 1–7 and 10–12 give the reference hashes; the 402 fuzz cases pass at the
+default thread count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12
+and 64; the 300 tiny seeds pass at 10 thread counts with 100-byte rounds; the region sets give
+step 27's results; clippy reports no warnings.
 
 ## Experiments that did not stay
 

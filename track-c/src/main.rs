@@ -33,8 +33,8 @@
 //!    follows (see [`join`]), so no pass over the file comes first.
 //! 3. **Each thread walks its records field by field.** [`join`] parses each record in
 //!    order and sums into its own [`Group`] per country. Names and notes are quoted, and
-//!    [`text_field`] jumps from quote to quote 32 bytes at a time with AVX2 compares. It measures
-//!    a field as its raw length minus one per `""` pair, so no field is ever unescaped.
+//!    [`text_field`] takes their quotes from a mask of 64 bytes that AVX2 compares build. It
+//!    measures a field as its raw length minus one per `""` pair, so no field is ever unescaped.
 //!    [`number`] reads each number from one 8-byte word, with no loop over its digits.
 //! 4. **Each distinct name belongs to one thread.** The name's hash picks its owner, and each
 //!    thread keeps the names it owns in a [`NameSet`] that no other thread touches: a hash table
@@ -76,7 +76,8 @@
 //! `amount_sum` fit in 64 bits. The name pool of §2.2 and the sizes in §5 only set the name
 //! sets' starting sizes. Records outside the §2.1 grammar are not validated.
 
-use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch, _mm256_cmpeq_epi8, _mm256_loadu_si256};
+use std::arch::x86_64::{_mm256_movemask_epi8, _mm256_set1_epi8};
 use std::sync::atomic::{AtomicU64, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
 use std::{fs::File, io::Write, ops::Range, os::fd::AsRawFd, path::Path, thread, time::Duration};
 
@@ -85,9 +86,9 @@ use std::{fs::File, io::Write, ops::Range, os::fd::AsRawFd, path::Path, thread, 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 /// Zero bytes that [`map_file`] puts after the last byte of each file. Every position a parse
 /// reaches lies before them, so the fixed-size reads of [`number`] (8 bytes), [`name_letter`]
-/// (24) and [`text_field`] (32) always fit in the input, and none of them needs a shorter path
-/// for its end.
-const PAD: usize = 32;
+/// (24) and [`quotes`] (64) always fit in the input, and none of them needs a shorter path for
+/// its end.
+const PAD: usize = 64;
 /// Bytes of its run a worker parses per round before the workers swap names. Small rounds keep
 /// the mailboxes small and the names just parsed still in cache when their owner reads them.
 const ROUND_BYTES: usize = 64 << 10;
@@ -323,9 +324,10 @@ fn join(data: &[u8], by_id: &[u8], group_count: usize, threads: usize) -> Vec<Gr
                         at += BOM.len();
                     }
                     let (id, comma) = number(data, at, b',');
-                    let (name, name_len, after_name) = text_field(data, comma + 1);
+                    let mut window = (comma + 1, quotes(data, comma + 1));
+                    let (name, name_len, after_name) = text_field(data, comma + 1, &mut window);
                     let letter = name_letter(data, name);
-                    let (_, note_len, after_note) = text_field(data, after_name);
+                    let (_, note_len, after_note) = text_field(data, after_name, &mut window);
                     let (region_id, comma) = number(data, after_note, b',');
                     let byte = by_id.as_ptr().wrapping_add(region_id as usize);
                     // SAFETY: a prefetch reads nothing the program sees, and never faults.
@@ -452,47 +454,64 @@ fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
 /// the raw length minus one per `""` pair. Distinct counting needs no unescaping either (see
 /// [`NameSet`]).
 ///
-/// Inside quotes only the quotes matter, so the scan jumps from one quote to the next, 32 bytes
-/// per step. A name or a note usually ends within the first step, where a loop over bytes took
-/// one step and one branch per byte. Every step has its 32 bytes, because the [`PAD`] follows
-/// the input.
+/// Inside quotes only the quotes matter. `window` is a start and the [`quotes`] of the 64 bytes
+/// from there that no field has read yet, and the hot loop starts one at each record's name,
+/// where it holds the name and the note of 98% of the records at full scale. A field takes its
+/// quotes from the mask, lowest first, and an escaped quote is two neighbouring bits, so most
+/// fields take no load and no branch per quote. A field that runs past the window moves it on.
 ///
 /// It is always inlined. As a call it returned its four words through the stack, and the caller
 /// read two of them back with one 16-byte load, which waits until both 8-byte stores reach the
 /// cache because store forwarding cannot merge them.
 #[inline(always)]
-fn text_field(data: &[u8], at: usize) -> (Range<usize>, i64, usize) {
+fn text_field(data: &[u8], at: usize, window: &mut (usize, u64)) -> (Range<usize>, i64, usize) {
     if data[at] != b'"' {
         // The generator writes unquoted text only empty (§2.2), but §2.1 allows any bytes but
         // quote, comma, CR and LF.
         let end = at + data[at..].iter().position(|&b| b == b',').unwrap();
         return (at..end, (end - at) as i64, end + 1);
     }
-    let (start, mut end, mut pairs) = (at + 1, at + 1, 0);
+    let (base, quotes) = window;
+    // Every quote before `at` is read, so the opening quote is the lowest bit, or the field
+    // starts past the window, which then holds no quote.
+    if *quotes == 0 {
+        (*base, *quotes) = (at, self::quotes(data, at));
+    }
+    let (mut q, mut pairs) = (*quotes & (*quotes - 1), 0);
     // Inside quotes only `"` is special: `""` is one escaped quote, and any other `"` closes the
     // field. Never test for "a quote followed by a comma": a note can hold `"",` (an escaped
     // quote, then a comma), which that test would take for the end of the field.
     // A note can also start or end with an escaped quote, so the field can open or close with
     // `"""`; pairing quotes left to right reads both right.
-    loop {
-        // On to the next quote. The compiler turns the loop into one AVX2 compare of all 32
-        // bytes (`vpcmpeqb` on `ymm`) and one `vpmovmskb` that packs the 32 results into a mask
-        // with bit i set where byte i is a quote. An empty mask has 32 trailing zeros, so a step
-        // that finds no quote moves on by all 32 bytes.
-        let mut quotes = 0u32;
-        for (i, &b) in data[end..end + 32].iter().enumerate() {
-            quotes |= u32::from(b == b'"') << i;
+    let end = loop {
+        let i = q.trailing_zeros() as usize;
+        if i >= 63 {
+            // No quote left that the window can tell from half of a pair: move it on, to the
+            // last bit's quote or past the window.
+            (*base, q) = (*base + i, self::quotes(data, *base + i));
+        } else if q >> (i + 1) & 1 == 0 {
+            *quotes = q & (q - 1);
+            break *base + i;
+        } else {
+            (pairs, q) = (pairs + 1, q & !(3 << i));
         }
-        end += quotes.trailing_zeros() as usize;
-        if data[end] != b'"' {
-            continue;
-        }
-        if data[end + 1] != b'"' {
-            break;
-        }
-        (pairs, end) = (pairs + 1, end + 2);
-    }
-    (start..end, (end - start - pairs) as i64, end + 2)
+    };
+    (at + 1..end, (end - at - 1 - pairs) as i64, end + 2)
+}
+
+/// The quotes among the 64 bytes at `at`, as a mask with bit i set where `data[at + i]` is a
+/// quote: two AVX2 compares of 32 bytes, each packed into 32 bits by `vpmovmskb`. Written as a
+/// loop over bytes, the compare that starts each record's window became byte loads and shifts.
+#[inline(always)]
+fn quotes(data: &[u8], at: usize) -> u64 {
+    let bytes: &[u8; 64] = data[at..].first_chunk().expect("the input is padded");
+    // SAFETY: the build targets Alder Lake, which has AVX2 (see `.cargo/config.toml`), and both
+    // 32-byte loads lie in `bytes`. `loadu` needs no alignment.
+    let mask = |i: usize| unsafe {
+        let v = _mm256_loadu_si256(bytes[i..].as_ptr().cast());
+        _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'"' as i8)))
+    };
+    u64::from(mask(0).cast_unsigned()) | u64::from(mask(32).cast_unsigned()) << 32
 }
 
 /// A letter for the name at `start..end` of `data`, without its group, which the poster adds to
