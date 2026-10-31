@@ -49,6 +49,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 42 | 1 fewer line with the same machine code: the name hash binds the length in the arms of its `match` | | | | |
 | 43 | 4 fewer lines on cold paths: `Interner::new` instead of an `impl Default`, the format queue as a lazy iterator, and a new name's padded copy from `array::from_fn` | | | | |
 | 44 | 4 fewer lines in `summarize`: a chunk's start found through a one-line `newline` closure, and the format loop as one `for_each` over the queue | | | | |
+| 45 | 2 fewer lines with the same machine code: the build stage mounts its sources instead of copying them, and `insert` stays out of line by `#[cold]` alone | | | | |
 
 ## Step 1: v1
 
@@ -641,9 +642,20 @@ hours from the queue in one `iter::from_fn(...).for_each(...)` instead of a `whi
 named closure; the lock is still taken and released inside the closure, so no thread holds it
 while it formats. The machine code changes only around those lines of the work closure and in
 its stack slots before the hour pass. `ab.py`, 40 interleaved runs, two rounds: medians
-20.20 → 20.07 and 20.16 → 20.12 ms against step 42 (step 41's code: 20.25 and 20.25 ms in the
+20.20 → 20.07 and 20.16 → 20.12 ms against step 43 (step 41's code: 20.25 and 20.25 ms in the
 same rounds). memory.peak, 24 alternating runs on seed 1: median 18.13 MB for both; on seeds 3, 7
 and 11, 8 runs each, within 0.02 MB of step 41. S 367 → 363. Gate: 310 pass, 0 fail.
+
+## Step 45: 2 fewer lines
+
+The Dockerfile's build stage mounts its context (`RUN --mount=type=bind,target=/src`) instead of
+copying it with `COPY . .`, and cargo builds into `--target-dir /out`, since the mount is
+read-only. `harness/dockerfile_check.py` accepts a bind mount of the context, and every builder
+that builds us is BuildKit: Depot, the board's rootless BuildKit fallback and final scoring's
+`docker build`. A local `docker build --network=none` of the old and the new Dockerfile gave
+byte-identical binaries. `insert` drops `#[inline(never)]`: `#[cold]` alone keeps it out of
+line. `.text` is byte-identical to step 44's, and `.rodata` differs only in the line numbers of
+27 panic locations, so T and M cannot move. S 363 → 361. Gate: 310 pass, 0 fail.
 
 ## Experiments that did not stay
 

@@ -612,11 +612,10 @@ impl<'a> Interner<'a> {
     }
 
     /// Gives `name`, which belongs in the empty `slot`, the next id. New names are rare (1,842
-    /// per seed), so this stays out of line, away from the hot loop. It hashes the name again
-    /// instead of taking the hash from `intern`: keeping that alive through the probe loop cost
-    /// 5.8 million instructions in the parse.
+    /// per seed), so it is marked cold, which keeps it out of line, away from the hot loop. It
+    /// hashes the name again instead of taking the hash from `intern`: keeping that alive through
+    /// the probe loop cost 5.8 million instructions in the parse.
     #[cold]
-    #[inline(never)]
     fn insert(&self, slot: usize, name: &'a [u8], window: &[u8; 64]) -> u32 {
         let mut count = self.count.lock().expect("panics abort");
         // Only the lock's holder fills a slot, and none is ever emptied. If `slot` is still empty,
