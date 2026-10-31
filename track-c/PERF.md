@@ -48,7 +48,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 41 | A name is known by a 128-bit hash of its bytes, three AES rounds: a letter is 16 bytes instead of 32 and is posted with one store, and a name set's entry is 40 bytes instead of 64, 64 bits of the hash beside the name's group bits | run-65f94ca68a16 | 0.0226 | 11.5 | 81.1 |
 | 42 | 13 fewer lines at the same speed: `region_amount` and `ALIGN` written shorter, the cold paths without `#[inline(never)]`, the mailboxes read in one `for_each` and published by their ends, and `parallel` written into `join` | run-d7d23764cf12 | 0.0219 | 11.4 | 81.6 |
 | 43 | A waiter at the barrier sleeps in steps of 10 µs with 1 ns of timer slack, so a sleeper is no longer late for its next round, and rounds of 128 KiB, half as many barriers | run-f276c02c1223 | 0.0219 | 11.4 | 81.6 |
-| 44 | 3 fewer lines at the same speed: the country numbers given by one `for_each` over `present().zip(1..)`, with the count from `present().count()`, and the mailbox ends published in one `for_each` | | | | |
+| 44 | 3 fewer lines at the same speed: the country numbers given by one `for_each` over `present().zip(1..)`, with the count from `present().count()`, and the mailbox ends published in one `for_each` | run-42fe84676c85 | 0.0218 | 11.6 | 81.6 |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
