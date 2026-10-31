@@ -25,7 +25,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 18 | A term table slot holds a term's first 12 bytes instead of 8, so a token of 9 to 12 bytes no longer loads its term's key from a second array | run-e847cb4a493b | 0.2208 | 41.8 | 69.9 |
 | 19 | 99 fewer code lines: the cold code and the term table simplified (no doubling), the walk's bit pops in one helper; the key-mask table aligned to a cache line | run-74f2276732d6 | 0.2241 | 42.9 | 70.1 |
 | 20 | The rarity sample is the corpus's first 1/64 (4,005 documents on seed 1) instead of its first 1,000 documents, each thread counting a part | run-75d28a617cc4 | 0.2158 | 42.8 | 70.5 |
-| 21 | 35 fewer code lines: one helper runs and joins each set of threads, the intern loop drops its prefetch, the output adds each query's cells once; every loop starts on a 64-byte boundary | | | | |
+| 21 | 35 fewer code lines: one helper runs and joins each set of threads, the intern loop drops its prefetch, the output adds each query's cells once; every loop starts on a 64-byte boundary | run-f0c533c66a88 | 0.2165 | 42.9 | 70.6 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
