@@ -1595,6 +1595,27 @@ runs: 10.3–10.6 MB for step 44 and 10.0–10.4 MB for this step. S 366 → 376
   `ab.py`, 51 interleaved runs, twice: 22.56 → 22.74 ms and 22.59 → 22.89 ms. +2 lines.
 - **Only the slot read unchecked** in the probe, with the entry's bounds check kept (one line
   fewer): 793.6 → 803.2 M instructions on the build above.
+- **Where step 45 stands** (P-cores, turbo off, `perf stat -M TopdownL1/L2`, 10 runs): retiring
+  47%, core bound 22%, branch mispredicts 10%, fetch latency 10%, memory bound 6%. Of the 1.84 M
+  branch misses, 87% are the probe's tag compare in `NameSet::read` (a name not in its home
+  slot, at a load of 0.51), and in the record loop the most cycle samples sit on the region
+  byte's prefetch, which waits on the region id's multiply-add chain.
+- **The name sets' slots at a quarter load** (local, turbo off, on step 45's code): twice the
+  slots, 32,768 per worker at full scale. Branch misses 1.84 → 0.81 M, instructions 800.7 →
+  792.4 M, cycles 522.9 → 520.6 M and 526.5 → 517.8 M (`perf stat -r 10`, interleaved), but
+  memory.peak 9.9–10.2 → 10.6–10.9 MB (4 alternating runs): +0.7 MB costs about 0.25 points,
+  which 1% of T does not pay for.
+- **`number` on an SSE window** (local, turbo off, on step 45's code): the id, and every other
+  field `number` reads, parsed as `region_amount` parses the region id, a compare with `/`, its
+  mask's first zero for the length, and the `pshufb` and multiply-adds of step 35 shared with
+  `region_amount`, instead of three multiplies of one word. The same lines (S 376), 800.8 →
+  784.5 M instructions, and the gate passes, but `ab.py` on a busy machine (other programs on
+  the P-cores, means up to 33 ms), interleaved, medians: seed 1, 23.43 → 23.28, 23.07 → 23.05
+  (51 runs) and 23.15 → 22.97 ms (61 runs); seed 2, 23.35 → 23.54 ms (61 runs). Within noise,
+  probably because the vector compare and `vpmovmskb` put the id's comma a few cycles further
+  along the record's chain, and the multiply-adds share their ports with the text masks and the
+  hash.
+  As a separate `id` function beside the SWAR `number`: 14 more lines for the same instructions.
 
 - **A structural index of the records** (local, on step 32's code), to break the chain between
   records: each record's start waits on the id's comma, the name's and the note's closing
