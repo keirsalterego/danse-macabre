@@ -50,6 +50,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 43 | A phrase candidate is first tested on one more of the phrase's terms, which the plan keeps beside the trigger, before the phrase's terms are loaded: 97.5% of the candidates stop there | run-b96f907a19fc | 0.1151 | 41.2 | 77.2 |
 | 44 | The line end's token loop prefetches each token's entry of `check_at`, which the BOOL triggers' loop reads at random, one token ahead of that loop | run-0f0011884453 | 0.1166 | 42.4 | 77.1 |
 | 45 | A token whose home slot holds another term stops there unless the slot is marked as the home of a term stored further on; a key's long bit is its byte 12's bit 5, moved by one shift | run-636a838e4422 | 0.1135 | 42.3 | 77.3 |
+| 46 | A window's matches counted and summed four words at a time from two nibble tables, instead of six masked popcounts per word | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1208,7 +1209,41 @@ two more rounds under a higher load: medians 123.80 and 123.09 → 119.52 and 11
 121.34 and 120.32 → 117.37 and 116.13 ms. memory.peak over 6 alternating runs: median 39.1 → 39.9 MB, highest 40.9 →
 40.0 MB, with the same allocations. S 783 → 800. Gate: 510 pass, 0 fail.
 
+## Step 46: a window's sums from nibble tables
+
+After step 45, `Window::flush` took 5–7% of the cycle samples, and about half of that went to the
+sum in `Tally::add_bits`: per word of a query's window, a popcount for its count and six masked
+popcounts for the sum of its bits' positions (`bit_index_sum`), 1,773 queries on sets times 61
+windows. LLVM vectorized them with `pshufb`, a table lookup per nibble for each of the seven.
+
+[`window_cell`] does the window in 16 steps of four words, with AVX2. Two lookups per nibble give
+each byte's bit count and the sum of its bits' places in the byte (a third table, for the high
+nibble, adds 4 per bit to the second). `sad` adds the counts and the places per word, and
+`maddubs` and `madd` weigh each byte's count by its offset in the word, 0 to 56, leaving each
+word's total in two 32-bit halves. A multiply adds each word's offset in the window times its
+count, and the window's first id times the whole count comes in at the end. The window's
+positions add up to less than 2^32, so the halves never carry into each other. The function is
+unsafe, as `Check::matches` and `classify` are, and takes one SAFETY comment at its call.
+
+Against step 45 (`perf stat -r 5`, interleaved): instructions 5,360.1 → 5,264.2 M, cycles 2,763
+and 2,769 → 2,656 and 2,677 M on a first form of the same code, and 2,770 → 2,730 M as committed;
+branch misses unchanged (12.6 M). Part of the cycles saved come from the vector ports that the
+other hyperthread's token loop leaves idle, so the wall moves less than the cycles.
+
+Local, against step 45 (`ab.py`, 41 alternating runs, on a box with a load average of 3–4 from
+other work): the first form, four rounds, medians 122.41, 118.78, 119.17 and 119.52 → 120.71,
+117.86, 117.57 and 117.99 ms, minimums 117.65, 117.41, 117.05 and 116.87 → 117.06, 116.02, 115.58
+and 115.99 ms; as committed, two rounds, medians 120.49 and 118.39 → 120.41 and 117.05 ms,
+minimums 117.53 and 116.36 → 115.91 and 114.73 ms. memory.peak over 5 alternating runs: median
+40.0 → 39.7 MB, with the same allocations. S 800 → 819 (the first form, with its tables as
+`_mm_setr_epi8` calls and tuples that rustfmt splits, cost 35). Gate: 510 pass, 0 fail.
+
 ## Experiments that did not stay
+
+- **After step 45, glibc's mmap threshold raised** from 128 KiB to 512 KiB or 2 MiB, so that the
+  tail's frees and allocations reuse the arena instead of queueing on the address space's lock
+  (`ab.py`, 21 alternating runs): medians 118.82 → 118.28 and 118.37 ms, but memory.peak over 5
+  runs, median 37.6 → 42.7 and 44.5 MB.
 
 - **After step 44, where the time goes at turbo off** (local, seed 1, builds with timestamps,
   12 runs, in ms since `main`). The walks start at 10.5–12.7 ms and end over a spread of 2.2–4

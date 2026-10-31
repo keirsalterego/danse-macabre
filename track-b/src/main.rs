@@ -784,10 +784,8 @@ impl Tally {
     }
 
     /// Records the documents `start + i` for each bit `i` set in `bits`, as [`Tally::add`] would
-    /// one by one. So it does until the query has its first matches; the rest are counted a
-    /// word at a time, and all words in one sum, which the compiler vectorizes. A word's count
-    /// is a popcount, and its id sum is its bit 0's id times the count plus the sum of the set
-    /// bits' positions ([`bit_index_sum`]).
+    /// one by one. So it does until the query has its first matches; the rest are counted and
+    /// summed four words at a time ([`window_cell`]).
     fn add_bits(&mut self, q: u32, start: u32, mut bits: [u64; WINDOW]) {
         let mut i = 0;
         while i < WINDOW && self.queries[q as usize] >> SUM_BITS < SHOWN_IDS as u64 {
@@ -796,11 +794,8 @@ impl Tally {
             }
             i += usize::from(bits[i] == 0);
         }
-        let cell = |(i, &word): (usize, &u64)| {
-            let n = u64::from(word.count_ones());
-            n << SUM_BITS | ((u64::from(start) + 64 * i as u64) * n + bit_index_sum(word))
-        };
-        self.queries[q as usize] += bits.iter().enumerate().map(cell).sum::<u64>();
+        // SAFETY: the binary targets alderlake (.cargo/config.toml), which has AVX2.
+        self.queries[q as usize] += unsafe { window_cell(start, &bits) };
     }
 
     /// Takes the first matches out, grouped by query and each in doc order: query `q`'s are
@@ -1063,11 +1058,42 @@ const HAS: [u64; 6] = [
     0xFFFF_FFFF_0000_0000,
 ];
 
-/// The sum of the positions of the set bits in `word`: each set bit of mask `k` ([`HAS`])
-/// adds `2^k`.
-fn bit_index_sum(word: u64) -> u64 {
-    let weight = |(k, &mask): (usize, &u64)| u64::from((word & mask).count_ones()) << k;
-    HAS.iter().enumerate().map(weight).sum()
+/// The cell ([`Tally::queries`]) of the documents `start + i` for each bit `i` set in `bits`.
+/// Four words at a time, a lookup per nibble gives each byte's bit count and the sum of its bits'
+/// positions in it, `sad` adds those per word, and a multiply-add weighs each byte's count by its
+/// offset in the word, instead of six masked popcounts per word (PERF.md, step 46).
+#[target_feature(enable = "avx2")]
+fn window_cell(start: u32, bits: &[u64; WINDOW]) -> u64 {
+    let table = |lo: i64, hi: i64| _mm256_setr_epi64x(lo, hi, lo, hi);
+    let count = table(0x0302_0201_0201_0100, 0x0403_0302_0302_0201);
+    let low = table(0x0303_0202_0101_0000, 0x0606_0505_0404_0303);
+    // A high nibble's bits sit 4 places further on.
+    let high = _mm256_add_epi8(low, _mm256_slli_epi16::<2>(count));
+    let offsets = _mm256_set1_epi64x(0x3830_2820_1810_0800);
+    let [mut n, mut sum] = [_mm256_setzero_si256(); 2];
+    let mut first = _mm256_setr_epi64x(0, 64, 128, 192);
+    let pick = |t, x| _mm256_shuffle_epi8(t, _mm256_and_si256(x, _mm256_set1_epi8(15)));
+    for words in bits.as_chunks::<4>().0 {
+        // SAFETY: the 32-byte load reads the four words.
+        let v = unsafe { _mm256_loadu_si256(words.as_ptr().cast()) };
+        let hi = _mm256_srli_epi16::<4>(v);
+        let c = _mm256_add_epi8(pick(count, v), pick(count, hi));
+        let p = _mm256_add_epi8(pick(low, v), pick(high, hi));
+        let words_n = _mm256_sad_epu8(c, _mm256_setzero_si256());
+        n = _mm256_add_epi64(n, words_n);
+        // Per word: its bits' places in their bytes, its bytes' counts weighed by their offsets
+        // in two 32-bit halves, and its offset in the window times its count.
+        let weighed = _mm256_madd_epi16(_mm256_maddubs_epi16(c, offsets), _mm256_set1_epi16(1));
+        let places = _mm256_add_epi64(_mm256_sad_epu8(p, _mm256_setzero_si256()), weighed);
+        sum = _mm256_add_epi64(sum, _mm256_mul_epu32(words_n, first));
+        sum = _mm256_add_epi64(sum, places);
+        first = _mm256_add_epi64(first, _mm256_set1_epi64x(256));
+    }
+    // SAFETY: an `__m256i` is four `u64`s.
+    let [n, sum] = [n, sum].map(|v| unsafe { std::mem::transmute::<__m256i, [u64; 4]>(v) });
+    let [n, sum]: [u64; 2] = [n, sum].map(|lanes| lanes.iter().sum());
+    // The low halves add up to less than 2^32: a window's positions do.
+    n << SUM_BITS | (u64::from(start) * n + (sum & 0xFFFF_FFFF) + (sum >> 32))
 }
 
 /// Starts loading the cache line that holds `item` into L1. A pointer, so that callers need no
