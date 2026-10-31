@@ -28,9 +28,13 @@ Every step from the reference to your final version, each with the live-board ru
 | 21 | 35 fewer code lines: one helper runs and joins each set of threads, the intern loop drops its prefetch, the output adds each query's cells once; every loop starts on a 64-byte boundary | run-f0c533c66a88 | 0.2165 | 42.9 | 70.6 |
 | 22 | 8 fewer code lines in code that runs once, with the same machine code | run-59d37d7b5803 | 0.2177 | 42.3 | 70.5 |
 | 23 | A per-document check reads its terms' bits with one AVX2 gather instead of six loads, and the document's term bits are read and cleared without bounds checks | run-29bb809aa3f8 | 0.2048 | 43.5 | 71.2 |
-| 24 | A document's checks are listed one by one as its BOOL triggers appear, so one loop runs them all instead of one loop per trigger | | | | |
+| 24 | A document's checks are listed one by one as its BOOL triggers appear, so one loop runs them all instead of one loop per trigger | run-170e5552bd10 | 0.2085 | 42.4 | 71.0 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
+
+Step 24's board run drew 208.5 ms, 1.8% slower than step 23's 204.8 ms, although step 24 ran 2%
+faster locally in three rounds (its section has them). Draws of the same code vary on the board:
+step 21's machine code measured 216.5 and 217.7 ms (rows 21 and 22).
 
 Local numbers below come from 12 threads on the P-cores (CPUs 0-11, turbo off), full seed 1,
 `perf stat -r 5`, with the variants interleaved over three rounds.
