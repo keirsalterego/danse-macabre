@@ -55,6 +55,7 @@
 //!
 //! Every step's measurements are in `PERF.md`.
 
+use std::arch::x86_64::*; // the AVX2 intrinsics of the sorting network
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::{Barrier, Mutex, OnceLock, atomic::AtomicU32, atomic::AtomicUsize};
 use std::{fs::File, io::Write, ops::Range, os::fd::AsRawFd, path::Path, ptr::null_mut, thread};
@@ -744,8 +745,8 @@ fn summarize_hour(runs: &[Run], order: &Order, names: &[&[u8]], buffer: &mut [u3
 /// Returns the p50, p95 and p99 of `group`, which it reorders.
 ///
 /// The spec's nearest-rank percentile (§4) is the value at 1-indexed rank ceil(p·n / 100), which
-/// it writes as (p·n + 99) / 100; we subtract 1 for a 0-based index. Groups of up to 64 values,
-/// 95% of them, go through a [`sort_network`]. Larger ones use `select_nth_unstable(k)`, which
+/// it writes as (p·n + 99) / 100; we subtract 1 for a 0-based index. Groups of up to 128 values,
+/// 98% of them, go through a [`sort_network`]. Larger ones use `select_nth_unstable(k)`, which
 /// puts the k-th smallest value at index k, everything smaller before it and everything larger
 /// after it, in linear time. Selecting the median first leaves both higher ranks in the upper
 /// half, and p95 then leaves p99 in the top 5%, so the three selections cover about 1.55 n
@@ -762,6 +763,8 @@ fn percentiles(group: &mut [u32]) -> [u32; 3] {
         17..=32 => unsafe { sort_network::<4>(group, at) },
         // SAFETY: as above.
         33..=64 => unsafe { sort_network::<8>(group, at) },
+        // SAFETY: as above.
+        65..=128 => unsafe { sort_network::<16>(group, at) },
         _ => {
             let p50 = *group.select_nth_unstable(i50).1;
             let p95 = *group[i50..].select_nth_unstable(i95 - i50).1;
@@ -783,7 +786,6 @@ fn percentiles(group: &mut [u32]) -> [u32; 3] {
 /// first and move the wanted positions up by their number.
 #[target_feature(enable = "avx2")]
 fn sort_network<const R: usize>(group: &[u32], at: [usize; 3]) -> [u32; 3] {
-    use std::arch::x86_64::*; // the twelve AVX2 intrinsics below
     let (lanes, splat) = (_mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7), _mm256_set1_epi32);
     let mut v: [__m256i; R] = std::array::from_fn(|r| {
         // A masked load: lanes past the group's end read nothing and hold 0. Reading lane by
@@ -792,28 +794,43 @@ fn sort_network<const R: usize>(group: &[u32], at: [usize; 3]) -> [u32; 3] {
         // SAFETY: the mask keeps the load inside `group`; masked lanes touch no memory.
         unsafe { _mm256_maskload_epi32(group.as_ptr().wrapping_add(8 * r).cast(), inside) }
     });
-    let mut k = 2;
-    while k <= 8 * R {
-        let mut m = k - 1;
-        while m > 0 {
-            let (old, top) = (v, splat(1 << m.ilog2()));
-            for (r, v) in v.iter_mut().enumerate() {
-                let to = _mm256_xor_si256(lanes, splat(m as i32 & 7));
-                // Each lane's partner `p`. Within a register (m < 8) it comes from `v` itself,
-                // not from the copy in `old`, which saves a store and a reload: 0.5% fewer
-                // instructions.
-                let p = _mm256_permutevar8x32_epi32(if m < 8 { *v } else { old[r ^ (m / 8)] }, to);
-                let position = _mm256_add_epi32(lanes, splat(8 * r as i32));
-                let upper = _mm256_cmpeq_epi32(_mm256_and_si256(position, top), top);
-                *v = _mm256_blendv_epi8(_mm256_min_epu32(*v, p), _mm256_max_epu32(*v, p), upper);
-            }
-            m = if m == k - 1 { k / 4 } else { m / 2 };
-        }
-        k *= 2;
-    }
+    merge::<R, 1>(&mut v);
+    merge::<R, 2>(&mut v);
+    merge::<R, 3>(&mut v);
+    merge::<R, 4>(&mut v);
+    merge::<R, 5>(&mut v);
+    merge::<R, 6>(&mut v);
+    merge::<R, 7>(&mut v);
     // SAFETY: both types are R·32 bytes of plain integers.
     let sorted: [[u32; 8]; R] = unsafe { std::mem::transmute_copy(&v) };
     at.map(|i| sorted.as_flattened()[i + 8 * R - group.len()])
+}
+
+/// Merges the sorted runs of `2^(L - 1)` values in `v` into sorted runs of `2^L`, if `v` holds
+/// that many. Each level is its own function, so its loop has a constant trip count that LLVM
+/// unrolls before it inlines the stages, and every stage then sees a constant `m`.
+#[target_feature(enable = "avx2")]
+fn merge<const R: usize, const L: usize>(v: &mut [__m256i; R]) {
+    for s in (0..L).rev().filter(|_| 1 << L <= 8 * R) {
+        stage(v, if s + 1 == L { (1 << L) - 1 } else { 1 << s });
+    }
+}
+
+/// One stage of [`sort_network`]: pairs every position `i` with `i ^ m`, and the lower position
+/// of each pair keeps the smaller value.
+#[target_feature(enable = "avx2")]
+fn stage<const R: usize>(v: &mut [__m256i; R], m: usize) {
+    let (lanes, splat) = (_mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7), _mm256_set1_epi32);
+    let (old, top) = (*v, splat(1 << m.ilog2()));
+    let to = _mm256_xor_si256(lanes, splat(m as i32 & 7));
+    for (r, v) in v.iter_mut().enumerate() {
+        // Each lane's partner `p`. Within a register (m < 8) it comes from `v` itself, not from
+        // the copy in `old`, which saves a store and a reload: 0.5% fewer instructions.
+        let p = _mm256_permutevar8x32_epi32(if m < 8 { *v } else { old[r ^ (m / 8)] }, to);
+        let position = _mm256_add_epi32(lanes, splat(8 * r as i32));
+        let upper = _mm256_cmpeq_epi32(_mm256_and_si256(position, top), top);
+        *v = _mm256_blendv_epi8(_mm256_min_epu32(*v, p), _mm256_max_epu32(*v, p), upper);
+    }
 }
 
 /// The six numbers an output line prints after the endpoint's name (spec §4): the request

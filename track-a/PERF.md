@@ -54,6 +54,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 47 | 5.8 instructions fewer per line: the probe counts the compare mask's trailing ones, the latency's digits combine in three steps, and their mask is one shifted constant | run-7eca9cefcfac | 0.0186 | 18.2 | 85.8 |
 | 48 | An endpoint table of 16,384 slots instead of 8,192: 1.9% of lines take a second probe instead of 3.9% | run-7eca9cefcfac | 0.0186 | 18.2 | 85.8 |
 | 49 | Three rare paths of the parse marked `std::hint::cold_path`, so its loop keeps its count, its end and its constants in registers | run-7eca9cefcfac | 0.0186 | 18.2 | 85.8 |
+| 50 | Sorting networks unrolled level by level, and a network of 128 values instead of selection for groups of 65 to 128 values | | | | |
 
 ## Step 1: v1
 
@@ -781,8 +782,67 @@ Steps 46 to 49 reached the board in one push. Its run, run-7eca9cefcfac, measure
 18.2 MB, against 18.8 and 19.1 ms for step 45's code in its last two runs (run-6e4daa8e2dbc,
 run-8a8f22b6a3dc).
 
+## Step 50: sorting networks unrolled level by level
+
+The network's two loops become one call per merge level, `merge::<R, L>`, each a loop of constant
+trip count `L` around a `stage` function. LLVM unrolls those loops before it inlines the stages, so
+every stage sees a constant partner distance: its masks are constants, each register's partner is a
+fixed register, and the networks of 32, 64 and 128 values come out without loops, blends on runtime
+masks or copies to the stack. A network of 128 values (`R = 16`) then beats selection too, and takes
+the groups of 65 to 128 values, 2.4% of them. In a microbenchmark over seed 1's 126,908 groups (one
+thread, ns per group), 17–32 values went 99.5 → 52.7, 33–64 values 253 → 100, and 65–128 values 687
+(selection) → 389–432; all groups 15.05 → 12.87 ms. As a loop, the 128-value network took 923 ns,
+more than selection.
+
+On step 45 the same change lost 2% (`ab.py`, 61 interleaved runs, medians 20.15 → 20.57 and
+20.17 → 20.53 ms) although it ran 17 M instructions fewer: the parse was then inlined in the work
+closure, and the larger closure gave it other registers and stack slots. With the parse out of line
+in both builds, the networks took 2.5–2.9% fewer cycles:u. Since step 46 the parse is a function of
+its own, and here its instructions are step 49's; only the address of the endpoint table in them
+changes.
+
+`ab.py`, 61 interleaved runs, four rounds, against step 49: medians 19.39 → 19.09, 19.34 → 19.08,
+19.36 → 19.14 and 19.34 → 19.03 ms (−1.1 to −1.6%), minimums 18.71 → 18.32, 18.74 → 18.36,
+18.93 → 18.52 and 18.76 → 18.43 ms; the first two rounds ran a build that also had `#[inline]` on
+`merge` and `stage`, with a byte-identical `.text`. `perf stat`, 10 interleaved rounds of 3 runs:
+instructions:u 616.0 → 598.9 M (−2.8%), cycles:u median 337.8 → 332.7 M (−1.5%). memory.peak, five
+alternating rounds on seeds 1, 2, 3, 5, 7, 10 and 11: median 18.34 → 18.24 MB. S 369 → 379. Gate:
+310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes; clippy reports no warnings.
+
 ## Experiments that did not stay
 
+- **`put_number` inlined, with its eight- to ten-digit path in a `#[cold]` function** (local, turbo
+  off, on step 49's code and on step 50's). `put_number` writes a value of eight digits or more by
+  calling itself for the leading digits. That call keeps it out of line, and every call, however
+  short its number, pushes and pops three registers and loads five 64-bit constants: 761,448 calls
+  on seed 1, of which 1,836 have eight digits or more. With that path in a `#[cold]` `put_large`,
+  `put_number` is inlined at its six uses in `format_hour`, and the constants stay in registers:
+  instructions:u 616.0 → 602.8 M on step 49 and 598.9 → 585.8 M on step 50, but cycles:u medians
+  337.8 → 337.9 M and 332.7 → 329.8 M (`perf stat`, 10 interleaved rounds of 3 runs). `ab.py`, 61
+  interleaved runs, four rounds: medians 19.39 → 19.41, 19.34 → 19.35, 19.36 → 19.34 and
+  19.34 → 19.37 ms on step 49, and 19.09 → 19.05, 19.08 → 18.95, 19.14 → 19.02 and 19.03 → 19.05 ms
+  on step 50: −0.35% on average there and +0.05% on step 49, against the 0.3% that its 4 lines cost.
+  Kept out of line by `#[inline(never)]` instead, it saved 7.6 M instructions:u on step 45 and no
+  cycles:u (on battery, not comparable). Not kept.
+- **Other selections for the groups over 128** (microbenchmark, one thread, ns per group for 129–256
+  / 257–1,024 / over 1,024 values). The current chain: 1,035 / 2,087 / 8,655. A radix select on a
+  log-scale key, a histogram and then the same chain on the candidate buckets: 1,109–1,422 /
+  2,332–3,355 / 10,601–10,711. Two pivots from a 64-value sample around each rank, one pass that
+  copies the values between them, and a select on those: 4,119 / 6,891 / 26,216, against 1,464 /
+  2,997 / 12,365 for the chain in the same runs (on battery, not comparable). `sort_unstable` took
+  13.3 ns per value against 4.6, and an AVX2 quickselect 2.53 ns per value against std's 2.21 for
+  the median of the largest groups. A 256-value network took 803 ns against 1,038 for 129–256
+  values: 0.35 ms of one thread's time over seed 1's 1,477 such groups, about 0.15% of T, less than
+  its 2 lines cost. Not kept.
+- **Other number formatting** (local, turbo off). Two digit groups in one `u128`: format
+  1.60 → 2.22 ms per thread. Lines built straight in their place instead of on the stack: no change
+  (microbenchmark, 41.4 against 41.3 ns per line). Name bytes from the padded copies: 0.1 ms per
+  thread less, but `format_hour` then needs the interner, and the longer signature and copy cost 5
+  lines after `rustfmt`. With `put_large` above, on step 45's code (on battery, not comparable): the
+  digits split out of `eight_ascii` before the `'0'` offset is added saved 1.6 M instructions:u more
+  for 2 more lines; a fixed 128-byte copy of the name, read past its end in the padded input
+  mapping, saved 0.3 M instructions:u for 1 line; and the width as `2 + (value | 1).ilog10()` cost
+  2 M instructions:u more. Not kept.
 - **Slots of 16 bits** (local, turbo off, on step 45's code): an id needs 12, so `AtomicU16` slots
   halve the table to 16 KB. `ab.py`, 41 interleaved runs, two rounds: medians 20.25 → 20.44 and
   20.19 → 20.38 ms. Not kept.
