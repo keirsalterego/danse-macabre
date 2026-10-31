@@ -30,7 +30,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 23 | A per-document check reads its terms' bits with one AVX2 gather instead of six loads, and the document's term bits are read and cleared without bounds checks | run-29bb809aa3f8 | 0.2048 | 43.5 | 71.2 |
 | 24 | A document's checks are listed one by one as its BOOL triggers appear, so one loop runs them all instead of one loop per trigger | run-170e5552bd10 | 0.2085 | 42.4 | 71.0 |
 | 25 | The token loop takes no branch on what a token is: a token that is no query term probes to an empty slot, id 0, and a document's new stored terms and BOOL triggers are listed by a store and an add | run-ab97ce51555f | 0.1746 | 43.5 | 72.9 |
-| 26 | A document's term bits are cleared by zeroing their words, a store with no load, and the probe's end test is kept one branch by an empty asm block instead of `black_box`, which sent it through the stack | | | | |
+| 26 | A document's term bits are cleared by zeroing their words, a store with no load, and the probe's end test is kept one branch by an empty asm block instead of `black_box`, which sent it through the stack | run-1d7859f315a0 | 0.1682 | 43.2 | 73.3 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
