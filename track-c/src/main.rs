@@ -33,9 +33,11 @@
 //!    follows (see [`join`]), so no pass over the file comes first.
 //! 3. **Each thread walks its records field by field.** [`join`] parses each record in
 //!    order and sums into its own [`Group`] per country. Names and notes are quoted, and
-//!    [`text_field`] takes their quotes from a mask of 64 bytes that AVX2 compares build. It
-//!    measures a field as its raw length minus one per `""` pair, so no field is ever unescaped.
-//!    [`number`] reads each number from one 8-byte word, with no loop over its digits.
+//!    [`text_fields`] finds the ends of both at once, from masks of the quotes and the commas in
+//!    the 64 bytes at the name that AVX2 compares build. It measures a field as its raw length
+//!    minus one per `""` pair, so no field is ever unescaped. [`number`] reads the id from one
+//!    8-byte word, and [`region_amount`] the region id and the amount from one 16-byte vector,
+//!    with no loop over their digits.
 //! 4. **Each distinct name belongs to one thread.** The name's hash picks its owner, and each
 //!    thread keeps the names it owns in a [`NameSet`] that no other thread touches: a hash table
 //!    whose entry for a name holds the name's bytes and a bitset with one bit per country, on
@@ -74,10 +76,11 @@
 //! makes the run starts exact. It relies on §2.3, where country codes are `[A-Z]{3}` and there
 //! are 240 countries (more than 255 stop the join with an error), and on §3, where `id_sum` and
 //! `amount_sum` fit in 64 bits. The name pool of §2.2 and the sizes in §5 only set the name
-//! sets' starting sizes. Records outside the §2.1 grammar are not validated.
+//! sets' starting sizes, and §2.2's bounds on region ids and amounts only size the window of
+//! [`region_amount`]: a field past them takes a slower path. Records outside the §2.1 grammar are
+//! not validated.
 
-use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch, _mm256_cmpeq_epi8, _mm256_loadu_si256};
-use std::arch::x86_64::{_mm256_movemask_epi8, _mm256_set1_epi8};
+use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering, Ordering::Relaxed};
 use std::{fs::write, io::Write, ops::Range, os::fd::AsRawFd, path::Path, thread, time::Duration};
 
@@ -85,9 +88,9 @@ use std::{fs::write, io::Write, ops::Range, os::fd::AsRawFd, path::Path, thread,
 /// anywhere else it is data (spec §2.1).
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 /// Zero bytes that [`map_file`] puts after the last byte of each file. Every position a parse
-/// reaches lies before them, so the fixed-size reads of [`number`] (8 bytes), [`name_letter`]
-/// (24) and [`quotes`] (64) always fit in the input, and none of them needs a shorter path for
-/// its end.
+/// reaches lies before them, so the fixed-size reads of [`number`] (8 bytes), [`region_amount`]
+/// (16), [`name_letter`] (24) and [`byte_mask`] (64) always fit in the input, and none of them
+/// needs a shorter path for its end.
 const PAD: usize = 64;
 /// Bytes of its run a worker parses per round before the workers swap names. Small rounds keep
 /// the mailboxes small and the names just parsed still in cache when their owner reads them.
@@ -218,7 +221,7 @@ fn region_rows(csv: &[u8], share: usize, shares: usize, mut row: impl FnMut(usiz
     let cut = |i| ((len * i / shares + 1..len).find(|&p| body[p - 1] == b'\n')).unwrap_or(len);
     let (mut at, end) = (cut(share), cut(share + 1));
     while at < end {
-        let (id, comma) = number(body, at, b',', 0);
+        let (id, comma) = number(body, at, b',');
         assert!(body[comma + 4] == b'\n', "regions.csv: bad row");
         let [a, b, c] = [1, 2, 3].map(|i| (body[comma + i] - b'A') as usize);
         row(id as usize, (a * 26 + b) * 26 + c);
@@ -288,7 +291,7 @@ fn join(data: &[u8], regions: &[u8], threads: usize) -> (Vec<Group>, Vec<[u8; 3]
     let boxes = letters.as_chunks::<4>().0;
     // The region table (see above): the codes that occur, as bits, and the group of each id.
     let last_row = (regions[..regions.len() - PAD - 1].iter()).rposition(|&b| b == b'\n');
-    let ids = 1 + last_row.map_or(0, |p| number(regions, p + 1, b',', 0).0 as usize);
+    let ids = 1 + last_row.map_or(0, |p| number(regions, p + 1, b',').0 as usize);
     // SAFETY: `AtomicU8` has the same layout as `u8`, and all-zero bits are a valid 0.
     let by_id = unsafe { Box::<[AtomicU8]>::new_zeroed_slice(ids).assume_init() };
     // The array's pages are mapped in here, on one CPU, before the workers start. memcg charges
@@ -303,8 +306,9 @@ fn join(data: &[u8], regions: &[u8], threads: usize) -> (Vec<Group>, Vec<[u8; 3]
     let seen = zeroed(CODES.div_ceil(64));
     let present = || (0..CODES).filter(|&c| seen[c / 64].load(Relaxed) >> (c % 64) & 1 == 1);
     // The hot loop, one run per worker `me`. The fields come in a fixed order, so the state is
-    // simply the position in the record. [`number`] parses each number from one word, and
-    // [`text_field`] skips names and notes while counting their escapes. In each round the
+    // simply the position in the record. [`number`] parses the id from one word, [`text_fields`]
+    // skips the name and the note while counting their escapes, and [`region_amount`] parses the
+    // region id and the amount from one vector. In each round the
     // worker parses about [`ROUND_BYTES`] of its records and posts each record's name to the
     // worker that owns it, waits at the barrier for all workers, and then marks the names posted
     // to it in its own [`NameSet`]. After the last round it gives its run's pages back.
@@ -357,32 +361,29 @@ fn join(data: &[u8], regions: &[u8], threads: usize) -> (Vec<Group>, Vec<[u8; 3]
                     // or a BOM, so a first byte of 0xEF is a BOM. The id's word already holds
                     // that byte, so the test takes no load, and only after a BOM is the id parsed
                     // twice.
-                    let (mut id, mut comma) = number(data, at, b',', 0);
+                    let (mut id, mut comma) = number(data, at, b',');
                     if data[at] == BOM[0] {
-                        (id, comma) = number(data, at + BOM.len(), b',', 0);
+                        (id, comma) = number(data, at + BOM.len(), b',');
                     }
-                    let mut window = (comma + 1, quotes(data, comma + 1));
-                    let (name, name_len, after_name) = text_field(data, comma + 1, &mut window);
+                    let (name, name_len, note_len, after_note) = text_fields(data, comma + 1);
                     let letter = name_letter(data, name);
-                    let (_, note_len, after_note) = text_field(data, after_name, &mut window);
-                    let (region_id, comma) = number(data, after_note, b',', 0);
+                    let (region_id, cents, dot) = region_amount(data, after_note);
                     let byte = by_id.as_ptr().wrapping_add(region_id as usize);
                     // SAFETY: a prefetch reads nothing the program sees, and never faults.
                     unsafe { _mm_prefetch::<_MM_HINT_T0>(byte.cast()) };
-                    // The sign applies to the whole value: -0.75 is -75 cents, not -0 * 100 + 75.
-                    let negative = data[comma + 1] == b'-';
-                    let (cents, dot) = number(data, comma + 1 + usize::from(negative), b'.', 2);
                     // Past the CR if any, then the LF. Only the last record may end at end of
                     // file instead (§2.1), which leaves `at` past the end and stops the loop.
                     at = dot + 4 + usize::from(data[dot + 3] == b'\r');
                     let to = ((u64::from(letter[3] as u32) * threads as u64) >> 32) as usize;
-                    // Read once: the four stores made the compiler load `sent[to]` again for each,
-                    // with a bounds check.
-                    let slot = sent[to];
+                    // Read once, because the four stores made the compiler load `sent[to]` again
+                    // for each, and unchecked, which saves its bounds check.
+                    // SAFETY: the hash is below 2^32, so `to` is below `threads`, the length of
+                    // `sent`.
+                    let sent = unsafe { sent.get_unchecked_mut(to) };
+                    let slot = *sent;
                     (0..4).for_each(|i| boxes[slot][i].store(letter[i], Relaxed));
-                    let cents = cents.cast_signed() * if negative { -1 } else { 1 };
                     batch[parsed] = (region_id, slot, id, cents, name_len, note_len);
-                    sent[to] = slot + 1;
+                    *sent = slot + 1;
                     parsed += 1;
                 }
                 for &(region_id, top, id, cents, name_len, note_len) in &batch[..parsed] {
@@ -457,40 +458,32 @@ fn merge(group: &mut Group, other: &Group) {
     [group[6], group[7]] = [group[6].min(other[6]), group[7].max(other[7])];
 }
 
-/// Parses the decimal digits from `at` up to the `stop` byte and the `decimals` digits after it,
-/// and returns the value and the position of `stop`. The field's end and its value come out of
-/// the same pass. An amount comes out in cents this way, with its dot as `stop`.
+/// Parses the decimal digits from `at` up to the `stop` byte, and returns the value and the
+/// position of `stop`. The field's end and its value come out of the same pass.
 ///
-/// A field that fits in 8 bytes with its `stop` and decimals is parsed from one 8-byte word, with
-/// no loop and no branch on its length (SWAR: SIMD within a register). Subtracting `0` from every
-/// byte leaves each digit's value in its byte and sets the top bit of each byte below `0`, which
-/// every `stop` is (`,` or `.`). Shifting the digits to the top of the word turns the missing ones
-/// into leading zeros, and three multiplies then join neighbouring digits into pairs, pairs into
-/// fours and fours into the value. With decimals, the shift puts the dot in the same byte for every
-/// length, and the digits below it move up over it, so an amount needs no second parse for its
-/// cents. Longer fields, such as an id with leading zeros (§2.1 allows them), take the loop over
-/// bytes. The word is always there, because the [`PAD`] follows the input.
+/// A field that fits in 8 bytes with its `stop` is parsed from one 8-byte word, with no loop and
+/// no branch on its length (SWAR: SIMD within a register). Subtracting `0` from every byte leaves
+/// each digit's value in its byte and sets the top bit of each byte below `0`, which every `stop`
+/// is (`,` or `.`). Shifting the digits to the top of the word turns the missing ones into leading
+/// zeros and drops `stop` and the bytes after it, and three multiplies then join neighbouring
+/// digits into pairs, pairs into fours and fours into the value. Longer fields, such as an id with
+/// leading zeros (§2.1 allows them), take the loop over bytes. The word is always there, because
+/// the [`PAD`] follows the input.
 ///
-/// It is always inlined. At each of its call sites `stop` and `decimals` are constants, so the
-/// call disappears and the masks and shifts that depend on them fold.
+/// It is always inlined, so the id's parse at the start of each record is not a call.
 #[inline(always)]
-fn number(data: &[u8], mut at: usize, stop: u8, decimals: usize) -> (u64, usize) {
+fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
     const ONES: u64 = u64::from_le_bytes([1; 8]);
     let word = u64::from_le_bytes(*data[at..].first_chunk().expect("the input is padded"));
     let digits = word.wrapping_sub(ONES * u64::from(b'0'));
     // The lowest set bit marks the first byte below `0`, so the first `stop`. Bits above it
     // can be false, which is why only the lowest one is used.
-    let stops = digits & !word & (ONES << 7 >> (8 * decimals));
+    let stops = digits & !word & (ONES << 7);
     if stops != 0 {
         let len = stops.trailing_zeros() as usize / 8;
-        // The subtraction borrows at `stop`, which spoils the decimals after it.
-        let masked = word & (ONES * 0x0F);
-        let digits = if decimals == 0 { digits } else { masked };
-        // `stop` goes to byte 7 - `decimals`, and the bytes below it move up over it. In two
-        // steps, because a 0-digit field would need a shift by 64.
-        let digits = digits << (8 * (7 - decimals - len));
-        let low = u64::MAX >> (8 * decimals);
-        let digits = (digits << 8) & low | digits & !low;
+        // The subtraction borrows at `stop` and spoils the bytes after it, which the shift drops.
+        // In two steps, because a 0-digit field would need a shift by 64.
+        let digits = digits << (8 * (7 - len)) << 8;
         let pairs = (digits.wrapping_mul(10 << 8 | 1) >> 8) & 0x00FF_00FF_00FF_00FF;
         let fours = (pairs.wrapping_mul(100 << 16 | 1) >> 16) & 0x0000_FFFF_0000_FFFF;
         return (fours.wrapping_mul(10000 << 32 | 1) >> 32, at + len);
@@ -499,76 +492,185 @@ fn number(data: &[u8], mut at: usize, stop: u8, decimals: usize) -> (u64, usize)
     while data[at] != stop {
         (value, at) = (value * 10 + u64::from(data[at] - b'0'), at + 1);
     }
-    (1..=decimals).for_each(|i| value = value * 10 + u64::from(data[at + i] - b'0'));
     (value, at)
 }
 
-/// Reads the name or note field at `at`, which a comma ends. Returns the field's raw bytes
-/// (between the quotes, still escaped), the value's length after unescaping, and the position
-/// after the comma.
+/// Parses the region id and the amount at `at`, `region_id,amount`, and returns the region id,
+/// the amount in cents and the position of the amount's dot.
 ///
-/// Unescaping would copy every field. The spec's byte counts need only the length, and that is
-/// the raw length minus one per `""` pair. Distinct counting needs no unescaping either (see
-/// [`NameSet`]).
+/// Spec §2.2 bounds region ids at 9,999,999 and amounts at -999.99 to 99,999.99, so both fields,
+/// with their comma, the dot and the cents, fit in 16 bytes, and one SSE register parses them
+/// together. The steps are those of [`number`], in a vector:
 ///
-/// Inside quotes only the quotes matter. `window` is a start and the [`quotes`] of the 64 bytes
-/// from there that no field has read yet, and the hot loop starts one at each record's name,
-/// where it holds the name and the note of 98% of the records at full scale. A field takes its
-/// quotes from the mask, lowest first, and an escaped quote is two neighbouring bits, so most
-/// fields take no load and no branch per quote. A field that runs past the window moves it on.
+/// 1. A compare with `/` marks the digits. The first byte that is not one is the comma, and the
+///    first past the byte after the comma, which is a digit or the sign, is the dot. Bit 16 stands
+///    for the byte past the window, so a field that runs out of the window fails the range check.
+/// 2. Subtracting `0` with saturation leaves each digit's value in its byte and turns every other
+///    byte, the sign included, into 0.
+/// 3. One `pshufb`, with the control for that comma and dot (see [`ALIGN`]), moves the region id's
+///    digits to the top of the low 8 bytes and the amount's to the top of the high 8, without the
+///    dot, so the missing digits become leading zeros.
+/// 4. Multiply-adds join neighbouring digits into pairs, pairs into fours and fours into the two
+///    values, which come out as the halves of one 64-bit word.
 ///
-/// It is always inlined. As a call it returned its four words through the stack, and the caller
-/// read two of them back with one 16-byte load, which waits until both 8-byte stores reach the
-/// cache because store forwarding cannot merge them.
-#[inline(always)]
-fn text_field(data: &[u8], at: usize, window: &mut (usize, u64)) -> (Range<usize>, i64, usize) {
-    if data[at] != b'"' {
-        // The generator writes unquoted text only empty (§2.2), but §2.1 allows any bytes but
-        // quote, comma, CR and LF.
-        let end = at + data[at..].iter().position(|&b| b == b',').unwrap();
-        return (at..end, (end - at) as i64, end + 1);
+/// Two parses of one word each took dependent shifts, multiplies and branches for each field;
+/// this runs 34 fewer instructions per record (PERF.md, step 35). Fields that §2.1 allows past
+/// those bounds, such as a region id with leading zeros, take [`region_amount_slow`].
+fn region_amount(data: &[u8], at: usize) -> (u64, i64, usize) {
+    let bytes: &[u8; 16] = data[at..].first_chunk().expect("the input is padded");
+    // SAFETY: the build targets Alder Lake, which has SSE2 (see `.cargo/config.toml`), and the
+    // load reads the 16 bytes of `bytes`. `loadu` needs no alignment.
+    let window = unsafe { _mm_loadu_si128(bytes.as_ptr().cast()) };
+    // SAFETY: as above.
+    let digits = unsafe { _mm_movemask_epi8(_mm_cmpgt_epi8(window, _mm_set1_epi8(b'/' as i8))) };
+    let stops = digits.cast_unsigned() ^ 0x1_FFFF;
+    let comma = stops.trailing_zeros() as usize;
+    let dot = (stops & !(3 << comma)).trailing_zeros() as usize;
+    if comma.wrapping_sub(1) >= 7 || dot.wrapping_sub(comma + 2) >= 5 {
+        return region_amount_slow(data, at);
     }
-    let (base, quotes) = window;
-    // Every quote before `at` is read, so the opening quote is the lowest bit, or the field
-    // starts past the window, which then holds no quote.
-    if *quotes == 0 {
-        (*base, *quotes) = (at, self::quotes(data, at));
-    }
-    let (mut q, mut pairs) = (*quotes & (*quotes - 1), 0);
-    // Inside quotes only `"` is special: `""` is one escaped quote, and any other `"` closes the
-    // field. Never test for "a quote followed by a comma": a note can hold `"",` (an escaped
-    // quote, then a comma), which that test would take for the end of the field.
-    // A note can also start or end with an escaped quote, so the field can open or close with
-    // `"""`; pairing quotes left to right reads both right.
-    let end = loop {
-        let i = q.trailing_zeros() as usize;
-        if i >= 63 {
-            // No quote left that the window can tell from half of a pair: move it on, to the
-            // last bit's quote or past the window.
-            (*base, q) = (*base + i, self::quotes(data, *base + i));
-        } else if q >> (i + 1) & 1 == 0 {
-            *quotes = q & (q - 1);
-            break *base + i;
-        } else {
-            (pairs, q) = (pairs + 1, q & !(3 << i));
-        }
+    let control = ALIGN[(comma << 4 | dot) & 127];
+    // SAFETY: the build targets Alder Lake, which has SSSE3 and SSE4.1 (see `.cargo/config.toml`).
+    let both = unsafe {
+        let aligned = _mm_shuffle_epi8(_mm_subs_epu8(window, _mm_set1_epi8(b'0' as i8)), control);
+        // The weights of each lane's halves, low half first: 10 and 1, 100 and 1, 10000 and 1.
+        let pairs = _mm_maddubs_epi16(aligned, _mm_set1_epi16((1 << 8) + 10));
+        let fours = _mm_madd_epi16(pairs, _mm_set1_epi32((1 << 16) + 100));
+        let fours = _mm_packus_epi32(fours, fours);
+        let both = _mm_madd_epi16(fours, _mm_set1_epi32((1 << 16) + 10000));
+        _mm_cvtsi128_si64(both).cast_unsigned()
     };
-    (at + 1..end, (end - at - 1 - pairs) as i64, end + 2)
+    let negative = stops >> (comma + 1) & 1 == 1;
+    let cents = (both >> 32).cast_signed() * if negative { -1 } else { 1 };
+    (both & 0xFFFF_FFFF, cents, at + dot)
 }
 
-/// The quotes among the 64 bytes at `at`, as a mask with bit i set where `data[at + i]` is a
-/// quote: two AVX2 compares of 32 bytes, each packed into 32 bits by `vpmovmskb`. Written as a
-/// loop over bytes, the compare that starts each record's window became byte loads and shifts.
-#[inline(always)]
-fn quotes(data: &[u8], at: usize) -> u64 {
+/// [`region_amount`] for fields that do not fit its window. No record of a generated file takes
+/// it (§2.2), so it is cold and out of line.
+#[cold]
+#[inline(never)]
+fn region_amount_slow(data: &[u8], at: usize) -> (u64, i64, usize) {
+    let (region_id, comma) = number(data, at, b',');
+    // The sign applies to the whole value: -0.75 is -75 cents, not -0 * 100 + 75.
+    let negative = data[comma + 1] == b'-';
+    let (units, dot) = number(data, comma + 1 + usize::from(negative), b'.');
+    let cents = (1..=2).fold(units, |c, i| c * 10 + u64::from(data[dot + i] - b'0')) as i64;
+    (region_id, if negative { -cents } else { cents }, dot)
+}
+
+/// The `pshufb` controls of [`region_amount`], one for each place of the comma and the dot, at
+/// `comma << 4 | dot`. Byte j of a control names the window byte that goes to byte j, and 0x80
+/// puts a zero there. Byte j < 8 takes byte j + comma - 8, which right-aligns the region id in
+/// the low half. Bytes 8 to 13 take j + dot - 14, the amount's sign and integer digits, and bytes
+/// 14 and 15 take j + dot - 13, its cents, which skips the dot. A byte whose source lies before
+/// its field stays 0x80. SSE shifts bytes only by constants, so each layout needs a control of
+/// its own, and as vectors the controls are 16-byte aligned, so none straddles two cache lines.
+static ALIGN: [__m128i; 128] = {
+    let mut table = [[0x80; 16]; 128];
+    let mut i = 0;
+    while i < 128 * 16 {
+        let (comma, dot, j) = (i >> 8, i >> 4 & 15, i & 15);
+        // The source plus 14, which keeps it from going below 0, and its field's start plus 14.
+        let [from, start] = [[j + comma + 6, 14], [j + dot + j / 14, comma + 15]][j / 8];
+        if from >= start {
+            table[i >> 4][j] = (from - 14) as u8;
+        }
+        i += 1;
+    }
+    // SAFETY: `__m128i` is 16 bytes, and every bit pattern is a valid one.
+    unsafe { std::mem::transmute(table) }
+};
+
+/// Reads the name and the note at `at`. Returns the name's raw bytes (between its quotes, still
+/// escaped), the lengths of both after unescaping, and the position after the note's comma.
+///
+/// Unescaping would copy every field. The spec's byte counts need only the lengths: a quoted
+/// field holds its value, the two quotes around it and one more quote per quote in it, so the
+/// value is the field's length less half its quotes, less one. Distinct counting needs no
+/// unescaping either (see [`NameSet`]).
+///
+/// The 64 bytes from the name's start hold the name and the note of 98% of the records at full
+/// scale, so both fields come from two masks of those bytes, of the quotes and of the commas,
+/// with no branch per field or per quote. Inside quotes a comma is data, and a byte is inside
+/// them when an odd number of quotes come before it (see [`prefix_xor`]), so the first two commas
+/// outside end the name and the note. An escaped `""` flips the parity twice, so a note can hold
+/// `"",`, which a test for a quote and then a comma would take for its end, or open or close with
+/// `"""`. Unquoted text has no quotes (§2.1). A note that ends past the window takes
+/// [`text_fields_slow`].
+///
+/// Walking each field's quotes cost a branch per quote, which records with an escaped quote
+/// mispredicted: this cut branch misses from 2.9 to 1.9 M per run (PERF.md, step 35).
+fn text_fields(data: &[u8], at: usize) -> (Range<usize>, i64, i64, usize) {
+    let (quotes, commas) = (byte_mask(data, at, b'"'), byte_mask(data, at, b','));
+    let ends = commas & !prefix_xor(quotes);
+    let (first, rest) = (ends.trailing_zeros() as usize, ends & ends.wrapping_sub(1));
+    if rest == 0 {
+        return text_fields_slow(data, at);
+    }
+    let second = rest.trailing_zeros() as usize;
+    let before = |i: usize| (quotes & ((1 << i) - 1)).count_ones() as usize;
+    let (q1, q2) = ((quotes & 1) as usize, (quotes >> (first + 1) & 1) as usize);
+    let (in_name, in_both) = (before(first), before(second));
+    let name_len = (first - in_name / 2 - q1) as i64;
+    let note_len = (second - first - 1 - (in_both - in_name) / 2 - q2) as i64;
+    let name = at + q1..at + first - q1;
+    (name, name_len, note_len, at + second + 1)
+}
+
+/// [`text_fields`] for a record whose note ends past the window: the same masks, 64 bytes at a
+/// time, with the parity of the quotes carried from each block to the next. About 2% of the
+/// records come here, so it is cold and out of line.
+#[cold]
+#[inline(never)]
+fn text_fields_slow(data: &[u8], at: usize) -> (Range<usize>, i64, i64, usize) {
+    // The commas that end the name and the note, each with the number of quotes before it.
+    let (mut ends, mut found, mut block, mut odd, mut seen) = ([[0; 2]; 2], 0, at, 0, 0);
+    while found < 2 {
+        let quotes = byte_mask(data, block, b'"');
+        let inside = prefix_xor(quotes) ^ odd;
+        let mut commas = byte_mask(data, block, b',') & !inside;
+        while commas != 0 && found < 2 {
+            let i = commas.trailing_zeros() as usize;
+            let before = seen + (quotes & ((1 << i) - 1)).count_ones() as usize;
+            (ends[found], found, commas) = ([block + i, before], found + 1, commas & (commas - 1));
+        }
+        // All ones when the block ends inside quotes.
+        odd = 0u64.wrapping_sub(inside >> 63);
+        (block, seen) = (block + 64, seen + quotes.count_ones() as usize);
+    }
+    let [[name, in_name], [note, in_both]] = ends;
+    // A field is quoted when it holds a quote (§2.1).
+    let (q1, q2) = (usize::from(in_name > 0), usize::from(in_both > in_name));
+    let name_len = (name - at - in_name / 2 - q1) as i64;
+    let note_len = (note - name - 1 - (in_both - in_name) / 2 - q2) as i64;
+    (at + q1..name - q1, name_len, note_len, note + 1)
+}
+
+/// The prefix XOR of `bits`: bit i is the parity of bits 0 to i. Of a mask of quotes, it marks
+/// the bytes inside quotes, each opening quote with them. A carry-less multiply by all ones
+/// computes it in one instruction, as simdjson does.
+fn prefix_xor(bits: u64) -> u64 {
+    // SAFETY: the build targets Alder Lake, which has PCLMULQDQ and SSE2 (see
+    // `.cargo/config.toml`).
+    unsafe {
+        let ones = _mm_set1_epi8(-1);
+        let odd = _mm_clmulepi64_si128::<0>(_mm_cvtsi64_si128(bits.cast_signed()), ones);
+        _mm_cvtsi128_si64(odd).cast_unsigned()
+    }
+}
+
+/// The bytes equal to `byte` among the 64 at `at`, as a mask with bit i set where `data[at + i]`
+/// is `byte`: two AVX2 compares of 32 bytes, each packed into 32 bits by `vpmovmskb`. Written as
+/// a loop over bytes, the compare that starts each record's window became byte loads and shifts.
+fn byte_mask(data: &[u8], at: usize, byte: u8) -> u64 {
     let bytes: &[u8; 64] = data[at..].first_chunk().expect("the input is padded");
     // SAFETY: the build targets Alder Lake, which has AVX2 (see `.cargo/config.toml`), and both
     // 32-byte loads lie in `bytes`. `loadu` needs no alignment.
-    let mask = |i: usize| unsafe {
+    let half = |i: usize| unsafe {
         let v = _mm256_loadu_si256(bytes[i..].as_ptr().cast());
-        _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'"' as i8)))
+        _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(byte.cast_signed())))
     };
-    u64::from(mask(0).cast_unsigned()) | u64::from(mask(32).cast_unsigned()) << 32
+    u64::from(half(0).cast_unsigned()) | u64::from(half(32).cast_unsigned()) << 32
 }
 
 /// A letter for the name at `start..end` of `data`, without its group, which the poster adds to
@@ -580,20 +682,20 @@ fn quotes(data: &[u8], at: usize) -> u64 {
 /// so short names need no variable-length copy. The bytes after a name are the rest of its
 /// record, and the [`PAD`] follows the input, so the read always fits.
 ///
-/// The hash is `FxHash`, the rotate-XOR-multiply hash rustc uses for its own tables, with a
-/// final fold of the high half into the low half, so the 32 bits kept depend on every word. The
-/// length seeds it, so names that differ only by trailing spaces, such as `Betts` and `Betts `,
-/// differ from the first step. For a long name it covers the first 24 bytes, which is enough to
-/// pick an owner, and the owner compares long names in full.
+/// The hash is the CRC32C of the three words, one SSE4.2 instruction per word, and its 32 bits
+/// depend on every word with no final fold. `FxHash`, the rotate-XOR-multiply hash rustc uses for
+/// its own tables, took 12 more instructions per record (PERF.md, step 35). The length seeds it,
+/// so names that differ only by trailing spaces, such as `Betts` and `Betts `, differ from the
+/// first step. For a long name it covers the first 24 bytes, which is enough to pick an owner,
+/// and the owner compares long names in full.
 fn name_letter(data: &[u8], Range { start, end }: Range<usize>) -> [u64; 4] {
     let len = end - start;
     let bytes: &[u8; 24] = data[start..].first_chunk().expect("the input is padded");
     let keep = &KEEP.as_flattened()[24 - len.min(24)..];
     let word = |b: &[u8], i| u64::from_le_bytes(b.as_chunks().0[i]);
     let words: [u64; 3] = std::array::from_fn(|i| word(bytes, i) & word(keep, i));
-    let mix = |h: u64, w: u64| (h.rotate_left(5) ^ w).wrapping_mul(0x517c_c1b7_2722_0a95);
-    let h = words.iter().fold(len as u64, |h, &w| mix(h, w));
-    let hash = (h ^ (h >> 32)) & 0xFFFF_FFFF;
+    // SAFETY: the build targets Alder Lake, which has SSE4.2 (see `.cargo/config.toml`).
+    let hash = (words.iter()).fold(len as u64, |h, &w| unsafe { _mm_crc32_u64(h, w) });
     if len > 24 {
         return [start as u64, end as u64, 0, hash | LONG << 32];
     }
@@ -646,12 +748,17 @@ impl NameSet {
         // to its mailbox again until every worker has passed the next barrier (see [`join`]).
         let letters: &[[u64; 4]] =
             unsafe { std::slice::from_raw_parts(letters.as_ptr().cast(), letters.len() / 4) };
-        for &[a, b, c, d] in letters {
+        // SAFETY: the build targets Alder Lake, which has AVX2 (see `.cargo/config.toml`).
+        let keep = unsafe { _mm256_set_epi64x((1 << 48) - 1, -1, -1, -1) };
+        for letter in letters {
             // A group fits in a byte (see [`join`]), so the bit's word is one of four
             // with no bounds check. The key is the letter without its group: the hash and the
             // length, 48 bits.
-            let (group, key) = ((d >> 48) as u8 as usize, [a, b, c, d & ((1 << 48) - 1)]);
-            let (mask, hash) = (self.slots.len() - 1, key[3] as u32);
+            let d = letter[3];
+            let group = (d >> 48) as u8 as usize;
+            // SAFETY: as above, and the load reads the 32 bytes of `letter`.
+            let key = unsafe { _mm256_and_si256(_mm256_loadu_si256(letter.as_ptr().cast()), keep) };
+            let (mask, hash) = (self.slots.len() - 1, d as u32);
             let (mut slot, tag) = (hash as usize & mask, (hash >> 20) << 24);
             // The probe ends at the entry's line rather than its index: `holds` has checked
             // that index, and the index taken out of the loop was checked once more.
@@ -660,7 +767,8 @@ impl NameSet {
                 match (found & ENTRY) as usize {
                     0 => break self.insert(slot, tag, key),
                     e if found & !ENTRY == tag && self.holds(e - 1, key, data) => {
-                        break &mut self.lines[e - 1];
+                        // SAFETY: see `holds`.
+                        break unsafe { self.lines.get_unchecked_mut(e - 1) };
                     }
                     _ => slot = (slot + 1) & mask,
                 }
@@ -674,19 +782,32 @@ impl NameSet {
     /// Whether `entry` is the name of `key`. A short name's key is the whole name, so equal keys
     /// are equal names. A long name's key says where the name lies in `data`, so two long names
     /// with the same hash are compared there.
-    fn holds(&self, entry: usize, key: [u64; 4], data: &[u8]) -> bool {
-        let held = &self.lines[entry].0[..4];
-        held == key || held[3] == key[3] && same_text(held, &key, data)
+    ///
+    /// The key stays in one AVX2 register from the letter's load to this compare, and the cold
+    /// calls take it that way too: as four words, the probe stored every letter's key to the stack
+    /// for the rare call.
+    fn holds(&self, entry: usize, key: __m256i, data: &[u8]) -> bool {
+        // SAFETY: a slot holds the number of an entry that exists, because `insert` pushes the
+        // entry before it writes the slot, and no entry is ever removed.
+        let held = unsafe { self.lines.get_unchecked(entry) };
+        // SAFETY: the build targets Alder Lake, which has AVX2, and the load reads the first 32
+        // bytes of `held`, a 64-byte aligned line.
+        let diff = unsafe { _mm256_xor_si256(_mm256_load_si256(held.0.as_ptr().cast()), key) };
+        // SAFETY: as above.
+        let same = unsafe { _mm256_testz_si256(diff, diff) == 1 };
+        same || same_text(&held.0, key, data)
     }
 
-    /// Appends an entry with the key `[a, b, c, d]` and no groups, puts it in the empty `slot`
-    /// with its `tag`, and returns its line. When the entries fill three quarters of the slots,
-    /// the slots double and every entry is placed again, so every probe ends at an empty slot.
+    /// Appends an entry with the key and no groups, puts it in the empty `slot` with its `tag`,
+    /// and returns its line. When the entries fill three quarters of the slots, the slots double
+    /// and every entry is placed again, so every probe ends at an empty slot.
     ///
     /// Cold, because inlined into [`NameSet::read`] it spilled the key of every letter.
     #[cold]
-    fn insert(&mut self, slot: usize, tag: u32, [a, b, c, d]: [u64; 4]) -> &mut Line {
+    fn insert(&mut self, slot: usize, tag: u32, key: __m256i) -> &mut Line {
         assert!(self.lines.len() < ENTRY as usize, "over 2^24 names");
+        // SAFETY: `__m256i` and `[u64; 4]` are both 32 bytes, and every bit pattern is valid.
+        let [a, b, c, d]: [u64; 4] = unsafe { std::mem::transmute(key) };
         self.lines.push(Line([a, b, c, d, 0, 0, 0, 0]));
         self.slots[slot] = tag | self.lines.len() as u32;
         if 4 * self.lines.len() > 3 * self.slots.len() {
@@ -704,14 +825,18 @@ impl NameSet {
     }
 }
 
-/// Whether the keys `a` and `b`, which share their hash and length, are of one long name: the
-/// same bytes of `data` (see [`NameSet::holds`]). It is cold and out of line because inlined,
-/// its bounds checks were hoisted into the setup of every letter's probe, 18 instructions per
-/// record. The test for a long name is here too, because in the probe its two 64-bit
+/// Whether the entry's key `a` and `key`, which differ, are of one long name: the same hash and
+/// length, and the same bytes of `data` (see [`NameSet::holds`]). It is cold and out of line
+/// because inlined, its bounds checks were hoisted into the setup of every letter's probe, 18
+/// instructions per record. The tests of the hash and of a long name are here too, so that the
+/// probe's compare is one vector compare, and because in the probe the long name's two 64-bit
 /// constants held two registers for every letter.
 #[cold]
-fn same_text(a: &[u64], b: &[u64], data: &[u8]) -> bool {
-    a[3] >> 32 == LONG && data[a[0] as usize..a[1] as usize] == data[b[0] as usize..b[1] as usize]
+fn same_text(a: &[u64; 8], key: __m256i, data: &[u8]) -> bool {
+    // SAFETY: `__m256i` and `[u64; 4]` are both 32 bytes, and every bit pattern is valid.
+    let b: [u64; 4] = unsafe { std::mem::transmute(key) };
+    let text = |key: &[u64]| &data[key[0] as usize..key[1] as usize];
+    a[3] == b[3] && a[3] >> 32 == LONG && text(a) == text(&b)
 }
 
 /// Writes one line per group that has records: the countries in bytewise order, then

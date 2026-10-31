@@ -39,6 +39,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 32 | The name set's probe ends at its entry's line, so a hit's index is checked once, and the test for a long name moves into the cold compare | run-4ca7cce6e305 | 0.0303 | 11.9 | 78.4 |
 | 33 | The join's threads build the region table themselves, in two steps behind the round barrier, instead of on a pool of its own followed by two serial passes, with its pages mapped in on one CPU first; and the name sets are never freed | run-45ab2da93bdb | 0.0291 | 12.2 | 78.7 |
 | 34 | The amount parses as one number in cents, every number finds its stop as its first byte below `0`, the BOM test reads the id's word, a letter's stores read `sent[to]` once, the batch is made once per worker, and the input is prefetched 448 bytes ahead | run-91b80b654f7a | 0.0269 | 12.2 | 79.4 |
+| 35 | The region id and the amount parse together in one SSE vector, the name and the note come from one mask of quotes and commas whose prefix XOR marks the quoted bytes, the name hash is CRC32, the name set's key stays in one AVX2 register, and a letter's slot is read unchecked | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -979,6 +980,74 @@ Dropped, on battery power, `perf stat`, 20 interleaved runs against the code bef
   instructions, +1.8% cycles.
 - Distinct names counted in a dense array per worker, 2 KiB, instead of in the groups, whose
   lines took 20% of the L1 misses in the marking loop: −1.1% instructions, cycles within noise.
+
+## Step 35: 65 fewer instructions per record
+
+Step 34 ran 383 instructions per record, and its profiles by source line pointed at the field
+parses: the two number parses of the region id and the amount, each a chain of shifts,
+multiplies and branches, and the walk over each field's quotes. The cuts, each measured with
+`perf stat` against the code before it (20 to 30 interleaved runs, medians; on battery power at
+first, so instructions:u and cycles:u only), and then timed again on AC power with `ab.py` (41
+interleaved runs, two rounds, medians, P-cores):
+
+- **The region id and the amount from one vector.** §2.2 bounds region ids at 9,999,999 and
+  amounts at -999.99 to 99,999.99, so the two fields fit in 16 bytes. One SSE compare finds the
+  comma and the dot, one `pshufb`, with a control picked by their places, right-aligns both
+  numbers' digits with the dot dropped, and three multiply-adds give both values at once. Fields
+  past those bounds that §2.1 still allows take two number parses, as before. `number` loses its
+  decimals, which only the amount used. Instructions −9.0%, cycles −5.2 to −5.7% (two sessions);
+  `ab.py` −5.2% and −5.3%.
+- **A CRC32 name hash** instead of `FxHash`: one `crc32` per word and no fold, and its 32 bits
+  depend on every word. −3.5% / −1.7%, with branch misses the same (2.91 → 2.92 M), so the names
+  spread over the slots as well; `ab.py` −1.2% / −1.4%.
+- **The name set's key in one AVX2 register**, from one load and one AND of the letter, compared
+  with an XOR and `vptest` against the first 32 bytes of the entry. The cold insert and the
+  long-name compare take the key as a vector too: when they took four words, the probe stored
+  every letter's key to the stack for them (+1.2% instructions, +1.0% cycles). −2.7% / −1.4%;
+  `ab.py` −1.0% / −1.7%.
+- **`sent[to]` without its bounds check.** `to` is a 32-bit hash times the thread count, shifted
+  down by 32, so it is below the thread count. −1.7% / +0.1%, `ab.py` −0.2% / +0.1%; but on the
+  final code, putting the check back cost 2.2% more instructions and 1.4% more cycles, so it stays.
+- **The name and the note from one mask of the 64 bytes at the name.** The prefix XOR of the
+  quote mask, one carry-less multiply by all ones as in simdjson, marks the bytes inside quotes;
+  the first two commas outside end the two fields, and a field's length is its raw length less
+  half its quotes. There is no branch per quote, where `text_field` walked the quotes one by one
+  and mispredicted on escaped ones. The 2.2% of records whose note ends past the window take a
+  loop over 64-byte blocks that carries the parity from block to block. −2.0% / −2.6%, branch
+  misses 2.89 → 1.89 M, branches 136.8 → 107.1 M; `ab.py` −2.4% / −2.3%.
+- **The `pshufb` controls 16-byte aligned**, as vectors, so that none straddles two cache lines:
+  cycles −0.2%, `ab.py` within noise.
+
+On AC power (profile `performance`, turbo off), `ab.py`, 41 interleaved runs, two rounds, against
+step 34: medians 29.66 and 29.46 → 26.72 and 26.50 ms, minimums 28.66 and 28.72 → 25.73 and 25.69
+ms, 9.9 to 10.6% faster. `perf stat`, 20 interleaved runs: instructions:u 1272.1 → 1055.2 M (−17.0%,
+383 → 318 per record), cycles:u 684.4 → 601.9 M (−12.0%). memory.peak, 30 alternating runs, two
+rounds: medians 12.00 → 12.19 MiB and 12.05 → 12.17 MiB, the highest of 5 by resampling 12.29 →
+12.54 MiB and 12.41 → 12.67 MiB. S 326 → 387: the step adds 61 lines, kept down by one glob import
+for the intrinsics and by the loss of `text_field` and `quotes`. Correctness: the gate, 310 pass, 0
+fail; full seeds 1–7 and 10–12 give the reference hashes; the 400 fuzz cases and the two long-name
+sets pass at the default thread count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at
+1, 2, 3, 12 and 64; the 300 tiny seeds pass at 1, 2, 3, 5, 7, 12, 16, 23, 37 and 64 threads with
+100-byte rounds; six generated files of edge cases (region ids of 1 to 8 digits against amounts of 1
+to 7, with signs and leading zeros, and names and notes whose quotes, escapes and commas fall around
+the 64-byte window and the 24-byte letter) match the reference at 1, 2, 3, 7, 12 and 64 threads and
+with 100-byte rounds; clippy reports no warnings.
+
+A profile of cycles by part on the step's code (a `profiling` build, 60 runs): marking the
+letters (`NameSet::read`) 27.4%, the rest of the record loop 9.6%, `region_amount` 7.8%, the
+barrier 7.6%, `text_fields` 7.3%, the merge 4.4% and `name_letter` 3.9%.
+
+Dropped, `perf stat`, 20 interleaved runs against the code before them, on battery power unless
+noted:
+- The id parsed by SSE too: instructions +0.1%, cycles the same.
+- The input prefetched 576 or 704 bytes ahead instead of 448: instructions +0.02% / +0.09%,
+  cycles medians +1.6% / +2.6%, minimums the same.
+- The marking loop prefetching the slots and entries of the letters 8 or 16 ahead, two shapes:
+  L1 misses 9.7 → 5.5 M and L2 misses 2.65 → 0.83 M per run, but instructions +8.6 to +9.0% and
+  cycles +0.6 to +1.7%, and the marking took as long, so it does not wait on those misses.
+- The probe's slots read without bounds checks: instructions −0.3%, cycles +0.3%.
+- The slow text path counting its quotes byte by byte, which takes fewer lines (on AC power, on
+  the final code): instructions +1.3%, cycles +1.5%; 2% of the records is enough for that.
 
 ## Experiments that did not stay
 

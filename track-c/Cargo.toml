@@ -30,5 +30,9 @@ cast_possible_truncation = "allow"
 # 2^63, made `i64` for the group sums. `From` and `cast_signed` would only lengthen the lines.
 cast_lossless = "allow"
 cast_possible_wrap = "allow"
-# Forced only where a measurement showed the call's cost (see `number` and `text_field`).
+# Forced only where a measurement showed the call's cost (see `number`).
 inline_always = "allow"
+# `use std::arch::x86_64::*`: the SIMD code takes 27 intrinsics and types from it.
+wildcard_imports = "allow"
+# Zero crates, so no `bytecount`, and the one byte count is on a cold path (`text_fields_slow`).
+naive_bytecount = "allow"
