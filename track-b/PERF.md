@@ -53,7 +53,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 46 | A window's matches counted and summed four words at a time from two nibble tables, instead of six masked popcounts per word | run-f954cb1f35f8 | 0.1117 | 43.3 | 77.4 |
 | 47 | A document's phrase triggers are listed in a fifth run of the token loop's slice, by a store and an add, instead of pushed to a `Vec` behind a branch | run-f954cb1f35f8 | 0.1117 | 43.3 | 77.4 |
 | 48 | Memory: a chunk's first matches kept as query indices, each doc's followed by its id, 4 bytes per match instead of 8; the long terms' keys kept off transparent huge pages | run-f91848d73390 | 0.1134 | 37.6 | 77.2 |
-| 49 | Step 48's first-match list undone, since B's memory sits at the cap; the long terms' keys stay off huge pages, and a term is common from one sampled document in 48 instead of 32 | | | | |
+| 49 | Step 48's first-match list undone, since B's memory sits at the cap; the long terms' keys stay off huge pages, and a term is common from one sampled document in 48 instead of 32 | run-ec587c6dcef4 | 0.1131 | 41.7 | 77.3 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
