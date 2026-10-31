@@ -44,6 +44,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 37 | The term table's huge pages asked for again: once the table is written, `MADV_COLLAPSE` collapses its 4 KiB pages into huge pages if its faults found no free one | run-5de0cb146d0e | 0.1445 | 41.4 | 74.8 |
 | 38 | No frees once the output is formatted, as the plan and the chunks are `ManuallyDrop`, and the output's numbers written by `format_into` instead of `write!` | run-5de0cb146d0e | 0.1445 | 41.4 | 74.8 |
 | 39 | The per-document checks on huge pages of their own, as the term table's slots are, through one helper; the rarity sample summed as each thread's part comes in instead of after the last; the plan's counting sort puts its items in from the back, so the starts need no rotation | run-8d0c750cfc9c | 0.1277 | 42.9 | 76.2 |
+| 40 | The plan's checks grouped on a thread of their own while the main thread groups the phrases, flags the terms, numbers the stores and marks the term table; a term's BOOL flag comes from the checks it keys, not from their groups | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1029,6 +1030,30 @@ six rounds: medians 137.54, 137.87, 136.85, 137.32, 137.11 and 137.23 → 134.96
 median 41.45 → 41.59 MB, highest 42.84 → 43.72 MB, as the checks' block takes 2.10 MB where
 they took 1.63. S 763 → 769. Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their
 reference hashes.
+
+## Step 40: the checks grouped while the table is marked
+
+After step 39, once its threads have planned the queries, the plan took 2.45 ms more on the
+main thread alone (a build with timestamps, medians of 10 runs): grouping the phrases 0.30 ms,
+the checks' block and the checks' grouping 0.36 and 0.79, the term flags 0.06, the stores 0.26,
+marking the term table 0.50 and the frees 0.19.
+
+The checks now go to a thread of their own, which allocates their block and groups them, while
+the main thread groups the phrases, flags the terms, numbers the stores and marks the table.
+Marking needs every term's flags, so a term's BOOL flag now comes from the checks' lists, set
+for each check's key, instead of from the grouped checks. In the same build, the plan's tail
+takes 1.76 ms instead of 2.45: the helper is done 1.36 ms after it starts, its block taking
+0.49 ms and its grouping 0.88, while the main thread groups the phrases in 0.51 ms, spawn
+included, flags the terms in 0.29, numbers the stores in 0.27 and marks the table in 0.52, so
+the join waits for nothing. The walks begin at 14.19 ms instead of 14.89.
+
+Local, against step 39 (`ab.py`, 20 alternating runs on the P-cores, on AC, load average 4–8),
+six rounds: medians 135.68, 135.60, 135.16, 135.64, 135.55 and 136.89 → 134.71, 134.42, 134.22,
+135.07, 134.36 and 135.32 ms, minimums 134.42, 134.50, 133.46, 133.46, 133.90 and 134.23 →
+133.51, 133.10, 132.99, 132.92, 132.88 and 133.19 ms. memory.peak over 40 alternating runs:
+median 41.62 → 41.76 MB, highest 43.34 → 44.33 MB, the next highest 43.36; nothing allocated
+changes, only the thread that allocates the checks' block. S 769 → 774. Gate: 510 pass, 0 fail;
+seeds 2, 3, 7, 10 and 12 match their reference hashes.
 
 ## Experiments that did not stay
 

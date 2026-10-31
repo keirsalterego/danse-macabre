@@ -348,40 +348,48 @@ impl Plan {
         })
         .into_iter()
         .unzip();
-        let (phrase_at, phrases) = group(terms.len(), &phrases);
-        // SAFETY: an all-zero check is a valid one.
-        let grouped = unsafe { huge(checks.iter().map(Vec::len).sum()) };
-        let check_at = group_into(terms.len(), &checks, grouped);
-        // A term triggers phrases or checks when its group holds any.
-        let has = |at: &[u32], flag| u8::from(at[0] < at[1]) * flag as u8;
-        let flag = |(p, c)| has(p, Slot::PHRASE) | has(c, Slot::BOOL);
-        let groups = phrase_at.windows(2).zip(check_at.windows(2));
-        let mut flags: Vec<_> = groups.map(flag).collect();
-        let mut store = vec![NO_STORE; terms.len()];
-        // How many bitset rows and id lists are numbered so far.
-        let mut sizes = [0; 2];
-        let sets = sets.concat();
-        for &t in sets.iter().flat_map(|&q| queries.terms(q as usize)) {
-            if store[t as usize] == NO_STORE {
-                // A common term keeps a bitset row, any other an id list: the next of its kind.
-                let kind = usize::from(!common(t));
-                store[t as usize] = sizes[kind] + LIST * kind as u32;
-                sizes[kind] += 1;
-                flags[t as usize] |= [Slot::ROW, Slot::LISTED][kind] as u8;
+        let n = terms.len();
+        // The checks are grouped on a thread of their own, while this one groups the phrases,
+        // flags the terms, numbers the stores and marks the term table, which takes as long.
+        thread::scope(|s| {
+            let grouping = s.spawn(|| {
+                // SAFETY: an all-zero check is a valid one.
+                let grouped = unsafe { huge(checks.iter().map(Vec::len).sum()) };
+                (group_into(n, &checks, grouped), grouped)
+            });
+            let (phrase_at, phrases) = group(n, &phrases);
+            // A term triggers phrases when its group holds any, and checks when it keys one.
+            let phrase = |at: &[u32]| u8::from(at[0] < at[1]) * Slot::PHRASE as u8;
+            let mut flags: Vec<_> = phrase_at.windows(2).map(phrase).collect();
+            (checks.iter().flatten()).for_each(|&(t, _)| flags[t as usize] |= Slot::BOOL as u8);
+            let mut store = vec![NO_STORE; n];
+            // How many bitset rows and id lists are numbered so far.
+            let mut sizes = [0; 2];
+            let sets = sets.concat();
+            for &t in sets.iter().flat_map(|&q| queries.terms(q as usize)) {
+                if store[t as usize] == NO_STORE {
+                    // A common term keeps a bitset row, any other an id list: the next of its
+                    // kind.
+                    let kind = usize::from(!common(t));
+                    store[t as usize] = sizes[kind] + LIST * kind as u32;
+                    sizes[kind] += 1;
+                    flags[t as usize] |= [Slot::ROW, Slot::LISTED][kind] as u8;
+                }
             }
-        }
-        terms.mark(&flags);
-        Self {
-            terms,
-            phrase_at,
-            phrases,
-            check_at,
-            checks: grouped,
-            store,
-            rows: sizes[0] as usize,
-            lists: sizes[1] as usize,
-            sets,
-        }
+            terms.mark(&flags);
+            let (check_at, checks) = grouping.join().expect("a panic aborts the process");
+            Self {
+                terms,
+                phrase_at,
+                phrases,
+                check_at,
+                checks,
+                store,
+                rows: sizes[0] as usize,
+                lists: sizes[1] as usize,
+                sets,
+            }
+        })
     }
 }
 
