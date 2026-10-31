@@ -52,6 +52,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 45 | A token whose home slot holds another term stops there unless the slot is marked as the home of a term stored further on; a key's long bit is its byte 12's bit 5, moved by one shift | run-636a838e4422 | 0.1135 | 42.3 | 77.3 |
 | 46 | A window's matches counted and summed four words at a time from two nibble tables, instead of six masked popcounts per word | run-f954cb1f35f8 | 0.1117 | 43.3 | 77.4 |
 | 47 | A document's phrase triggers are listed in a fifth run of the token loop's slice, by a store and an add, instead of pushed to a `Vec` behind a branch | run-f954cb1f35f8 | 0.1117 | 43.3 | 77.4 |
+| 48 | Memory: a chunk's first matches kept as query indices, each doc's followed by its id, 4 bytes per match instead of 8; the long terms' keys kept off transparent huge pages | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1258,7 +1259,52 @@ rounds: medians 120.51, 119.23, 118.19 and 117.84 → 118.32, 118.01, 117.17 and
 alternating runs: median 40.2 → 37.8 MB, one `Vec` fewer per thread. S 819 → 818. Gate: 510
 pass, 0 fail.
 
+## Step 48: the first matches in half the memory
+
+A build that sampled the cgroup's `memory.current` and `memory.stat` every 20 µs from a thread of
+its own, with `/proc/self/smaps` at the phase ends, on seed 1 (local medians 39.8–40.8 MB, in two
+modes 2 MB apart). Memory rises from 16 MB when the plan is ready to 27 MB as the walks start
+(per thread 400 KB of query cells, 326 KB of check cells, the window's rows and lists), then
+climbs to 39 MB through the walks, and peaks either late in the walks or as the threads group
+their first matches, about level. What climbs is `Tally::first`: about 121,800 (query, doc) pairs
+per thread, 976 KB each, 11.7 MB on 12 threads, the largest piece of the peak. At the peak the
+cgroup held 36.5–38.9 MB of anonymous memory, 1.1 MB of kernel memory (0.74 MB of page tables)
+and no file pages. Of the anonymous memory, 6 or 8 MB sat on huge pages: the term table's 4 MB
+and the checks' 2 MB, as meant, and in the higher mode one more 2 MB page under the term keys
+(`TermTable::keys`, 4.9 MB, `calloc`ed, of which only 13 entries, the terms longer than 12
+bytes, are ever written). THP is `always` on this box, so the first write into a 2 MiB-aligned
+stretch of that block faults in a whole huge page when one is free.
+
+- **The first matches a doc at a time.** The pairs of one doc come together, 3.7 per doc on
+  average (32,700 runs for 121,800 pairs per thread), so `first` now holds the query indices
+  alone, `u32`, and after each doc's, its id marked with the top bit ([`DOC`]): `Tally::mark`
+  at the end of `add_checks`, which runs once per doc, after its phrases; and after each first
+  match of a query on sets, whose docs come out of order at the window's end. Grouping reads the
+  list from the back, where a doc's id comes before its queries, through the same counting sort,
+  which now takes its items as an iterator from the last to the first. 154,500 entries of 4
+  bytes per thread instead of 121,800 of 8: 618 instead of 976 KB.
+- **The keys off huge pages.** `MADV_NOHUGEPAGE` on the keys' block: 13 pages of 4 KB instead
+  of, in most runs, a 2 MB huge page.
+
+Local, against step 47: memory.peak over 5 to 6 alternating runs, three sessions: medians 40.0,
+40.85 and 39.8 → 33.8 and 33.7 MB with both changes, 37.9 MB with the keys alone (37.5–39.1
+against 37.5–41.2). `ab.py`, 41 alternating runs, four rounds (the first two on a build identical
+but for formatting): medians 116.99, 117.29, 117.51 and 117.49 → 116.33, 116.58, 116.68 and 117.01
+ms, minimums 115.09, 115.58, 115.33 and 115.76 → 114.79, 115.16, 115.06 and 115.30 ms. S 818 →
+841. Gate: 510 pass, 0 fail. Step 47's memory median, 40.2 → 37.8 MB, was most likely the keys'
+huge page coming and going.
+
 ## Experiments that did not stay
+
+- **After step 48, the check cells dropped** (local, seed 1). With the first matches halved,
+  memory peaks as the threads group them, about 1.5 MB above the walks (in about half the runs,
+  33.0 against 34.6 MB), and the 326 KB of check cells per thread are freed by then. A check
+  then added its match to its query's cell, a random line of 400 KB, instead of its own cell
+  beside its neighbours: 8 lines fewer, but cycles 2,712 and 2,649 → 2,830 and 2,793 M, `ab.py`
+  (41 alternating runs) median 117.24 → 120.90 ms, memory.peak median 35.0 → 32.4 MB over 5,
+  about even at the board's rates. With the query cell prefetched six checks ahead: cycles 2,705
+  and 2,709 → 2,741 and 2,735 M, medians 116.63 and 117.55 → 117.61 and 117.84 ms, memory.peak
+  median 34.7 → 33.85 MB over 6, again about even.
 
 - **After step 45, glibc's mmap threshold raised** from 128 KiB to 512 KiB or 2 MiB, so that the
   tail's frees and allocations reuse the arena instead of queueing on the address space's lock
