@@ -38,6 +38,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 31 | 1 fewer line with the same binary: the Dockerfile's build stage mounts its sources instead of copying them | run-66c99a1d91aa | 0.0309 | 11.9 | 78.2 |
 | 32 | The name set's probe ends at its entry's line, so a hit's index is checked once, and the test for a long name moves into the cold compare | run-4ca7cce6e305 | 0.0303 | 11.9 | 78.4 |
 | 33 | The join's threads build the region table themselves, in two steps behind the round barrier, instead of on a pool of its own followed by two serial passes, with its pages mapped in on one CPU first; and the name sets are never freed | run-45ab2da93bdb | 0.0291 | 12.2 | 78.7 |
+| 34 | The amount parses as one number in cents, every number finds its stop as its first byte below `0`, the BOM test reads the id's word, a letter's stores read `sent[to]` once, the batch is made once per worker, and the input is prefetched 448 bytes ahead | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -917,6 +918,65 @@ sets as before measured 32.04 / 31.57 and 32.09 / 31.60 ms against 31.94 / 31.38
 31.57 ms with the forget (50 runs, two rounds), with memory.peak 12.11 against 11.86 MiB (24
 runs).
 
+## Step 34: 44 fewer instructions per record
+
+Step 33 ran 427 instructions per record, and a profile of `uops_issued.any` by source line (a
+`profiling` build of step 33, 20 runs) found no block that dominates: the three number parses
+were 18% of the samples, the name set's key compare 11%, and the posting, the batch and the
+bounds checks a few percent each. The cuts, each measured as instructions:u and cycles:u with
+`perf stat` (20 interleaved runs against step 33, medians):
+
+- **The amount as one number.** `number` takes a count of decimals after its stop. The word is
+  shifted so that the stop lands in byte 7 minus the decimals for every length, and the bytes
+  below it move up over it, so the same three multiplies give the cents. §2.2 bounds the amount
+  at 99,999.99, so its digits and its dot fit in one word; a longer one takes the byte loop,
+  which reads the decimals too. −0.4% instructions, −1.3% cycles.
+- **The batch made once per worker** instead of zeroed for every batch: with the amount,
+  −0.8% / −2.5%.
+- **`sent[to]` read once.** The four stores of a letter made the compiler load it again for
+  each, with a bounds check. On step 32's code this measured slower (see the experiments below);
+  on top of the amount it measured −4.7% / −3.3%, and borrowing the letter's slot once instead,
+  `&boxes[sent[to]]`, −4.3% / −2.9%.
+- **The BOM test from the id's word.** A record starts with a digit or a BOM, so the id is parsed
+  first and parsed again from past the BOM when its first byte is 0xEF, which the id's word
+  already holds: no load and no bounds check for the test. On top of the amount, −2.7% / −2.7%.
+  The four together: −7.4% / −5.1 to −5.8% (three sessions).
+- **The stop as the first byte below `0`.** Subtracting `0` from every byte replaces the XOR with
+  the stop: every stop, `,` or `.`, lies below `0`, and the difference already holds each digit's
+  value, so an id and a region id need no mask. On top of the four: −10.8% / −7.4 to −8.0%.
+- **The input prefetched 448 bytes ahead** of each record. PEBS `mem_load_retired.l1_miss` on a
+  `profiling` build put 10.1 M L1 misses on a run: 73% on the name set (its slots 27%, the key
+  compare 26%, the group's distinct count 20%), 18% on the groups' merge and 7% on the input
+  (the quote masks' 64-byte loads and the number words). With the prefetch, L1 misses 10.11 →
+  9.39 M, instructions +0.5% and cycles −1.1% (40 interleaved runs); 384 bytes ahead, −1.0%.
+
+Measured on battery power, so wall time is not comparable and no `ab.py` number is given (local,
+P-cores): `perf stat`, 40 interleaved runs, two rounds, instructions:u 1418.0 → 1271.2 M (−10.4%),
+cycles:u medians 768.5 → 703.0 M and 764.2 → 699.1 M (−8.5%), minimums 758.3 → 694.4 M and
+754.6 → 694.1 M. memory.peak, 30 alternating runs: medians 12.01 → 11.96 MiB, the highest of 5
+by resampling 12.52 → 12.37 MiB. S 319 → 326. Correctness: the gate, 310 pass, 0 fail; full seeds
+1–7 and 10–12 give the reference hashes; the 400 fuzz cases and the two long-name sets pass at
+the default thread count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12
+and 64; the 300 tiny seeds pass at 1, 2, 3, 5, 7, 12, 16, 23, 37 and 64 threads with 100-byte
+rounds; clippy reports no warnings.
+
+Branch misses, 0.87 per record (2.87 M per run), are 55% the name set's probe, which step 32's
+eight-slot probe already took on with no gain (see the experiments below), and 34% the pair test
+in `text_field`, on names and notes with an escaped quote. A branchless pair test costs more
+instructions than the misses' cycles, which the hyperthread sibling partly hides.
+
+Dropped, on battery power, `perf stat`, 20 interleaved runs against the code before them:
+- Each letter posted right after its name, so that its four words were not held across the note
+  and the numbers: instructions −2.7%, but cycles +2.0%, and backend-bound slots 22.0 → 26.6%.
+- The batch holding a reference to the letter's last word instead of its slot: −0.2%
+  instructions, +1.0% cycles.
+- The owner count in a local, instead of the captured thread count: +0.3% instructions, cycles
+  within noise.
+- A zero byte past the region table, so that the lookup takes `min` instead of `get`: +1.3%
+  instructions, +1.8% cycles.
+- Distinct names counted in a dense array per worker, 2 KiB, instead of in the groups, whose
+  lines took 20% of the L1 misses in the marking loop: −1.1% instructions, cycles within noise.
+
 ## Experiments that did not stay
 
 - **A structural index of the records** (local, on step 32's code), to break the chain between
@@ -975,7 +1035,8 @@ runs).
 - **`sent[to]` read once per record** (local, on step 32's code): the four atomic stores of a
   letter make the compiler reload `sent[to]` five times, each with a bounds check. Reading it
   into a local first measured slower: medians 33.01 → 33.37 and 33.03 → 33.89 ms (`ab.py`, 40
-  interleaved runs, two rounds).
+  interleaved runs, two rounds). Step 34 reads it once after all, where on top of its other
+  changes it cut cycles:u by 1.9%.
 - **PGO** (local, turbo off, on step 27's code): a profile from three runs on each of full seeds
   2–4, passed as `-C profile-use`, with every function matching it. `ab.py`, 40 interleaved runs,
   medians / minimums: 36.35 / 35.39 → 37.71 / 36.69 ms and 36.27 / 35.64 → 37.39 / 36.79 ms on

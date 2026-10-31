@@ -218,7 +218,7 @@ fn region_rows(csv: &[u8], share: usize, shares: usize, mut row: impl FnMut(usiz
     let cut = |i| ((len * i / shares + 1..len).find(|&p| body[p - 1] == b'\n')).unwrap_or(len);
     let (mut at, end) = (cut(share), cut(share + 1));
     while at < end {
-        let (id, comma) = number(body, at, b',');
+        let (id, comma) = number(body, at, b',', 0);
         assert!(body[comma + 4] == b'\n', "regions.csv: bad row");
         let [a, b, c] = [1, 2, 3].map(|i| (body[comma + i] - b'A') as usize);
         row(id as usize, (a * 26 + b) * 26 + c);
@@ -288,7 +288,7 @@ fn join(data: &[u8], regions: &[u8], threads: usize) -> (Vec<Group>, Vec<[u8; 3]
     let boxes = letters.as_chunks::<4>().0;
     // The region table (see above): the codes that occur, as bits, and the group of each id.
     let last_row = (regions[..regions.len() - PAD - 1].iter()).rposition(|&b| b == b'\n');
-    let ids = 1 + last_row.map_or(0, |p| number(regions, p + 1, b',').0 as usize);
+    let ids = 1 + last_row.map_or(0, |p| number(regions, p + 1, b',', 0).0 as usize);
     // SAFETY: `AtomicU8` has the same layout as `u8`, and all-zero bits are a valid 0.
     let by_id = unsafe { Box::<[AtomicU8]>::new_zeroed_slice(ids).assume_init() };
     // The array's pages are mapped in here, on one CPU, before the workers start. memcg charges
@@ -333,6 +333,9 @@ fn join(data: &[u8], regions: &[u8], threads: usize) -> (Vec<Group>, Vec<[u8; 3]
         // and a thread owns a share of them. The set grows when a file has more.
         let mut names = NameSet::new(len / 2048 / threads);
         let mut sent = vec![0; threads];
+        // The batch of the record loop (see below). Zeroed at the start of every batch, it took
+        // seven more instructions per four records.
+        let mut batch = [(0, 0, 0, 0, 0, 0); 4];
         for round in 0..rounds {
             let half = round % 2;
             (sent.iter_mut().enumerate()).for_each(|(to, s)| *s = mailbox(half, me, to) * MAILBOX);
@@ -341,36 +344,45 @@ fn join(data: &[u8], regions: &[u8], threads: usize) -> (Vec<Group>, Vec<[u8; 3]
                 // The records of a batch are parsed and posted first, and added to their groups
                 // after, so that the prefetch of each record's byte in the region table, which
                 // misses the L2 cache about half the time, has the rest of the batch to arrive.
-                let (mut batch, mut parsed) = ([(0, 0, 0, 0, 0, 0); 4], 0);
+                let mut parsed = 0;
                 while parsed < batch.len() && at < round_end {
+                    // The input 448 bytes ahead, about seven records, so that its lines arrive
+                    // before the parse needs them: the hardware prefetcher alone left 0.7 M more
+                    // L1 misses per run on the input's loads (PERF.md, step 34).
+                    let ahead = data.as_ptr().wrapping_add(at + 448);
+                    // SAFETY: a prefetch reads nothing the program sees, and never faults.
+                    unsafe { _mm_prefetch::<_MM_HINT_T0>(ahead.cast()) };
                     // A BOM at the start of a record is not data (§2.1). It sits in front of the
-                    // id, so missing it would show up in `id_sum`. The test of its first byte
-                    // keeps the whole compare, a call to `bcmp`, off the path of other records.
-                    if data[at] == BOM[0] && data[at..].starts_with(BOM) {
-                        at += BOM.len();
+                    // id, so missing it would show up in `id_sum`. A record starts with a digit
+                    // or a BOM, so a first byte of 0xEF is a BOM. The id's word already holds
+                    // that byte, so the test takes no load, and only after a BOM is the id parsed
+                    // twice.
+                    let (mut id, mut comma) = number(data, at, b',', 0);
+                    if data[at] == BOM[0] {
+                        (id, comma) = number(data, at + BOM.len(), b',', 0);
                     }
-                    let (id, comma) = number(data, at, b',');
                     let mut window = (comma + 1, quotes(data, comma + 1));
                     let (name, name_len, after_name) = text_field(data, comma + 1, &mut window);
                     let letter = name_letter(data, name);
                     let (_, note_len, after_note) = text_field(data, after_name, &mut window);
-                    let (region_id, comma) = number(data, after_note, b',');
+                    let (region_id, comma) = number(data, after_note, b',', 0);
                     let byte = by_id.as_ptr().wrapping_add(region_id as usize);
                     // SAFETY: a prefetch reads nothing the program sees, and never faults.
                     unsafe { _mm_prefetch::<_MM_HINT_T0>(byte.cast()) };
                     // The sign applies to the whole value: -0.75 is -75 cents, not -0 * 100 + 75.
                     let negative = data[comma + 1] == b'-';
-                    let (whole, dot) = number(data, comma + 1 + usize::from(negative), b'.');
-                    let frac = (data[dot + 1] - b'0') as u64 * 10 + (data[dot + 2] - b'0') as u64;
-                    let cents = (whole * 100 + frac).cast_signed();
+                    let (cents, dot) = number(data, comma + 1 + usize::from(negative), b'.', 2);
                     // Past the CR if any, then the LF. Only the last record may end at end of
                     // file instead (§2.1), which leaves `at` past the end and stops the loop.
                     at = dot + 4 + usize::from(data[dot + 3] == b'\r');
                     let to = ((u64::from(letter[3] as u32) * threads as u64) >> 32) as usize;
-                    (0..4).for_each(|i| boxes[sent[to]][i].store(letter[i], Relaxed));
-                    let cents = if negative { -cents } else { cents };
-                    batch[parsed] = (region_id, sent[to], id, cents, name_len, note_len);
-                    sent[to] += 1;
+                    // Read once: the four stores made the compiler load `sent[to]` again for each,
+                    // with a bounds check.
+                    let slot = sent[to];
+                    (0..4).for_each(|i| boxes[slot][i].store(letter[i], Relaxed));
+                    let cents = cents.cast_signed() * if negative { -1 } else { 1 };
+                    batch[parsed] = (region_id, slot, id, cents, name_len, note_len);
+                    sent[to] = slot + 1;
                     parsed += 1;
                 }
                 for &(region_id, top, id, cents, name_len, note_len) in &batch[..parsed] {
@@ -445,31 +457,40 @@ fn merge(group: &mut Group, other: &Group) {
     [group[6], group[7]] = [group[6].min(other[6]), group[7].max(other[7])];
 }
 
-/// Parses the decimal digits from `at` up to the `stop` byte, and returns the value and the
-/// position of `stop`. The field's end and its value come out of the same pass.
+/// Parses the decimal digits from `at` up to the `stop` byte and the `decimals` digits after it,
+/// and returns the value and the position of `stop`. The field's end and its value come out of
+/// the same pass. An amount comes out in cents this way, with its dot as `stop`.
 ///
-/// A field whose `stop` lies within 8 bytes is parsed from one 8-byte word, with no loop and no
-/// branch on its length (SWAR: SIMD within a register). XOR with `stop` in every byte turns each
-/// `stop` into a zero byte, which a zero-byte test finds. Shifting the digits to the top of the
-/// word turns the missing ones into leading zeros, and three multiplies then join neighbouring
-/// digits into pairs, pairs into fours and fours into the value. Longer fields, such as an id
-/// with leading zeros (§2.1 allows them), take the loop over bytes. The word is always there,
-/// because the [`PAD`] follows the input.
+/// A field that fits in 8 bytes with its `stop` and decimals is parsed from one 8-byte word, with
+/// no loop and no branch on its length (SWAR: SIMD within a register). Subtracting `0` from every
+/// byte leaves each digit's value in its byte and sets the top bit of each byte below `0`, which
+/// every `stop` is (`,` or `.`). Shifting the digits to the top of the word turns the missing ones
+/// into leading zeros, and three multiplies then join neighbouring digits into pairs, pairs into
+/// fours and fours into the value. With decimals, the shift puts the dot in the same byte for every
+/// length, and the digits below it move up over it, so an amount needs no second parse for its
+/// cents. Longer fields, such as an id with leading zeros (§2.1 allows them), take the loop over
+/// bytes. The word is always there, because the [`PAD`] follows the input.
 ///
-/// It is always inlined. At each of its call sites `stop` is a constant, so the call and the
-/// multiply that copies `stop` into every byte disappear, 29 instructions per record.
+/// It is always inlined. At each of its call sites `stop` and `decimals` are constants, so the
+/// call disappears and the masks and shifts that depend on them fold.
 #[inline(always)]
-fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
+fn number(data: &[u8], mut at: usize, stop: u8, decimals: usize) -> (u64, usize) {
     const ONES: u64 = u64::from_le_bytes([1; 8]);
     let word = u64::from_le_bytes(*data[at..].first_chunk().expect("the input is padded"));
-    let x = word ^ (ONES * u64::from(stop));
-    // The lowest set bit marks the first zero byte of `x`, so the first `stop`. Bits above it
+    let digits = word.wrapping_sub(ONES * u64::from(b'0'));
+    // The lowest set bit marks the first byte below `0`, so the first `stop`. Bits above it
     // can be false, which is why only the lowest one is used.
-    let stops = x.wrapping_sub(ONES) & !x & (ONES << 7);
+    let stops = digits & !word & (ONES << 7 >> (8 * decimals));
     if stops != 0 {
         let len = stops.trailing_zeros() as usize / 8;
-        // In two steps, because a 0-digit field would need a shift by 64.
-        let digits = ((word & (ONES * 0x0F)) << (56 - 8 * len)) << 8;
+        // The subtraction borrows at `stop`, which spoils the decimals after it.
+        let masked = word & (ONES * 0x0F);
+        let digits = if decimals == 0 { digits } else { masked };
+        // `stop` goes to byte 7 - `decimals`, and the bytes below it move up over it. In two
+        // steps, because a 0-digit field would need a shift by 64.
+        let digits = digits << (8 * (7 - decimals - len));
+        let low = u64::MAX >> (8 * decimals);
+        let digits = (digits << 8) & low | digits & !low;
         let pairs = (digits.wrapping_mul(10 << 8 | 1) >> 8) & 0x00FF_00FF_00FF_00FF;
         let fours = (pairs.wrapping_mul(100 << 16 | 1) >> 16) & 0x0000_FFFF_0000_FFFF;
         return (fours.wrapping_mul(10000 << 32 | 1) >> 32, at + len);
@@ -478,6 +499,7 @@ fn number(data: &[u8], mut at: usize, stop: u8) -> (u64, usize) {
     while data[at] != stop {
         (value, at) = (value * 10 + u64::from(data[at] - b'0'), at + 1);
     }
+    (1..=decimals).for_each(|i| value = value * 10 + u64::from(data[at + i] - b'0'));
     (value, at)
 }
 
