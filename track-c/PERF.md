@@ -1548,6 +1548,38 @@ run-604f816aac75 (commit 0327cbc, which changed only track A), drew 22.76 ms, 12
     measured build's table did not grow, so it was checked on full seeds 1–7 and 10–12, which
     give the reference hashes; a build that sizes the table from an upper bound passes the gate
     (310 pass, 0 fail).
+- **The region table indexed by rank, again** (local, turbo off, on step 39's code), for memory:
+  the 1 MB array of one group byte per region id became a 16-byte entry per 64 ids, the bits of
+  the ids in the table and the count of table ids below them, and the groups of the 200,000 rows
+  in id order, 0.45 MB at full scale. In step 0 each share's rows set their bits with a locked OR
+  and the shares counted their rows, and in step 1 each row's group went to its number among all
+  rows. A record's group is the one at its entry's count plus the set bits below its own, so the
+  merge waits on a second load that depends on the first, after a `bzhi` and a `popcnt`, and only
+  the first load can be prefetched.
+  - `ab.py`, 41 interleaved runs, three rounds, medians: 24.92, 24.90 and 24.85 → 26.80, 26.76
+    and 26.80 ms (+7.5% to +7.8%). Unchecked, with the ids past the table clamped onto an empty
+    last entry: 26.73, 26.67 and 26.77 ms (+7.1% to +7.7%); `perf stat`, 10 interleaved runs,
+    instructions:u 936.8 → 995.7 M, cycles:u 570.5 → 630.1 M. With the groups' index masked to
+    their first 1 KB, so that the second load always hits L1 (a wrong output, for timing only):
+    25.79, 25.84 and 25.82 ms (+3.5% to +3.9%). About half the cost is that load's misses and
+    half the longer chain into the merge.
+  - The group computed where the region's byte was prefetched, and carried in the batch: 28.91
+    against 24.95 ms (+16%). The first load then misses with nothing to overlap it.
+  - Building the table moved the first round 0.06 ms later: 1.29 → 1.35 ms from the start of
+    `join`, medians of 41 runs.
+  - memory.peak, 80 alternating runs: medians 12.28 → 11.76 MiB, highest of five 12.69 → 12.31
+    MiB (expected), with the groups' 200 KB mapped in by main, as step 33 does for the byte-wide
+    table. Main cannot know the row count before the workers count the rows, so the build
+    measured took full seed 1's as given. With each worker mapping in the groups of its own rows
+    instead: 12.91 and 13.15 MiB, 0.6 MiB above step 39.
+  - S 387 → 420, untrimmed. At 0.345 points per MB and 0.108 per 1% of T, the 0.4 to 0.5 MB
+    saved is worth about +0.16 points and +7% of T about −0.8. Even the masked build's +3.5%
+    would lose 0.38.
+- **The byte-wide table mapped in by the first worker** instead of by main (local, turbo off, on
+  step 39's code), so that main would start the threads 0.25 ms sooner, while that worker mapped
+  in the 1 MB as the others started: `ab.py`, 41 interleaved runs, medians 24.86 → 25.00 ms;
+  memory.peak, 40 alternating runs, medians 12.18 → 12.36 MiB, highest of five 12.61 → 12.96 MiB
+  (expected).
 
 ## Profile notes
 
@@ -1561,3 +1593,10 @@ run-604f816aac75 (commit 0327cbc, which changed only track A), drew 22.76 ms, 12
   104 ms, 85.1–86.8 ms each, so the chunks are balanced; merge about 1 ms; distinct counting
   105.3–114.2 ms on one thread; format and write 0.6 ms. About 20 ms of the 115 ms runs on one
   thread.
+- Setup timeline at step 39 (P-cores, 12 threads, turbo off, instrumented copy, medians of 21
+  runs, from the start of `join`): main's allocations and the region table's 1 MB mapped in take
+  0.25 ms; the first worker starts at 0.47 ms and the last at 0.79 ms, in an order that does not
+  follow the spawns, which points at idle CPUs waking up; step 0 of the region table ends at
+  0.61 to 0.92 ms; the workers that waited longest had gone to sleep and leave that barrier up
+  to 0.12 ms after the last arrival; the second barrier passes at 1.22 ms. About 5% of T passes
+  before the first round.
