@@ -379,6 +379,17 @@ unsafe fn parse(log: &'static [u8], lines: Range<usize>) -> Chunk {
     // probe in the interner. Without the hints, the loop kept the record count and its end on the
     // stack and built its constants again on every line; with them, they stay in registers: 8
     // instructions fewer per line (`PERF.md`, step 49).
+    //
+    // A line's id is settled one line late. The loop loads the first slot of the line's name as
+    // soon as its hash is known, but compares the name with the slot's known name only after the
+    // next line's front half. The two loads depend on each other, and each missed L1 on a third
+    // or a quarter of lines; done back to back, the line could not retire until both returned,
+    // which held up the lines behind it (`PERF.md`, step 58). `last` is the line before: its
+    // name, the 64 bytes from it, its slot and the slot's content, and its record without the id.
+    let mut last: (&[u8], &[u8; 64], usize, u32, u32) = (&[], &[0; 64], 0, 0, 0);
+    let finish = |(name, window, slot, value, bits)| {
+        ENDPOINTS.intern(name, slot, value, window) << 20 | bits
+    };
     while at < end {
         // How well the hardware prefetcher kept the input in L1 depended on where the loop's
         // code landed: a change elsewhere in its function could raise the misses by half
@@ -414,13 +425,18 @@ unsafe fn parse(log: &'static [u8], lines: Range<usize>) -> Chunk {
         (micros >= LARGE).then(|| chunk.large.push(std::mem::replace(&mut micros, LARGE)));
         let name = &line[start..space - 4];
         let window = line[start..start + 64].try_into().expect("start <= 40");
-        let id = ENDPOINTS.intern(name, hash(name, word(line, start)), window);
+        // The top 14 of the CRC's 32 bits, one of 16,384 slots. With the low 14, 2.2–3.0% of lines
+        // took a second probe instead of 1.9–2.5% (seeds 1, 3 and 5, simulated).
+        let slot = (hash(name, word(line, start)) >> 18) as usize;
         // SAFETY: each line moves `at` on by at least MIN_LINE bytes, malformed or not, since
         // `line_end` starts looking at byte MIN_LINE - 1, so `count` stays below the length the
         // records were given.
-        unsafe { *chunk.records.get_unchecked_mut(count) = id << 20 | error << 19 | micros };
+        (count > 0).then(|| unsafe { *chunk.records.get_unchecked_mut(count - 1) = finish(last) });
+        let value = ENDPOINTS.slots[slot].load(Acquire);
+        last = (name, window, slot, value, error << 19 | micros);
         count += 1;
     }
+    (count > 0).then(|| chunk.records[count - 1] = finish(last));
     chunk.records.truncate(count);
     chunk.runs.push((HOURS, count, chunk.large.len()));
     chunk
@@ -605,6 +621,9 @@ struct Padded([u8; 64]);
 impl<'a> Interner<'a> {
     /// Returns `name`'s id, assigning the next free one if the name is new.
     ///
+    /// The probe starts at `slot`, the first slot on the name's path, and `value` is what the
+    /// caller loaded from it: [`parse`] loads it one line before it needs the id.
+    ///
     /// `window` is 64 bytes that start with `name` and the space after it: the line itself, or a
     /// padded copy. With them a probe compares a name of up to 63 bytes without a call to
     /// `memcmp`. That covers 1,791 of the 1,842 endpoints of seed 1 and 94% of its lines; longer
@@ -623,11 +642,8 @@ impl<'a> Interner<'a> {
     /// bytes, not the 125 a name can reach, because half the size keeps more of them in cache:
     /// that was worth 0.8 ms.
     #[inline(always)]
-    fn intern(&self, name: &'a [u8], hash: u64, window: &[u8; 64]) -> u32 {
-        // The top 14 of the CRC's 32 bits, one of 16,384 slots. With the low 14, 2.2–3.0% of lines
-        // took a second probe instead of 1.9–2.5% (seeds 1, 3 and 5, simulated).
-        let mut slot = (hash >> 18) as usize;
-        while let Some(id) = self.slots[slot].load(Acquire).checked_sub(1) {
+    fn intern(&self, name: &'a [u8], mut slot: usize, mut value: u32, window: &[u8; 64]) -> u32 {
+        while let Some(id) = value.checked_sub(1) {
             let found = if name.len() < 64 {
                 // SAFETY: the copy was written before `id` went into the slot, and never again.
                 // An id in a slot is below the count of names, which `insert` keeps within the
@@ -644,6 +660,7 @@ impl<'a> Interner<'a> {
             // A second probe is rare, about 2% of lines, and marked cold (see [`parse`]).
             std::hint::cold_path();
             slot = (slot + 1) & (self.slots.len() - 1);
+            value = self.slots[slot].load(Acquire);
         }
         self.insert(slot, name, window)
     }
@@ -657,10 +674,12 @@ impl<'a> Interner<'a> {
         let mut count = self.count.lock().expect("panics abort");
         // Only the lock's holder fills a slot, and none is ever emptied. If `slot` is still empty,
         // no thread has added the name since we probed: it would have gone there. If another
-        // thread has filled the slot since, with this name or another, we probe again.
-        if self.slots[slot].load(Relaxed) != 0 {
+        // thread has filled the slot since, with this name or another, we probe on from it: the
+        // slots before it on the name's path hold other names, and always will.
+        let value = self.slots[slot].load(Acquire);
+        if value != 0 {
             drop(count);
-            return self.intern(name, hash(name, word(window, 0)), window);
+            return self.intern(name, slot, value, window);
         }
         // The spec gives every seed 1,842 endpoints (§2), well below the 4,096 that 12 bits hold:
         // the index of the 4,097th name's copy would stop the program.

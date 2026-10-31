@@ -62,6 +62,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 55 | 3 fewer lines: `parse` an `unsafe fn` whose contract is the padding its `assert!` checked, and two range checks left to the indexes behind them | run-c0db6c54d9a4 | 0.0225 | 18.0 | 83.8 |
 | 56 | 6 fewer lines at the same speed: a line's six numbers written in one `map`, the format queue built without collecting the hours, the latencies placed in the whole buffer, the two counters on one line | run-c0db6c54d9a4 | 0.0225 | 18.0 | 83.8 |
 | 57 | Threads started one after another by one helper instead of by a tree, so that fewer of them wait for the interner's lock at once: 2 fewer lines | run-0899dd30b0f4 | 0.0172 | 18.4 | 86.7 |
+| 58 | Each line's id settled one line late: its name's slot is loaded as soon as the hash is known, and the name compared with the slot's padded copy after the next line's front half | | | | |
 
 ## Step 1: v1
 
@@ -997,8 +998,73 @@ and ten rounds, and for the same code before its comment 18.18 → 18.18, 18.40 
 is the same. S 355 → 353. Gate: 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference
 hashes; clippy reports no warnings.
 
+## Step 58: each line's id settled one line late
+
+A profile of step 57 (local, AC power, turbo off, seed 1; `perf record` of cycles, eight runs) put
+43% of the cycles in `parse`, and 27% of its samples on the `vpmovmskb` right after the compare that
+loads the slot's padded copy, 6% more on the test after the slot load. The two loads depend on each
+other: the slot's index comes from the CRC, the copy's address from the slot. Precise samples of
+`mem_load_retired.l1_miss` put an L1 miss on the slot load for 34% of lines and on the copy's two
+halves for 25% and 20%, nearly all L2 hits (144,000 L2 misses a run in all). Each hyperthread has
+half of the core's reorder buffer, about two and a half lines of this loop, so a line whose two
+loads missed one after the other could not retire, and the lines behind it waited.
+
+Now the loop loads the slot of a line's name as soon as the hash is known, and carries it to the
+next iteration with the name, the 64 bytes from it, the slot's index and the record without its id.
+That iteration first does the next line's front half (its LF, latency, status, name, hash and slot
+load) and only then compares the carried name with the padded copy its slot names, and stores its
+record. `intern` takes the slot and the content loaded from it instead of the hash; a second probe
+loads the next slot as before. When `insert` finds that another thread filled the slot first, it
+probes on from that slot with its new content instead of hashing the name again: the slots before
+it on the name's path hold other names for good. So does the next line when it has the same new
+name, since its slot was loaded before this thread filled it. The first line of a chunk has no line
+before it to finish, and the last is finished after the loop.
+
+Local, AC power, turbo off, seed 1. `perf stat`, three interleaved rounds of 10 runs: instructions:u
+583.5 → 627.6 M (14 per line more), cycles:u 319.2, 322.3 and 319.9 → 307.1, 310.5 and 308.4 M
+(−3.6%), cycles:k and branch-misses:u unchanged. Top-down (10 runs): retiring 54.5 → 59.8% of the
+slots, backend-bound 22.2 → 18.0%. `perf record`: samples at the copy's compare 27 → 6% of the
+parse's, after the slot load 6 → 3%. Phase timestamps (41 runs): each thread's parse took about
+8.4–8.7 → 7.9–8.2 ms (per-thread medians), and the plan reached the threads at 11.22–11.27 →
+10.90–10.97 ms after the fork. `ab.py`, 61 interleaved runs, seven rounds, the first four on the
+same loop before `insert` lost its second hash: medians 18.53 → 18.09, 18.51 → 18.02,
+18.97 → 18.55 and 19.01 → 18.69 ms, and under outside load 19.40 → 18.79, 19.47 → 18.91 and
+19.41 → 19.03 ms: −0.46 ms (−2.4%) on average. memory.peak, three alternating rounds on seeds 1, 3
+and 5: median 16.9 → 16.9 MB. S 353 → 361. Gate: 310 pass, 0 fail; full seeds 1–7 and 10–12 give
+the reference hashes; clippy reports no warnings.
+
 ## Experiments that did not stay
 
+- **Other ways to settle the id late** (local, AC power, turbo off, on step 57's code; `perf stat`,
+  10 runs, interleaved with step 58's loop where two numbers are given). The front half as a
+  function that returns the whole next line in an `Option`, carried by `while let`: 712 M
+  instructions:u and 322 M cycles:u against step 57's 583 and 318 M (as a closure, which LLVM did
+  not inline, 772 M). The slot hashed again inside `intern` on every line: 665 M and 313 M. The slot
+  only prefetched a line ahead and loaded just before the compare, `intern` unchanged: 646 M and
+  310–312 M against 626 M and 306–308 M. The padded copy also prefetched once its slot was loaded:
+  633 M and 309–310 M against 306–307 M. The status and the latency stored at once and the id ORed
+  into the record a line later: 0.6 M instructions fewer, cycles:u 305–311 M against 306–309 M, and
+  `ab.py` (41 runs) 18.22 against 18.12 ms. The slot hashed again only on the rare path, with
+  `intern` taking the slot's content alone: 626.5 M, the same cycles, `intern` 7 lines longer, and
+  `ab.py` medians 18.20 and 18.12 against 18.09 and 18.02 ms (61 runs, two rounds). Not kept.
+- **16-bit slots, on step 58's loop** (local, turbo off): instructions:u +3.7 M, cycles:u 306.8 and
+  309.5 M against 305.4 and 307.5 M (`perf stat`, 10 runs, interleaved). Not kept.
+- **One input prefetch per line instead of two** (local, turbo off, on step 58's code): instructions:u
+  −3.1 M, cycles:u 312–314 M against 306–310 M (`perf stat`, 10 runs, interleaved). Not kept.
+- **Each thread's chunk mapped with `MADV_POPULATE_READ` before its parse** (local, turbo off, on
+  step 58's loop): cycles:u −0.8%, but `ab.py`, 41 interleaved runs: median 17.99 → 18.62 ms
+  (+3.5%), since each thread maps all of its 20 MB before it parses a line. Not kept.
+- **The scatter's destination prefetched 16 records ahead** (local, turbo off, on step 58's code):
+  instructions:u +31 M, cycles:u 308.0 and 307.5 M against 308.9 and 306.4 M. Not kept.
+- **Measured, not built** (local, on step 58's code). About 2,800 TLB-shootdown interrupts reach
+  CPUs 0–11 per run (`/proc/interrupts`), some 230 per thread, most of them from the hour pass's
+  per-run record releases; step 45's notes put what dropping those releases saves at 0.8–1.5%, for
+  4.9 MB more. `available_parallelism` takes 55 µs before the first spawn, reading the cgroup's CPU
+  quota as well as the affinity mask; `sched_getaffinity` alone would start too many threads on a
+  box that limits CPUs by quota. Creating and mapping the output takes 44 µs between the second
+  barrier and the first hour's formatting. Per run, the last parse ends 0.15 ms after the mean of
+  all twelve (10.73 against 10.58 ms, medians of 41 runs), which bounds any static reweighting of
+  the chunks.
 - **Other ways to start the threads** (local, AC power, turbo off, on step 56's code; `ab.py`, 61
   interleaved runs, medians against step 56). All eleven spawned by thread 0, 3 lines fewer than
   step 57: +0.24 to +0.45 ms in six rounds (+1.7%), since thread 0 began its own parse only after
