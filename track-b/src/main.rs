@@ -287,9 +287,10 @@ struct Plan {
     /// index, position of the term in the phrase).
     phrase_at: Vec<u32>,
     phrases: Vec<(u32, u32)>,
-    /// Term `t` triggers the per-document checks `checks[check_at[t]..check_at[t + 1]]`.
+    /// Term `t` triggers the per-document checks `checks[check_at[t]..check_at[t + 1]]`, which
+    /// sit on huge pages of their own ([`huge`]), as the pass reads them at random.
     check_at: Vec<u32>,
-    checks: Vec<Check>,
+    checks: &'static mut [Check],
     /// Per term: how its documents are kept.
     store: Vec<Store>,
     /// The number of bitset rows.
@@ -348,7 +349,9 @@ impl Plan {
         .into_iter()
         .unzip();
         let (phrase_at, phrases) = group(terms.len(), &phrases);
-        let (check_at, checks) = group(terms.len(), &checks);
+        // SAFETY: an all-zero check is a valid one.
+        let grouped = unsafe { huge(checks.iter().map(Vec::len).sum()) };
+        let check_at = group_into(terms.len(), &checks, grouped);
         // A term triggers phrases or checks when its group holds any.
         let has = |at: &[u32], flag| u8::from(at[0] < at[1]) * flag as u8;
         let flag = |(p, c)| has(p, Slot::PHRASE) | has(c, Slot::BOOL);
@@ -373,7 +376,7 @@ impl Plan {
             phrase_at,
             phrases,
             check_at,
-            checks,
+            checks: grouped,
             store,
             rows: sizes[0] as usize,
             lists: sizes[1] as usize,
@@ -412,22 +415,26 @@ impl Plan {
 /// Groups the items of `parts`, taken in order, by key, keeping their order within a key: key
 /// `k`'s are `grouped[at[k]..at[k + 1]]`. A counting sort, so it allocates no list per key.
 fn group<T: Copy + Default>(keys: usize, parts: &[Vec<(u32, T)>]) -> (Vec<u32>, Vec<T>) {
-    let mut at = vec![0; keys + 1];
+    let mut grouped = vec![T::default(); parts.iter().map(Vec::len).sum()];
+    (group_into(keys, parts, &mut grouped), grouped)
+}
+
+/// [`group`] into `grouped`, which holds as many items as `parts`; returns `at`.
+fn group_into<T: Copy>(keys: usize, parts: &[Vec<(u32, T)>], grouped: &mut [T]) -> Vec<u32> {
+    // Written here, as in [`Tally::new`], so the counts' loads find no shared zero page.
+    let mut at = [0].repeat(keys + 1);
     for &(k, _) in parts.iter().flatten() {
-        at[k as usize + 1] += 1;
-    }
-    for k in 0..keys {
-        at[k + 1] += at[k];
-    }
-    let mut grouped = vec![T::default(); at[keys] as usize];
-    for &(k, item) in parts.iter().flatten() {
-        grouped[at[k as usize] as usize] = item;
         at[k as usize] += 1;
     }
-    // Each group's start moved to its end, the next group's start.
-    at.rotate_right(1);
-    at[0] = 0;
-    (at, grouped)
+    for k in 1..=keys {
+        at[k] += at[k - 1];
+    }
+    // Each key's end moves back to its start as its items go in, last first.
+    for &(k, item) in parts.iter().flatten().rev() {
+        at[k as usize] -= 1;
+        grouped[at[k as usize] as usize] = item;
+    }
+    at
 }
 
 /// A BOOL query compiled for one document at a time: its result as a truth table over which
@@ -500,20 +507,22 @@ impl Check {
 fn sample_hits(docs: &[u8], terms: &TermTable, threads: usize) -> (Vec<u32>, usize) {
     let sample = &docs[..line_end(docs, docs.len() / SAMPLE_SHARE)];
     let bounds = line_bounds(sample, threads);
-    thread::scope(|s| {
-        let counters: Vec<_> = (bounds.windows(2))
-            .map(|w| s.spawn(move || count_hits(&sample[w[0]..w[1]], terms)))
-            .collect();
-        // The sum starts from the first part, whose pages are written already: a new zeroed
-        // vector would fault twice on each page, once for the load and again for the store.
-        (counters.into_iter())
-            .map(|c| c.join().expect("a panic aborts the process"))
-            .reduce(|(mut hits, docs), (part, more)| {
-                hits.iter_mut().zip(part).for_each(|(h, p)| *h += p);
-                (hits, docs + more)
-            })
-            .expect("line_bounds returns at least one part")
-    })
+    // Each thread adds its part in as soon as it is counted, and frees it: freed one by one on
+    // a single thread after the last part, the parts took longer than the sums. The first part
+    // becomes the sum, as its pages are written already: a new zeroed vector would fault twice
+    // on each page, once for the load and again for the store.
+    let sum = std::sync::Mutex::new((Vec::new(), 0));
+    parallel(threads, &|i| {
+        let (part, docs) = count_hits(&sample[bounds[i]..bounds[i + 1]], terms);
+        let mut sum = sum.lock().expect("a panic aborts the process");
+        if sum.0.is_empty() {
+            sum.0 = part;
+        } else {
+            sum.0.iter_mut().zip(&part).for_each(|(h, p)| *h += p);
+        }
+        sum.1 += docs;
+    });
+    sum.into_inner().expect("a panic aborts the process")
 }
 
 /// [`sample_hits`] on one part of the sample.
@@ -1121,6 +1130,33 @@ impl Slot {
     }
 }
 
+/// `len` zeroed items alone on transparent huge pages, never freed: for an array read at random,
+/// whose reads on 4 KiB pages would mostly walk the page tables first. If the first writes
+/// found no free huge page, `MADV_COLLAPSE` asks again, now compacting memory if it must,
+/// whatever the sysfs THP settings say; a kernel before 6.1 or without THP refuses it,
+/// harmlessly.
+///
+/// # Safety
+///
+/// An all-zero `T` is a valid `T`.
+unsafe fn huge<T>(len: usize) -> &'static mut [T] {
+    // Whole huge pages, as a huge page only maps a whole 2 MiB of the block; and one at least,
+    // as `alloc` takes no empty layout.
+    let size = (size_of::<T>() * len).max(1).next_multiple_of(2 << 20);
+    let layout = Layout::from_size_align(size, 2 << 20).expect("fits");
+    // SAFETY: the size is nonzero.
+    let block = unsafe { std::alloc::alloc(layout) };
+    assert!(!block.is_null(), "out of memory");
+    // SAFETY: `block` holds `layout.size()` bytes, aligned for any `T`, and is never freed; an
+    // all-zero `T` is valid, as the caller ensures. Neither advice changes any data.
+    unsafe {
+        madvise(block, layout.size(), 14); // MADV_HUGEPAGE
+        block.write_bytes(0, layout.size());
+        madvise(block, layout.size(), 25); // MADV_COLLAPSE
+        std::slice::from_raw_parts_mut(block.cast(), len)
+    }
+}
+
 /// Open-addressing map from query term to its [`Slot`]. A probe compares a slot's `head` and
 /// `tail` with the token's first 12 bytes; only a term longer than 12 bytes, rare among tokens,
 /// then loads the rest of its key. So most tokens cost one memory access here, whether or not
@@ -1143,29 +1179,15 @@ impl TermTable {
     /// and there is always one. For the spec's 150,000 or so occurrences, of which about half
     /// are distinct terms, that is 262,144 slots, at most 29% full.
     ///
-    /// The slots sit alone on transparent huge pages and are never freed. The pass reads them
-    /// at random, and on 4 KiB pages most of those reads would first walk the page tables. If
-    /// the first writes found no free huge page, `MADV_COLLAPSE` asks again, now compacting
-    /// memory if it must, whatever the sysfs THP settings say; a kernel before 6.1 or without
-    /// THP refuses it, harmlessly.
+    /// The slots sit on huge pages of their own ([`huge`]), as the pass reads them at random.
     fn new(occurrences: usize) -> Self {
         // A term id times 16 fits in `Slot::flags`.
         assert!(occurrences < 1 << 28, "queries.txt: too many terms");
         // 2 slots or more, so that the shift in [`TermTable::home`] stays below 64.
         let len = (occurrences * 3 / 2 + 1).next_power_of_two().max(2);
-        let layout = Layout::from_size_align(size_of::<Slot>() * len, 2 << 20).expect("fits");
-        // SAFETY: `len` is at least 2, so the size is nonzero.
-        let block = unsafe { std::alloc::alloc(layout) };
-        assert!(!block.is_null(), "out of memory");
-        // SAFETY: `block` holds `layout.size()` bytes, aligned for slots, and an all-zero slot
-        // is empty; neither advice changes any data.
-        let slots = unsafe {
-            madvise(block, layout.size(), 14); // MADV_HUGEPAGE
-            block.write_bytes(0, layout.size());
-            madvise(block, layout.size(), 25); // MADV_COLLAPSE
-            std::slice::from_raw_parts_mut(block.cast(), len)
-        };
         let (lens, keys) = (vec![0], vec![[0; MAX_TERM / 8]; occurrences + 1]);
+        // SAFETY: an all-zero slot is a valid one, empty.
+        let slots = unsafe { huge(len) };
         Self { slots, lens, keys }
     }
 

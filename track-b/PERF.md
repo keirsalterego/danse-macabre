@@ -43,6 +43,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 36 | The serial start about 2.2 ms shorter: the intern prefetches 16 keys ahead and keeps each term's length and only the long terms' keys, a term's cost is computed where the planning reads it, the sample keeps each term's count and last document in one cell, and the term table's flags are collected in bytes | run-ce4c2e1d13c6 | 0.1342 | 42.8 | 75.7 |
 | 37 | The term table's huge pages asked for again: once the table is written, `MADV_COLLAPSE` collapses its 4 KiB pages into huge pages if its faults found no free one | run-5de0cb146d0e | 0.1445 | 41.4 | 74.8 |
 | 38 | No frees once the output is formatted, as the plan and the chunks are `ManuallyDrop`, and the output's numbers written by `format_into` instead of `write!` | run-5de0cb146d0e | 0.1445 | 41.4 | 74.8 |
+| 39 | The per-document checks on huge pages of their own, as the term table's slots are, through one helper; the rarity sample summed as each thread's part comes in instead of after the last; the plan's counting sort puts its items in from the back, so the starts need no rotation | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -995,7 +996,60 @@ before, and track D's 147.7 ms, against 122 to 132 ms.
 A second run of the same code, run-0ea6dd17c4d2 (with track C's step 36), drew 129.1 ms at
 39.6 MB.
 
+## Step 39: the checks on huge pages, and the sample summed as it comes in
+
+After step 37, 2.0 M dTLB load misses remained, 45% of them at the BOOL triggers' prefetch of
+their checks: 40,710 checks on seed 1, 1.63 MB, too little for a huge page of their own.
+
+- **The checks on huge pages.** One helper, `huge`, now allocates both the term table's slots
+  and the grouped checks: alone, at a 2 MiB boundary, never freed, `MADV_HUGEPAGE` before the
+  writes and `MADV_COLLAPSE` after them, as in step 37. Its size is rounded up to whole 2 MiB
+  pages, as a huge page maps only a whole aligned 2 MiB of a block: a block of 1.63 MB got none.
+  The counting sort writes the checks straight into it (`group_into`). `perf stat -r 3`, three
+  alternating rounds: dTLB load misses 2.49–2.59 → 0.41–0.47 M, dTLB store misses 0.28–0.30 →
+  0.21 M, page faults 16,646–16,674 → 16,237–16,268, cycles 3,401–3,502 → 3,444–3,455 M,
+  instructions 6,273 → 6,271 M.
+
+- **The sample summed as it comes in.** Each thread adds its part of the sample's counts to the
+  sum under a lock as soon as it has counted, and frees it. Before, the main thread joined all
+  the parts first, then summed them and freed them one by one, 0.56 ms after the last part was
+  counted; now the sum is ready 0.03 ms after it (a build with timestamps, medians of 10 runs).
+
+- **The counting sort from the back.** `group_into` counts into an array written when
+  allocated, so the counts' loads find no shared zero page (step 16), and puts the items in
+  last first, each key's end moving back to its start, so the starts need no rotation.
+
+In the timing build (medians of 10 runs), the walks begin at 14.78 ms instead of 15.36, and the
+passes end at 131.81 ms instead of 133.87.
+
+Local, against step 38 (`ab.py`, 20 alternating runs on the P-cores, on AC, load average 2–6),
+six rounds: medians 137.54, 137.87, 136.85, 137.32, 137.11 and 137.23 → 134.96, 135.30, 136.33,
+135.57, 135.05 and 135.66 ms, minimums 135.87, 136.16, 135.55, 136.13, 136.14 and 136.46 →
+133.38, 134.02, 134.19, 134.09, 133.95 and 134.47 ms. memory.peak over 28 alternating runs:
+median 41.45 → 41.59 MB, highest 42.84 → 43.72 MB, as the checks' block takes 2.10 MB where
+they took 1.63. S 763 → 769. Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their
+reference hashes.
+
 ## Experiments that did not stay
+
+- **After step 38, on the serial start** (local, a build with timestamps, seed 1, medians of 10
+  runs, in ms since the process was spawned; `main` starts at 2.0, as a trivial static binary's
+  does). The main thread alone spawns the parse threads (2.16–2.59), allocates the term table
+  (0.94), interns the terms (3.02, 126 user instructions per occurrence at 4.3 per cycle), sums
+  the sample (0.59), groups the phrases (0.26) and the checks (1.34), sets the stores (0.28),
+  marks the table (0.73) and frees the planning's lists (0.18): about 8.5 ms, against about 4.5
+  ms in which every thread works. Each scanning thread then takes 0.8–1.0 ms to set up before
+  its walk begins at 15.2–15.7 ms. None of these changes paid:
+  - The intern in a function of its own: 3.02 → 3.35 ms, and the pass about 4 ms slower in the
+    same build, from the moved code.
+  - The terms' keys touched before the intern, or prefetched 48 keys ahead: 3.05 ms.
+  - The term table zeroed by the kernel, `mmap` and `MADV_POPULATE_WRITE`: 0.85 → 0.86 ms.
+  - The table marked through the slot positions the intern recorded: 0.61 → 1.37 ms.
+  - The corpus faulted in ahead of the pass. With `MADV_POPULATE_READ` on the main thread:
+    9.1 ms, for a pass about 2 ms shorter. From helper threads, the intern waited about 10 ms on
+    the `mmap_lock`; per chunk in the scanning threads, 9–10 ms, serialized on the same lock.
+    Helper threads reading a byte per page at nice 19: the parse, sample and plan about 2 ms
+    slower, the pass about 1.6 ms faster, the wall 138.41 → 138.00 ms.
 
 - **After step 33, on the serial parts** (local, a build with timestamps, seed 1). The pass
   starts at 15.4 ms: parsing the queries takes 7.7 ms, of which interning 3.4, the sample 3.5,
