@@ -703,6 +703,8 @@ shuffled ids passes, and the two with 689 and 692 countries stop with the error;
 no warnings.
 The board's run, run-b89d1be25a5e, drew 34.8 ms, against 34.9 ms for step 24's: one draw on the
 board does not show the 5% measured here.
+A second run of the step 25 code, run-835825f2db93 (commit 7128f44, which changed only track A),
+measured 34.4 ms, 12.7 MB and 76.9 points.
 
 ## Step 26: the long-name compare out of the probe
 

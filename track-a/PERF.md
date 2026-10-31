@@ -43,7 +43,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 36 | Each record stored, and each padded copy read, without a bounds check | run-921f52908023 | 0.0183 | 18.5 | 85.7 |
 | 37 | 5 fewer lines with the same machine code: the hour sizes summed inside `sort_by_cached_key`, the name hash's two cases as a `match`, and `same_name` folded into its one caller | run-9fe0786e93d3 | 0.0195 | 18.3 | 85.1 |
 | 38 | A large latency's record field set in the branch that lists it, instead of by a `min` on every line | run-e44188ffe025 | 0.0197 | 18.5 | 84.9 |
-| 39 | 5 fewer lines with the same machine code: the running sum of the hour's counts as one `for_each`, and a large latency listed and replaced by `LARGE` in one `bool::then` | | | | |
+| 39 | 5 fewer lines with the same machine code: the running sum of the hour's counts as one `for_each`, and a large latency listed and replaced by `LARGE` in one `bool::then` | run-89adcd077219 | 0.0196 | 18.4 | 85.1 |
 
 ## Step 1: v1
 
@@ -569,6 +569,8 @@ instead of a three-line `for` loop. `parse` lists a large latency and leaves `LA
 with one `bool::then`, whose `mem::replace` hands the old value to the side list, instead of a
 four-line `if`. `.text` and `.rodata` are byte-identical to step 38's, so T and M cannot move.
 S 381 → 376. Gate: 310 pass, 0 fail.
+The board's run, run-89adcd077219, drew 19.6 ms: the fourth draw of 19.5–19.7 ms in a row since
+step 36's 18.3 ms, on code that has changed by 3 instructions per line since.
 
 ## Experiments that did not stay
 
