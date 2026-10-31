@@ -45,6 +45,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 38 | No frees once the output is formatted, as the plan and the chunks are `ManuallyDrop`, and the output's numbers written by `format_into` instead of `write!` | run-5de0cb146d0e | 0.1445 | 41.4 | 74.8 |
 | 39 | The per-document checks on huge pages of their own, as the term table's slots are, through one helper; the rarity sample summed as each thread's part comes in instead of after the last; the plan's counting sort puts its items in from the back, so the starts need no rotation | run-8d0c750cfc9c | 0.1277 | 42.9 | 76.2 |
 | 40 | The plan's checks grouped on a thread of their own while the main thread groups the phrases, flags the terms, numbers the stores and marks the term table; a term's BOOL flag comes from the checks it keys, not from their groups | | | | |
+| 41 | 5.5% fewer instructions in the corpus pass: the walk keys and prefetches the tokens itself, into a buffer whose address and count stay in registers; a block's token ends are taken one line at a time, split at its LFs by one mask, so the token loop tests no LF; a line's id is left out at its end instead of tested for at each token; a key is folded in two vector operations instead of four | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1055,7 +1056,50 @@ median 41.62 → 41.76 MB, highest 43.34 → 44.33 MB, the next highest 43.36; n
 changes, only the thread that allocates the checks' block. S 769 → 774. Gate: 510 pass, 0 fail;
 seeds 2, 3, 7, 10 and 12 match their reference hashes.
 
+## Step 41: the walk's probes in registers, and a block's tokens split at its LFs
+
+After step 39 the pass ran 6,132 M instructions on seed 1, and two loops took most of its
+cycles: the walk, which keys, hashes and prefetches each token (28% of the samples), and the line
+end's token loop (34%). The walk loaded eight values from the stack at each token, three of them
+the header of the `Vec` of probes, whose length it also stored back at every push.
+
+- **The walk keys the tokens.** Both callers gave [`walk`] the same token callback, a key and a
+  prefetch pushed to a `Vec`. The walk now does that itself and passes each line's probes to its
+  one callback as a slice. They sit in a buffer that each block first grows, if it must, to 32
+  entries past the line's tokens so far, the most that one block ends, so the buffer's address
+  and the count stay in registers and the push tests no capacity: 5 instructions instead of 11.
+- **The ids left out at the line end.** Every line starts with its id, which reads as a token.
+  The walk compared every token's start with the line's start to skip it; the line end now takes
+  the line's tokens from the second on.
+- **A block's ends split at its LFs.** The token loop tested at each token whether an LF came
+  before it. A token never spans an LF, so the block's ends are now taken one line at a time:
+  those up to the next LF, its own bit included, with one mask (`lfs ^ (lfs - 1)`, which takes
+  all of them when the block holds no LF). The token loop tests no LF, and the line end, now
+  called from one place, is inlined into the walk.
+- **The key fold in two steps.** A key ORs 0x20 into each of its 32 bytes, which lowercases a
+  letter and leaves a digit as it is, and then masks off the bytes past the token: two vector
+  operations instead of four.
+
+Built up on step 39 (`perf stat -r 5`, two rounds): the fold, instructions 6,132.1 → 6,053.5 M,
+cycles 3,270 and 3,282 → 3,267 and 3,267 M; the walk keying the tokens, 5,936.5 M, 3,199 and
+3,199 M; the ids left out, 5,886.6 M, 3,164 and 3,219 M; the ends split at the LFs, 5,794.5 M,
+3,167 and 3,165 M, and branch misses 16.63 → 16.29 M.
+
+Local, against step 39 (`ab.py`, 41 alternating runs on the P-cores, on AC, load average 5–6),
+two rounds: medians 135.79 and 135.36 → 132.35 and 131.44 ms, minimums 133.76 and 133.45 →
+129.75 and 130.03 ms. memory.peak over 8 alternating runs: median 41.42 → 40.71 MB, highest
+42.97 → 42.06 MB. S 774 → 763 (on step 39's code, 769 → 758). Gate: 510 pass, 0 fail.
+
 ## Experiments that did not stay
+
+- **After step 39, each token's range of checks prefetched** (local, seed 1). The BOOL triggers'
+  loop stalled on its load of `check_at[t]`, a 303 KB array read at random: 4.4% of all cycle
+  samples sat on that load and the prefetches that wait for it. The line end's token loop then
+  prefetched it for each token. Picking the entry of a new BOOL trigger, or entry 0, by a
+  conditional move, on step 38 with step 41's fold: instructions 6,054 → 6,329 M and cycles
+  3,312 → 3,353 M, as the loop spilled registers. Prefetching every token's entry: 6,147 M
+  instructions and 3,247 M cycles there, but on step 41, `ab.py`, 41 alternating runs, median
+  131.77 against 131.65 ms without it, minimum 129.69 against 129.84 ms.
 
 - **After step 38, on the serial start** (local, a build with timestamps, seed 1, medians of 10
   runs, in ms since the process was spawned; `main` starts at 2.0, as a trivial static binary's

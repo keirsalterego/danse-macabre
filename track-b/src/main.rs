@@ -543,19 +543,14 @@ fn count_hits(sample: &[u8], terms: &TermTable) -> (Vec<u32>, usize) {
     // the estimates; the most documents `answer_all` takes, 2^20, sample about 2^14. Widen the
     // cells to u64 if parts grow that large.
     let mut cells = [0xFFFF].repeat(terms.len());
-    // A line's tokens are probed at its end, as in [`scan`], and one past `MAX_TERM` bytes takes
-    // a key that no term has.
-    let (mut doc, mut probes) = (0, Vec::new());
-    let token = |probes: &mut Vec<_>, start, end| {
-        let key = key_in(sample, start, end).unwrap_or([!0; MAX_TERM / 8]);
-        probes.push((key, terms.prefetch(&key)));
-    };
-    walk(sample, &mut probes, token, |probes| {
+    // A line's tokens are probed at its end, as in [`scan`].
+    let mut doc = 0;
+    walk(sample, terms, |probes| {
         let low = doc as u32 & 0xFFFF;
-        for (key, at) in probes.drain(..) {
+        for (key, at) in probes {
             // A token that is no query term counts at id 0, which no query reads.
             // SAFETY: `at` is the key's home slot, from [`TermTable::prefetch`].
-            let cell = &mut cells[unsafe { terms.find_from(&key, at) }.id() as usize];
+            let cell = &mut cells[unsafe { terms.find_from(key, *at) }.id() as usize];
             *cell = (*cell & !0xFFFF | low) + (u32::from(*cell & 0xFFFF != low) << 16);
         }
         doc += 1;
@@ -579,10 +574,9 @@ fn id_at(docs: &[u8], at: usize) -> Result<u32, String> {
     Ok((docs[at..at + digits].iter()).fold(0, |id, &digit| id * 10 + u32::from(digit - b'0')))
 }
 
-/// Calls `on_token(state, start, end)` with every token `chunk[start..end]` of every document
-/// in `chunk`, and `on_line_end(state)` at every line end, in order. `chunk` holds whole lines,
-/// the last one ending in LF. Two calls that share `state`, rather than one that takes either
-/// event, let the compiler inline the call made once per token.
+/// Calls `on_line_end(probes)` at every line end in `chunk`, in order, where `probes` holds each
+/// token of the line's document as its key and its home slot in `terms`, whose load is under
+/// way by then ([`TermTable::prefetch`]). `chunk` holds whole lines, the last one ending in LF.
 ///
 /// No loop here looks at single bytes. [`classify`] turns 64 bytes at a time into two masks:
 /// `token`, with bit `i` set when byte `i` is a letter or digit, and `lf`. A token starts where
@@ -598,21 +592,22 @@ fn id_at(docs: &[u8], at: usize) -> Result<u32, String> {
 ///
 /// `trailing_zeros` walks the set bits. Starts and ends alternate, so each end closes the
 /// oldest open start, and a token still open at a block's end carries into the next block.
-/// A line starts with its id, digits that look like a token, so a token that starts a line is
-/// skipped: document text only begins after the TAB.
-fn walk<S>(
-    chunk: &[u8],
-    state: &mut S,
-    mut on_token: impl FnMut(&mut S, usize, usize),
-    mut on_line_end: impl FnMut(&mut S),
-) {
+/// A line starts with its id, digits that look like a token, so a line's first token is left
+/// out: document text only begins after the TAB.
+fn walk(chunk: &[u8], terms: &TermTable, mut on_line_end: impl FnMut(&[(Key, usize)])) {
     // 1 when the byte before the block is a token byte; then, the start of the token that runs
-    // on past the block; where the current line starts.
-    let (mut prev_bit, mut open, mut line_start) = (0, 0, 0);
+    // on past the block.
+    let (mut prev_bit, mut open) = (0, 0);
     // The last block, short of 64 bytes, padded with zero bytes, which are separators.
     let (mut padded, tail) = ([0; 64], chunk.as_chunks::<64>().1);
     padded[..tail.len()].copy_from_slice(tail);
+    // The current line's first `n` tokens. Each block takes a slice with room for 32 more, the
+    // most that one block ends, so that the slice's address and `n` stay in registers: a `Vec`
+    // pushed per token was reloaded and stored after each push (PERF.md, step 41).
+    let (mut probes, mut n) = (Vec::new(), 0);
     for base in (0..chunk.len()).step_by(64) {
+        probes.resize(probes.len().max(n + 32), ([0; MAX_TERM / 8], 0));
+        let probes = &mut probes[..];
         let block = chunk[base..].first_chunk().unwrap_or(&padded);
         // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
         let (token, lf) = unsafe { classify(block) };
@@ -627,24 +622,35 @@ fn walk<S>(
         starts =
             std::hint::select_unpredictable(prev_bit != 0, starts, starts & starts.wrapping_sub(1));
         prev_bit = token >> 63;
-        while ends != 0 {
-            let end = base + pop(&mut ends);
-            let start = std::mem::replace(&mut next, base + starts.trailing_zeros() as usize);
-            starts &= starts.wrapping_sub(1);
-            while lfs != 0 && base + (lfs.trailing_zeros() as usize) < start {
-                line_start = base + pop(&mut lfs) + 1;
-                on_line_end(state);
+        // A token never spans an LF, so the ends up to the block's first LF, the LF's own bit
+        // included, close the tokens of the line it ends; then come the next LF's, and after
+        // the last LF the rest. Without an LF, `lfs ^ (lfs - 1)` takes all of them. So the token
+        // loop tests no LF, and the line end has one call site, where it is inlined (PERF.md,
+        // step 41).
+        loop {
+            let upto = lfs ^ lfs.wrapping_sub(1);
+            let mut line = ends & upto;
+            ends &= !upto;
+            while line != 0 {
+                let end = base + pop(&mut line);
+                let start = std::mem::replace(&mut next, base + starts.trailing_zeros() as usize);
+                starts &= starts.wrapping_sub(1);
+                // A token past `MAX_TERM` bytes takes a key of 0xFF bytes, which no term has.
+                let key = key_in(chunk, start, end).unwrap_or([!0; MAX_TERM / 8]);
+                // SAFETY: `n` has grown by at most one per end since the block's start, where
+                // `probes` held 32 entries more than `n`, and a block holds at most 32 ends, as
+                // each follows a token byte.
+                *unsafe { probes.get_unchecked_mut(n) } = (key, terms.prefetch(&key));
+                n += 1;
             }
-            if start != line_start {
-                on_token(state, start, end);
+            if lfs == 0 {
+                break;
             }
+            lfs &= lfs - 1;
+            on_line_end(probes.get(1..std::mem::take(&mut n)).unwrap_or_default());
         }
         // The start of the token the block ends in, if it ends in one (`prev_bit`).
         open = next;
-        while lfs != 0 {
-            line_start = base + pop(&mut lfs) + 1;
-            on_line_end(state);
-        }
     }
 }
 
@@ -873,16 +879,10 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
     // the cursors `rows`, `lists` and `bools`. Keeping a term takes a store and an add, not a
     // branch, and one slice without bounds checks leaves the loop registers to spare.
     let mut kept = Vec::new();
-    // The current doc's tokens as (key, home slot), probed only at the line end: by then every
-    // slot load is long under way ([`TermTable::prefetch`]), instead of each stalling in turn.
-    let mut probes: Vec<(Key, usize)> = Vec::new();
     let mut doc = ids.start;
-    let token = |probes: &mut Vec<_>, start, end| {
-        // A token past `MAX_TERM` bytes takes a key of 0xFF bytes, which no term has.
-        let key = key_in(text, start, end).unwrap_or([!0; MAX_TERM / 8]);
-        probes.push((key, plan.terms.prefetch(&key)));
-    };
-    walk(text, &mut probes, token, |probes| {
+    // The current doc's tokens are probed only at the line end: by then every slot load is long
+    // under way ([`TermTable::prefetch`]), instead of each stalling in turn.
+    walk(text, &plan.terms, |probes| {
         let n = probes.len();
         kept.resize(kept.len().max(4 * n), 0);
         let (kept, mut rows, mut lists, mut bools) = (&mut kept[..4 * n], n, 2 * n, 3 * n);
@@ -917,7 +917,6 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
                 phrase_at.push(k);
             }
         }
-        probes.clear();
         let terms = &kept[..n];
         // As locals, their addresses stay in registers across the stores to `todo`.
         let (check_at, checks, cells) = (&plan.check_at[..], &plan.checks[..], &tally.checks[..]);
@@ -1086,10 +1085,9 @@ fn fold(window: &[u8; MAX_TERM], len: usize) -> Key {
         let word = |bytes: &[u8; MAX_TERM]| {
             u64::from_le_bytes(*bytes[8 * i..].first_chunk().expect("8 of 32 bytes"))
         };
-        let word = word(window) & word(mask);
-        // Copying each byte's bit 6 into its bit 5 lowercases a letter (A-Z have bit 6 set)
-        // and leaves digits and the zero padding alone.
-        word | (word >> 1 & 0x2020_2020_2020_2020)
+        // A lowercase letter and a digit have bit 5 set, so setting it lowercases a letter and
+        // leaves a digit as it is; the mask then zeroes the bytes past the token.
+        (word(window) | 0x2020_2020_2020_2020) & word(mask)
     })
 }
 
