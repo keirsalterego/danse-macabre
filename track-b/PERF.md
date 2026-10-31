@@ -851,6 +851,9 @@ cycles 3,661–3,672 → 3,361–3,391 M, instructions 6,980 → 6,178 M, branch
 memory.peak over five alternating runs: median 42.2 → 41.5 MB. S 751 → 761. Gate: 510 pass, 0
 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes. The board's run,
 run-8bf61f0fec95, measured 131.3 ms and 43.3 MB, against 145.5 ms and 41.3 MB for step 33's.
+On AC power again (profile `performance`, turbo off), `ab.py`, 20 alternating runs, two rounds:
+medians 151.75 and 150.43 → 140.81 and 140.10 ms, minimums 149.67 and 148.58 → 139.43 and
+139.21 ms, 6.9 to 7.2% faster.
 
 Peeling the carried token out of the loop behind a branch cut instructions to 6,259 M but added
 0.6 M branch misses, as whether a block starts inside a token follows no pattern; peeling only
