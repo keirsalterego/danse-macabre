@@ -1316,6 +1316,15 @@ with about 2 MB to spare at the board's usual reading. S 818 → 820. The gate p
 
 ## Experiments that did not stay
 
+- **The scanning threads' tails mapping and unmapping nothing** (on step 49). The tail's wall time was
+  1.5–6 ms against 1.3–2.2 ms of CPU: each `munmap` and `mmap` waited on the memory-map lock while
+  other threads dropped their 21 MB of corpus pages with `MADV_DONTNEED`. Releasing the window bits,
+  check cells and first-match list by `MADV_DONTNEED` instead of freeing them, and reserving the
+  grouping's `at` and `ids` before the walk, took T down 0.89–1.49 ms in six rounds of 41 (seeds 1
+  and 2), and 114.47 → 113.56 ms on seed 3. But with no lock waits the threads group at the same
+  moment: memory.peak on seed 3 went 38.5–39.4 → 39.5–42.5 MiB, and 42.5 MiB is over B's 44.0 MB
+  cap before the board's extra MB. For 12 lines, and `scan` past clippy's line limit, the net was
+  about zero. Not kept.
 - **After step 48, the check cells dropped** (local, seed 1). With the first matches halved,
   memory peaks as the threads group them, about 1.5 MB above the walks (in about half the runs,
   33.0 against 34.6 MB), and the 326 KB of check cells per thread are freed by then. A check
