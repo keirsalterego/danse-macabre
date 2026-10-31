@@ -38,7 +38,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 31 | 1 fewer line with the same binary: the Dockerfile's build stage mounts its sources instead of copying them | run-66c99a1d91aa | 0.0309 | 11.9 | 78.2 |
 | 32 | The name set's probe ends at its entry's line, so a hit's index is checked once, and the test for a long name moves into the cold compare | run-4ca7cce6e305 | 0.0303 | 11.9 | 78.4 |
 | 33 | The join's threads build the region table themselves, in two steps behind the round barrier, instead of on a pool of its own followed by two serial passes, with its pages mapped in on one CPU first; and the name sets are never freed | run-45ab2da93bdb | 0.0291 | 12.2 | 78.7 |
-| 34 | The amount parses as one number in cents, every number finds its stop as its first byte below `0`, the BOM test reads the id's word, a letter's stores read `sent[to]` once, the batch is made once per worker, and the input is prefetched 448 bytes ahead | | | | |
+| 34 | The amount parses as one number in cents, every number finds its stop as its first byte below `0`, the BOM test reads the id's word, a letter's stores read `sent[to]` once, the batch is made once per worker, and the input is prefetched 448 bytes ahead | run-91b80b654f7a | 0.0269 | 12.2 | 79.4 |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -958,7 +958,8 @@ by resampling 12.52 → 12.37 MiB. S 319 → 326. Correctness: the gate, 310 pas
 1–7 and 10–12 give the reference hashes; the 400 fuzz cases and the two long-name sets pass at
 the default thread count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12
 and 64; the 300 tiny seeds pass at 1, 2, 3, 5, 7, 12, 16, 23, 37 and 64 threads with 100-byte
-rounds; clippy reports no warnings.
+rounds; clippy reports no warnings. The board's run, run-91b80b654f7a, measured 26.9 ms and
+12.2 MB, against 29.1 ms and 12.2 MB for step 33's.
 
 Branch misses, 0.87 per record (2.87 M per run), are 55% the name set's probe, which step 32's
 eight-slot probe already took on with no gain (see the experiments below), and 34% the pair test
