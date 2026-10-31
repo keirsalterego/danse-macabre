@@ -48,6 +48,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 41 | 4 fewer lines with the same machine code: the record store on one line, the counting pass without a binding for the endpoint, and each output line's length summed in one statement | run-32182846e438 | 0.0256 | 18.0 | 82.3 |
 | 42 | 1 fewer line with the same machine code: the name hash binds the length in the arms of its `match` | | | | |
 | 43 | 4 fewer lines on cold paths: `Interner::new` instead of an `impl Default`, the format queue as a lazy iterator, and a new name's padded copy from `array::from_fn` | | | | |
+| 44 | 4 fewer lines in `summarize`: a chunk's start found through a one-line `newline` closure, and the format loop as one `for_each` over the queue | | | | |
 
 ## Step 1: v1
 
@@ -631,6 +632,18 @@ closure from the format queue on; elsewhere only addresses of constants and stac
 `ab.py` against step 41, two rounds of 60 runs: medians 20.15 → 20.10 and 19.99 → 19.85 ms,
 minimums 19.50 → 19.34 and 19.44 → 19.24 ms. memory.peak, 24 alternating runs on seed 1: median
 18.29 → 18.13 MB. S 371 → 367. Gate: 310 pass, 0 fail.
+
+## Step 44: 4 fewer lines in `summarize`
+
+`start` finds a chunk's first line through a one-line `newline` closure, the position of the LF
+before the chunk's nominal start, instead of a block with a binding of its own. The threads take
+hours from the queue in one `iter::from_fn(...).for_each(...)` instead of a `while let` over a
+named closure; the lock is still taken and released inside the closure, so no thread holds it
+while it formats. The machine code changes only around those lines of the work closure and in
+its stack slots before the hour pass. `ab.py`, 40 interleaved runs, two rounds: medians
+20.20 → 20.07 and 20.16 → 20.12 ms against step 42 (step 41's code: 20.25 and 20.25 ms in the
+same rounds). memory.peak, 24 alternating runs on seed 1: median 18.13 MB for both; on seeds 3, 7
+and 11, 8 runs each, within 0.02 MB of step 41. S 367 → 363. Gate: 310 pass, 0 fail.
 
 ## Experiments that did not stay
 

@@ -182,10 +182,8 @@ fn summarize(log: &[u8], out_path: &Path) {
     // Chunk t starts at the last line start at or before byte `len * t / threads`, so
     // every line lands in exactly one chunk. With fewer lines than threads, some chunks are
     // simply empty.
-    let start = |t: usize| {
-        let newline = log[..len * t / threads].iter().rposition(|&b| b == b'\n');
-        newline.map_or(0, |p| p + 1)
-    };
+    let newline = |t: usize| log[..len * t / threads].iter().rposition(|&b| b == b'\n');
+    let start = |t| newline(t).map_or(0, |p| p + 1);
     // Each thread's chunk, each hour's output lines, every endpoint's id, which all threads
     // give out as they parse, and the ids in output order.
     let chunks: Vec<OnceLock<Chunk>> = (0..threads).map(|_| OnceLock::new()).collect();
@@ -263,10 +261,8 @@ fn summarize(log: &[u8], out_path: &Path) {
         let chunk = chunks[t].get().expect("parsed");
         release(&chunk.records);
         release(&chunk.large);
-        let next = || queue.lock().expect("panics abort").next();
-        while let Some((index, ((lines, _), place))) = next() {
-            format_hour(index, lines, names, place);
-        }
+        std::iter::from_fn(|| queue.lock().expect("panics abort").next())
+            .for_each(|(index, ((lines, _), place))| format_hour(index, lines, names, place));
         release(&log[len * t / threads..len * (t + 1) / threads]);
         // The output is complete once the last thread gets here: skip joining the others.
         (finished.fetch_add(1, Relaxed) + 1 == threads).then(|| std::process::exit(0));
