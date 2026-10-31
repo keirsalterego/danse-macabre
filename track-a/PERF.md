@@ -660,6 +660,23 @@ line. `.text` is byte-identical to step 44's, and `.rodata` differs only in the 
 
 ## Experiments that did not stay
 
+- **Hours summarized during the parse, for a lower peak** (local, turbo off, on step 45's code).
+  The log went out in 72 pieces of about an hour each, in file order. An hour was summarized and
+  its records freed as soon as every piece from the one before its first line to the one after
+  its last was parsed; a line arriving after its hour was done would have rerun the program
+  without early hours (never tested). Each hour's lines were freed once it was formatted. On
+  full seeds 1–7 and 10–12, 62 hours went early and the output matched. memory.peak on seed 1,
+  5 alternating rounds: 17,444–18,280 → 15,112–15,672 KiB. The peak moved to the end of
+  formatting (15.2 MB, 9.9 of it output), and the parse alone climbed steadily to 13.3 MB,
+  because three things stayed: the 12 latency buffers, about 280 KB each and now touched during
+  the parse, the lines of the hours done so far, and the pages that two runs share. `ab.py`, 61
+  interleaved runs on seed 1, medians / minimums: 20.27 / 19.72 → 21.48 / 20.81 ms and 20.18 /
+  19.71 → 21.48 / 21.02 ms (+6%). `perf stat -r 8`, twice: instructions:u 633.6 → 631.3 M,
+  cycles:u 336–337 → 339–342 M, cycles:k 77–78 → 80–82 M, so the work grew about 2% and the
+  rest was waiting. Phase timestamps: threads finished their last piece between 12.5 and 15.0 ms
+  and waited for the last one, 0.8 ms each on average against 0.42 ms at the parse barrier, and
+  with only the 10 hours left after the parse for 12 threads, each sat idle 0.56 ms on average,
+  against 0.3 ms at the end of the full hour pass. S 361 → 461. Not kept.
 - **No barrier before the output is mapped** (one line fewer: the first thread done with its
   hours waits for each hour's `OnceLock` instead). On step 39's PIE build, `ab.py` medians went
   20.92 → 20.44 and 20.80 → 20.31 ms, but phase timestamps put only 20 µs of that in the wait
