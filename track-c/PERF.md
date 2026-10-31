@@ -52,6 +52,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 45 | The two hyperthreads of a core mark and parse side by side: a worker on an even CPU marks the round before's letters before its parse and one on an odd CPU after it. The 64-byte window of `text_fields` and the name set's probe read unchecked, and a new min or max is a branch instead of two stores per record | run-15ada601c130 | 0.0206 | 11.4 | 82.2 |
 | 46 | `NameSet::read` leaves its loop at a new name, and `insert` calls it again from that letter, so the loop keeps the set's slots, mask and entries in registers instead of loading them for every letter; and `number` parses on a 16-byte SSE window, with the shuffle and multiply-adds of `region_amount` | run-9d22ed670100 | 0.0208 | 11.6 | 82.0 |
 | 47 | `NameSet::read` reads a name's home slot and the next as one word and takes the next, with a `cmov`, when the home slot's tag is not the name's, so a name one slot past home no longer mispredicts; only names further on take the probe loop | run-ef37700846c7 | 0.0202 | 11.5 | 82.3 |
+| 48 | The region table in one pass: a code's group is the next number when its first row is read, given under a lock, so the second parse of the rows, its scans of the codes and one barrier go, and the output walks the codes in bytewise order to their groups | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1635,7 +1636,56 @@ seed 2, 61 runs, 22.99 / 22.36 → 22.67 / 21.92, 22.97 / 22.37 → 22.65 / 22.0
 10.0–10.3 MB for step 46 and 9.8–10.5 MB for this step. S 377 → 384. The gate passes (310 of
 310), full seeds 1 and 2 give the reference hashes, and clippy reports no warnings.
 
+## Step 48: the region table in one pass
+
+A timeline of step 47 (P-cores, turbo off, an instrumented copy, 8 runs, from the start of
+`main`): the workers start at 0.53–0.73 ms and the last at 0.84–1.17 ms, the last ends step 0
+of the region table at 0.98–1.33 ms, the last ends step 1 at 1.27–1.94 ms and the first round
+starts at 1.33–2.00 ms. Step 1 took 0.25–0.6 ms: two scans of the 17,576 code bits with an
+atomic load each (`present()`), the second parse of the share's rows and a barrier. After the
+last round, the release of the input took 0.51–0.66 ms per worker, the entries 0.03–0.10 ms, and
+the merge, format and write 0.2 ms.
+
+- **One step.** Each worker parses its share of `regions.csv` once and writes each row's group.
+  A code's group lives in a shared array of 17,576 `AtomicU8`, 0 until the code's first row is
+  read; that row takes the lock, checks again and gives the code the next number. A share holds
+  almost every code, and the workers start up to 0.6 ms apart, so the first worker numbers most
+  codes and the others take the lock for a few. Groups are no longer in bytewise order, so the
+  last worker walks the codes in index order (bytewise) to their groups for the output. Each
+  worker keeps all 256 groups a byte can name, so both indexes into them (the merge and the
+  marking) are checked by the type and need no `unsafe`. The lock is the one that collects the
+  workers' groups at the end. S 384 → 384.
+
+`perf stat -r 10`, full seed 1, interleaved: instructions:u 775.2 → 769.6 M and 800.7 → 787.2 M
+(the barrier's spins vary). `ab.py`, turbo off, 61 interleaved runs per round, medians / minimums,
+step 47 → step 48: full seed 1, 22.03 / 21.61 → 21.92 / 20.95 and 22.22 / 21.75 → 22.01 / 21.43
+ms; full seed 2, 22.19 / 21.37 → 22.03 / 21.23 and 22.34 / 21.72 → 22.08 / 21.64 ms. Before the
+lines were trimmed (the same code): seed 1, 22.31 / 21.84 → 22.19 / 21.15 and 22.31 / 21.72 →
+21.95 / 21.57 ms; seed 2, 22.24 / 21.67 → 22.03 / 21.67 and 22.20 / 21.72 → 21.96 / 21.57 ms.
+All eight medians lower, by 0.5% to 1.6% (about 1.0%). memory.peak, 5 alternating runs:
+10.3–10.7 MB for step 47 and 10.2–10.6 MB for this step. The gate passes (310 of 310), full seeds
+1 and 2 give the reference hashes, and clippy reports no warnings.
+
 ## Experiments that did not stay
+
+- **The input mapped in up front** (local, turbo off, on step 47's code): each worker called
+  `madvise(MADV_POPULATE_READ)` on its run before the region table, so that the rounds would
+  not fault. Page faults 4,724 → 1,654, but cycles:k 59.0 → 63.5 M and `ab.py`, 41 interleaved
+  runs, medians 22.11 → 27.23 ms (+23%): the populate is slower per page than the faults it
+  replaces, and it delays the first round.
+- **Where step 47 stands** (P-cores, turbo off, `perf record -e instructions:upp` and
+  `cycles:k`, an instrumented copy for the rounds). Per record: about 150 instructions of parse
+  and post (id 21, `text_fields` 44, the hash 14, `region_amount` 36, the post, the batch and the
+  loop about 35), 28 of merge, and 33 per letter in `NameSet::read` for a name at home; 775 M in
+  all. cycles:k is 10% of all cycles: 55% of it the input's page faults (`filemap_map_pages`,
+  `next_uptodate_folio`), about 1.1 ms per worker inside the rounds, and 18% the release after
+  them. In the rounds a worker works 95% of the span on average and the busiest 97%, so the
+  barriers cost about 3% of jitter and 1.5% for the owner of the empty name, which gets 12% more
+  letters. Costed and not built: the marking four letters at a time with `vpgatherqq` for the
+  slot pairs and the keys, about 8 instructions fewer per letter (a third of the groups of four
+  hold a name past home + 1), for about 35 lines; the id's value and `region_amount` from one
+  256-bit shuffle and multiply-add chain, about 5 fewer per record; a third set of mailboxes, so
+  a worker can run a round ahead, +0.58 MB for at most the 3% of jitter.
 
 - **Other ways to make the not-home case cheaper, costed before step 47** (simulation of 8,400
   names in 16,384 slots, as one worker at full scale; none built):

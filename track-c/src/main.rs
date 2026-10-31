@@ -24,9 +24,9 @@
 //!
 //! 1. **The lookup becomes a direct-address table.** The threads of [`join`] first parse
 //!    `regions.csv` into a flat array indexed by region id that holds a group number, one byte
-//!    per id. Countries are numbered in bytewise order, so the group number is already the output
-//!    order and no sort is needed at the end. Group 0 is `_UNMATCHED`, and it is also what every
-//!    id missing from the table reads as.
+//!    per id. Countries are numbered in the order their first rows are read, and the output
+//!    walks the codes in bytewise order to their groups, so no sort is needed at the end. Group 0
+//!    is `_UNMATCHED`, and it is also what every id missing from the table reads as.
 //! 2. **The records are split even though fields contain newlines.** The file is cut into one
 //!    run per hardware thread, and a cut can land inside a quoted note, where an LF is data and
 //!    not a record end. Each run starts at the first LF after its cut that a digit or a BOM
@@ -263,15 +263,19 @@ fn region_rows(csv: &[u8], share: usize, shares: usize, mut row: impl FnMut(usiz
 ///
 /// # The region table
 ///
-/// Before the rounds, the same threads build the array from region id to group, in two steps
-/// that each end at the barrier, and each thread takes one share of the rows (see
-/// [`region_rows`]). In the first step it sets a bit in `seen` for each country code it reads.
-/// Numbering the codes that occur by walking the bits in index order then sorts them bytewise
-/// for free, so in the second step every thread numbers them and writes the group of each of its
-/// rows. A pool of threads of its own for this, then the numbering and the array's writes on one
-/// thread, kept the rounds from starting for 2.4 ms (PERF.md, step 33). Region ids ascend (spec
-/// §2.3), so the last row sizes the array before the threads start. A byte holds the groups of
-/// the spec's 240 countries and keeps the array at 1 MB at full scale.
+/// Before the rounds, the same threads build the array from region id to group, in one step that
+/// ends at the barrier, and each thread takes one share of the rows (see [`region_rows`]). A
+/// code's group is the next number when the first of its rows is read, given under a lock, and
+/// each row writes its code's group. The rows of a share hold almost every code, so a thread
+/// takes the lock only for the codes no thread has read yet. The output walks the codes in index
+/// order, which is bytewise, to their groups. Numbering the codes in that order took a step of
+/// its own, which marked the codes, then a barrier, and a second parse of the rows that wrote
+/// their groups, 0.2–0.6 ms before the first round (PERF.md, step 48). A pool of threads of its
+/// own for this, then the numbering and the array's writes on one thread, kept the rounds from
+/// starting for 2.4 ms (step 33). Region ids ascend (spec §2.3), so the last row sizes the array
+/// before the threads start. A byte holds the groups of the spec's 240 countries and keeps the
+/// array at 1 MB at full scale, and each worker keeps all 256 groups a byte can name, so no
+/// index into them is checked.
 ///
 /// # The exchange
 ///
@@ -286,7 +290,7 @@ fn region_rows(csv: &[u8], share: usize, shares: usize, mut row: impl FnMut(usiz
 ///
 /// Every worker takes part in every round, as many as the longest run needs, so the barrier
 /// only counts arrivals: the barrier that ends step k is passed once `threads` × (k + 1) workers
-/// have arrived, and round r is step r + 2. Zeroed memory this big comes as fresh pages from the
+/// have arrived, and round r is step r + 1. Zeroed memory this big comes as fresh pages from the
 /// kernel, mapped in only when first written, so the mailbox pages that no round fills cost
 /// nothing.
 fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
@@ -319,9 +323,11 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
     // SAFETY: the advice changes no byte of memory. It maps in the pages of the range, all of
     // which hold the array or share its first page.
     unsafe { madvise(std::ptr::without_provenance(at), end - at, 23) };
-    let seen = zeroed(CODES.div_ceil(64));
-    let present = || (0..CODES).filter(|&c| seen[c / 64].load(Relaxed) >> (c % 64) & 1 == 1);
-    let parts = std::sync::Mutex::new(Vec::new());
+    // The group of each country code, 0 until a row of it is read. `parts` holds the last group
+    // given, then the groups of the workers that are done.
+    // SAFETY: `AtomicU8` has the same layout as `u8`, and all-zero bits are a valid 0.
+    let group_of = unsafe { Box::<[AtomicU8]>::new_zeroed_slice(CODES).assume_init() };
+    let parts = std::sync::Mutex::new((0u8, Vec::new()));
     // The hot loop, one run per worker `me`. The fields come in a fixed order, so the state is
     // simply the position in the record. [`number`] parses the id from one word, [`text_fields`]
     // skips the name and the note while counting their escapes, and [`region_amount`] parses the
@@ -331,24 +337,24 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
     // [`NameSet`], before or after the parse, and waits at the barrier for all workers. After the
     // last round it gives its pages back, and the last worker to finish writes the output.
     let work = |me: usize| {
-        // Step 0 of the region table: the codes of this thread's share of the rows.
-        let mut mine = [0u64; CODES.div_ceil(64)];
-        region_rows(regions, me, threads, |_, c| mine[c / 64] |= 1 << (c % 64));
-        (seen.iter().zip(mine)).for_each(|(s, m)| _ = s.fetch_or(m, Relaxed));
+        // The region table (see above): the group of each id of this thread's share of the rows.
+        region_rows(regions, me, threads, |i, c| {
+            if group_of[c].load(Relaxed) == 0 {
+                // Under the lock, a code still without a group takes the next number.
+                let mut last = parts.lock().unwrap();
+                if group_of[c].load(Relaxed) == 0 {
+                    last.0 = last.0.checked_add(1).expect("at most 255 countries");
+                    group_of[c].store(last.0, Relaxed);
+                }
+            }
+            by_id[i].store(group_of[c].load(Relaxed), Relaxed);
+        });
         barrier(&arrived, threads);
-        // Step 1: the number of each code that occurs, and the group of each of this share's
-        // ids. The numbers are freed before the groups are made, which then reuse their pages.
-        let (mut num, group_count) = (vec![0; CODES], 1 + present().count());
-        (present().zip(1..))
-            .for_each(|(c, n)| num[c] = u8::try_from(n).expect("at most 255 countries"));
-        region_rows(regions, me, threads, |i, c| by_id[i].store(num[c], Relaxed));
-        drop(num);
-        barrier(&arrived, 2 * threads);
         // SAFETY: `AtomicU8` has the same layout as `u8`, and no thread writes the array after
         // the barrier, which orders every write before every read. Atomic loads would keep the
         // compiler from holding anything else in a register across them.
         let by_id = unsafe { &*(&raw const *by_id as *const [u8]) };
-        let (mut at, end, mut groups) = (bounds[me], bounds[me + 1], vec![EMPTY; group_count]);
+        let (mut at, end, mut groups) = (bounds[me], bounds[me + 1], Box::new([EMPTY; 256]));
         // Full scale draws from 100,000 names (spec §2.2) in 202 MB (§5), about one per 2 KiB,
         // and a thread owns a share of them. The set grows when a file has more.
         let mut names = NameSet::new(len / 2048 / threads);
@@ -368,7 +374,7 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
             // (CPUs 2k and 2k + 1) mostly run the marking, which waits on loads, next to a parse,
             // which keeps the core's ports busy, where in step with each other they ran both
             // together (PERF.md, step 45). The extra round marks the last round's letters.
-            let read = |names: &mut NameSet, groups: &mut [Group]| {
+            let read = |names: &mut NameSet, groups: &mut [Group; 256]| {
                 (0..threads).for_each(|from| names.read(mail(mailbox(1 - half, from, me)), groups));
             };
             // SAFETY: the call takes no arguments and only reads which CPU runs this thread. A
@@ -456,15 +462,14 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
                     // reference, and no other thread reads or writes them before the barrier.
                     unsafe { byte.add(15).write(group as u8) };
                     let record = [1, id as i64, cents, name_len, note_len, 0, cents, cents];
-                    // SAFETY: `by_id` holds 0 or a number from step 1, below `group_count`, the
-                    // length of `groups`. The bounds check took two instructions per record.
-                    merge(unsafe { groups.get_unchecked_mut(group) }, &record);
+                    // A group is a byte and `groups` holds 256, so the index needs no check.
+                    merge(&mut groups[group], &record);
                 }
             }
             (sent.iter().enumerate())
                 .for_each(|(to, &n)| ends[mailbox(half, me, to)].store(n as u64, Relaxed));
             (round > 0 && odd).then(|| read(&mut names, &mut groups));
-            (round < rounds).then(|| barrier(&arrived, (round + 3) * threads));
+            (round < rounds).then(|| barrier(&arrived, (round + 2) * threads));
         }
         // The run's pages go back to the kernel with `madvise(MADV_DONTNEED)`, and then the name
         // set's entries. At exit the kernel unmaps every page left on one thread, inside the timed
@@ -493,17 +498,18 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
         // freed, since the exit unmaps it all, and `fs::write` keeps no user-space buffer.
         // A panic aborts the process, so the lock is never poisoned.
         let mut all = parts.lock().unwrap();
-        if all.len() + 1 < threads {
-            all.push(groups);
+        if all.1.len() + 1 < threads {
+            all.1.push(groups);
             drop(all);
             // Asleep until the end. A spurious wakeup would only end this thread early.
             return thread::park();
         }
         let code = |c: usize| [c / 676, c / 26 % 26, c % 26].map(|c| b'A' + c as u8);
-        let codes: Vec<_> = present().map(code).collect();
+        let codes = (0..CODES).map(|c| (code(c), group_of[c].load(Relaxed) as usize));
+        let codes: Vec<_> = codes.filter(|&(_, group)| group > 0).collect();
         // Every part numbers its groups as `groups` does, so the parts merge into it pairwise.
-        (all.iter()).for_each(|part| (groups.iter_mut().zip(part)).for_each(|(g, p)| merge(g, p)));
-        write(out, format_output(&groups, &codes)).expect("a writable output directory");
+        (all.1.iter()).for_each(|q| (groups.iter_mut().zip(q)).for_each(|(g, p)| merge(g, p)));
+        write(out, format_output(&*groups, &codes)).expect("a writable output directory");
         std::process::exit(0)
     };
     // One thread per worker. The scope never ends: the last worker to finish ends the process,
@@ -902,7 +908,7 @@ impl NameSet {
     /// loop that resumed after the call had to load the slots, their length and the entries again
     /// for every letter, 15 M instructions per run (PERF.md, step 46).
     #[inline(never)]
-    fn read(&mut self, mut letters: &[[AtomicU64; 2]], groups: &mut [Group]) {
+    fn read(&mut self, mut letters: &[[AtomicU64; 2]], groups: &mut [Group; 256]) {
         let (slots, entries) = (&self.slots[..], &mut self.entries[..]);
         while let [[key, high], ..] = letters {
             let (key, high) = (key.load(Relaxed), high.load(Relaxed));
@@ -943,10 +949,7 @@ impl NameSet {
                 }
             };
             let (word, bit) = (&mut entry.1[group / 64], 1 << (group % 64));
-            // SAFETY: the group is the byte that the letter's poster took from `by_id`, 0 or a
-            // number below `group_count`. Every worker counts the same codes, so that is the
-            // length of `groups` here too (see [`join`]).
-            unsafe { groups.get_unchecked_mut(group)[5] += i64::from(*word & bit == 0) }
+            groups[group][5] += i64::from(*word & bit == 0);
             (*word, letters) = (*word | bit, &letters[1..]);
         }
     }
@@ -959,7 +962,7 @@ impl NameSet {
     ///
     /// Cold, because inlined into [`NameSet::read`] it spilled the key of every letter.
     #[cold]
-    fn insert(&mut self, slot: usize, letters: &[[AtomicU64; 2]], groups: &mut [Group]) {
+    fn insert(&mut self, slot: usize, letters: &[[AtomicU64; 2]], groups: &mut [Group; 256]) {
         let [key, high] = letters[0].each_ref().map(|word| word.load(Relaxed));
         assert!(self.entries.len() < ENTRY as usize, "over 2^24 names");
         self.slots[slot] = (self.entries.len() as u32) << 8 | u32::from((high >> 48) as u8);
@@ -982,21 +985,20 @@ impl NameSet {
 /// Writes one line per group that has records: the countries in bytewise order, then
 /// `_UNMATCHED`, which sorts after every capital letter because `_` is 0x5F (spec §4).
 ///
-/// Group numbers already follow bytewise order (see [`join`]), so this is a walk, not
-/// a sort. Money prints as `-?I.DD`: -525 is `-5.25`, -5 is `-0.05`, and zero is `0.00`, never
+/// `codes` holds the countries in bytewise order, each with its group (see [`join`]), so this
+/// is a walk, not a sort. Money prints as `-?I.DD`: -525 is `-5.25`, -5 is `-0.05`, and zero is `0.00`, never
 /// `-0.00`, because the sign is printed only for a negative value.
-fn format_output(groups: &[Group], codes: &[[u8; 3]]) -> Vec<u8> {
+fn format_output(groups: &[Group], codes: &[([u8; 3], usize)]) -> Vec<u8> {
     let money = |c: i64| {
         let (sign, abs) = (if c < 0 { "-" } else { "" }, c.abs());
         format!("{sign}{}.{:02}", abs / 100, abs % 100)
     };
     let mut out = Vec::new();
-    // Group k + 1 is country k, and group 0, `_UNMATCHED`, goes last.
-    let keys = (codes.iter().map(|code| &code[..])).chain([&b"_UNMATCHED"[..]]);
-    let lines = keys.zip(groups[1..].iter().chain(&groups[..1]));
-    // A country without records prints nothing (§3).
-    for (key, group) in lines.filter(|(_, group)| group[0] > 0) {
-        let [count, ids, sum, name_bytes, note_bytes, distinct, min, max] = *group;
+    // Each code with its group, then group 0, `_UNMATCHED`. A country without records prints
+    // nothing (§3).
+    let lines = (codes.iter().map(|(c, g)| (&c[..], *g))).chain([(&b"_UNMATCHED"[..], 0)]);
+    for (key, group) in lines.filter(|&(_, g)| groups[g][0] > 0) {
+        let [count, ids, sum, name_bytes, note_bytes, distinct, min, max] = groups[group];
         let (sum, min, max) = (money(sum), money(min), money(max));
         out.extend_from_slice(key);
         write!(out, " {count} {ids} {sum} {min} {max}").unwrap();
