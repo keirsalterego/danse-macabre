@@ -31,12 +31,13 @@
 //!    endpoint a global id ([`Interner::merge`]). One thread then sorts the 1,842 names
 //!    bytewise. That order is also the order of the endpoints within an hour of the output, so
 //!    the output never needs sorting.
-//! 4. **Summarize by hour.** Threads take hours one at a time, largest first
-//!    ([`summarize_hour`]). For one hour a thread goes through that hour's runs in every chunk.
-//!    It counts the lines per endpoint, uses the counts to place each latency next to the others
-//!    of its endpoint (a counting sort), and picks the three percentiles out of each endpoint's
-//!    latencies ([`percentiles`]). What it keeps is six numbers per output line, and the hour's
-//!    exact length once formatted. The hour's records are freed as soon as they are read.
+//! 4. **Summarize by hour.** Threads take hours one at a time, smallest first, except that the
+//!    smallest few come last ([`summarize_hour`]). For one hour a thread goes through that hour's
+//!    runs in every chunk. It counts the lines per endpoint, uses the counts to place each
+//!    latency next to the others of its endpoint (a counting sort), and picks the three
+//!    percentiles out of each endpoint's latencies ([`percentiles`]). What it keeps is six
+//!    numbers per output line, and the hour's exact length once formatted. The hour's records
+//!    are freed as soon as they are read.
 //! 5. **Write in place.** With every hour's length known, we give the output file its final size
 //!    and map it into memory ([`map_output`]). Each thread then frees what is left of its
 //!    chunk's records and formats hours straight into place in the file ([`format_hour`]).
@@ -209,14 +210,21 @@ fn summarize(log: &[u8], out_path: &Path) {
                     runs[hour].push((&chunk.records[start..end], &chunk.large[first..], ids));
                 }
             }
-            // Night hours carry about half the traffic of day hours, so fixed blocks of hours
-            // would leave some workers idle while others finish. Workers instead take one hour
-            // at a time from a shared counter, largest first (longest-processing-time-first
-            // scheduling). Each hour's size is summed once, not in every comparison: that took
-            // 0.03 ms of the plan, which the other threads wait for.
+            // Hours range from 14,000 to 73,000 lines (seed 1), so fixed blocks of hours would
+            // leave some workers idle while others finish. Workers instead take one hour at a
+            // time from a shared counter, in an order that also keeps the memory peak down.
+            // A worker's latency buffer takes memory as far as the largest hour it has done, and
+            // the records of the hours not yet done are all still in memory. Largest first, the
+            // usual order for balance, grew every buffer to full size before a single record was
+            // freed: about 3 MB within a millisecond, the program's peak. Smallest first, buffers
+            // grow a little at a time while earlier hours free their records. The `threads`
+            // smallest hours go last, though, so that every worker's last hour is short and they
+            // finish together. Each hour's size is summed once, not in every comparison: that
+            // took 0.03 ms of the plan, which the other threads wait for.
             let mut by_size: Vec<usize> = (0..HOURS).collect();
             let size = |h: &usize| runs[*h].iter().map(|run| run.0.len()).sum::<usize>();
-            by_size.sort_by_cached_key(|h| std::cmp::Reverse(size(h)));
+            by_size.sort_by_cached_key(size);
+            by_size.rotate_left(threads.min(HOURS));
             let names: Vec<&[u8]> = all.names.iter().map(|&(name, _)| name).collect();
             let _ = plan.set((names, runs, by_size));
             // No hour needs the names' order before its lines, so the others start counting
@@ -231,7 +239,11 @@ fn summarize(log: &[u8], out_path: &Path) {
             let _ = sorted.set(order);
         }
         let (names, runs, by_size) = plan.wait();
-        let mut latencies = Vec::new();
+        // Room for every line, so any hour fits. glibc's malloc gives a request this large its
+        // own mapping of fresh zero pages, and `vec!` (calloc) does not write them again: a page
+        // takes memory only once a latency lands in it. Growing the buffer with `resize` wrote
+        // zeros over a whole hour's latencies first, while all the records were still in memory.
+        let mut latencies = vec![0; len / MIN_LINE + 1];
         for &hour in std::iter::from_fn(|| by_size.get(taken.fetch_add(1, Relaxed))) {
             let _ = hours[hour].set(summarize_hour(&runs[hour], &sorted, names, &mut latencies));
         }
@@ -646,13 +658,13 @@ type Order = OnceLock<Vec<usize>>;
 ///    are a counting sort by endpoint.
 ///
 /// Then we take the endpoints in output `order`, waiting for it if another thread is still
-/// sorting it, and the three percentiles of each. A thread keeps `buffer` from one hour to the
-/// next.
+/// sorting it, and the three percentiles of each. A thread keeps `buffer`, which has room for
+/// any hour, from one hour to the next.
 ///
 /// Each run's records are freed right after the second pass, their last reader. Before, all
 /// 12 MB of records stayed until the hour pass ended, when the hours' lines and every
 /// thread's buffer had joined them: that was the program's memory peak.
-fn summarize_hour(runs: &[Run], order: &Order, names: &[&[u8]], buffer: &mut Vec<u32>) -> Hour {
+fn summarize_hour(runs: &[Run], order: &Order, names: &[&[u8]], buffer: &mut [u32]) -> Hour {
     // `start[e]` first counts endpoint e's lines, then, after the running sum, holds the end of
     // its latencies. Placing each latency moves it down by one, so it ends as their start.
     let (mut start, mut errors) = (vec![0u32; names.len() + 1], vec![0u32; names.len()]);
@@ -666,7 +678,7 @@ fn summarize_hour(runs: &[Run], order: &Order, names: &[&[u8]], buffer: &mut Vec
     for e in 1..start.len() {
         start[e] += start[e - 1];
     }
-    buffer.resize(start[names.len()] as usize, 0);
+    let buffer = &mut buffer[..start[names.len()] as usize];
     for &(records, large, ids) in runs {
         let mut large = large.iter();
         for &r in records {

@@ -36,6 +36,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 29 | 1 fewer line with the same machine code: the network's compare-exchange blends its minimum and maximum in one expression | run-1286db1e2359 | 0.0199 | 21.2 | 84.3 |
 | 30 | The names' output order sorted by one thread while the others start the hour pass, which needs it only at its lines | run-5d31ecdadb69 | 0.0198 | 20.9 | 84.4 |
 | 31 | The hours sorted by size with each hour's size computed once (`sort_by_cached_key`) | run-c441864672ce | 0.0195 | 21.1 | 84.5 |
+| 32 | Hours summarized smallest first, the smallest few last, into a latency buffer of untouched zero pages | | | | |
 
 ## Step 1: v1
 
@@ -384,6 +385,47 @@ The leader's plan before `plan.set`, timed with rdtsc over 31 interleaved runs: 
 0.099 ms, minimum 0.105 → 0.083 ms. That is 0.13% of the run, below what `ab.py` resolves
 (two rounds of 101: medians 22.34 → 22.37 and 22.22 → 22.30 ms). S unchanged at 377. Gate: 307
 pass, 0 fail.
+
+## Step 32: a lower peak from the order of the hours
+
+Every thread of an instrumented copy read memory.current at each step of its work (local, turbo
+off, seed 1, three runs). The peak was not at the end, where the output fills up, but at the
+start of the hour pass. Each worker's first hour was one of the twelve largest, about 70,000
+lines, and `resize` wrote zeros over its 280 KB latency buffer before the first latency, while
+an hour's records go back to the kernel only after their scatter. Within 0.6 ms of the start,
+memory.current rose by 2.6–3.1 MiB to 19.4–20.5 MiB. The parse had topped out at 17.8–18.4 MiB
+and the finished output at 19.3–19.5 MiB.
+
+Two changes:
+
+- Each worker's latency buffer is allocated once, with room for every line of the log
+  (`vec![0; len / MIN_LINE + 1]`, 24 MB of address space). glibc's malloc maps a request that
+  large as fresh zero pages, which `calloc` leaves untouched, so a page takes memory only once a
+  latency lands in it.
+- The hours go smallest first, so each buffer grows a little at a time while earlier hours free
+  their records. The `threads` smallest hours go last instead, so every worker ends on a short
+  hour, as with largest first.
+
+In four runs of the same probe, the hour pass now tops out 0.2–1.2 MiB above where it starts, at
+17.5–18.0 MiB, and the output at 16.8–17.2 MiB. The peak is the end of the parse, 17.6–18.3 MiB,
+where the threads still parsing hold their name tables (about 190 KB each) on top of the
+records. Local, turbo off: memory.peak, 20 alternating runs each, median 19.89 → 18.15 MiB on
+seed 1; 10 each on seed 2, 19.97 → 17.96 MiB. `ab.py`, 61 interleaved runs, two rounds on seed
+1: medians 22.56 → 22.33 and 22.72 → 22.53 ms, minimums 21.49 → 21.53 and 21.80 → 21.89 ms; one
+round on seed 2: median 21.49 → 21.25 ms, minimum 20.98 → 20.89 ms. S 377 → 378. Gate: 310 pass,
+0 fail (full seeds 1–7 and 10–12, 300 tiny seeds).
+
+Tried and dropped, medians of memory.peak over 8 to 12 alternating runs, local, turbo off:
+
+- The untouched buffer alone, largest first: 19.84–19.90 MiB. Most endpoints have a few
+  latencies an hour, and their places are spread over the whole buffer, so its pages fill early
+  anyway.
+- Smallest first all the way: 17.91–18.04 MiB, but the longest hours then start last and the
+  threads finish apart: `ab.py` medians +0.9% and +1.9% (60 runs, two rounds).
+- The 12 or the 24 smallest hours first, then largest first: 19.56 and 19.03 MiB.
+- The kept order with the buffer grown by `resize`: 18.72 MiB.
+- `malloc_trim(0)` after each thread's merge, to give its freed name table back: 17.72 against
+  18.04 MiB in one session, 18.01 against 17.99 MiB in another.
 
 ## Experiments that did not stay
 
