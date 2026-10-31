@@ -231,6 +231,8 @@ fn summarize(log: &'static [u8], out_path: &Path) {
             // no thread writes one after it.
             let padded = |id: usize| unsafe { &(*all.padded[id].get()).0 };
             order.sort_unstable_by_key(|&id| (padded(id), all.names[id].get()));
+            // Nothing reads the interner again: its pages given back now lower the hour pass's peak.
+            release(std::slice::from_ref(all));
             let _ = sorted.set(order);
         }
         let (names, runs, by_size) = plan.wait();

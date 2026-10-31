@@ -63,6 +63,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 56 | 6 fewer lines at the same speed: a line's six numbers written in one `map`, the format queue built without collecting the hours, the latencies placed in the whole buffer, the two counters on one line | run-c0db6c54d9a4 | 0.0225 | 18.0 | 83.8 |
 | 57 | Threads started one after another by one helper instead of by a tree, so that fewer of them wait for the interner's lock at once: 2 fewer lines | run-0899dd30b0f4 | 0.0172 | 18.4 | 86.7 |
 | 58 | Each line's id settled one line late: its name's slot is loaded as soon as the hash is known, and the name compared with the slot's padded copy after the next line's front half | | | | |
+| 59 | The interner's pages given back once the names are sorted, before the hour pass's peak | | | | |
 
 ## Step 1: v1
 
@@ -1033,8 +1034,47 @@ same loop before `insert` lost its second hash: medians 18.53 → 18.09, 18.51 �
 and 5: median 16.9 → 16.9 MB. S 353 → 361. Gate: 310 pass, 0 fail; full seeds 1–7 and 10–12 give
 the reference hashes; clippy reports no warnings.
 
+## Step 59: the interner released after the name sort
+
+Nothing reads the interner after the plan: the parse is over, the names' slices are copied into
+the plan, and the sort is the last reader of the padded copies and the name table. The thread that
+sorts now releases the whole static with `release`, about 0.2 MiB of touched pages (the 64 KiB of
+slots, the 116 KiB of copies and the name table's 1,858 entries). The release lands about 0.2 ms
+into the hour pass, before each worker's first hour has filled its buffer, which is when memory
+peaks (step 34). One `madvise` call: one TLB shootdown for the other threads, which are counting.
+
+Local, AC power, turbo off. memory.peak, alternating runs: seed 1, 20 and 15 rounds, means
+16.77 → 16.59 and 16.69 → 16.51 MB (medians 16.75 → 16.65 and 16.6 → 16.5); seed 3, 15 rounds,
+17.21 → 16.85 (median 17.2 → 16.8); seed 5, 15 rounds, 17.05 → 16.93 (median 17.0 → 17.0): about
+−0.2 MB. `ab.py`, 41 interleaved runs, two rounds, under outside load (load average about 3.5):
+medians 18.69 → 18.77 and 18.73 → 18.72 ms, minimums 18.15 → 18.26 and 18.11 → 18.06 ms. S 361 →
+362. Gate: 310 pass, 0 fail; clippy reports no warnings.
+
 ## Experiments that did not stay
 
+- **The input released once a thread's hours are done, before the second barrier** (local, turbo
+  off, on step 58's code), to use the wait for the slowest worker: `ab.py`, 41 interleaved runs,
+  median 18.81 → 19.66 ms (+4.5%). The release's shootdowns reach the workers still in the hour
+  pass, and every name read while formatting faults its page in again. Not kept.
+- **Each hour's whole output pages released once formatted** (local, turbo off, on step 59's code),
+  so that the exit has fewer of the output's page-table entries to clear: `ab.py`, 61 interleaved
+  runs, three rounds, medians 18.91 → 19.42, 18.81 → 19.05 and 18.96 → 19.29 ms (+1.9%), and 4
+  lines more. The 72 `madvise` calls interrupt the formatting threads with shootdowns. Not kept.
+- **Thread 0 spinning until every thread is done, instead of sleeping in the scope's join** (local,
+  turbo off, on step 59's code), so that the exit need not wake it: `ab.py`, 41 interleaved runs,
+  medians 18.74 → 18.63 and 18.66 → 18.84 ms. No difference beyond the noise, for 3 lines. Not
+  kept.
+- **`percentiles` inlined into the hour pass** (`#[inline(always)]`, local, turbo off, on step 58's
+  code): instructions:u +0.8 M, cycles:u 309.3, 312.0 and 306.9 M against 305.3, 310.7 and 307.2 M.
+  Not kept. In step 58's profile (5 runs, call graphs), `percentiles` is 8.9% of all samples, 5.9
+  of them the selections for groups over 128 values, 2.5 the networks; the count and the scatter
+  are 3.5 and 5.7%; page faults are 20.4% (input 5.8, the output's shmem pages 4.9, records and
+  buffers 3.3, the rest entry and locking) and `madvise` 8.1%.
+- **Other hour orders, simulated** (seed 1's hour sizes, time proportional to lines): the kept order
+  ends 0.10 ms after largest first (4.35 against 4.25 ms per worker); ascending to the 30th hour,
+  then descending, then the 12 smallest, ends at 4.28 ms. At most 0.4% of T, less than the run to
+  run spread of the workers' last hour (0.7 ms between the first and the last worker, phase
+  timestamps). Not built.
 - **Other ways to settle the id late** (local, AC power, turbo off, on step 57's code; `perf stat`,
   10 runs, interleaved with step 58's loop where two numbers are given). The front half as a
   function that returns the whole next line in an `Option`, carried by `while let`: 712 M
