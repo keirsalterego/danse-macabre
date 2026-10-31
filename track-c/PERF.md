@@ -37,6 +37,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 30 | 5 fewer lines, three of them with the same machine code: the name set's insert builds its entry in the push and its marking loop takes the group and the key in one statement, `main` writes the output in one line and reads each directory with `nth`, and `merge` sets the min and the max in one assignment | run-3ce10275f327 | 0.0310 | 12.2 | 78.1 |
 | 31 | 1 fewer line with the same binary: the Dockerfile's build stage mounts its sources instead of copying them | run-66c99a1d91aa | 0.0309 | 11.9 | 78.2 |
 | 32 | The name set's probe ends at its entry's line, so a hit's index is checked once, and the test for a long name moves into the cold compare | run-4ca7cce6e305 | 0.0303 | 11.9 | 78.4 |
+| 33 | The join's threads build the region table themselves, in two steps behind the round barrier, instead of on a pool of its own followed by two serial passes, with its pages mapped in on one CPU first; and the name sets are never freed | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -869,6 +870,52 @@ Dropped, by instructions on one E-core against this step's 1402.29 M: the key co
 of XORs, which keeps the key out of memory but has LLVM build it from four scalars, 1444.50 M;
 `holds` borrowing the key, 1418.49 M; `insert` taking the letter where it lies, 1435.00 M; and
 `same_text` taking the key's offsets by value, 1402.29 M, the same code.
+
+## Step 33: one pool for the regions and the join
+
+Step 32 built the region table on a pool of its own before the join: each thread listed the rows
+of one share of `regions.csv`, then the main thread numbered the codes from the lists and wrote
+the array, and only then started the join's threads. On an instrumented copy of step 32 (local,
+P-cores, ms after `main` began), the region threads ran from 0.41 to 0.97, the numbering ended
+at 1.51 and the array's writes at 2.35, and the join's workers started at 2.45–2.63. Now the
+join's workers build the table before their rounds, with no lists, in two steps that end at the
+barrier the rounds use, which moved into `barrier`. In the first, each worker reads its share of
+the rows (`region_rows`) and ORs a bit per country code into a shared set of 26³ bits. In the
+second, every worker numbers the codes from the bits, in index order as the serial pass did, and
+reads its rows again to write each id's group. With a timestamp at the start of each worker's
+rounds, the rounds began 1.33–1.70 ms after `main` began, against 2.44–3.73 ms for step 32
+(4 runs each). The name sets are no longer freed, either: each worker's `munmap` calls stopped
+the other workers for a TLB flush, and the exit unmaps the pages anyway.
+
+Mapped in by every worker, the array's pages raised memory.peak by 1.1 MiB, 13.04 against 11.91
+MiB (medians, 24 alternating runs), and by 0.6–1.4 MiB on each of full seeds 1–7 and 10–12
+(3 runs each), though `smaps` at exit showed less anonymous memory than step 32's. memcg charges
+a CPU 64 pages at a time and keeps the rest of the batch for that CPU's next pages, and
+memory.peak counts the whole batch. At the end of the rounds memory.current exceeded `anon` +
+`kernel` in memory.stat by a median 2.1 MiB, against 1.2 MiB for step 32 with the forget (12
+and 18 runs). More pages per worker confirmed it: 16 or 32 more each, 0.75 or
+1.5 MiB in all, left the peak at 13.10 and 13.16 MiB (13.10 without them), and 48 raised it to
+15.27 MiB. So the main thread maps the array's pages in before the spawn with
+`madvise(MADV_POPULATE_WRITE)`, on one CPU as step 32's writes were: 11.79 against 11.74 MiB
+(medians, 30 alternating runs; the highest of 5 runs, which the board takes, 12.20 against 12.15
+MiB by resampling). The table of code numbers, 17.5 KB per worker, is freed before the worker's
+groups are made, which reuse its pages: 0.23 MiB less `anon`.
+
+`ab.py` against step 32, 50 interleaved runs, two rounds, medians / minimums: 32.60 / 31.98 →
+31.58 / 30.87 ms and 33.04 / 32.17 → 31.82 / 31.01 ms. instructions:u on one E-core: 1402.29 →
+1403.90 M, the rows now read twice. S 309 → 319. Correctness: the gate, 310 pass, 0 fail; full
+seeds 1–7 and 10–12 give the reference hashes; the 400 fuzz cases pass at the default thread
+count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300
+tiny seeds pass at 1, 2, 3, 5, 7, 12, 16, 23, 37 and 64 threads with 100-byte rounds; clippy
+reports no warnings.
+
+Dropped: the pages written from the main thread one byte each, the same memory.peak and 0.16 to
+0.28 ms slower (`ab.py`, 50 runs, three rounds); the pages written by worker 0 during the first
+step, 12.43 against 11.96 MiB for step 32 (16 runs); and the array written by worker 0 alone in
+the second step, 12.89 against 12.30 MiB for step 32 with the forget (6 runs). Freeing the name
+sets as before measured 32.04 / 31.57 and 32.09 / 31.60 ms against 31.94 / 31.38 and 32.03 /
+31.57 ms with the forget (50 runs, two rounds), with memory.peak 12.11 against 11.86 MiB (24
+runs).
 
 ## Experiments that did not stay
 
