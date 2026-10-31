@@ -1406,7 +1406,8 @@ interleaved runs:
   it: instructions −0.77%, cycles −0.02%, seven rounds from −0.2% to +0.2%.
 
 The board's run, run-d1b2c0ca269e (commit ca86ea9), drew 24.0 ms, a slow draw: step 39's code drew
-22.8 ms in its own run, and this step runs 0.8–1.4% faster locally.
+22.8 ms in its own run, and this step runs 0.8–1.4% faster locally. A second run of the same code,
+run-604f816aac75 (commit 0327cbc, which changed only track A), drew 22.76 ms, 12.5 MB and 80.5 points.
 
 ## Experiments that did not stay
 

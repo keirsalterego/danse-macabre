@@ -61,7 +61,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 54 | The latency's space bounded with `assert_unchecked`, so reading the status and ending the name take no bounds checks: 9.8 M instructions fewer | run-c0db6c54d9a4 | 0.0225 | 18.0 | 83.8 |
 | 55 | 3 fewer lines: `parse` an `unsafe fn` whose contract is the padding its `assert!` checked, and two range checks left to the indexes behind them | run-c0db6c54d9a4 | 0.0225 | 18.0 | 83.8 |
 | 56 | 6 fewer lines at the same speed: a line's six numbers written in one `map`, the format queue built without collecting the hours, the latencies placed in the whole buffer, the two counters on one line | run-c0db6c54d9a4 | 0.0225 | 18.0 | 83.8 |
-| 57 | Threads started one after another by one helper instead of by a tree, so that fewer of them wait for the interner's lock at once: 2 fewer lines | | | | |
+| 57 | Threads started one after another by one helper instead of by a tree, so that fewer of them wait for the interner's lock at once: 2 fewer lines | run-0899dd30b0f4 | 0.0172 | 18.4 | 86.7 |
 
 ## Step 1: v1
 
