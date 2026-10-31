@@ -42,6 +42,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 35 | The name hash reads two 8-byte windows of the name instead of three | run-b8eed3b9c923 | 0.0187 | 18.3 | 85.6 |
 | 36 | Each record stored, and each padded copy read, without a bounds check | run-921f52908023 | 0.0183 | 18.5 | 85.7 |
 | 37 | 5 fewer lines with the same machine code: the hour sizes summed inside `sort_by_cached_key`, the name hash's two cases as a `match`, and `same_name` folded into its one caller | run-9fe0786e93d3 | 0.0195 | 18.3 | 85.1 |
+| 38 | A large latency's record field set in the branch that lists it, instead of by a `min` on every line | | | | |
 
 ## Step 1: v1
 
@@ -543,6 +544,20 @@ took four. `same_name`, a one-line function with one caller, is folded into `Int
 whose doc now carries its explanation. `.text` and `.rodata` are byte-identical to step 36's, so
 T and M cannot move. S 385 → 380. Gate: 310 pass, 0 fail. The board's run of this code, run-9fe0786e93d3,
 drew 19.5 ms, against 18.3 ms for step 36's identical machine code: a slow draw.
+
+## Step 38: no `min` on every line
+
+The record's latency field was `micros.min(LARGE)`, a compare and a conditional move on
+every line, though the branch just before it, which lists a large latency, has already decided
+the same thing. That branch now sets the field to `LARGE` itself, and other lines store the
+latency as it is.
+
+Local, turbo off: instructions 701.5 → 692.3 M (3 per line). `ab.py`, 61 interleaved runs, six
+rounds: medians 20.98 → 20.91, 21.04 → 20.91, 20.98 → 20.85, 20.99 → 20.77, 20.97 → 20.85 and
+20.98 → 20.88 ms, minimums 20.37 → 20.28, 20.24 → 20.02, 20.50 → 20.39, 20.46 → 20.03,
+20.22 → 20.16 and 20.56 → 20.28 ms. memory.peak, 11 alternating rounds on each of seeds 1–7 and
+10–12: median 18.08 → 18.13 MB, with no change to any allocation. S 380 → 381. Gate: 310 pass,
+0 fail.
 
 ## Experiments that did not stay
 

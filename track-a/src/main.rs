@@ -386,7 +386,7 @@ fn parse<'a>(log: &'a [u8], lines: Range<usize>, endpoints: &Interner<'a>) -> Ch
         // It is the first byte there without bit 6 (0x40), which every capital letter has.
         let start = 32 + (!word(line, 31) & 0x4040_4040_4040_4040).trailing_zeros() as usize / 8;
         // `space` precedes the latency; before it sit the 3-digit status and its own space.
-        let (micros, space) = latency(line, lf);
+        let (mut micros, space) = latency(line, lf);
         let name = &line[start..space - 4];
         let window = line[start..start + 64].try_into().expect("start <= 40");
         let id = endpoints.intern(name, hash(name, word(line, start)), window);
@@ -394,12 +394,13 @@ fn parse<'a>(log: &'a [u8], lines: Range<usize>, endpoints: &Interner<'a>) -> Ch
         let error = u32::from(line[space - 3] == b'5');
         if micros >= LARGE {
             chunk.large.push(micros);
+            micros = LARGE;
         }
         // SAFETY: each line moves `i` on by at least MIN_LINE bytes, malformed or not, since
         // `line_end` starts looking at byte MIN_LINE - 1, so `count` stays below the length the
         // records were given.
         unsafe {
-            *chunk.records.get_unchecked_mut(count) = id << 20 | error << 19 | micros.min(LARGE);
+            *chunk.records.get_unchecked_mut(count) = id << 20 | error << 19 | micros;
         }
         count += 1;
     }
