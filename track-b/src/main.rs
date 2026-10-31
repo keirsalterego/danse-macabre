@@ -220,7 +220,7 @@ fn parse_queries(text: &[u8], threads: usize) -> Result<(Queries, TermTable), St
             queries.at.push(queries.at[queries.at.len() - 1] + len);
         }
         queries.ops.extend(part.ops);
-        (queries.terms).extend(part.keys.iter().map(|&key| table.intern(key)));
+        (queries.terms).extend((0..part.keys.len()).map(|i| table.intern(&part.keys, i)));
     }
     Ok((queries, table))
 }
@@ -311,16 +311,10 @@ impl Plan {
     fn new(queries: &Queries, mut terms: TermTable, docs: &[u8], threads: usize) -> Self {
         let (hits, sampled) = sample_hits(docs, &terms, threads);
         // Fewer sample hits cost less. Among equals (often zero hits), longer terms tend to be
-        // rarer, so they cost a little less; a key's length is its count of nonzero bytes.
-        // Computed in one pass, as reading hits and keys term by term costs two cache misses
-        // per call.
-        let costs: Vec<u64> = (hits.iter().zip(&terms.keys))
-            .map(|(&hits, key)| {
-                let len: u32 = key.iter().map(|word| 8 - word.leading_zeros() / 8).sum();
-                u64::from(hits) * 64 + u64::from(MAX_TERM as u32 - len)
-            })
-            .collect();
-        let cost = |t: u32| costs[t as usize];
+        // rarer, so they cost a little less.
+        let cost = |t: u32| {
+            u64::from(hits[t as usize]) * 64 + MAX_TERM as u64 - u64::from(terms.lens[t as usize])
+        };
         // A bitset takes a bit per document and a list 16 bits per document holding the term.
         let common = |t: u32| hits[t as usize] as usize * DENSE_SHARE >= sampled.max(1);
         // Each thread plans a share of the queries: its (trigger term, phrase) and (trigger term,
@@ -354,7 +348,7 @@ impl Plan {
         let (phrase_at, phrases) = group(terms.len(), &phrases);
         let (check_at, checks) = group(terms.len(), &checks);
         // A term triggers phrases or checks when its group holds any.
-        let has = |at: &[u32], flag| u32::from(at[0] < at[1]) * flag;
+        let has = |at: &[u32], flag| u8::from(at[0] < at[1]) * flag as u8;
         let flag = |(p, c)| has(p, Slot::PHRASE) | has(c, Slot::BOOL);
         let groups = phrase_at.windows(2).zip(check_at.windows(2));
         let mut flags: Vec<_> = groups.map(flag).collect();
@@ -368,7 +362,7 @@ impl Plan {
                 let kind = usize::from(!common(t));
                 store[t as usize] = sizes[kind] + LIST * kind as u32;
                 sizes[kind] += 1;
-                flags[t as usize] |= [Slot::ROW, Slot::LISTED][kind];
+                flags[t as usize] |= [Slot::ROW, Slot::LISTED][kind] as u8;
             }
         }
         terms.mark(&flags);
@@ -522,10 +516,14 @@ fn sample_hits(docs: &[u8], terms: &TermTable, threads: usize) -> (Vec<u32>, usi
 
 /// [`sample_hits`] on one part of the sample.
 fn count_hits(sample: &[u8], terms: &TermTable) -> (Vec<u32>, usize) {
-    // Written when allocated, as in [`Tally::new`], so that no page faults twice.
-    let mut hits = [0].repeat(terms.len());
-    // Per term, the last sampled document counted, so a document counts once.
-    let mut counted = vec![usize::MAX; terms.len()];
+    // Per term, 2^16 times the number of documents that hold it, plus the number of the last of
+    // them, so that a document counts once, in one access per token. The low half starts at
+    // 0xFFFF, no document's number but the 65,536th. Written when allocated, as in
+    // [`Tally::new`], so that no page faults twice.
+    // shortcut: a part of 2^16 documents or more wraps the numbers and counts, which only skews
+    // the estimates; the most documents `answer_all` takes, 2^20, sample about 2^14. Widen the
+    // cells to u64 if parts grow that large.
+    let mut cells = [0xFFFF].repeat(terms.len());
     // A line's tokens are probed at its end, as in [`scan`], and one past `MAX_TERM` bytes takes
     // a key that no term has.
     let (mut doc, mut probes) = (0, Vec::new());
@@ -534,16 +532,16 @@ fn count_hits(sample: &[u8], terms: &TermTable) -> (Vec<u32>, usize) {
         probes.push((key, terms.prefetch(&key)));
     };
     walk(sample, &mut probes, token, |probes| {
+        let low = doc as u32 & 0xFFFF;
         for (key, at) in probes.drain(..) {
             // A token that is no query term counts at id 0, which no query reads.
             // SAFETY: `at` is the key's home slot, from [`TermTable::prefetch`].
-            let id = unsafe { terms.find_from(&key, at) }.id() as usize;
-            hits[id] += u32::from(counted[id] != doc);
-            counted[id] = doc;
+            let cell = &mut cells[unsafe { terms.find_from(&key, at) }.id() as usize];
+            *cell = (*cell & !0xFFFF | low) + (u32::from(*cell & 0xFFFF != low) << 16);
         }
         doc += 1;
     });
-    (hits, doc)
+    (cells.into_iter().map(|cell| cell >> 16).collect(), doc)
 }
 
 /// The id of the line that starts at `at`, or the number of documents when `at` is the end of
@@ -1126,8 +1124,11 @@ impl Slot {
 struct TermTable {
     /// The slot count is a power of two.
     slots: &'static mut [Slot],
-    /// Term id → its key. Id 0 is no term: it is the id of an empty slot, all zero, which a
-    /// probe for a token that is no query term returns.
+    /// Term id → its length in bytes. Id 0 is no term: it is the id of an empty slot, all zero,
+    /// which a probe for a token that is no query term returns.
+    lens: Vec<u8>,
+    /// Term id → its key, for the terms longer than 12 bytes, the only keys a probe reads. The
+    /// others stay zero, so that a page that holds no long term's key is never touched.
     keys: Vec<Key>,
 }
 
@@ -1155,12 +1156,12 @@ impl TermTable {
             block.write_bytes(0, layout.size());
             std::slice::from_raw_parts_mut(block.cast(), len)
         };
-        let keys = vec![[0; MAX_TERM / 8]];
-        Self { slots, keys }
+        let (lens, keys) = (vec![0], vec![[0; MAX_TERM / 8]; occurrences + 1]);
+        Self { slots, lens, keys }
     }
 
     fn len(&self) -> usize {
-        self.keys.len()
+        self.lens.len()
     }
 
     /// The slot of the query term whose key this is, given `at = self.home(key)`, or else the
@@ -1189,27 +1190,35 @@ impl TermTable {
         at
     }
 
-    /// The id of the term whose key this is. A new term takes the next id and the free slot
-    /// where its probe ends.
-    fn intern(&mut self, key: Key) -> u32 {
+    /// The id of the term `keys[i]`. A new term takes the next id and the free slot where its
+    /// probe ends. The home slot of `keys[i + 16]` starts loading meanwhile, so that its probe
+    /// seldom waits.
+    fn intern(&mut self, keys: &[Key], i: usize) -> u32 {
+        keys.get(i + 16).map(|ahead| self.prefetch(ahead));
+        let key = keys[i];
         // SAFETY: a home slot is below the slot count.
         let at = unsafe { self.position(&key, self.home(&key)) };
         // No branch on whether the term is new, which follows no pattern: the slot is written
-        // and the key pushed either way, and the key dropped again unless the term is new.
-        let (new, n) = (self.slots[at].head == 0, self.keys.len());
+        // and the length pushed either way, and the length dropped again unless the term is new.
+        let (new, n) = (self.slots[at].head == 0, self.lens.len());
         let id = std::hint::select_unpredictable(new, n as u32, self.slots[at].id());
         let (head, tail, flags) = (key[0], Slot::tail(&key), id << 4);
         self.slots[at] = Slot { head, tail, flags };
-        self.keys.push(key);
-        self.keys.truncate(n + usize::from(new));
+        // A key's length is its count of nonzero bytes.
+        self.lens
+            .push(key.iter().map(|w| 8 - w.leading_zeros() as u8 / 8).sum());
+        self.lens.truncate(n + usize::from(new));
+        // Only a new term longer than 12 bytes keeps its key; every other key goes to entry 0,
+        // which no probe reads, so that no branch is taken.
+        self.keys[usize::from(new && key[1] >> 32 != 0) * id as usize] = key;
         id
     }
 
     /// Adds `flags[id]` to the flags of each term `id`. An empty slot, id 0, adds `flags[0]`,
     /// which is 0: a test for empty slots, which lie at random, would mispredict often.
-    fn mark(&mut self, flags: &[u32]) {
+    fn mark(&mut self, flags: &[u8]) {
         for slot in self.slots.iter_mut() {
-            slot.flags |= flags[slot.id() as usize];
+            slot.flags |= u32::from(flags[slot.id() as usize]);
         }
     }
 

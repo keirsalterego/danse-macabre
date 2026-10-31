@@ -40,6 +40,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 33 | A document's checks are added in one `Tally` method that takes no branch on a check's result: the queries of the checks that the document is one of the first matches of are moved to the front of its list of checks, and only those go on to the first-match counts | run-94e224675c5a | 0.1455 | 41.3 | 74.8 |
 | 34 | The term lookups take no bounds checks: the probe reads the slots unchecked from a key's home slot on, the prefetches take pointers, and the token loop holds the term table and the seen bits as locals | run-401b90111691 | 0.1618 | 40.5 | 73.7 |
 | 35 | 11% fewer instructions in the corpus pass: a document's checks are written to a slice sized once and evaluated without bounds checks, the tokenizer picks the start of a token carried over from the previous block once per block, a key's window takes one bounds check and its hash two words, phrases are compared inline, and a long key's mark rides in its slot's tail | run-8bf61f0fec95 | 0.1313 | 43.3 | 75.9 |
+| 36 | The serial start about 2.2 ms shorter: the intern prefetches 16 keys ahead and keeps each term's length and only the long terms' keys, a term's cost is computed where the planning reads it, the sample keeps each term's count and last document in one cell, and the term table's flags are collected in bytes | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -860,6 +861,58 @@ Peeling the carried token out of the loop behind a branch cut instructions to 6,
 the block's first end, with the conditional move kept there, cut them to 6,332 M. Writing the
 rest of a range of more than four checks through a `zip` added 120 M instructions; writing it
 at an offset from the cursor, one line shorter, added 8.5 M and 0.1 M branch misses.
+
+## Step 36: a shorter serial start
+
+After step 35 the pass started 14.2–14.9 ms into a run on seed 1 (local, on AC, turbo off, a
+build with timestamps, 12 threads on the P-cores, medians over three rounds of 11 or more
+runs). Interning the query terms on one thread took 3.7 ms, the sample 3.4–3.7 ms and the
+planning 1.3 ms, all of it before the pass.
+
+- **The intern prefetch put back.** [`TermTable::intern`] takes the parsed keys and an index,
+  and starts loading the home slot of the key 16 places on, so that its probe seldom waits:
+  interning 3.60 → 3.02 ms. After step 33 it saved about 0.35 ms for 3 more lines and was
+  left out; it now takes 2.
+- **Lengths instead of keys.** The table kept each term's 32-byte key, pushed at each occurrence
+  and dropped again unless the term was new: 2.4 MB for seed 1's 75,747 terms. The costs read
+  only the keys' lengths, and the probe only the keys longer than 12 bytes, which a slot does
+  not hold whole (13 terms on seed 1). The table now keeps each term's length in a byte, and the
+  long keys in an array of zeroed entries, one per term occurrence and one for id 0: only a new
+  long term writes its key at its id, and every other key is written to entry 0, which no probe
+  reads, so that no branch is taken. On seed 1 its written entries take one 2 MiB huge page.
+  Interning without the prefetch: 3.73 → 3.60 ms.
+- **Costs where the planning reads them.** A term's cost is computed from its sample hits and
+  its length when a query is planned, instead of read from a table that one pass over the hits
+  and the keys filled first: the planning 1.30–1.34 → 0.98–1.06 ms.
+- **The sample in one cell per term.** [`count_hits`] kept, per term, a count and the last
+  document counted in two arrays, so each token cost two random accesses, and the second
+  array, 606 KB per thread, took 148 page faults on each. A `u32` cell now holds the count in
+  its high half and the last document's number in its low half: the sample 3.40–3.72 →
+  2.33–2.46 ms.
+- **The flags in bytes.** The flags that [`TermTable::mark`] adds to the slots are collected
+  in bytes instead of `u32`s: 0.15–0.16 → 0.04 ms.
+
+In the round that timed both, the pass started at 14.24 ms for step 35 and 12.06 ms for this
+step; over three rounds each, at 14.24–14.86 and 12.06–12.50 ms, and the pass itself took
+118.8–121.6 and 119.5–119.8 ms.
+
+Local, against step 35 (`ab.py`, 20 alternating runs, CPUs 12-15, on AC), two rounds: medians
+139.93 and 140.59 → 137.99 and 138.03 ms, minimums 138.94 and 138.95 → 135.71 and 136.54 ms.
+`perf stat` on CPUs 12-15: instructions 6,080 → 6,090 M, page faults 11,949 → 10,560; on the
+P-cores, page faults 19,235 → 16,669. memory.peak over 12 alternating runs on the P-cores:
+median 42.3 → 41.4 MB. S 761 → 761. Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match
+their reference hashes.
+
+The grouping's arrays written when allocated, as tried after step 17, took the checks' grouping
+from 1.27 to 1.32 ms, with 10,564 page faults against 10,560. The prefetch 8 or 32 places on:
+interning 3.17 and 3.15 ms, against 3.09 at 16. The table's flags added on every thread, a share
+of the slots each: marking and the rest of the plan 0.83 → 0.69 ms, for 3 more lines. On
+battery, the plan's groups placed on every thread, a range of keys each, took the phrases'
+grouping from 0.47 to 1.33 ms and the checks' from 2.03 to 1.65 ms, and the start from 20.51 to
+21.53 ms; the sample's counts summed on every thread after a barrier took the start from 19.13
+to 18.92 ms, for 15 more lines. A long key found by a binary search in a sorted list of the long
+terms, or in a cold function, instead of in an array by id, added 200–302 M instructions to the
+pass, as the probe loop then spilled registers.
 
 ## Experiments that did not stay
 
