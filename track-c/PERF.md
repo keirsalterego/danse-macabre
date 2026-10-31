@@ -31,6 +31,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 24 | 1 fewer line: `main` maps both input files through one closure | run-b455f587cb61 | 0.0358 | 12.9 | 76.4 |
 | 25 | A name's letter masked to its length by a 24-byte window of a constant, and each letter posted at a running index into its owner's mailbox | run-b89d1be25a5e | 0.0348 | 12.5 | 76.9 |
 | 26 | The long-name compare out of line, so the probe for every other name stops paying for its bounds checks | run-8378d5c7581d | 0.0334 | 12.6 | 77.2 |
+| 27 | A plain static executable instead of a static PIE (`relocation-model=static`) | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -726,6 +727,17 @@ two of them sets of long names, pass at the default thread count, at 1, 3, 12, 3
 threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300 tiny seeds pass at 10 thread
 counts with 100-byte rounds; the region sets give step 25's results; clippy reports no
 warnings.
+
+## Step 27: a plain static executable
+
+`-C relocation-model=static` joins `+crt-static` in `.cargo/config.toml`, as in track A: the
+binary is a plain static executable at a fixed address instead of a static PIE that relocates
+itself before `main`.
+
+Local, turbo off: `ab.py` against step 26, 40 interleaved runs, five rounds: medians 36.54 →
+36.47, 36.65 → 36.49, 37.50 → 36.60, 36.47 → 36.17 and 36.61 → 36.53 ms, minimums 35.92 → 35.57,
+35.83 → 35.86, 35.53 → 35.73, 35.61 → 35.60 and 35.85 → 35.56 ms. The third round ran on a busy
+machine (means 49.9 and 45.5 ms). S unchanged at 299. Gate: 310 pass, 0 fail.
 
 ## Experiments that did not stay
 
