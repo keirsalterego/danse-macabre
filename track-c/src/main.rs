@@ -88,9 +88,6 @@ const BOM: &[u8] = b"\xEF\xBB\xBF";
 /// (24) and [`text_field`] (32) always fit in the input, and none of them needs a shorter path
 /// for its end.
 const PAD: usize = 32;
-/// The number of possible country codes. Codes are `[A-Z]{3}` (spec §2.3), so a code read as a
-/// base-26 number indexes a table of 26³ entries, and that number sorts like the code's bytes.
-const CODES: usize = 26 * 26 * 26;
 /// Bytes of its run a worker parses per round before the workers swap names. Small rounds keep
 /// the mailboxes small and the names just parsed still in cache when their owner reads them.
 const ROUND_BYTES: usize = 64 << 10;
@@ -119,7 +116,7 @@ unsafe extern "C" {
     fn prctl(option: i32, ...) -> i32;
     /// glibc's `mallopt(3)`, used once, with `M_MMAP_THRESHOLD`.
     fn mallopt(param: i32, value: i32) -> i32;
-    /// libc's `madvise(2)`, used with `MADV_DONTNEED` (see [`release`]).
+    /// libc's `madvise(2)`, used with `MADV_DONTNEED` (see [`join`]).
     fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
 }
 
@@ -193,23 +190,6 @@ fn map_file(path: &Path) -> Result<&'static [u8], String> {
     Ok(unsafe { std::slice::from_raw_parts(ptr, len + PAD) })
 }
 
-/// Gives the whole pages inside `bytes` back to the kernel with `madvise(MADV_DONTNEED)`.
-///
-/// At exit the kernel unmaps every page of the input on one thread, inside the timed window: an
-/// explicit `munmap` of the 200 MB took 2.8 ms. So each worker releases its own run of records,
-/// in parallel, once the last round has shown that every worker is done parsing (see
-/// [`join`]). Releasing earlier would slow the threads still parsing, because dropping
-/// pages makes the kernel flush every thread's TLB. A page shared with a neighbouring run stays
-/// mapped. A later read of a dropped page maps the file's data again, so the call is only
-/// advice, and its result is ignored.
-fn release(bytes: &[u8]) {
-    let first = bytes.as_ptr().addr().next_multiple_of(4096);
-    let len = ((bytes.as_ptr().addr() + bytes.len()) & !4095).saturating_sub(first);
-    // SAFETY: the pages lie inside `bytes`, in a file mapping that stays mapped, so a later read
-    // of them sees the same bytes. An empty range does nothing. Advice 4 is `MADV_DONTNEED`.
-    unsafe { madvise(bytes.as_ptr().with_addr(first), len, 4) };
-}
-
 /// Runs `work(i)` for each `i` in `0..n`, each on a thread of its own, and returns the results
 /// in order of `i`.
 fn parallel<T: Send>(n: usize, work: &(impl Fn(usize) -> T + Sync)) -> Vec<T> {
@@ -229,17 +209,15 @@ fn parallel<T: Send>(n: usize, work: &(impl Fn(usize) -> T + Sync)) -> Vec<T> {
 /// even share of the file as (id, country code). Each row is `region_id,country` and an LF (spec
 /// §2.3): the digits run up to the comma, and the rest of a row has a fixed length, so the row's
 /// end comes out of the parse with no search for the LF. Numbering the countries that occur, by
-/// walking the [`CODES`] table in index order, then sorts them bytewise for free, and one walk
-/// over the rows writes each region's group. The join cannot start before this ends, and on one
-/// thread it took 3.8 ms (PERF.md, step 11).
+/// walking the table of all 26³ codes in index order, then sorts them bytewise for free, and one
+/// walk over the rows writes each region's group. The join cannot start before this ends, and on
+/// one thread it took 3.8 ms (PERF.md, step 11).
 fn parse_regions(csv: &[u8], threads: usize) -> (Vec<u8>, Vec<[u8; 3]>) {
-    let body = &csv[csv.iter().position(|&b| b == b'\n').expect("a header line") + 1..];
+    // From the header's LF on, so that a row starts at `p` exactly when `body[p - 1]` is an LF.
+    let body = &csv[csv.iter().position(|&b| b == b'\n').expect("a header line")..];
     let len = body.len() - PAD;
-    // The first row that starts at or after the `i`th of `threads` even cuts.
-    let cut = |i| match len * i / threads {
-        0 => 0,
-        at => (body[at - 1..len].iter().position(|&b| b == b'\n')).map_or(len, |lf| at + lf),
-    };
+    // The first row that starts after the `i`th of `threads` even cuts.
+    let cut = |i| ((len * i / threads + 1..len).find(|&p| body[p - 1] == b'\n')).unwrap_or(len);
     let lists = parallel(threads, &|i| {
         // Sized for the shortest row, `0,ABC` and its LF, so that the list never grows: lists
         // that grew left their old copies resident in each thread's malloc arena, 1.5 MiB in all.
@@ -254,20 +232,17 @@ fn parse_regions(csv: &[u8], threads: usize) -> (Vec<u8>, Vec<[u8; 3]>) {
         }
         list
     });
-    let (mut group_of_code, mut max_id) = (vec![0u8; CODES], 0);
-    for &(id, code) in lists.iter().flatten() {
-        group_of_code[code] = 1;
-        max_id = max_id.max(id);
-    }
+    // Codes are `[A-Z]{3}` (spec §2.3), so a code read as a base-26 number indexes a table of 26³
+    // entries, and that number sorts like the code's bytes.
+    let (mut group_of_code, mut max_id) = (vec![0u8; 26 * 26 * 26], 0);
+    (lists.iter().flatten()).for_each(|&(id, c)| (group_of_code[c], max_id) = (1, max_id.max(id)));
     let mut codes = Vec::new();
     for (code, group) in (group_of_code.iter_mut().enumerate()).filter(|g| *g.1 != 0) {
         codes.push([code / 676, code / 26 % 26, code % 26].map(|c| b'A' + c as u8));
         *group = u8::try_from(codes.len()).expect("at most 255 countries");
     }
     let mut by_id = vec![0; max_id + 1];
-    for &(id, code) in lists.iter().flatten() {
-        by_id[id] = group_of_code[code];
-    }
+    (lists.iter().flatten()).for_each(|&(id, code)| by_id[id] = group_of_code[code]);
     (by_id, codes)
 }
 
@@ -307,11 +282,9 @@ fn join(data: &[u8], by_id: &[u8], group_count: usize, threads: usize) -> Vec<Gr
     let body = 1 + data.iter().position(|&b| b == b'\n').expect("a header");
     // After an LF, a digit or a BOM, whose first byte is 0xEF.
     let start = |&k: &usize| data[k - 1] == b'\n' && matches!(data[k], b'0'..=b'9' | 0xEF);
-    let cut = |i| body + (len - body) * i / threads;
-    let guess = |i| (cut(i)..len).find(start).unwrap_or(len);
-    let bounds: Vec<_> = (0..threads).map(guess).chain([len]).collect();
-    let longest = bounds.windows(2).map(|w| w[1] - w[0]).max();
-    let rounds = longest.unwrap_or(0).div_ceil(ROUND_BYTES);
+    let run_start = |i| ((body + (len - body) * i / threads..len).find(start)).unwrap_or(len);
+    let bounds: Vec<_> = (0..threads).map(run_start).chain([len]).collect();
+    let rounds = (bounds.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0)).div_ceil(ROUND_BYTES);
     // SAFETY: `AtomicU64` has the same layout as `u64`, and all-zero bits are a valid 0.
     let zeroed = |len| unsafe { Box::<[AtomicU64]>::new_zeroed_slice(len).assume_init() };
     let letters = zeroed(2 * threads * threads * MAILBOX * 4);
@@ -323,8 +296,7 @@ fn join(data: &[u8], by_id: &[u8], group_count: usize, threads: usize) -> Vec<Gr
     // [`text_field`] skips names and notes while counting their escapes. In each round the
     // worker parses about [`ROUND_BYTES`] of its records and posts each record's name to the
     // worker that owns it, waits at the barrier for all workers, and then marks the names posted
-    // to it in its own [`NameSet`]. After the last round it gives its run's pages back (see
-    // [`release`]).
+    // to it in its own [`NameSet`]. After the last round it gives its run's pages back.
     let parts = parallel(threads, &|me| {
         let (mut at, end, mut groups) = (bounds[me], bounds[me + 1], vec![EMPTY; group_count]);
         // Full scale draws from 100,000 names (spec §2.2) in 202 MB (§5), about one per 2 KiB,
@@ -403,13 +375,24 @@ fn join(data: &[u8], by_id: &[u8], group_count: usize, threads: usize) -> Vec<Gr
                 names.read(mail(mailbox(half, from, me)), data, &mut groups);
             }
         }
-        release(&data[bounds[me]..bounds[me + 1]]);
+        // The run's pages go back to the kernel with `madvise(MADV_DONTNEED)`. At exit the kernel
+        // unmaps every page of the input on one thread, inside the timed window (an explicit
+        // `munmap` of the 200 MB took 2.8 ms), so each worker drops its own run here, in
+        // parallel. Every worker is done parsing by the last barrier; dropping pages earlier
+        // would slow the threads still parsing, because it makes the kernel flush every thread's
+        // TLB.
+        let page = bounds[me] & !4095;
+        // SAFETY: `data` is the read-only file mapping from [`map_file`], which starts a page,
+        // and the range, rounded out to whole pages, stays inside the file's pages. A dropped
+        // page that is read again, such as the end of the run before or a long name that an
+        // owner still compares, maps the same bytes from the file, so the call is only advice
+        // and its result is ignored. Advice 4 is `MADV_DONTNEED`.
+        unsafe { madvise(data[page..].as_ptr(), bounds[me + 1] - page, 4) };
         groups
     });
     let mut groups = vec![EMPTY; group_count];
-    for part in &parts {
-        groups.iter_mut().zip(part).for_each(|(g, p)| merge(g, p));
-    }
+    // Every part holds `group_count` groups, so the flattened parts go through them in turn.
+    (parts.iter().flatten().enumerate()).for_each(|(i, p)| merge(&mut groups[i % group_count], p));
     groups
 }
 

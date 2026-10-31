@@ -27,6 +27,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 20 | 2 fewer lines with the same machine code: a worker's position, run end and groups set in one statement, and so are a quoted field's start and end | run-66de751504ed | 0.0389 | 13.0 | 75.3 |
 | 21 | 3 fewer lines with the same machine code: one `unsafe` statement per `mmap` call, and the digit loop's two updates in one assignment | | | | |
 | 22 | 1 fewer line with the same machine code: the name set's probe names the hash once and takes the slot and the tag from it | | | | |
+| 23 | 17 fewer lines outside the record loop: each run's pages given back in two lines, rounded out to whole pages; the region rows cut, marked and written in one line each; and the rounds counted and the parts merged in one line each | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -572,15 +573,20 @@ Steps 16 and 17 went to the board in one push, so both rows cite run-521d52addb7
 
 ## Step 18: a leaner rewrite
 
-Lines were what kept C behind: at S 534 against an Sref of 108, they cost about 1.8 points
+Lines were what kept C behind: at S 534 against an Sref of 108, they cost about 1.9 points
 next to an entry of the same speed at S 298. So the design was written again with only the
 parts that measured as paying. Spec §2.2 makes the run starts exact: inside a note an LF is
 followed by a lowercase word or a quote, never by a digit or a BOM, so the first LF after a cut
 that a digit or a BOM follows starts a record. That drops the guessed starts, the check that
 the runs tile the file, the rerun when they don't, and the sentinel record. The name exchange
 keeps its design (owners, 32-byte letters, 64 KiB rounds, one barrier per round) with plain
-mailboxes instead of the `Exchange` type, and the field parsers, the region table and the name
-sets keep theirs. S 534 → 323.
+mailboxes instead of the `Exchange` type. Each mailbox now holds a whole round's worst case,
+64 KiB of 11-byte records, so no round ends early, every worker takes part in as many rounds
+as the longest run needs, and the barrier only counts arrivals: a waiter spins, then sleeps in
+50 µs steps, where step 17's parked until the last worker to arrive unparked it. The field
+parsers, the region table and the name sets keep their designs, less step 11's map for groups
+past 254 countries: more than 255 countries now stop the join with an error (§2.3 has 240),
+and a name's entry is always one 64-byte line. S 534 → 323.
 
 - `ab.py` against step 17, interleaved, medians / minimums: 101 runs twice, 39.82 / 38.86 →
   39.43 / 38.07 and 39.96 / 38.59 → 39.55 / 38.31 ms; 60 runs on seed 1, 39.92 / 38.77 →
@@ -590,7 +596,8 @@ sets keep theirs. S 534 → 323.
 - Correctness: the gate, 307 pass, 0 fail; full seeds 1–7 give the reference hashes; the 402
   fuzz cases pass at 1, 3, 12, 37 and 64 threads and with 100-byte rounds at 1, 2, 3, 12 and 64;
   the 300 tiny seeds pass at 10 thread counts with 100-byte rounds; the image built offline and
-  run with the harness's sandbox flags gives seed 1's hash.
+  run with the harness's sandbox flags gives seed 1's hash. Of step 11's region sets, the one
+  with shuffled ids passes, and the two with 689 and 692 countries stop with the error.
 
 ## Step 19: 5 fewer lines, the same machine code
 
@@ -625,6 +632,32 @@ and the max in one assignment. S 316 → 313. Gate: 307 pass, 0 fail; clippy rep
 it, where it cast `key[3]` twice, so its three declarations before the probe become two.
 `.text` and `.rodata` are byte-identical to step 21's binary. S 313 → 312. Gate: 307 pass,
 0 fail; clippy reports no warnings.
+
+## Step 23: 17 fewer lines outside the record loop
+
+Cuts on step 22 outside the record loop. The worker's code differs from step 22's only at its
+end and in register choices, a few stack moves and alignment padding:
+
+- Each worker gives its run's pages back in two lines at the end of its closure, instead of
+  through `release`. The range now runs from the page that holds the run's first byte to the
+  page that holds its last, where `release` kept to the pages wholly inside the run. A
+  neighbour that still reads a shared page, at the end of the run before, maps the same bytes
+  from the file again, as a long name compared after the release already could. 4 lines.
+- `parse_regions` keeps the header's LF at the start of `body`, so a row starts at `p` exactly
+  when `body[p - 1]` is an LF, and each cut is one `find` (3 lines). Marking the countries that
+  occur along with the largest id, and writing each region's group, take one statement each
+  (5 lines), and `CODES` is written out at its one use (1 line).
+- In `join`, a run's start is one closure, and the rounds are counted and the parts merged in
+  one statement each. 4 lines. `guess` is now `run_start`, since step 18 made the starts exact.
+
+S 312 → 295. `ab.py` against step 22, 101 interleaved runs, medians / minimums, two sessions:
+seed 1, 39.28 / 38.21 → 39.07 / 38.24 and 39.25 / 38.01 → 39.16 / 38.17 ms; seed 3,
+39.18 / 38.19 → 39.04 / 37.78 and 39.08 / 38.21 → 38.90 / 38.04 ms. memory.peak, 40
+alternating rounds: medians 11.950 → 11.930 MiB, means 12.024 → 11.915 MiB. Correctness: the
+gate, 307 pass, 0 fail; full seeds 1–7 give the reference hashes; the 402 fuzz cases pass at the
+default thread count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12
+and 64; the 300 tiny seeds pass at 10 thread counts with 100-byte rounds; clippy reports no
+warnings.
 
 ## Experiments that did not stay
 
