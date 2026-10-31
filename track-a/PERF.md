@@ -39,6 +39,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 32 | Hours summarized smallest first, the smallest few last, into a latency buffer of untouched zero pages | run-13fb10f4c6ee | 0.0196 | 19.1 | 84.9 |
 | 33 | One endpoint table that all threads share while they parse, instead of one per thread merged after it | run-9e334b5f00fa | 0.0190 | 18.9 | 85.3 |
 | 34 | The padded copies allocated uninitialized, not zeroed, and each list of large latencies reserved once | run-2c0e91287411 | 0.0190 | 18.3 | 85.4 |
+| 35 | The name hash reads two 8-byte windows of the name instead of three | | | | |
 
 ## Step 1: v1
 
@@ -486,6 +487,29 @@ parse. Tried and dropped, medians of memory.peak over 20 alternating runs, local
 - Each hour's lines released once formatted (1 line): in the probe the end of the output falls
   from 16.6–17.0 MiB (step 33) to 14.3–14.7 MiB, but the hour pass still sets the peak (17.47
   against 17.42 MiB without it).
+
+## Step 35: two windows per name hash
+
+A phase split of step 34 (instrumented build, 30 runs, local, turbo off; ms from before the
+fork): `main` starts at 0.57, the first worker at 0.80 and the last at 1.33. The parse takes
+11.1–11.7 ms per thread and ends between 12.39 and 12.64, the plan 0.07. The hour pass ends at
+17.12–17.55: per thread, counting 0.60 ms, the scatter 1.10, releasing records 0.24, and
+percentiles and lines 2.41. Formatting takes 1.67 ms per thread, releasing the input 0.59, the
+last thread calls `exit` at 20.40, and the parent's `wait` returns 0.79 ms later.
+
+`perf stat` counts 238.5 user instructions per line at 1.99 per cycle on each hyperthread, with
+0.05 L2 misses per line and 1.4% of cycles stalled on an L1 miss: the parse is bound by
+instructions, not by memory. The name hash read three 8-byte windows of the name, and the middle
+one cost a subtraction, a shift, a bounds check, a load, a rotate and an XOR on every line. Now
+it reads the first and the last only. In a simulation of the 8,192-slot table, 3.6–4.7% of lines
+need a second probe instead of 3.1–3.4% (seeds 1, 3 and 5), each a mispredicted branch: far less
+than the instructions saved.
+
+Local, turbo off: instructions 739.4 → 714.2 M, branch misses 1.09 → 1.08 M. `ab.py`, 61
+interleaved runs, four rounds: medians 21.58 → 21.12, 21.53 → 21.14, 21.58 → 21.11 and
+21.56 → 21.22 ms, minimums 21.10 → 20.62, 20.93 → 20.55, 20.98 → 20.39 and 21.17 → 20.74 ms.
+memory.peak, 12 alternating runs: median 18.17 → 18.14 MB. S unchanged at 382. Gate: 310 pass,
+0 fail.
 
 ## Experiments that did not stay
 

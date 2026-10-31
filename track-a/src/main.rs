@@ -497,22 +497,22 @@ fn word(bytes: &[u8], at: usize) -> u64 {
 /// Hashes an endpoint name for the [`Interner`], given `first`, the 8 bytes it starts with.
 ///
 /// Hashing every byte would need a loop whose length varies from line to line. Instead we mix
-/// the length with three 8-byte windows: the first, the middle and the last. That is a fixed
-/// amount of work, and it covers every byte of names up to 24 bytes long. Each window lies
-/// inside the name, so equal names always hash equal. Two different names that agree on all
-/// three windows would only share a probe sequence: the interner still compares the bytes.
+/// the length with two 8-byte windows: the first and the last. That is a fixed amount of work,
+/// and it covers every byte of names up to 16 bytes long. Each window lies inside the name, so
+/// equal names always hash equal. Two different names of one length that agree on both windows
+/// would only share a probe sequence: the interner still compares the bytes.
 ///
-/// The windows are rotated apart and combined with XOR, and one multiply mixes the result, whose
-/// top bits then depend on every bit (the interner indexes by them). Three dependent
-/// multiply-rotate steps, as in rustc's `FxHasher`, cost 21 million more instructions in the
-/// parse and saved few second probes: 3.1% of lines took one, against 3.2% now (seeds 1, 3 and
-/// 5, simulated).
+/// The last window is rotated away from the first and combined with XOR, and one multiply mixes
+/// the result, whose top bits then depend on every bit (the interner indexes by them). A middle
+/// window as well saved few second probes (3.1–3.4% of lines took one, against 3.6–4.7% now;
+/// seeds 1, 3 and 5, simulated) for 25 million instructions in the parse, 2% of the wall time.
+/// Three dependent multiply-rotate steps, as in rustc's `FxHasher`, cost 21 million more.
 fn hash(name: &[u8], first: u64) -> u64 {
     let n = name.len();
     let words = if n < 8 {
         first & u64::MAX >> (64 - 8 * n)
     } else {
-        first ^ word(name, n / 2 - 4).rotate_left(21) ^ word(name, n - 8).rotate_left(42)
+        first ^ word(name, n - 8).rotate_left(42)
     };
     (words ^ n as u64).wrapping_mul(0x517c_c1b7_2722_0a95)
 }
@@ -521,8 +521,8 @@ fn hash(name: &[u8], first: u64) -> u64 {
 ///
 /// It uses open addressing with linear probing. A name's hash picks a slot, and on a collision
 /// we try the next slot until we find the name or an empty slot. The table has 8,192 slots, so
-/// with the 1,842 endpoints of a seed it is less than a quarter full: at half full, 7.8% of
-/// seed 1's lines needed a second probe, each a mispredicted branch; at a quarter, 3.4% do. It
+/// with the 1,842 endpoints of a seed it is less than a quarter full: at half full, 8.2% of
+/// seed 1's lines would need a second probe, each a mispredicted branch; at a quarter, 3.9% do. It
 /// never grows: ids have 12 bits in a record, so a table takes at most 4,096 names, and at that
 /// it is half full and probes still end.
 ///
