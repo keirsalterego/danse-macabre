@@ -49,6 +49,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 42 | 13 fewer lines at the same speed: `region_amount` and `ALIGN` written shorter, the cold paths without `#[inline(never)]`, the mailboxes read in one `for_each` and published by their ends, and `parallel` written into `join` | run-d7d23764cf12 | 0.0219 | 11.4 | 81.6 |
 | 43 | A waiter at the barrier sleeps in steps of 10 µs with 1 ns of timer slack, so a sleeper is no longer late for its next round, and rounds of 128 KiB, half as many barriers | run-f276c02c1223 | 0.0219 | 11.4 | 81.6 |
 | 44 | 3 fewer lines at the same speed: the country numbers given by one `for_each` over `present().zip(1..)`, with the count from `present().count()`, and the mailbox ends published in one `for_each` | run-42fe84676c85 | 0.0218 | 11.6 | 81.6 |
+| 45 | The two hyperthreads of a core mark and parse side by side: a worker on an even CPU marks the round before's letters before its parse and one on an odd CPU after it. The 64-byte window of `text_fields` and the name set's probe read unchecked, and a new min or max is a branch instead of two stores per record | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1534,7 +1535,66 @@ On the same machine with turbo off, step 43 runs at 23.5 ms against step 42's 23
 the 7–12% that step 43 measured with turbo on most likely came from idle states the board's
 machine does not reach (its run drew 21.88 ms, step 42's 21.86 and 22.25).
 
+## Step 45: hyperthreads that mark while their sibling parses, and 39 M fewer instructions
+
+A profile of step 44 (P-cores, turbo off, 10 runs of `perf record -e cycles:upp`) put 24–26% of
+the samples in `NameSet::read`, 43% of them on the compare of the entry's key, which waits on the
+entry's load, and 5–14% on the barrier's `pause`. The marking runs on all 12 threads at once
+after each barrier, so both hyperthreads of a core waited on loads at the same time, and both
+parsed at the same time, when the core's ports are the limit (about 1.9 instructions per cycle
+each).
+
+- **Marking beside a parse.** The round loop runs once more than there are rounds, and in each
+  round a worker marks the letters of the round before, from the other half of the mailboxes:
+  before its parse if `sched_getcpu()` is even, after it if odd. Both orders mark round r − 1
+  between barriers r − 1 and r, and nothing posts to that half until barrier r has passed, so
+  the result is the same. CPUs 2k and 2k + 1 are the hyperthreads of one core here, so each core
+  runs one marking next to one parse at the start and the end of each round. The parity is read
+  once per round, so a worker that moves still marks each round once. +6 lines.
+- **The text window unchecked.** `byte_mask` takes the 64 bytes as `&[u8; 64]`, and
+  `text_fields` reads them without a bounds check, as an `unsafe fn`: the id's stop is at most
+  the pad's first byte, or its fourth after a BOM, so `PAD` grows to 128 bytes and the window
+  always fits. `text_fields_slow` keeps the check for its further blocks. 16.9 M fewer
+  instructions (4.8 per record).
+- **The probe unchecked.** `NameSet::read` takes the slot with `get_unchecked`, since the slots
+  are never empty, and the entry too, since a slot's number names an entry pushed before it.
+  13.0 M fewer instructions (3.7 per letter).
+- **Min and max as branches.** A record rarely sets a new min or max, so `merge` stores each only
+  when it changes. 9.1 M fewer instructions (2.6 per record), and two stores fewer.
+
+`perf stat -r 10`, full seed 1: instructions:u 851.3 → 812.2 M for the last three, then 800.2 M
+with the order of marking and parsing; the profile then has 24% in `read` and 5–10% in `pause`.
+`ab.py`, turbo off, interleaved runs, medians / minimums, step 44 → step 45: full seed 1, 51
+runs, 23.39 / 22.89 → 22.68 / 22.02 ms (−3.0%) and 23.43 / 22.85 → 22.52 / 22.08 ms (−3.9%);
+full seed 2, 41 runs, 23.38 / 23.01 → 22.54 / 22.05 ms (−3.6%). The three unchecked reads and
+the branches alone: 23.52 → 23.06 ms and 23.48 → 23.08 ms (−2.0%, −1.7%); the order of marking
+on top of them: 23.04 → 22.74 ms and 23.08 → 22.82 ms (−1.3%, −1.1%). memory.peak, 5 alternating
+runs: 10.3–10.6 MB for step 44 and 10.0–10.4 MB for this step. S 366 → 376. The gate passes
+(310 of 310), full seeds 1 and 2 give the reference hashes, and clippy reports no warnings.
+
 ## Experiments that did not stay
+
+- **Prefetching ahead in `NameSet::read`** (local, turbo off, on step 44's code), now that the
+  entry's load holds 43% of its samples: at letter i, the slot of letter i + 2k prefetched and the
+  entry of the slot of letter i + k (its first probe) prefetched, k = 4, 8 or 16, with the key's
+  line or the entry's first. `ab.py`, 25 interleaved runs, medians: 23.37 → 23.74, 23.78, 23.91
+  and 23.85 ms. For k = 8: L1 misses 11.38 → 6.63 M, but instructions 851.4 → 928.5 M (22 per
+  letter, the bounds checks of the reads ahead) and cycles 537.4 → 552.6 M. The entry prefetch
+  alone, 6 letters ahead: 23.45 → 23.48 ms (31 runs). Step 9's stage 4 found the same with
+  64-byte entries.
+- **The id's digits summed without parsing them** (local, turbo off, on step 45's unchecked reads
+  and branches): the id's word, shifted so its last digit is the top byte, went into the batch,
+  and the merge added its eight bytes, widened by `vpmovzxbd`, into four more words of the group,
+  as eight 32-bit sums of the digits at each place, joined into `id_sum` only for the output. That
+  skips the id's three multiplies. Instructions 812.2 → 809.0 M only, since the batch, the
+  96-byte groups and the slow path's value took back most of them, and cycles 520.8 → 532.4 M
+  and 521.9 → 528.3 M (`perf stat -r 10`, interleaved).
+- **The letter kept in a vector register** (local, turbo off, on step 45's code): `name_letter`
+  returned the `__m128i`, the owner came from `_mm_extract_epi32`, and the store took the
+  register, where the `[u64; 2]` went through the stack. 800.6 → 793.6 M instructions, but
+  `ab.py`, 51 interleaved runs, twice: 22.56 → 22.74 ms and 22.59 → 22.89 ms. +2 lines.
+- **Only the slot read unchecked** in the probe, with the entry's bounds check kept (one line
+  fewer): 793.6 → 803.2 M instructions on the build above.
 
 - **A structural index of the records** (local, on step 32's code), to break the chain between
   records: each record's start waits on the id's comma, the name's and the note's closing

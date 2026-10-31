@@ -45,9 +45,9 @@
 //!    names in rounds. In each round a thread parses 128 KiB of its records and posts each
 //!    record's name and group to the name's owner as a 16-byte letter, the name's 128-bit hash
 //!    with the group in its top byte (see [`name_letter`]). All threads then meet at a barrier,
-//!    and each reads the letters posted to it and sets the bits (see [`join`]). A bit that goes
-//!    from 0 to 1 is a name new to that country, so the counts come out of the marking with no
-//!    pass over the tables afterwards.
+//!    and in the next round each reads the letters posted to it and sets the bits (see [`join`]),
+//!    some before their parse and some after. A bit that goes from 0 to 1 is a name new to that
+//!    country, so the counts come out of the marking with no pass over the tables afterwards.
 //!
 //!    Names are hashed still escaped. Escaping is one to one, so two raw names differ exactly
 //!    when their unescaped values do, and the quoted empty name `""` and the unquoted one are
@@ -95,8 +95,9 @@ const BOM: &[u8] = b"\xEF\xBB\xBF";
 /// Zero bytes that [`map_file`] puts after the last byte of each file. Every position a parse
 /// reaches lies before them, so the fixed-size reads of [`number`] (8 bytes), [`region_amount`]
 /// (16), [`name_letter`] (32) and [`byte_mask`] (64) always fit in the input, and none of them
-/// needs a shorter path for its end.
-const PAD: usize = 64;
+/// needs a shorter path for its end. A name's window starts at most 3 bytes into the pad (see
+/// [`text_fields`]), so its 64 bytes need 67.
+const PAD: usize = 128;
 /// Bytes of its run a worker parses per round before the workers swap names. Small rounds keep
 /// the mailboxes small and the names just parsed still in cache when their owner reads them, and
 /// at 128 KiB a round's letters to one owner still fit in one page of its mailbox (see
@@ -142,6 +143,8 @@ unsafe extern "C" {
     fn mallopt(param: i32, value: i32) -> i32;
     /// libc's `madvise(2)`, used with `MADV_POPULATE_WRITE` and `MADV_DONTNEED` (see [`join`]).
     fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
+    /// glibc's `sched_getcpu(3)`, the CPU that runs the calling thread (see [`join`]).
+    fn sched_getcpu() -> i32;
 }
 
 /// The running aggregates of one output line: the record count, the id sum, the amount sum, the
@@ -324,9 +327,9 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
     // skips the name and the note while counting their escapes, and [`region_amount`] parses the
     // region id and the amount from one vector. In each round the
     // worker parses about [`ROUND_BYTES`] of its records and posts each record's name to the
-    // worker that owns it, waits at the barrier for all workers, and then marks the names posted
-    // to it in its own [`NameSet`]. After the last round it gives its pages back, and the last
-    // worker to finish writes the output.
+    // worker that owns it, marks the names posted to it in the round before in its own
+    // [`NameSet`], before or after the parse, and waits at the barrier for all workers. After the
+    // last round it gives its pages back, and the last worker to finish writes the output.
     let work = |me: usize| {
         // Step 0 of the region table: the codes of this thread's share of the rows.
         let mut mine = [0u64; CODES.div_ceil(64)];
@@ -358,8 +361,20 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
         // side, two of them were loaded as one, which cannot be forwarded from two stores, so it
         // waited for both to reach the cache, 0.44 to 0.64 M times per run (PERF.md, step 36).
         let mut batch = [(0, 0, 0, 0, 0, &boxes[0]); 4];
-        for round in 0..rounds {
+        for round in 0..=rounds {
             let half = round % 2;
+            // The letters of the round before. A worker on an even CPU marks them before it
+            // parses this round, and one on an odd CPU after, so the two hyperthreads of a core
+            // (CPUs 2k and 2k + 1) mostly run the marking, which waits on loads, next to a parse,
+            // which keeps the core's ports busy, where in step with each other they ran both
+            // together (PERF.md, step 45). The extra round marks the last round's letters.
+            let read = |names: &mut NameSet, groups: &mut [Group]| {
+                (0..threads).for_each(|from| names.read(mail(mailbox(1 - half, from, me)), groups));
+            };
+            // SAFETY: the call takes no arguments and only reads which CPU runs this thread. A
+            // thread that moves to another CPU still marks the round once, before or after.
+            let odd = unsafe { sched_getcpu() } % 2 == 1;
+            (round > 0 && !odd).then(|| read(&mut names, &mut groups));
             (sent.iter_mut().enumerate()).for_each(|(to, s)| *s = mailbox(half, me, to) * MAILBOX);
             let round_end = end.min(at + ROUND_BYTES);
             while at < round_end {
@@ -387,15 +402,18 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
                         // SAFETY: as above.
                         (id, comma) = unsafe { number(data, at + BOM.len(), b',') };
                     }
-                    let (name, name_len, note_len, after_note) = text_fields(data, comma + 1);
+                    // SAFETY: the id's stop is its first byte below `0`, so at the latest the pad's
+                    // first byte, or its fourth after a BOM at the input's last byte: the 64 bytes
+                    // past it end inside the pad.
+                    let (name, name_len, note_len, rest) = unsafe { text_fields(data, comma + 1) };
                     // SAFETY: the name ends at the latest at the comma after it, which
-                    // `text_fields` found. The 64 bytes of the pad are zeros, so the comma lies
+                    // `text_fields` found. The bytes of the pad are zeros, so the comma lies
                     // before them, and the name ends more than 64 bytes before the end of `data`.
                     let letter = unsafe { name_letter(data, name) };
-                    // SAFETY: `after_note` is one past a comma of the input. The 64 bytes of the
-                    // pad are zeros, so the comma lies before them, and the 16 bytes from it on
-                    // lie in `data`.
-                    let (region_id, cents, dot) = unsafe { region_amount(data, after_note) };
+                    // SAFETY: `rest` is one past a comma of the input. The bytes of the pad are
+                    // zeros, so the comma lies before them, and the 16 bytes from it on lie in
+                    // `data`.
+                    let (region_id, cents, dot) = unsafe { region_amount(data, rest) };
                     let byte = by_id.as_ptr().wrapping_add(region_id as usize);
                     // SAFETY: a prefetch reads nothing the program sees, and never faults.
                     unsafe { _mm_prefetch::<_MM_HINT_T0>(byte.cast()) };
@@ -403,10 +421,10 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
                     // file instead (§2.1), which leaves `at` past the end and stops the loop. CR
                     // is 0x0D and LF 0x0A, so the byte's lowest bit tells them apart, with one
                     // instruction fewer than a compare with CR.
-                    // SAFETY: `region_amount` puts the dot at most 13 bytes past `after_note`,
-                    // and `region_amount_slow` at most at the pad's second byte. `after_note` is
-                    // at most the input's length (see above), so the byte 3 past the dot lies in
-                    // the pad at the latest. Checked, the read took three more instructions.
+                    // SAFETY: `region_amount` puts the dot at most 13 bytes past `rest`, and
+                    // `region_amount_slow` at most at the pad's second byte. `rest` is at most
+                    // the input's length (see above), so the byte 3 past the dot lies in the pad
+                    // at the latest. Checked, the read took three more instructions.
                     at = dot + 4 + usize::from(unsafe { *data.get_unchecked(dot + 3) } & 1);
                     // The thread count as `sent.len()`: `threads`, read through the closure's
                     // reference to it, took one more load per record.
@@ -445,8 +463,8 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
             }
             (sent.iter().enumerate())
                 .for_each(|(to, &n)| ends[mailbox(half, me, to)].store(n as u64, Relaxed));
-            barrier(&arrived, (round + 3) * threads);
-            (0..threads).for_each(|from| names.read(mail(mailbox(half, from, me)), &mut groups));
+            (round > 0 && odd).then(|| read(&mut names, &mut groups));
+            (round < rounds).then(|| barrier(&arrived, (round + 3) * threads));
         }
         // The run's pages go back to the kernel with `madvise(MADV_DONTNEED)`, and then the name
         // set's entries. At exit the kernel unmaps every page left on one thread, inside the timed
@@ -514,10 +532,13 @@ fn barrier(arrived: &AtomicU64, all: usize) {
 }
 
 /// Adds `other`'s records to `group`. The hot loop in [`join`] also adds each single record this
-/// way, as a group of one, so there is one place that knows how fields combine.
+/// way, as a group of one, so there is one place that knows how fields combine. A record rarely
+/// sets a new min or max, so each takes a branch that skips its store: as `min` and `max`, both
+/// stored every time, they took 2.6 more instructions per record (PERF.md, step 45).
 fn merge(group: &mut Group, other: &Group) {
     (0..6).for_each(|i| group[i] += other[i]);
-    [group[6], group[7]] = [group[6].min(other[6]), group[7].max(other[7])];
+    (other[6] < group[6]).then(|| group[6] = other[6]);
+    (other[7] > group[7]).then(|| group[7] = other[7]);
 }
 
 /// Parses the decimal digits from `at` up to the `stop` byte, and returns the value and the
@@ -681,8 +702,14 @@ static ALIGN: [__m128i; 128] = {
 ///
 /// Walking each field's quotes cost a branch per quote, which records with an escaped quote
 /// mispredicted: this cut branch misses from 2.9 to 1.9 M per run (PERF.md, step 35).
-fn text_fields(data: &[u8], at: usize) -> (Range<usize>, i64, i64, usize) {
-    let (quotes, commas) = (byte_mask(data, at, b'"'), byte_mask(data, at, b','));
+///
+/// # Safety
+///
+/// The 64 bytes from `at` on lie in `data`. Checked, the read took six instructions per record.
+unsafe fn text_fields(data: &[u8], at: usize) -> (Range<usize>, i64, i64, usize) {
+    // SAFETY: the caller keeps the 64 bytes in `data`, and `[u8; 64]` needs no alignment.
+    let bytes = unsafe { &*data.as_ptr().add(at).cast() };
+    let (quotes, commas) = (byte_mask(bytes, b'"'), byte_mask(bytes, b','));
     let ends = commas & !prefix_xor(quotes);
     let (first, rest) = (ends.trailing_zeros() as usize, ends & ends.wrapping_sub(1));
     if rest == 0 {
@@ -709,9 +736,10 @@ fn text_fields_slow(data: &[u8], at: usize) -> (Range<usize>, i64, i64, usize) {
     // The commas that end the name and the note, each with the number of quotes before it.
     let (mut ends, mut found, mut block, mut odd, mut seen) = ([[0; 2]; 2], 0, at, 0, 0);
     while found < 2 {
-        let quotes = byte_mask(data, block, b'"');
+        let bytes = data[block..].first_chunk().expect("the input is padded");
+        let quotes = byte_mask(bytes, b'"');
         let inside = prefix_xor(quotes) ^ odd;
-        let mut commas = byte_mask(data, block, b',') & !inside;
+        let mut commas = byte_mask(bytes, b',') & !inside;
         while commas != 0 && found < 2 {
             let i = commas.trailing_zeros() as usize;
             let before = seen + (quotes & ((1 << i) - 1)).count_ones() as usize;
@@ -742,11 +770,10 @@ fn prefix_xor(bits: u64) -> u64 {
     }
 }
 
-/// The bytes equal to `byte` among the 64 at `at`, as a mask with bit i set where `data[at + i]`
-/// is `byte`: two AVX2 compares of 32 bytes, each packed into 32 bits by `vpmovmskb`. Written as
+/// The bytes equal to `byte` among `bytes`, as a mask with bit i set where `bytes[i]` is `byte`:
+/// two AVX2 compares of 32 bytes, each packed into 32 bits by `vpmovmskb`. Written as
 /// a loop over bytes, the compare that starts each record's window became byte loads and shifts.
-fn byte_mask(data: &[u8], at: usize, byte: u8) -> u64 {
-    let bytes: &[u8; 64] = data[at..].first_chunk().expect("the input is padded");
+fn byte_mask(bytes: &[u8; 64], byte: u8) -> u64 {
     // SAFETY: the build targets Alder Lake, which has AVX2 (see `.cargo/config.toml`), and both
     // 32-byte loads lie in `bytes`. `loadu` needs no alignment.
     let half = |i: usize| unsafe {
@@ -875,11 +902,18 @@ impl NameSet {
             let (mask, tag) = (self.slots.len() - 1, (high >> 48) as u8);
             let (group, mut slot) = ((high >> 56) as usize, key as usize & mask);
             let entry = loop {
-                let found = self.slots[slot];
+                // SAFETY: the slots are never empty (see `new`), so `mask` keeps `slot` below their
+                // length. Checked, the load took two instructions per probe.
+                let found = *unsafe { self.slots.get_unchecked(slot) };
                 match (found >> 8) as usize {
                     0 => break self.insert(slot, tag, key),
-                    e if found as u8 == tag && self.entries[e - 1].0 == key => {
-                        break &mut self.entries[e - 1];
+                    // SAFETY: a slot that is not 0 holds the entry count just after its entry was
+                    // pushed (see `insert`), and no entry is removed, so `e - 1` is an entry.
+                    e if found as u8 == tag
+                        && unsafe { self.entries.get_unchecked(e - 1) }.0 == key =>
+                    {
+                        // SAFETY: as above.
+                        break unsafe { self.entries.get_unchecked_mut(e - 1) };
                     }
                     _ => slot = (slot + 1) & mask,
                 }
