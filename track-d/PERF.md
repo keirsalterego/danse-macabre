@@ -21,7 +21,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 14 | 11 fewer lines with the same machine code: the single-item `use` lines in one, the `mmap` and `mallopt` constants written at their one call each with their names in a comment, the file descriptor passed straight to `mmap`, and two pairs of variables declared together | run-954b4981ddcb | 0.1255 | 68.1 | 72.7 |
 | 15 | 1 fewer line with the same machine code: `sort`'s counters and its running sum declared together | run-5194056b1310 | 0.1244 | 68.4 | 72.7 |
 | 16 | `Queue::push` forced inline, so a relaxation no longer pays for a call: 1.8% fewer instructions | run-fc6e22635c4b | 0.1221 | 67.7 | 73.0 |
-| 17 | Pass 3 gives back the places of sorted blocks as it goes: the threads take the blocks in turn, and the 2 MB pages below the slowest one's progress are dropped with `madvise` | | | | |
+| 17 | Pass 3 gives back the places of sorted blocks as it goes: the threads take the blocks in turn, and the 2 MB pages below the slowest one's progress are dropped with `madvise` | run-d253110190f5 | 0.1276 | 66.0 | 72.6 |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
