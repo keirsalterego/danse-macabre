@@ -957,6 +957,8 @@ and 10–12 give the reference hashes; clippy reports no warnings.
 The board's run of steps 54 to 56 together, run-c0db6c54d9a4 (commit ace82cf), drew 22.5 ms, a
 slow draw: locally, step 56's binary ran a median of 18.84 ms against step 53's 18.87 (`ab.py`, 82
 interleaved runs), and in the same run track D's unchanged code drew 127.8 ms, against 122 to 127.
+A second run of the same code, run-e31417916add (commit e7e0423, which changed only PERF.md files),
+drew 17.65 ms, 18.6 MB and 86.3 points.
 
 ## Experiments that did not stay
 
