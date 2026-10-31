@@ -36,6 +36,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 29 | `NameSet::read` takes each letter with plain loads and its group as a byte, and `insert` is cold, so marking a name runs 17 fewer instructions per record | run-c02fb16de73f | 0.0312 | 12.5 | 77.8 |
 | 30 | 5 fewer lines, three of them with the same machine code: the name set's insert builds its entry in the push and its marking loop takes the group and the key in one statement, `main` writes the output in one line and reads each directory with `nth`, and `merge` sets the min and the max in one assignment | run-3ce10275f327 | 0.0310 | 12.2 | 78.1 |
 | 31 | 1 fewer line with the same binary: the Dockerfile's build stage mounts its sources instead of copying them | run-66c99a1d91aa | 0.0309 | 11.9 | 78.2 |
+| 32 | The name set's probe ends at its entry's line, so a hit's index is checked once, and the test for a long name moves into the cold compare | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -842,6 +843,32 @@ mount of the context, and every builder that builds us is BuildKit: Depot, the b
 BuildKit fallback and final scoring's `docker build`. A local `docker build --network=none` of
 the old and the new Dockerfile gave binaries byte-identical to each other and to a cargo build of
 step 30, so T and M cannot move. S 308 → 307. Gate: 310 pass, 0 fail.
+
+## Step 32: the probe ends at its line
+
+`NameSet::read` probed for an entry's index and then indexed the entries with it once more to
+mark the bit. On a hit `holds` had already checked that index, but the check came again after
+the loop, where the index that `insert` returns joins it. The probe now ends at the line itself
+and `insert` returns the line it pushed, so a hit's index is checked once. The test for a long
+name, `key[3] >> 32 == LONG`, moved from `holds` into `same_text`, which only runs when two keys
+share their hash and length: in the probe, its two 64-bit constants held two registers for every
+letter.
+
+instructions:u on one E-core, so one worker and no waiting: 1428.20 → 1402.29 M, 7.0 fewer per
+record; the line alone 1408.85 M, the long-name test alone 1411.93 M. `perf stat -r 5` on the
+P-cores, twice: 1.442 / 1.443 → 1.415 / 1.417 G. `ab.py` against step 31, which has step 30's
+binary, 101 interleaved runs, medians / minimums: 33.50 / 32.31 → 33.05 / 32.07 ms and 33.59 /
+32.60 → 33.17 / 32.50 ms. The worker's code stays where it was; only `NameSet` and `same_text`
+change. S 307 → 309. No allocation changed. Correctness: the gate, 310 pass, 0 fail; full seeds
+1–7 and 10–12 give the reference hashes; the 400 fuzz cases pass at the default thread count, at
+1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300 tiny seeds
+pass at 1, 3, 12 and 64 threads with 100-byte rounds; 40 generated sets of names pass at 1–4
+CPUs; clippy reports no warnings.
+
+Dropped, by instructions on one E-core against this step's 1402.29 M: the key compare as an OR
+of XORs, which keeps the key out of memory but has LLVM build it from four scalars, 1444.50 M;
+`holds` borrowing the key, 1418.49 M; `insert` taking the letter where it lies, 1435.00 M; and
+`same_text` taking the key's offsets by value, 1402.29 M, the same code.
 
 ## Experiments that did not stay
 

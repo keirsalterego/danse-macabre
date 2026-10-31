@@ -593,15 +593,19 @@ impl NameSet {
             let (group, key) = ((d >> 48) as u8 as usize, [a, b, c, d & ((1 << 48) - 1)]);
             let (mask, hash) = (self.slots.len() - 1, key[3] as u32);
             let (mut slot, tag) = (hash as usize & mask, (hash >> 20) << 24);
-            let entry = loop {
+            // The probe ends at the entry's line rather than its index: `holds` has checked
+            // that index, and the index taken out of the loop was checked once more.
+            let line = loop {
                 let found = self.slots[slot];
                 match (found & ENTRY) as usize {
                     0 => break self.insert(slot, tag, key),
-                    e if found & !ENTRY == tag && self.holds(e - 1, key, data) => break e - 1,
+                    e if found & !ENTRY == tag && self.holds(e - 1, key, data) => {
+                        break &mut self.lines[e - 1];
+                    }
                     _ => slot = (slot + 1) & mask,
                 }
             };
-            let word = &mut self.lines[entry].0[4 + group / 64];
+            let word = &mut line.0[4 + group / 64];
             groups[group][5] += i64::from(*word >> (group % 64) & 1 == 0);
             *word |= 1 << (group % 64);
         }
@@ -612,16 +616,16 @@ impl NameSet {
     /// with the same hash are compared there.
     fn holds(&self, entry: usize, key: [u64; 4], data: &[u8]) -> bool {
         let held = &self.lines[entry].0[..4];
-        held == key || held[3] == key[3] && key[3] >> 32 == LONG && same_text(held, &key, data)
+        held == key || held[3] == key[3] && same_text(held, &key, data)
     }
 
     /// Appends an entry with the key `[a, b, c, d]` and no groups, puts it in the empty `slot`
-    /// with its `tag`, and returns its index. When the entries fill three quarters of the slots,
+    /// with its `tag`, and returns its line. When the entries fill three quarters of the slots,
     /// the slots double and every entry is placed again, so every probe ends at an empty slot.
     ///
     /// Cold, because inlined into [`NameSet::read`] it spilled the key of every letter.
     #[cold]
-    fn insert(&mut self, slot: usize, tag: u32, [a, b, c, d]: [u64; 4]) -> usize {
+    fn insert(&mut self, slot: usize, tag: u32, [a, b, c, d]: [u64; 4]) -> &mut Line {
         assert!(self.lines.len() < ENTRY as usize, "over 2^24 names");
         self.lines.push(Line([a, b, c, d, 0, 0, 0, 0]));
         self.slots[slot] = tag | self.lines.len() as u32;
@@ -636,16 +640,18 @@ impl NameSet {
                 self.slots[slot] = (line.0[3] as u32 >> 20) << 24 | (entry + 1) as u32;
             }
         }
-        self.lines.len() - 1
+        self.lines.last_mut().expect("an entry was just pushed")
     }
 }
 
-/// Whether the long names whose keys are `a` and `b` are the same bytes of `data` (see
-/// [`NameSet::holds`]). It is cold and out of line because inlined, its bounds checks were
-/// hoisted into the setup of every letter's probe, 18 instructions per record.
+/// Whether the keys `a` and `b`, which share their hash and length, are of one long name: the
+/// same bytes of `data` (see [`NameSet::holds`]). It is cold and out of line because inlined,
+/// its bounds checks were hoisted into the setup of every letter's probe, 18 instructions per
+/// record. The test for a long name is here too, because in the probe its two 64-bit
+/// constants held two registers for every letter.
 #[cold]
 fn same_text(a: &[u64], b: &[u64], data: &[u8]) -> bool {
-    data[a[0] as usize..a[1] as usize] == data[b[0] as usize..b[1] as usize]
+    a[3] >> 32 == LONG && data[a[0] as usize..a[1] as usize] == data[b[0] as usize..b[1] as usize]
 }
 
 /// Writes one line per group that has records: the countries in bytewise order, then
