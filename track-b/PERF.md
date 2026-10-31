@@ -35,7 +35,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 28 | The rarity sample probes a line's tokens at its end, as the pass does, and counts without a branch; interning a term takes no branch on whether it is new; the sample's end is found without the other 63 cuts | run-75ef64ef4099 | 0.1643 | 42.2 | 73.5 |
 | 29 | A query on sets adds its window's matches in one vectorized sum instead of a call per word; a term's store is a `u32` code instead of an enum; the terms kept in rows and in lists are listed apart, so adding them takes no branch on which | run-575e79713710 | 0.1623 | 43.1 | 73.7 |
 | 30 | A plain static executable (`crt-static` and `relocation-model=static`) instead of a dynamically linked PIE | run-4654d088e3bb | 0.1615 | 41.1 | 73.7 |
-| 31 | The token loop writes a document's term ids and its kept rows, lists and BOOL triggers into four runs of one slice, and its seen bits, without bounds checks, so its registers no longer spill | | | | |
+| 31 | The token loop writes a document's term ids and its kept rows, lists and BOOL triggers into four runs of one slice, and its seen bits, without bounds checks, so its registers no longer spill | run-ea58cfb946e5 | 0.1483 | 42.1 | 74.6 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -725,6 +725,12 @@ and the run took 11 ms longer.
 
 ## Experiments that did not stay
 
+- **PGO** (local, turbo off, on step 31's code): a profile from three runs on each of full seeds
+  2–4, passed as `-C profile-use`, with every function matching it. `ab.py`, 16 interleaved runs,
+  medians / minimums: 161.21 / 157.44 → 168.09 / 160.76 ms and 158.09 / 155.53 → 161.43 / 159.20 ms
+  on seed 1; 158.11 / 156.41 → 161.79 / 159.80 ms and 163.53 / 156.80 → 168.75 / 161.82 ms on seed
+  10, which it was not trained on. `perf stat -r 5`, twice: instructions:u 7.34 → 7.73 G, cycles:u
+  3.83–3.87 → 3.84–3.93 G, branch-misses:u 18.1 → 17.8 M.
 - **After step 17, on the serial start and the end** (local, alternating runs, 16 each, against
   step 17 at 238.5–239.6 ms median). Where the time goes on seed 1: 2.1 ms from spawn to `main`,
   parsing to 8.5 ms, the sample 5.3 ms, the per-query planning loop 5.2 ms and the rest of the
