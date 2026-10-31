@@ -579,11 +579,20 @@ impl NameSet {
 
     /// Marks the names of `letters` and counts each name that is new for its group in
     /// `groups`. Kept out of line so that this loop gets the registers to itself.
+    ///
+    /// The letters are read with plain loads, which the compiler may merge: the four atomic
+    /// loads of a letter took four instructions and seven more to put its key in one vector.
     #[inline(never)]
     fn read(&mut self, letters: &[AtomicU64], data: &[u8], groups: &mut [Group]) {
-        for letter in letters.as_chunks::<4>().0 {
-            let letter: [u64; 4] = std::array::from_fn(|i| letter[i].load(Relaxed));
-            let group = (letter[3] >> 48) as usize;
+        // SAFETY: `AtomicU64` has the layout of `u64`, and no letter here is stored while this
+        // reads it: each was posted before the barrier this worker passed, and no worker posts
+        // to its mailbox again until every worker has passed the next barrier (see [`join`]).
+        let letters: &[[u64; 4]] =
+            unsafe { std::slice::from_raw_parts(letters.as_ptr().cast(), letters.len() / 4) };
+        for &letter in letters {
+            // A group fits in a byte (see [`parse_regions`]), so the bit's word is one of four
+            // with no bounds check.
+            let group = (letter[3] >> 48) as u8 as usize;
             // The key is the letter without its group: the hash and the length, 48 bits.
             let key = [letter[0], letter[1], letter[2], letter[3] & ((1 << 48) - 1)];
             let (mask, hash) = (self.slots.len() - 1, key[3] as u32);
@@ -613,6 +622,9 @@ impl NameSet {
     /// Appends an entry with this key and no groups, puts it in the empty `slot` with its `tag`,
     /// and returns its index. When the entries fill three quarters of the slots, the slots
     /// double and every entry is placed again, so every probe ends at an empty slot.
+    ///
+    /// Cold, because inlined into [`NameSet::read`] it spilled the key of every letter.
+    #[cold]
     fn insert(&mut self, slot: usize, tag: u32, key: [u64; 4]) -> usize {
         assert!(self.lines.len() < ENTRY as usize, "over 2^24 names");
         let line = Line([key[0], key[1], key[2], key[3], 0, 0, 0, 0]);

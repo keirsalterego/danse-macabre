@@ -33,6 +33,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 26 | The long-name compare out of line, so the probe for every other name stops paying for its bounds checks | run-8378d5c7581d | 0.0334 | 12.6 | 77.2 |
 | 27 | A plain static executable instead of a static PIE (`relocation-model=static`) | run-a8bc41aa5aa0 | 0.0340 | 12.5 | 77.1 |
 | 28 | A record's name and note take their quotes from one 64-byte mask, built by AVX2 compares at the name's start, where each quote cost a 32-byte scan | run-4dc3f93575f3 | 0.0319 | 12.5 | 77.7 |
+| 29 | `NameSet::read` takes each letter with plain loads and its group as a byte, and `insert` is cold, so marking a name runs 17 fewer instructions per record | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -771,6 +772,30 @@ machine's spread of 11.7–14.0 MB, and no allocation changed. Correctness: the 
 default thread count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12
 and 64; the 300 tiny seeds pass at 10 thread counts with 100-byte rounds; the region sets give
 step 27's results; clippy reports no warnings.
+
+## Step 29: plain loads and a cold insert in the mark loop
+
+`NameSet::read` took each letter as four atomic loads, which the compiler may not merge, and
+then spent seven more instructions putting the 32-byte key in one vector for the compare in
+`holds`. A round's letters are read only after the barrier their posters passed, and none is
+stored again until every worker has passed the next one, so `read` now views its mailbox as
+plain `[u64; 4]` letters and loads each key at once. `insert`, inlined into the probe, took its
+registers and spilled every letter's key; a name is new only once, so `insert` is now `#[cold]`
+and out of line. And a letter's group is read as a byte, which it always fits (`parse_regions`
+stops at 255 countries), so the word of its bit takes no bounds check.
+
+`perf stat -r 5`, twice: instructions:u 1.505 / 1.511 → 1.450 / 1.440 G, 17 fewer per record;
+without the cold `insert`, 1.481 G. S 311 → 313. `ab.py` against step 28, 101 interleaved runs,
+medians / minimums: 35.09 / 33.13 → 34.21 / 32.56 ms and 35.18 / 33.29 → 34.57 / 32.78 ms; the
+same source without `#[cold]` against with it, 34.76 / 32.85 → 34.70 / 32.43 ms and
+34.63 / 32.79 → 33.90 / 32.35 ms; on step 27, against step 27, 36.35 / 35.53 → 35.91 / 35.09 ms
+and 36.33 / 35.53 → 35.81 / 35.07 ms. memory.peak, on step 27, 10 seeds × 11 alternating
+rounds: the per-seed medians move by +0.07 MB on average (−0.48 to +0.85 MB), inside this
+machine's spread, and no allocation changed. Correctness: the gate, 310 pass, 0 fail; full
+seeds 1–7 and 10–12 give the reference hashes; the 400 fuzz cases pass at the default thread
+count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300
+tiny seeds pass at 1, 3, 12 and 64 threads with 100-byte rounds; 40 generated sets of names
+pass at 1–4 CPUs; clippy reports no warnings.
 
 ## Experiments that did not stay
 
