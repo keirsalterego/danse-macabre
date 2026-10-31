@@ -402,6 +402,10 @@ fn parse(log: &'static [u8], lines: Range<usize>) -> Chunk {
         let start = 32 + (!word(line, 31) & 0x4040_4040_4040_4040).trailing_zeros() as usize / 8;
         // `space` precedes the latency; before it sit the 3-digit status and its own space.
         let (mut micros, space) = latency(line, lf);
+        // With this bound, reading the status and ending the name take no bounds checks: 3.1
+        // instructions fewer per line (`PERF.md`, step 54).
+        // SAFETY: `latency` returns a space from byte 4 on and below the LF, which lies in `line`.
+        unsafe { std::hint::assert_unchecked((4..LINE).contains(&space)) };
         // The status and a large latency come before the lookup, so fewer values live through it.
         // Errors are exactly 500..=599, so the status's first digit decides.
         let error = u32::from(line[space - 3] == b'5');
@@ -465,7 +469,8 @@ fn hour_index(line: &[u8]) -> Option<usize> {
     hour.checked_sub(18).filter(|&hour| hour < HOURS)
 }
 
-/// Returns the latency that ends at `lf`, and the index of the space before it.
+/// Returns the latency that ends at `lf`, and the index of the space before it, which is at
+/// least 4 (see [`parse`]).
 ///
 /// Latencies of up to 7 digits (99.9% of lines) take one step without a loop. We load the 8
 /// bytes before the LF as one integer and find the last space in it: digits (`0x30` to `0x39`)
@@ -481,7 +486,8 @@ fn latency(line: &[u8], lf: usize) -> (u32, usize) {
         // 8 to 10 digits: rare enough for a plain loop, and marked cold (see [`parse`]).
         std::hint::cold_path();
         let space = line[..lf].iter().rposition(|&b| b == b' ');
-        let space = space.expect("a space precedes the latency");
+        // A space below byte 4 comes only with a malformed line, which gets one at 4 instead.
+        let space = space.expect("a space precedes the latency").max(4);
         let digits = line[space + 1..lf].iter();
         return (digits.fold(0, |v, &d| v * 10 + u32::from(d - b'0')), space);
     }

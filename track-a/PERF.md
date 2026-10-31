@@ -58,6 +58,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 51 | 6 fewer lines at the same speed: the parse's intrinsics from the file's one wildcard import, and the interner's padded copies zeroed in its static | run-b35557b63892 | 0.0180 | 18.8 | 85.9 |
 | 52 | Endpoint names hashed with the CPU's CRC32C instruction instead of a multiply: 9.2 M instructions fewer | run-3367489cfd2c | 0.0176 | 18.6 | 86.3 |
 | 53 | 9 fewer lines in the hour pass at the same speed: the large latency taken in `unwrap_or_else`, empty groups filtered out, the three selections in one `map`, the chunk's two releases in one | run-3367489cfd2c | 0.0176 | 18.6 | 86.3 |
+| 54 | The latency's space bounded with `assert_unchecked`, so reading the status and ending the name take no bounds checks: 9.8 M instructions fewer | | | | |
 
 ## Step 1: v1
 
@@ -884,8 +885,39 @@ five alternating rounds on seeds 1, 2, 3, 5, 7, 10 and 11, three times: medians 
 18.05 → 18.09 and 18.29 → 18.23 MB, from the same allocations. S 373 → 364. Gate: 310 pass,
 0 fail; full seeds 1–7 and 10–12 give the reference hashes; clippy reports no warnings.
 
+## Step 54: the latency's space bounded
+
+`latency` returns the index of the line's last space, and the parse reads the status at `space - 3`
+and ends the name at `space - 4`. On the fast path the space lies 1 to 8 bytes below the LF, from
+byte 31 on. The slow path, for 8 to 10 digits, now lifts it to at least 4, which only a malformed
+line can need. `std::hint::assert_unchecked` hands the parse that range, `4..LINE`, and LLVM drops
+the bounds checks of the status's byte and of the name's end: 3.1 instructions fewer per line.
+
+Local, AC power, turbo off, on step 53's code. `perf stat`, 30 interleaved runs: instructions:u
+595.2 → 585.4 M (−1.6%), cycles:u median 321.2 → 320.9 M, L1-dcache-load-misses:u 3.98 → 3.98 M.
+`ab.py`, 61 interleaved runs, six rounds: medians 18.92 → 18.88, 18.80 → 18.77, 18.84 → 18.79,
+18.89 → 18.79, 18.86 → 18.81 and 18.79 → 18.75 ms, −0.05 ms (−0.3%) on average. On step 52's code,
+before step 53 went in, the same change ran instructions:u 591.5 → 581.8 M and cycles:u
+324.3 → 322.3 M, and −0.11 ms (−0.6%) on average in eleven rounds of 61 runs (listed with the
+pointer form under "Experiments that did not stay"). memory.peak, eight alternating rounds on seeds
+1, 2, 3, 5, 7, 10 and 11: median 18.26 → 18.30 MB, noise, as the change allocates nothing.
+S 363 → 364. Gate: 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes; clippy
+reports no warnings.
+
 ## Experiments that did not stay
 
+- **The records written through a pointer** (local, AC power, turbo off, on step 52's code). The
+  parse writes each record at `get_unchecked_mut(count)` and counts up. A pointer that moves up one
+  record per line, with a closure that turns it back into a count for the runs and the final length,
+  took 2 lines more and an `unsafe` write. Alone it saved 3.0 M instructions:u (591.5 → 588.5 M) and
+  0.2 M cycles:u (324.3 → 324.1 M); on top of step 54's bound, 3.1 M instructions and 1.2 M cycles
+  more (581.8 → 578.7 M and 322.3 → 321.1 M; `perf stat`, 30 interleaved runs). `ab.py`, 61
+  interleaved runs, eleven rounds, step 52 / the bound / the bound and the pointer: medians
+  18.86 / 18.79 / 18.70, 18.87 / 18.83 / 18.75, 18.85 / 18.75 / 18.75, 18.94 / 18.81 / 18.78,
+  18.85 / 18.80 / 18.82, 19.00 / 18.84 / 18.69, 18.89 / 18.72 / 18.70, 18.95 / 18.82 / 18.85,
+  18.96 / 18.81 / 18.82, 18.83 / 18.71 / 18.63 and 18.78 / 18.68 / 18.64 ms. On average the bound
+  gained 0.11 ms (0.6%) for its line, and the pointer 0.04 ms (0.2%) more for its two, about what
+  two lines cost.
 - **Selection for every group, without the networks** (local, turbo off, on step 50's code):
   `percentiles` with only its three selections, and `sort_network`, `merge`, `stage` and their
   wildcard import deleted, S 379 → 334. `ab.py`, 61 interleaved runs: median 19.06 → 20.84 ms
