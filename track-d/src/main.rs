@@ -24,7 +24,7 @@
 //! scale), and the weight in the bits above it (11 at full scale, so up to 2,046). Road weights
 //! are between 1 and a few thousand, median about 120 (spec §2), so nearly every weight fits.
 //! The others set the field to all ones and live in a small side map ([`Csr::heavy`]). At 4
-//! bytes an edge, the two CSRs take 54 MB at full scale instead of 94 MB.
+//! bytes an edge, the edges of the two CSRs take 40 MB at full scale instead of 80 MB.
 //!
 //! [`build_graph`] fills both with a parallel counting sort in three passes, one thread per chunk
 //! of lines, and no atomics. Pass 1 counts each chunk's edges per block of 2,048 consecutive node

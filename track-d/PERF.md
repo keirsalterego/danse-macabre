@@ -389,7 +389,7 @@ and M cannot move. S 453 → 442. Gate: 509 pass, 0 fail.
 
 Steps 13 and 14 went to the board in one push, so both rows cite the same run.
 
-## Step 15: 1 more line
+## Step 15: 1 fewer line
 
 `sort` declares its counters and its running sum together. `.text` and `.rodata` are
 byte-identical to step 14's. S 442 → 441. Gate: 509 pass, 0 fail.

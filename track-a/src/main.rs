@@ -44,7 +44,7 @@
 //!
 //! - **One pass over the input.** The log is 239 MB, ten times the L3 cache, so every pass over
 //!   it streams from main memory. We parse it once and keep 12 MB of compact records instead.
-//! - **No byte-by-byte scanning.** One AVX2 compare finds a line's end ([`line_end`]). The
+//! - **No byte-by-byte scanning.** AVX2 compares find a line's end ([`line_end`]). The
 //!   latency, the status and the end of the endpoint are then read backwards from it at known
 //!   offsets, and the latency's digits convert in a single SWAR step ([`latency`]).
 //! - **Working sets that fit in cache.** One hour holds about 43,000 lines, so its latency
@@ -179,7 +179,7 @@ fn map(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32) -> std::io::Re
 fn summarize(log: &[u8], out_path: &Path) {
     let threads = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let len = log.len() - LINE;
-    // Chunk t starts at the first line that starts at or after byte `len * t / threads`, so
+    // Chunk t starts at the last line start at or before byte `len * t / threads`, so
     // every line lands in exactly one chunk. With fewer lines than threads, some chunks are
     // simply empty.
     let start = |t: usize| {
