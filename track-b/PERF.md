@@ -24,6 +24,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 17 | Each thread drops its chunk's pages of the corpus mapping when its pass ends, instead of the exit unmapping all of them on one core after the output is written | run-bfce9886b69d | 0.2354 | 43.4 | 69.2 |
 | 18 | A term table slot holds a term's first 12 bytes instead of 8, so a token of 9 to 12 bytes no longer loads its term's key from a second array | run-e847cb4a493b | 0.2208 | 41.8 | 69.9 |
 | 19 | 99 fewer code lines: the cold code and the term table simplified (no doubling), the walk's bit pops in one helper; the key-mask table aligned to a cache line | run-74f2276732d6 | 0.2241 | 42.9 | 70.1 |
+| 20 | The rarity sample is the corpus's first 1/64 (4,005 documents on seed 1) instead of its first 1,000 documents, each thread counting a part | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -388,6 +389,32 @@ pass, 0 fail.
 
 On the board, run-74f2276732d6 measured 0.2241 s, in a run where track A drew 22.9 ms and
 track C 38.4 ms, slow draws for both (their usual draws are about 19 and 35 ms).
+
+## Step 20: a larger sample, counted in parallel
+
+The plan picks each query's triggers from how many sampled documents hold each term
+([`sample_hits`]). In the first 1,000 documents most query terms have no hits at all, so they
+tie, and the plan picks triggers that the pass then checks more often than it needs to. With
+nothing else changed but the constant (the same code layout, on step 17's code), the pass's
+user cycles on seed 1 were 5.98 G for a 250-document sample, 5.86 G for 500, 5.79 G for 1,000,
+5.73 G for 2,000, 5.69 G for 4,000 and 5.66 G for 8,000. Counted on one thread, though, every
+1,000 more documents delay the pass by about 5 ms.
+
+The sample is now the corpus's first 1/64 (`SAMPLE_SHARE`; 4,005 documents and 4.0 MB on seed
+1), split at line starts into one part per thread. Each thread counts its part
+([`count_hits`]), and the parts are summed into the first part's counts, whose pages are
+written already: a new zeroed vector would fault each page twice, once for the first load and
+again for the first store. The shares 1/128, 1/96, 1/48 and 1/32 came out within noise of 1/64:
+a larger sample costs about as much time before the pass as it saves in it.
+
+Locally, against step 19, alternating runs (`ab.py`, 14 each), two rounds: median 229.5 and
+229.6 → 226.6 and 226.4 ms; the same change written with a loop instead of `reduce`, in two
+other rounds: 229.5 and 230.1 → 226.9 and 227.1 ms. The loop form with every function aligned
+to 64 bytes, so that the hot functions, whose code is the same, sit at the same offsets: 230.8
+and 230.8 → 226.8 and 226.7 ms. `perf stat`: user cycles 5.59 → 5.51–5.56 G, instructions 8.739 →
+8.686 G. In a `perf record` timeline the pass starts at 21.4 ms instead of 21.1–22.0 ms, and
+its threads' cycles fall 5.59 → 5.51 G. memory.peak over six interleaved runs: median 39.3 →
+39.1 MiB. S 758 → 771. Gate: 510 pass, 0 fail.
 
 ## Experiments that did not stay
 

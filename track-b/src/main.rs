@@ -15,7 +15,7 @@
 //! 1. **Queries first.** We read `queries.txt` before the corpus (spec §3 allows it) and give
 //!    every distinct query term a small id ([`TermTable`]). A corpus token that no query uses
 //!    is looked up once and then forgotten.
-//! 2. **Triggers.** Tokenizing the first [`SAMPLE_DOCS`] documents estimates how many
+//! 2. **Triggers.** Tokenizing the first 1/[`SAMPLE_SHARE`] of the corpus estimates how many
 //!    documents contain each term ([`sample_hits`]). Every query then gets *triggers*, terms
 //!    such that each matching document contains at least one of them ([`Plan`]): a phrase's
 //!    rarest term, or a BOOL query's [`bool_cover`]. Triggers decide how much work is done,
@@ -42,8 +42,9 @@ use std::{
     ops::Range, os::fd::AsRawFd, path::Path, thread,
 };
 
-/// Documents tokenized up front to estimate how rare each query term is.
-const SAMPLE_DOCS: usize = 1000;
+/// The first `1 / SAMPLE_SHARE` of the corpus is tokenized up front to estimate how rare each
+/// query term is.
+const SAMPLE_SHARE: usize = 64;
 /// An output line lists at most this many ids (spec §4).
 const SHOWN_IDS: usize = 10;
 /// The low bits of a [`Tally`] cell hold the sum of the ids matched in a chunk, which
@@ -110,7 +111,7 @@ fn answer_all(query_text: &[u8], docs: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     }
     let threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
     let (queries, terms) = parse_queries(query_text, threads)?;
-    let plan = Plan::new(&queries, terms, docs);
+    let plan = Plan::new(&queries, terms, docs, threads);
     let bounds = line_bounds(docs, threads);
     // Line `i` holds id `i` (spec §2.1), so the id at a chunk's first line numbers all of its
     // lines, and the id after the last line is the number of documents.
@@ -333,8 +334,8 @@ impl Plan {
     /// terms keep a bitset and the others an id list, whichever is smaller. A term absent
     /// from the corpus never fires and keeps an empty list, which leaves its queries at `0 0`
     /// with no special case.
-    fn new(queries: &Queries, mut terms: TermTable, docs: &[u8]) -> Self {
-        let (hits, sampled) = sample_hits(docs, &terms);
+    fn new(queries: &Queries, mut terms: TermTable, docs: &[u8], threads: usize) -> Self {
+        let (hits, sampled) = sample_hits(docs, &terms, threads);
         // Fewer sample hits cost less. Among equals (often zero hits), longer terms tend to be
         // rarer, so they cost a little less; a key's length is its count of nonzero bytes.
         // Computed in one pass, as reading hits and keys term by term costs two cache misses
@@ -514,14 +515,32 @@ impl Check {
     }
 }
 
-/// Counts, for each term, the documents among the first `SAMPLE_DOCS` that contain it, and
-/// returns those counts with the number of documents sampled: a cheap estimate of document
-/// frequency.
-fn sample_hits(docs: &[u8], terms: &TermTable) -> (Vec<u32>, usize) {
-    let mut lines = docs.iter().enumerate().filter(|&(_, &b)| b == b'\n');
-    let end = (lines.nth(SAMPLE_DOCS - 1)).map_or(docs.len(), |(at, _)| at + 1);
-    let sample = &docs[..end];
-    let mut hits = vec![0; terms.len()];
+/// Counts, for each term, the documents in the first `1 / SAMPLE_SHARE` of the corpus that
+/// contain it, and returns those counts with the number of documents sampled: a cheap estimate
+/// of document frequency. Each of `threads` threads counts a part of the sample.
+fn sample_hits(docs: &[u8], terms: &TermTable, threads: usize) -> (Vec<u32>, usize) {
+    let sample = &docs[..line_bounds(docs, SAMPLE_SHARE)[1]];
+    let bounds = line_bounds(sample, threads);
+    thread::scope(|s| {
+        let counters: Vec<_> = (bounds.windows(2))
+            .map(|w| s.spawn(move || count_hits(&sample[w[0]..w[1]], terms)))
+            .collect();
+        // The sum starts from the first part, whose pages are written already: a new zeroed
+        // vector would fault twice on each page, once for the load and again for the store.
+        (counters.into_iter())
+            .map(|c| c.join().expect("a panic aborts the process"))
+            .reduce(|(mut hits, docs), (part, more)| {
+                hits.iter_mut().zip(part).for_each(|(h, p)| *h += p);
+                (hits, docs + more)
+            })
+            .expect("line_bounds returns at least one part")
+    })
+}
+
+/// [`sample_hits`] on one part of the sample.
+fn count_hits(sample: &[u8], terms: &TermTable) -> (Vec<u32>, usize) {
+    // Written when allocated, as in [`Tally::new`], so that no page faults twice.
+    let mut hits = [0].repeat(terms.len());
     // Per term, the last sampled document counted, so a document counts once.
     let mut counted = vec![usize::MAX; terms.len()];
     let mut doc = 0;
