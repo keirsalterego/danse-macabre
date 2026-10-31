@@ -387,16 +387,21 @@ fn parse<'a>(log: &'a [u8], lines: Range<usize>, endpoints: &Interner<'a>) -> Ch
         // It is the first byte there without bit 6 (0x40), which every capital letter has.
         let start = 32 + (!word(line, 31) & 0x4040_4040_4040_4040).trailing_zeros() as usize / 8;
         // `space` precedes the latency; before it sit the 3-digit status and its own space.
-        let (latency_us, space) = latency(line, lf);
+        let (micros, space) = latency(line, lf);
         let name = &line[start..space - 4];
         let window = line[start..start + 64].try_into().expect("start <= 40");
         let id = endpoints.intern(name, hash(name, word(line, start)), window);
         // Errors are exactly 500..=599, so the status's first digit decides.
         let error = u32::from(line[space - 3] == b'5');
-        if latency_us >= LARGE {
-            chunk.large.push(latency_us);
+        if micros >= LARGE {
+            chunk.large.push(micros);
         }
-        chunk.records[count] = id << 20 | error << 19 | latency_us.min(LARGE);
+        // SAFETY: each line moves `i` on by at least MIN_LINE bytes, malformed or not, since
+        // `line_end` starts looking at byte MIN_LINE - 1, so `count` stays below the length the
+        // records were given.
+        unsafe {
+            *chunk.records.get_unchecked_mut(count) = id << 20 | error << 19 | micros.min(LARGE);
+        }
         count += 1;
     }
     chunk.records.truncate(count);
@@ -589,7 +594,10 @@ impl<'a> Interner<'a> {
         while let Some(id) = self.slots[slot].load(Acquire).checked_sub(1) {
             let found = if name.len() < 64 {
                 // SAFETY: the copy was written before `id` went into the slot, and never again.
-                let known = unsafe { (*self.padded[id as usize].get()).assume_init_ref() };
+                // An id in a slot is below the count of names, which `insert` keeps within the
+                // 4,096 copies, so the index needs no check.
+                let known =
+                    unsafe { (*self.padded.get_unchecked(id as usize).get()).assume_init_ref() };
                 same_name(window, &known.0, name.len())
             } else {
                 self.names[id as usize].get() == Some(&name)

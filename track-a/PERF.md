@@ -40,6 +40,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 33 | One endpoint table that all threads share while they parse, instead of one per thread merged after it | run-9e334b5f00fa | 0.0190 | 18.9 | 85.3 |
 | 34 | The padded copies allocated uninitialized, not zeroed, and each list of large latencies reserved once | run-2c0e91287411 | 0.0190 | 18.3 | 85.4 |
 | 35 | The name hash reads two 8-byte windows of the name instead of three | run-b8eed3b9c923 | 0.0187 | 18.3 | 85.6 |
+| 36 | Each record stored, and each padded copy read, without a bounds check | | | | |
 
 ## Step 1: v1
 
@@ -510,6 +511,27 @@ interleaved runs, four rounds: medians 21.58 → 21.12, 21.53 → 21.14, 21.58 �
 21.56 → 21.22 ms, minimums 21.10 → 20.62, 20.93 → 20.55, 20.98 → 20.39 and 21.17 → 20.74 ms.
 memory.peak, 12 alternating runs: median 18.17 → 18.14 MB. S unchanged at 382. Gate: 310 pass,
 0 fail.
+
+## Step 36: two bounds checks fewer per line
+
+Every line paid for two bounds checks that could never fail, whatever the input. The store of
+its record: `line_end` starts looking at byte `MIN_LINE - 1`, so each line, malformed or not,
+moves on by at least `MIN_LINE` bytes, and the chunk's `len / MIN_LINE + 1` records always have
+room. And the padded copy read for every probe: an id in a slot is below the count of names,
+which `insert` keeps within the 4,096 copies. Both are now unchecked, with that argument as the
+SAFETY note. The other checks on the line stay: the name and status offsets come from the
+line's bytes, and only well-formed input keeps them in range.
+
+The compiler's register allocation decided the gain. Shifting the error bit where it is
+computed, rather than in the record's expression, gave the same instruction count, but the loop
+then reloaded a pointer from the global offset table on every line instead of keeping it in a
+register, and gained about 0.05 ms instead of 0.25.
+
+Local, turbo off: instructions 714.2 → 701.5 M (4 per line), cycles 375.6 → 371.7 M (5 runs).
+`ab.py`, 61 interleaved runs, four rounds: medians 21.16 → 20.89, 21.14 → 20.91, 21.17 → 20.90
+and 21.13 → 20.93 ms, minimums 20.67 → 20.30, 20.60 → 20.18, 20.61 → 20.51 and 20.80 → 20.50 ms.
+memory.peak, 11 alternating rounds on each of seeds 1–7 and 10–12: median 18.09 → 18.07 MB.
+S 382 → 385. Gate: 310 pass, 0 fail.
 
 ## Experiments that did not stay
 
