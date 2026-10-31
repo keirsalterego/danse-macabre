@@ -847,7 +847,12 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
                     let checks = plan.check_range(slot.id());
                     prefetch(&plan.checks[checks.start]);
                     prefetch(&tally.checks[checks.start]);
-                    bool_terms.push(checks);
+                    // Four indices written at once, then cut to the range's length: a loop
+                    // per trigger would mispredict its exit, as the lengths follow no pattern.
+                    let start = checks.start as u32;
+                    bool_terms.extend_from_slice(&[start, start + 1, start + 2, start + 3]);
+                    bool_terms.truncate(bool_terms.len() - 4 + checks.len().min(4));
+                    bool_terms.extend(checks.skip(4).map(|c| c as u32));
                 }
             }
             if slot.flags & Slot::PHRASE != 0 {
@@ -867,12 +872,10 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
                 }
             }
         }
-        for checks in bool_terms.drain(..) {
-            for c in checks {
-                let check = &plan.checks[c];
-                // SAFETY: the binary targets alderlake (.cargo/config.toml), which has AVX2.
-                tally.add_check(c, check.q, doc, unsafe { check.matches(&seen) });
-            }
+        for c in bool_terms.drain(..) {
+            let check = &plan.checks[c as usize];
+            // SAFETY: the binary targets alderlake (.cargo/config.toml), which has AVX2.
+            tally.add_check(c as usize, check.q, doc, unsafe { check.matches(&seen) });
         }
         for &t in &terms {
             // SAFETY: `terms` holds term ids and `miss`, all below `64 * seen.len()`.

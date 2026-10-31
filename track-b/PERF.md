@@ -28,6 +28,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 21 | 35 fewer code lines: one helper runs and joins each set of threads, the intern loop drops its prefetch, the output adds each query's cells once; every loop starts on a 64-byte boundary | run-f0c533c66a88 | 0.2165 | 42.9 | 70.6 |
 | 22 | 8 fewer code lines in code that runs once, with the same machine code | run-59d37d7b5803 | 0.2177 | 42.3 | 70.5 |
 | 23 | A per-document check reads its terms' bits with one AVX2 gather instead of six loads, and the document's term bits are read and cleared without bounds checks | | | | |
+| 24 | A document's checks are listed one by one as its BOOL triggers appear, so one loop runs them all instead of one loop per trigger | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -491,6 +492,27 @@ M; branch misses 57.3 → 58.7 M. On step 20, built with every function aligned 
 unchecked loads alone ran 226.6 → 221.1 ms and the gather on top of them 213.8 ms.
 memory.peak over six alternating runs: median 43.5 → 43.2 MB. S 728 → 732. Gate: 510 pass, 0
 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
+
+## Step 24: one loop over a document's checks
+
+A document kept the check range of each BOOL trigger it held, and at its end ran a loop over
+each range. On seed 1 the 8.56 million ranges hold 1 check (4.0 M), 2 (2.28 M), 3 (1.17 M), 4
+(0.57 M) or more (0.37 M), with no pattern from one to the next, so the exit of nearly every
+range's loop mispredicted. Profiled with the last branch record (`perf record -b`, the
+mispredicted entries counted by branch address), that exit drew 13% of step 23's
+mispredictions, after the term table probe's compare (25%), the stored-term test (22%) and the
+first-sighting test (16%).
+
+The trigger now appends its check indices to one list for the document: four written at once
+and the list cut back to the range's length, so no branch depends on that length, plus a loop
+over the indices past four, which runs for one trigger in 23. At the document's end one loop
+runs the whole list.
+
+Locally, against step 23 (alternating runs, `ab.py`, 20 each), three rounds: median 216.91,
+217.53 and 215.92 → 212.68, 211.64 and 211.56 ms, min 215.02, 214.46 and 214.59 → 210.38,
+210.73 and 210.50 ms. `perf stat`: branch misses 58.5 → 52.0 M, user cycles 5.32 → 5.23 G,
+instructions 7,517 → 7,625 M. memory.peak over six alternating runs: median 43.8 → 43.3 MB.
+S 732 → 733. Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
 
 ## Experiments that did not stay
 
