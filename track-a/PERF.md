@@ -42,7 +42,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 35 | The name hash reads two 8-byte windows of the name instead of three | run-b8eed3b9c923 | 0.0187 | 18.3 | 85.6 |
 | 36 | Each record stored, and each padded copy read, without a bounds check | run-921f52908023 | 0.0183 | 18.5 | 85.7 |
 | 37 | 5 fewer lines with the same machine code: the hour sizes summed inside `sort_by_cached_key`, the name hash's two cases as a `match`, and `same_name` folded into its one caller | run-9fe0786e93d3 | 0.0195 | 18.3 | 85.1 |
-| 38 | A large latency's record field set in the branch that lists it, instead of by a `min` on every line | | | | |
+| 38 | A large latency's record field set in the branch that lists it, instead of by a `min` on every line | run-e44188ffe025 | 0.0197 | 18.5 | 84.9 |
 | 39 | 5 fewer lines with the same machine code: the running sum of the hour's counts as one `for_each`, and a large latency listed and replaced by `LARGE` in one `bool::then` | | | | |
 
 ## Step 1: v1
@@ -559,6 +559,8 @@ rounds: medians 20.98 → 20.91, 21.04 → 20.91, 20.98 → 20.85, 20.99 → 20.
 20.22 → 20.16 and 20.56 → 20.28 ms. memory.peak, 11 alternating rounds on each of seeds 1–7 and
 10–12: median 18.08 → 18.13 MB, with no change to any allocation. S 380 → 381. Gate: 310 pass,
 0 fail.
+The board measured this code in the run of commit 3e78ba2, which changed only track C:
+run-e44188ffe025 drew 19.7 ms, against 18.3 ms for step 36's code, a slow draw.
 
 ## Step 39: 5 fewer lines
 

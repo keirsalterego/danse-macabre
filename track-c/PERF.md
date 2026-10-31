@@ -29,7 +29,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 22 | 1 fewer line with the same machine code: the name set's probe names the hash once and takes the slot and the tag from it | run-af528e5f49cc | 0.0353 | 12.3 | 76.6 |
 | 23 | 17 fewer lines outside the record loop: each run's pages given back in two lines, rounded out to whole pages; the region rows cut, marked and written in one line each; and the rounds counted and the parts merged in one line each | run-d4936b9f2b5b | 0.0349 | 12.7 | 76.7 |
 | 24 | 1 fewer line: `main` maps both input files through one closure | run-b455f587cb61 | 0.0358 | 12.9 | 76.4 |
-| 25 | A name's letter masked to its length by a 24-byte window of a constant, and each letter posted at a running index into its owner's mailbox | | | | |
+| 25 | A name's letter masked to its length by a 24-byte window of a constant, and each letter posted at a running index into its owner's mailbox | run-b89d1be25a5e | 0.0348 | 12.5 | 76.9 |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -700,6 +700,8 @@ and 64, where that build now asserts that no worker's index runs past its mailbo
 seeds pass at 10 thread counts with 100-byte rounds; of step 11's region sets, the one with
 shuffled ids passes, and the two with 689 and 692 countries stop with the error; clippy reports
 no warnings.
+The board's run, run-b89d1be25a5e, drew 34.8 ms, against 34.9 ms for step 24's: one draw on the
+board does not show the 5% measured here.
 
 ## Experiments that did not stay
 
