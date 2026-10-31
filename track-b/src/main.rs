@@ -818,15 +818,16 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
     // Bit `t` is set while the current doc contains term `t`, bit 0 while it holds a token that
     // is no query term. One more bit, never set, pads the checks ([`Check`]).
     let mut seen = vec![0u64; (plan.terms.len() + 1).div_ceil(64)];
-    // The current doc's term id per token (0 for the rest), the positions of its phrase
-    // triggers, the checks of its distinct BOOL triggers, and the phrases it matched, so none
-    // counts twice.
-    let (mut terms, mut phrase_at, mut bool_terms) = (Vec::new(), Vec::new(), Vec::new());
-    // Its distinct terms kept in rows, in lists, and BOOL triggers, in the first `in_rows`,
-    // `in_lists` and `bools` entries: one entry per token, so that keeping a term takes a store
-    // and an add, not a branch.
-    let (mut rows, mut lists, mut triggered) = (Vec::new(), Vec::new(), Vec::new());
-    let mut found = Vec::new();
+    // The token loop below reads the words of `seen` without bounds checks.
+    assert!(64 * seen.len() > plan.terms.len());
+    // The positions of the current doc's phrase triggers, the checks of its distinct BOOL
+    // triggers, and the phrases it matched, so none counts twice.
+    let (mut phrase_at, mut bool_terms, mut found) = (Vec::new(), Vec::new(), Vec::new());
+    // For the current doc's `n` tokens, four runs of `n` entries: each token's term id (0 for
+    // the rest), then the doc's distinct terms kept in rows, in lists, and BOOL triggers, up to
+    // the cursors `rows`, `lists` and `bools`. Keeping a term takes a store and an add, not a
+    // branch, and one slice without bounds checks leaves the loop registers to spare.
+    let mut kept = Vec::new();
     // The current doc's tokens as (key, home slot), probed only at the line end: by then every
     // slot load is long under way ([`TermTable::prefetch`]), instead of each stalling in turn.
     let mut probes: Vec<(Key, usize)> = Vec::new();
@@ -837,34 +838,41 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
         probes.push((key, plan.terms.prefetch(&key)));
     };
     walk(text, &mut probes, token, |probes| {
-        if rows.len() < probes.len() {
-            rows.resize(probes.len(), 0);
-            lists.resize(probes.len(), 0);
-            triggered.resize(probes.len(), 0);
-        }
-        let (mut in_rows, mut in_lists, mut bools) = (0, 0, 0);
+        let n = probes.len();
+        kept.resize(kept.len().max(4 * n), 0);
+        let (kept, mut rows, mut lists, mut bools) = (&mut kept[..4 * n], n, 2 * n, 3 * n);
         // No branch on what a token is, a query term or not, seen in the doc before or not,
         // stored or a BOOL trigger: none of it follows a pattern, so each branch would
         // mispredict often.
-        for (key, at) in probes.drain(..) {
-            let slot = plan.terms.find_from(&key, at);
+        for (k, (key, at)) in probes.iter().enumerate() {
+            let slot = plan.terms.find_from(key, *at);
             let (t, bit) = (slot.id() as usize / 64, 1 << (slot.id() % 64));
             // The term's flags if the doc did not hold it yet, else none: a term is kept and
             // triggers once per doc.
-            let new = std::hint::select_unpredictable(seen[t] & bit == 0, slot.flags, 0);
-            seen[t] |= bit;
-            rows[in_rows] = slot.id();
-            in_rows += usize::from(new & Slot::ROW != 0);
-            lists[in_lists] = slot.id();
-            in_lists += usize::from(new & Slot::LISTED != 0);
-            triggered[bools] = slot.id();
+            // SAFETY: a slot's id is 0 or a term's, below `plan.terms.len()`, so its word `t` lies
+            // below `seen.len()`, as asserted where `seen` is sized.
+            let word = unsafe { seen.get_unchecked_mut(t) };
+            let new = std::hint::select_unpredictable(*word & bit == 0, slot.flags, 0);
+            *word |= bit;
+            // SAFETY: `kept` holds `4 * n` entries, as the slicing above checks. `k < n`, and each
+            // cursor has moved at most `k` times from the start of its run of `n` entries, so it
+            // is still inside the run.
+            unsafe {
+                *kept.get_unchecked_mut(k) = slot.id();
+                *kept.get_unchecked_mut(rows) = slot.id();
+                *kept.get_unchecked_mut(lists) = slot.id();
+                *kept.get_unchecked_mut(bools) = slot.id();
+            }
+            rows += usize::from(new & Slot::ROW != 0);
+            lists += usize::from(new & Slot::LISTED != 0);
             bools += usize::from(new & Slot::BOOL != 0);
             if slot.flags & Slot::PHRASE != 0 {
-                phrase_at.push(terms.len());
+                phrase_at.push(k);
             }
-            terms.push(slot.id());
         }
-        for &t in &triggered[..bools] {
+        probes.clear();
+        let terms = &kept[..n];
+        for &t in &kept[3 * n..bools] {
             // Start loading its checks and their cells now, to use below.
             let checks = plan.check_range(t);
             prefetch(&plan.checks[checks.start]);
@@ -877,10 +885,10 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
             bool_terms.extend(checks.skip(4).map(|c| c as u32));
         }
         let i = (doc - sets.start) as usize;
-        for &t in &rows[..in_rows] {
+        for &t in &kept[n..rows] {
             sets.bits[plan.store[t as usize] as usize][i / 64] |= 1 << (i % 64);
         }
-        for &t in &lists[..in_lists] {
+        for &t in &kept[2 * n..lists] {
             sets.lists[(plan.store[t as usize] ^ LIST) as usize].push(i as u16);
         }
         for &at in &phrase_at {
@@ -902,11 +910,10 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
         }
         // Every set bit is one of the doc's terms, so zeroing their words clears `seen`: a store
         // with no load, so tokens that share a word, as all misses do, do not wait on each other.
-        for &t in &terms {
+        for &t in terms {
             // SAFETY: `terms` holds term ids and 0, all below `64 * seen.len()`.
             *unsafe { seen.get_unchecked_mut(t as usize / 64) } = 0;
         }
-        terms.clear();
         phrase_at.clear();
         found.clear();
         doc += 1;

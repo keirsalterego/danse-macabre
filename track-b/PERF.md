@@ -35,6 +35,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 28 | The rarity sample probes a line's tokens at its end, as the pass does, and counts without a branch; interning a term takes no branch on whether it is new; the sample's end is found without the other 63 cuts | run-75ef64ef4099 | 0.1643 | 42.2 | 73.5 |
 | 29 | A query on sets adds its window's matches in one vectorized sum instead of a call per word; a term's store is a `u32` code instead of an enum; the terms kept in rows and in lists are listed apart, so adding them takes no branch on which | run-575e79713710 | 0.1623 | 43.1 | 73.7 |
 | 30 | A plain static executable (`crt-static` and `relocation-model=static`) instead of a dynamically linked PIE | run-4654d088e3bb | 0.1615 | 41.1 | 73.7 |
+| 31 | The token loop writes a document's term ids and its kept rows, lists and BOOL triggers into four runs of one slice, and its seen bits, without bounds checks, so its registers no longer spill | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -682,6 +683,43 @@ Local, turbo off: `ab.py` against step 29, 16 interleaved runs, five rounds: med
 168.05, 169.05 → 168.17, 169.66 → 168.04, 168.57 → 167.54 and 168.25 → 168.58 ms, minimums
 167.37 → 165.93, 167.15 → 166.76, 167.45 → 166.86, 167.84 → 166.44 and 167.50 → 166.34 ms.
 S unchanged at 745. Gate: 510 pass, 0 fail.
+
+## Step 31: the token loop's stores without bounds checks
+
+After step 29 the token loop ran about 100 instructions per token. It is a closure, and the
+four per-token vectors it wrote (the term ids, and the rows, lists and BOOL triggers kept) were
+captured `Vec`s: LLVM cannot tell that a store into one of their buffers leaves the `Vec`
+headers alone, so after every store it reloaded each header's pointer and length from memory,
+and checked each index against the length. With the loop's registers taken, more spilled.
+
+- **One slice, four runs.** The four vectors are one now, sliced to `4 * n` entries for a
+  document of `n` tokens: the term ids from 0, then the rows, lists and BOOL triggers kept from
+  `n`, `2n` and `3n`, each up to its cursor. The slice's pointer stays in a register, and the
+  writes take no bounds check: a cursor moves at most once per token, so it stays in its run.
+- **The seen word unchecked.** A token's word of `seen` is read and written without a bounds
+  check, as the clearing loop already did (step 23); an `assert!` where `seen` is sized states
+  the bound.
+- **The probes read in place.** The loop reads each (key, home slot) from the probe list
+  instead of moving it out with `drain`, which copied the 32-byte key to the stack.
+
+Built up on step 29 (local, 18 to 20 alternating runs, rounds against the same step 29
+binary): the three kept vectors unchecked 168.95 → 165.97 ms; with the seen word and a fourth
+vector for the term ids, 169.08 → 163.80; the four as one slice 169.08 → 158.80 (the same
+round); the probes read in place on top of that, 160.05 → 158.60 and 159.58 → 157.92 ms.
+Locally, against step 30 (`ab.py`, 20 alternating runs each, with other jobs on the box, load
+average 7–11), three rounds: median 169.99, 172.52 and 169.26 → 158.49, 159.94 and 158.42 ms,
+min 167.46, 166.78 and 167.99 → 156.55, 157.30 and 156.29 ms. `perf stat`: user cycles 4.01 →
+3.62 G, instructions 8,268 → 7,338 M, branch misses 18.2 → 18.1 M. memory.peak over eight
+alternating runs: median 41.3 → 40.9 MB. S 745 → 746. Gate: 510 pass, 0 fail; seeds 2, 3, 7,
+10 and 12 match their reference hashes.
+
+Taking `seen` as a slice inside the closure cut 81 M more instructions but did not measure. A
+flag in the term table marking a home slot that a term was displaced from, so that a probe
+ends at its home slot unless the flag is set, sent 1.39 million of the 36.8 million lookups
+past the home slot and cut branch misses from 18.4 to 15.6 M, but it added 91 M instructions,
+the user cycles stayed at 4.13–4.16 G, and the wall did not move: 169.69 → 169.10 and 168.87
+→ 169.29 ms, for 9 more lines. Without `#[inline(always)]`, its lookup was no longer inlined
+and the run took 11 ms longer.
 
 ## Experiments that did not stay
 
