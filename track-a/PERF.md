@@ -38,7 +38,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 31 | The hours sorted by size with each hour's size computed once (`sort_by_cached_key`) | run-c441864672ce | 0.0195 | 21.1 | 84.5 |
 | 32 | Hours summarized smallest first, the smallest few last, into a latency buffer of untouched zero pages | run-13fb10f4c6ee | 0.0196 | 19.1 | 84.9 |
 | 33 | One endpoint table that all threads share while they parse, instead of one per thread merged after it | run-9e334b5f00fa | 0.0190 | 18.9 | 85.3 |
-| 34 | The padded copies allocated uninitialized, not zeroed, and each list of large latencies reserved once | | | | |
+| 34 | The padded copies allocated uninitialized, not zeroed, and each list of large latencies reserved once | run-2c0e91287411 | 0.0190 | 18.3 | 85.4 |
 
 ## Step 1: v1
 
