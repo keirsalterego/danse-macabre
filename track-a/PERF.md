@@ -44,6 +44,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 37 | 5 fewer lines with the same machine code: the hour sizes summed inside `sort_by_cached_key`, the name hash's two cases as a `match`, and `same_name` folded into its one caller | run-9fe0786e93d3 | 0.0195 | 18.3 | 85.1 |
 | 38 | A large latency's record field set in the branch that lists it, instead of by a `min` on every line | run-e44188ffe025 | 0.0197 | 18.5 | 84.9 |
 | 39 | 5 fewer lines with the same machine code: the running sum of the hour's counts as one `for_each`, and a large latency listed and replaced by `LARGE` in one `bool::then` | run-89adcd077219 | 0.0196 | 18.4 | 85.1 |
+| 40 | A plain static executable instead of a static PIE (`relocation-model=static`) | | | | |
 
 ## Step 1: v1
 
@@ -571,6 +572,24 @@ four-line `if`. `.text` and `.rodata` are byte-identical to step 38's, so T and 
 S 381 → 376. Gate: 310 pass, 0 fail.
 The board's run, run-89adcd077219, drew 19.6 ms: the fourth draw of 19.5–19.7 ms in a row since
 step 36's 18.3 ms, on code that has changed by 3 instructions per line since.
+
+## Step 40: a plain static executable
+
+The binary was a static PIE: the kernel loads it at a random address and it relocates itself
+before `main`. Built with `-C relocation-model=static`, it is a plain static executable at a
+fixed address instead, with the same code apart from addressing: 692.3 → 689.4 M instructions.
+Yet it ran 3.9% fewer user cycles (383.7 → 368.8 and 382.7 → 368.5 M, 10 runs each), with
+about as many dTLB load misses (81,200 → 77,700) and half the iTLB misses (15,300 → 7,500).
+Kernel cycles and page faults did not move. The phase split puts all of it in the parse: 10.64
+→ 10.03 and 10.55 → 10.06 ms per thread (two sets of 30 runs), while start-up, the hour pass
+and formatting kept their lengths. It is not the alignment of the code: aligning every function
+of the PIE build to 64 bytes (`-align-all-functions=6`) changed nothing.
+
+Local, turbo off: `ab.py`, 61 interleaved runs against step 38's code, four rounds: medians
+20.47 → 19.97, 20.48 → 19.93, 20.62 → 20.13 and 20.90 → 20.36 ms, minimums 20.17 → 19.61,
+19.96 → 19.65, 20.15 → 19.50 and 20.27 → 19.59 ms; against step 39's build, two clean rounds:
+20.59 → 20.09 and 20.80 → 20.48 ms. memory.peak, 11 alternating rounds on each of seeds 1–7 and
+10–12: median 18.18 → 18.21 MB. S unchanged at 376. Gate: 310 pass, 0 fail.
 
 ## Experiments that did not stay
 
