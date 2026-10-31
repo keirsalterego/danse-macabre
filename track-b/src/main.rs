@@ -531,7 +531,8 @@ fn count_hits(sample: &[u8], terms: &TermTable) -> (Vec<u32>, usize) {
     let mut doc = 0;
     let token = |&mut doc: &mut usize, start, end| {
         if let Some(key) = key_in(sample, start, end)
-            && let Some(slot) = terms.find_from(&key, terms.home(&key))
+            // A token that is no query term counts at id 0, which no query reads.
+            && let slot = terms.find_from(&key, terms.home(&key))
             && counted[slot.id() as usize] != doc
         {
             counted[slot.id() as usize] = doc;
@@ -813,52 +814,65 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
         lists: vec![Vec::new(); plan.lists],
     };
     let mut tally = Tally::new(queries.len(), plan.checks.len());
-    // Bit `t` is set while the current doc contains term `t`. One more bit, never set, pads
-    // the checks ([`Check`]) and stands for every token that is no query term, `miss`.
+    // Bit `t` is set while the current doc contains term `t`, bit 0 while it holds a token that
+    // is no query term. One more bit, never set, pads the checks ([`Check`]).
     let mut seen = vec![0u64; (plan.terms.len() + 1).div_ceil(64)];
-    let miss = plan.terms.len() as u32;
-    // The current doc's term id per token (`miss` for the rest), the positions of its phrase
+    // The current doc's term id per token (0 for the rest), the positions of its phrase
     // triggers, the checks of its distinct BOOL triggers, and the phrases it matched, so none
     // counts twice.
     let (mut terms, mut phrase_at, mut bool_terms) = (Vec::new(), Vec::new(), Vec::new());
+    // Its distinct stored terms and BOOL triggers, in the first `stored` and `bools` entries:
+    // one entry per token, so that keeping a term takes a store and an add, not a branch.
+    let (mut kept, mut triggered) = (Vec::new(), Vec::new());
     let mut found = Vec::new();
     // The current doc's tokens as (key, home slot), probed only at the line end: by then every
     // slot load is long under way ([`TermTable::prefetch`]), instead of each stalling in turn.
-    let mut probes: Vec<Option<(Key, usize)>> = Vec::new();
+    let mut probes: Vec<(Key, usize)> = Vec::new();
     let mut doc = ids.start;
     let token = |probes: &mut Vec<_>, start, end| {
-        let key = key_in(text, start, end);
-        probes.push(key.map(|key| (key, plan.terms.prefetch(&key))));
+        // A token past `MAX_TERM` bytes takes a key of 0xFF bytes, which no term has.
+        let key = key_in(text, start, end).unwrap_or([!0; MAX_TERM / 8]);
+        probes.push((key, plan.terms.prefetch(&key)));
     };
     walk(text, &mut probes, token, |probes| {
-        for probe in probes.drain(..) {
-            let Some(slot) = probe.and_then(|(key, at)| plan.terms.find_from(&key, at)) else {
-                terms.push(miss);
-                continue;
-            };
+        if kept.len() < probes.len() {
+            kept.resize(probes.len(), 0);
+            triggered.resize(probes.len(), 0);
+        }
+        let (mut stored, mut bools) = (0, 0);
+        // No branch on what a token is, a query term or not, seen in the doc before or not,
+        // stored or a BOOL trigger: none of it follows a pattern, so each branch would
+        // mispredict often.
+        for (key, at) in probes.drain(..) {
+            let slot = plan.terms.find_from(&key, at);
             let (t, bit) = (slot.id() as usize / 64, 1 << (slot.id() % 64));
-            if seen[t] & bit == 0 {
-                seen[t] |= bit;
-                if slot.flags & Slot::STORED != 0 {
-                    sets.add(plan.store[slot.id() as usize], doc);
-                }
-                if slot.flags & Slot::BOOL != 0 {
-                    // Start loading its checks and their cells now, to use at the line end.
-                    let checks = plan.check_range(slot.id());
-                    prefetch(&plan.checks[checks.start]);
-                    prefetch(&tally.checks[checks.start]);
-                    // Four indices written at once, then cut to the range's length: a loop
-                    // per trigger would mispredict its exit, as the lengths follow no pattern.
-                    let start = checks.start as u32;
-                    bool_terms.extend_from_slice(&[start, start + 1, start + 2, start + 3]);
-                    bool_terms.truncate(bool_terms.len() - 4 + checks.len().min(4));
-                    bool_terms.extend(checks.skip(4).map(|c| c as u32));
-                }
-            }
+            // The term's flags if the doc did not hold it yet, else none: a term is kept and
+            // triggers once per doc.
+            let new = std::hint::select_unpredictable(seen[t] & bit == 0, slot.flags, 0);
+            seen[t] |= bit;
+            kept[stored] = slot.id();
+            stored += usize::from(new & Slot::STORED != 0);
+            triggered[bools] = slot.id();
+            bools += usize::from(new & Slot::BOOL != 0);
             if slot.flags & Slot::PHRASE != 0 {
                 phrase_at.push(terms.len());
             }
             terms.push(slot.id());
+        }
+        for &t in &triggered[..bools] {
+            // Start loading its checks and their cells now, to use below.
+            let checks = plan.check_range(t);
+            prefetch(&plan.checks[checks.start]);
+            prefetch(&tally.checks[checks.start]);
+            // Four indices written at once, then cut to the range's length: a loop
+            // per trigger would mispredict its exit, as the lengths follow no pattern.
+            let start = checks.start as u32;
+            bool_terms.extend_from_slice(&[start, start + 1, start + 2, start + 3]);
+            bool_terms.truncate(bool_terms.len() - 4 + checks.len().min(4));
+            bool_terms.extend(checks.skip(4).map(|c| c as u32));
+        }
+        for &t in &kept[..stored] {
+            sets.add(plan.store[t as usize], doc);
         }
         for &at in &phrase_at {
             for &(q, offset) in plan.phrases(terms[at]) {
@@ -878,7 +892,7 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
             tally.add_check(c as usize, check.q, doc, unsafe { check.matches(&seen) });
         }
         for &t in &terms {
-            // SAFETY: `terms` holds term ids and `miss`, all below `64 * seen.len()`.
+            // SAFETY: `terms` holds term ids and 0, all below `64 * seen.len()`.
             *unsafe { seen.get_unchecked_mut(t as usize / 64) } &= !(1 << (t % 64));
         }
         terms.clear();
@@ -1041,7 +1055,8 @@ impl Slot {
 struct TermTable {
     /// The slot count is a power of two.
     slots: &'static mut [Slot],
-    /// Term id → its key.
+    /// Term id → its key. Id 0 is no term: it is the id of an empty slot, all zero, which a
+    /// probe for a token that is no query term returns.
     keys: Vec<Key>,
 }
 
@@ -1068,7 +1083,7 @@ impl TermTable {
             block.write_bytes(0, layout.size());
             std::slice::from_raw_parts_mut(block.cast(), len)
         };
-        let keys = Vec::new();
+        let keys = vec![[0; MAX_TERM / 8]];
         Self { slots, keys }
     }
 
@@ -1076,10 +1091,10 @@ impl TermTable {
         self.keys.len()
     }
 
-    /// The slot of the query term whose key this is, if any, given `at = self.home(key)`.
-    fn find_from(&self, key: &Key, at: usize) -> Option<Slot> {
-        let slot = self.slots[self.position(key, at)];
-        (slot.head != 0).then_some(slot)
+    /// The slot of the query term whose key this is, given `at = self.home(key)`, or else the
+    /// empty slot where its probe ends, whose id, 0, is no term's.
+    fn find_from(&self, key: &Key, at: usize) -> Slot {
+        self.slots[self.position(key, at)]
     }
 
     /// Where the probe for `key` starts.
@@ -1121,11 +1136,16 @@ impl TermTable {
         let long = key[1] >> 32 | key[2] | key[3] != 0;
         loop {
             let slot = &self.slots[at];
-            let found = slot.head == key[0]
-                && slot.tail == key[1] as u32
-                && (slot.flags & Slot::LONG != 0) == long
-                && (!long || self.keys[slot.id() as usize] == *key);
-            if slot.head == 0 || found {
+            // No `&&`: whether a token is a query term follows no pattern, so the probe takes
+            // one branch, mostly taken, which ends it at the term or at an empty slot.
+            let mut found = (slot.head ^ key[0]) | u64::from(slot.tail ^ key[1] as u32) == 0;
+            found &= (slot.flags & Slot::LONG != 0) == long;
+            if found & long {
+                found = self.keys[slot.id() as usize] == *key;
+            }
+            // Kept as one value, the test stays one branch: LLVM would split it in two, the
+            // first of which mispredicts on every token that is no query term.
+            if std::hint::black_box((slot.head == 0) | found) {
                 return at;
             }
             at = (at + 1) & mask;

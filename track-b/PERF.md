@@ -29,6 +29,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 22 | 8 fewer code lines in code that runs once, with the same machine code | run-59d37d7b5803 | 0.2177 | 42.3 | 70.5 |
 | 23 | A per-document check reads its terms' bits with one AVX2 gather instead of six loads, and the document's term bits are read and cleared without bounds checks | run-29bb809aa3f8 | 0.2048 | 43.5 | 71.2 |
 | 24 | A document's checks are listed one by one as its BOOL triggers appear, so one loop runs them all instead of one loop per trigger | run-170e5552bd10 | 0.2085 | 42.4 | 71.0 |
+| 25 | The token loop takes no branch on what a token is: a token that is no query term probes to an empty slot, id 0, and a document's new stored terms and BOOL triggers are listed by a store and an add | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -518,6 +519,48 @@ Locally, against step 23 (alternating runs, `ab.py`, 20 each), three rounds: med
 210.73 and 210.50 ms. `perf stat`: branch misses 58.5 → 52.0 M, user cycles 5.32 → 5.23 G,
 instructions 7,517 → 7,625 M. memory.peak over six alternating runs: median 43.8 → 43.3 MB.
 S 732 → 733. Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
+
+## Step 25: a token loop without data-dependent branches
+
+Step 24's 52 million mispredicted branches came from four tests per token, counted by branch
+address in the last branch record (`perf record -b`): the term table probe's compare (34%),
+whether the doc held the term already (20%), whether the term is stored (26%) and whether it
+triggers BOOL checks (11%). Each tests a property that follows no pattern from one token to
+the next. On seed 1, 79% of the 36.3 million tokens are query terms, 78% of those are new in
+their document, and of the new ones 53% are stored and 38% are triggers.
+
+- **Id 0 is no term.** The table's first key is a placeholder, so term ids start at 1, and an
+  empty slot, all zero, carries id 0 and no flags. A probe for a token that is no query term
+  returns that empty slot, and the pass treats the token as any other: bit 0 of `seen`, id 0
+  in the doc's terms, nothing stored or triggered. A token past `MAX_TERM` bytes takes a key of
+  0xFF bytes, which no term has. The sample counts its misses at id 0, which no query reads.
+- **One branch per probe.** The compare uses `^`, `|` and `&` instead of `&&`, and the test
+  that ends the probe (an empty slot, or the term) goes through `black_box`: as one value it
+  stays one branch, mostly taken, where LLVM split it into two, the first of which
+  mispredicted on every token that is no query term.
+- **Lists by store and add.** A conditional move picks the term's flags when the doc did not
+  hold it yet, and 0 when it did. The term id is written at the end of the doc's stored-term
+  list and at the end of its trigger list, and each list's length grows by the matching flag
+  bit, 0 or 1. Both lists have one entry per token, so neither needs a capacity test. After
+  the doc's last token, one loop does the stored adds and one appends the triggers' checks, as
+  before.
+
+Built up step by step on step 24, median of 14 to 18 alternating runs: the empty slot as the
+probe's result for misses, with the compare's two branches as LLVM left them, 211.9 → 209.7 ms; the lists by
+store and add on top, 195.0 ms; one branch per probe, 189.6 ms; id 0 for the empty slot
+instead of an id written into every empty slot after planning, 187.0 ms; the conditional move
+and the `^` compare instead of `&` between booleans, 183.6 ms. Two versions lost. The single
+probe branch alone, with the old tests after it, ran 216.8 ms against 209.7: each token's
+randomness moved into the first-sighting test. Doing the stored add and the check append for
+every token, the spare row and list absorbing the others, cut mispredictions to 24 M but
+added 2.8 G instructions: 5.76 G user cycles against 5.18 G.
+
+Locally, against step 24 (alternating runs, `ab.py`, 18 each), two clean rounds: median 212.38
+and 211.81 → 183.60 and 183.71 ms, min 210.92 and 210.03 → 182.48 and 183.17 ms. Two other
+rounds, run while the box was loaded (load average 7–8), are left out. `perf stat`: branch
+misses 52.1 → 20.8 M, instructions 7,625 → 8,392 M, user cycles 5.23 → 4.42–4.44 G.
+memory.peak over six alternating runs: median 42.6 → 42.9 MB. S 733 → 738. Gate: 510 pass, 0
+fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
 
 ## Experiments that did not stay
 
