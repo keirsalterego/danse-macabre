@@ -36,7 +36,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 29 | `NameSet::read` takes each letter with plain loads and its group as a byte, and `insert` is cold, so marking a name runs 17 fewer instructions per record | run-c02fb16de73f | 0.0312 | 12.5 | 77.8 |
 | 30 | 5 fewer lines, three of them with the same machine code: the name set's insert builds its entry in the push and its marking loop takes the group and the key in one statement, `main` writes the output in one line and reads each directory with `nth`, and `merge` sets the min and the max in one assignment | run-3ce10275f327 | 0.0310 | 12.2 | 78.1 |
 | 31 | 1 fewer line with the same binary: the Dockerfile's build stage mounts its sources instead of copying them | run-66c99a1d91aa | 0.0309 | 11.9 | 78.2 |
-| 32 | The name set's probe ends at its entry's line, so a hit's index is checked once, and the test for a long name moves into the cold compare | | | | |
+| 32 | The name set's probe ends at its entry's line, so a hit's index is checked once, and the test for a long name moves into the cold compare | run-4ca7cce6e305 | 0.0303 | 11.9 | 78.4 |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
