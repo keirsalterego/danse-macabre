@@ -392,10 +392,8 @@ fn parse<'a>(log: &'a [u8], lines: Range<usize>, endpoints: &Interner<'a>) -> Ch
         let id = endpoints.intern(name, hash(name, word(line, start)), window);
         // Errors are exactly 500..=599, so the status's first digit decides.
         let error = u32::from(line[space - 3] == b'5');
-        if micros >= LARGE {
-            chunk.large.push(micros);
-            micros = LARGE;
-        }
+        // A large latency goes on the side list, and its field holds LARGE in its place.
+        (micros >= LARGE).then(|| chunk.large.push(std::mem::replace(&mut micros, LARGE)));
         // SAFETY: each line moves `i` on by at least MIN_LINE bytes, malformed or not, since
         // `line_end` starts looking at byte MIN_LINE - 1, so `count` stays below the length the
         // records were given.
@@ -694,9 +692,7 @@ fn summarize_hour(runs: &[Run], order: &Order, names: &[&[u8]], buffer: &mut [u3
             errors[e] += r >> 19 & 1;
         }
     }
-    for e in 1..start.len() {
-        start[e] += start[e - 1];
-    }
+    (1..start.len()).for_each(|e| start[e] += start[e - 1]);
     let buffer = &mut buffer[..start[names.len()] as usize];
     for &(records, large) in runs {
         let mut large = large.iter();
