@@ -55,14 +55,15 @@
 //! the slots in input order, so the output never depends on which thread answered what.
 
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::{cmp::Reverse, error::Error, io, io::Write, os::fd::AsRawFd, path::Path, thread};
 
-// `mmap(2)` and `mallopt(3)` from the C library, which std links already. Declaring them here
-// saves the `libc` crate. The constants are Linux's, from `<sys/mman.h>` and `<malloc.h>`; a
-// comment at each call names them.
+// `mmap(2)`, `madvise(2)` and `mallopt(3)` from the C library, which std links already. Declaring
+// them here saves the `libc` crate. The constants are Linux's, from `<sys/mman.h>` and
+// `<malloc.h>`; a comment at each call names them.
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
 }
 
@@ -307,27 +308,40 @@ fn build_graph(body: &[u8], n: usize, threads: usize) -> Result<[Csr; 2], Box<dy
         }
     }
 
-    // Pass 3: sort every block, split evenly over the threads, one direction at a time, so the
+    // Pass 3: sort every block, dealt out to the threads in turn, one direction at a time, so the
     // first direction's places are freed before the second direction's rows take memory. The
     // rows are faulted in first, one write per 2 MB, for the same reason as the arrays above:
     // 12 threads writing to new pages at once raised the peak by up to 20 MB on seed 1.
     for (direction, (graph, mut places)) in graphs.iter_mut().zip(places).enumerate() {
         on_threads(graph.rows.chunks_mut(1 << 18), |rows| rows[0] = 0);
         let lens = || (0..blocks).map(|block| in_block(direction, block).sum());
-        let block_runs = split_runs(&mut graph.edges, lens()).into_iter();
+        let block_runs = split_runs(&mut graph.edges, lens()).into_iter().enumerate();
+        let freed = AtomicUsize::new(places.as_ptr().addr().next_multiple_of(1 << 21));
         let block_places = block_runs.zip(split_runs(&mut places, lens()));
-        let (mut work, mut first) = (Vec::with_capacity(blocks), 0);
-        for ((run, places), rows) in block_places.zip(graph.rows.chunks_mut(BLOCK / 4)) {
+        let (mut work, mut first) = ((0..threads).map(|_| Vec::new()).collect::<Vec<_>>(), 0);
+        for (((i, run), places), rows) in block_places.zip(graph.rows.chunks_mut(BLOCK / 4)) {
             let next = first + run.len() as u32;
-            work.push((run, places, rows, first, Vec::new()));
+            work[i % threads].push((run, places, rows, first, Vec::new()));
             first = next;
         }
-        on_threads(work.chunks_mut(blocks.div_ceil(threads)), |share| {
+        // Thread i sorts blocks i, i + threads, i + 2 * threads and so on, and after each one it
+        // sets done[i] to where that block's places end. Every place below the least of them
+        // then belongs to a sorted block, so the whole 2 MB pages there are given back at once
+        // (a part of a huge page would stay charged). Else the first direction's rows add to
+        // both directions' places, which was the run's peak: 1.9 MB lower on seed 1 (PERF.md).
+        let done: Vec<_> = (0..threads).map(|_| AtomicUsize::new(0)).collect();
+        on_threads(work.iter_mut().zip(&done), |(share, end)| {
             for (run, places, rows, first, wide) in share {
                 sort(run, places, rows, *first, wide);
+                end.store(places.as_ptr_range().end.addr(), SeqCst);
+                let to = done.iter().map(|d| d.load(SeqCst)).min().unwrap_or(0) >> 21 << 21;
+                let from = freed.fetch_max(to, Relaxed);
+                // SAFETY: the range is empty or holds only places of sorted blocks, which nothing
+                // reads again. MADV_DONTNEED (4) drops its pages.
+                unsafe { madvise(from as *mut u8, to.saturating_sub(from), 4) };
             }
         });
-        graph.wide = work.into_iter().flat_map(|work| work.4).collect();
+        graph.wide = work.into_iter().flatten().flat_map(|work| work.4).collect();
     }
     Ok(graphs)
 }

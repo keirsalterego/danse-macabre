@@ -21,6 +21,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 14 | 11 fewer lines with the same machine code: the single-item `use` lines in one, the `mmap` and `mallopt` constants written at their one call each with their names in a comment, the file descriptor passed straight to `mmap`, and two pairs of variables declared together | run-954b4981ddcb | 0.1255 | 68.1 | 72.7 |
 | 15 | 1 fewer line with the same machine code: `sort`'s counters and its running sum declared together | run-5194056b1310 | 0.1244 | 68.4 | 72.7 |
 | 16 | `Queue::push` forced inline, so a relaxation no longer pays for a call: 1.8% fewer instructions | run-fc6e22635c4b | 0.1221 | 67.7 | 73.0 |
+| 17 | Pass 3 gives back the places of sorted blocks as it goes: the threads take the blocks in turn, and the 2 MB pages below the slowest one's progress are dropped with `madvise` | | | | |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
@@ -424,6 +425,39 @@ label tables grown to 32,768 or 65,536 buckets. So a cut to the labels alone can
 the build peak falls by about 4.4 MiB. It also explains the measured peaks below: u16 labels
 save 2–3 MB in the queries and nothing in the peak.
 
+## Step 17: pass 3 gives back the places it has sorted
+
+A phase trace of step 16 (seed 1, `memory.current` and `memory.peak` of the cgroup at each phase
+mark, KiB, 3 runs) put the peak at the end of pass 3's first direction, 65,856–66,048, against
+62,356–62,388 at the end of pass 2 and 60,488–62,632 when the query threads finish. The difference
+is the forward rows, written while both directions' places are still alive, plus the sort's
+buffers.
+
+Pass 3 now deals the blocks out in turn: thread i sorts blocks i, i + 12, i + 24 and so on, in
+order, and after each block stores where that block's places end. Below the least of the 12
+stored ends every place belongs to a sorted block (a block that reaches below it is behind its
+own thread's last one), so after each block the whole 2 MB pages below it that are not yet
+dropped go back with `madvise(MADV_DONTNEED)`. The bounds are 2 MB aligned because a dropped part
+of a huge page stays charged until the rest of it goes. The reverse direction runs the same code.
+
+- Phase trace after (seed 1, 5 runs, KiB): pass 2 ends at 62,192–62,872, the forward pass 3 tops
+  out at 63,436–64,448, and the query threads end at 62,948–63,652. The forward pass still adds
+  about 1.2 MiB: the first huge page of places goes only once the slowest thread is past it, and
+  the 4 KB pages before it stay.
+- memory.peak, MiB, 6 alternating runs each: seed 1 63.9–64.4 → 61.9–62.7 (medians 64.1 →
+  62.25) and 64.0–64.6 → 61.8–62.4 (64.3 → 62.15); seed 2 63.9–64.5 → 61.8–62.7 (64.1 → 62.35);
+  seed 3 64.0–64.7 → 61.8–62.7 (64.2 → 62.15).
+- `ab.py`, 41 alternating runs per binary, medians (minimums): seed 1 128.75 → 128.01 (126.90 →
+  126.43) ms; seed 3 134.67 → 135.20 (132.45 → 132.43) ms. Before two line cuts that leave the
+  logic as is (an `if` around the call, and acquire/release orderings): seed 1 128.57 → 128.08
+  and 128.84 → 129.01, seed 2 129.70 → 130.59 ms. A tie.
+- S 442 → 449. Gate: 512 pass, 0 fail.
+
+The three levels are now within about 1.5 MB of each other: the end of pass 2 (both edge
+arrays and both place arrays, 57.2 MiB, with about 4.5 MiB of process, page tables and the
+cgroup's per-CPU charge batches), the forward pass 3, and the queries. A lower M needs all three
+to fall, and the places only shrink with a slower build (the transposed build below took 6.5 ms).
+
 ## Tried and reverted (local, turbo off, no run ID)
 
 Each row's baseline ran in the same interleaved session as the experiment, so baselines differ
@@ -488,3 +522,5 @@ between rows.
 | Labels in a dense `u32` array per search, 2^21 slots, reset through a list of touched nodes (on step 15) | `ab.py`, 11 runs: median 131.04 → 243.08 ms | 24 arrays of 8 MiB written in full on first use, about 200 MB of page faults and zeroing |
 | `#[inline(always)]` on `Search::step` (on step 15) | `perf stat`, 5 runs: cycles 3.137 → 3.111 G (−0.8%), instructions +0.8% | Below `push`'s gain, which step 16 took |
 | The forward CSR built first, then the reverse one by transposing it, so the two place arrays are never live together (on step 15) | memory.peak, 6 runs: median 67.78 → 64.88 MB, highest 67.97 → 65.52. `ab.py`, 31 runs: median 130.61 → 137.06 ms, min 128.61 → 135.52. Build 34.5 → 42.7 ms (forward count 9.1, fault 3.6, scatter 10.9, sort 3.2; reverse count 3.1, fault 1.6, scatter 5.4, sort 3.5) | 2.9 MB saved for 6.5 ms: the queries' own peak, about 64–65 MB, then caps the saving, and the second scatter costs more than pass 2 saves |
+| Step 17's pass 3 in four rounds, each its own `on_threads`, with the sorted places given back between rounds | Not built in full: one `on_threads` of 12 threads that do nothing takes 172–189 µs (average of 20, three runs), so the forward direction's three extra rounds cost about 0.55 ms | Step 17 frees as much with no extra rounds |
+| Step 17 with each thread's sorted blocks counted, and every block below 12 × the least count freed (on step 16) | memory.peak, 6 alternating runs: 62.1–62.5 against 63.9–64.3 MB | The same memory as step 17, which needs no list of block starts |
