@@ -38,8 +38,8 @@
 
 // The AVX2 intrinsics of `classify` and the prefetch of `prefetch`.
 use std::{
-    alloc::Layout, arch::x86_64::*, error::Error, fs::File, io::Write, num::NonZeroUsize,
-    ops::Range, os::fd::AsRawFd, path::Path, thread,
+    alloc::Layout, arch::asm, arch::x86_64::*, error::Error, fs::File, io::Write,
+    num::NonZeroUsize, ops::Range, os::fd::AsRawFd, path::Path, thread,
 };
 
 /// The first `1 / SAMPLE_SHARE` of the corpus is tokenized up front to estimate how rare each
@@ -891,9 +891,11 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
             // SAFETY: the binary targets alderlake (.cargo/config.toml), which has AVX2.
             tally.add_check(c as usize, check.q, doc, unsafe { check.matches(&seen) });
         }
+        // Every set bit is one of the doc's terms, so zeroing their words clears `seen`: a store
+        // with no load, so tokens that share a word, as all misses do, do not wait on each other.
         for &t in &terms {
             // SAFETY: `terms` holds term ids and 0, all below `64 * seen.len()`.
-            *unsafe { seen.get_unchecked_mut(t as usize / 64) } &= !(1 << (t % 64));
+            *unsafe { seen.get_unchecked_mut(t as usize / 64) } = 0;
         }
         terms.clear();
         phrase_at.clear();
@@ -1143,9 +1145,12 @@ impl TermTable {
             if found & long {
                 found = self.keys[slot.id() as usize] == *key;
             }
-            // Kept as one value, the test stays one branch: LLVM would split it in two, the
-            // first of which mispredicts on every token that is no query term.
-            if std::hint::black_box((slot.head == 0) | found) {
+            // Hidden from the optimizer, the test stays one branch: LLVM would split it in two,
+            // the first of which mispredicts on every token that is no query term.
+            let mut stop = u8::from(slot.head == 0) | u8::from(found);
+            // SAFETY: the asm block is empty; it only keeps the optimizer from seeing `stop`.
+            unsafe { asm!("/* {} */", inout(reg_byte) stop, options(pure, nomem)) };
+            if stop != 0 {
                 return at;
             }
             at = (at + 1) & mask;

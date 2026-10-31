@@ -30,6 +30,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 23 | A per-document check reads its terms' bits with one AVX2 gather instead of six loads, and the document's term bits are read and cleared without bounds checks | run-29bb809aa3f8 | 0.2048 | 43.5 | 71.2 |
 | 24 | A document's checks are listed one by one as its BOOL triggers appear, so one loop runs them all instead of one loop per trigger | run-170e5552bd10 | 0.2085 | 42.4 | 71.0 |
 | 25 | The token loop takes no branch on what a token is: a token that is no query term probes to an empty slot, id 0, and a document's new stored terms and BOOL triggers are listed by a store and an add | run-ab97ce51555f | 0.1746 | 43.5 | 72.9 |
+| 26 | A document's term bits are cleared by zeroing their words, a store with no load, and the probe's end test is kept one branch by an empty asm block instead of `black_box`, which sent it through the stack | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -561,6 +562,25 @@ rounds, run while the box was loaded (load average 7–8), are left out. `perf s
 misses 52.1 → 20.8 M, instructions 7,625 → 8,392 M, user cycles 5.23 → 4.42–4.44 G.
 memory.peak over six alternating runs: median 42.6 → 42.9 MB. S 733 → 738. Gate: 510 pass, 0
 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
+
+## Step 26: stores to clear a document's bits, and the probe's test in a register
+
+- **Clearing by stores.** After a document's last token, a loop cleared each token's bit in
+  `seen` with a load, an AND and a store. Tokens whose bits share a word, among them every
+  token that is no query term (bit 0 of word 0), made a chain through memory, each load
+  waiting on the store before it. Every set bit belongs to one of the document's terms, so
+  setting each term's word to 0 clears them all, with a store and no load.
+- **The probe's test in a register.** `black_box`, which kept the probe's end test one branch
+  in step 25, writes its value to the stack and reads it back, which adds a store-to-load
+  forward to every probe. An empty `asm!` block that takes the value in a register hides it
+  from LLVM the same way, with no memory access.
+
+Each alone, against step 25 (median of 18 alternating runs): the stores 3.5 ms, the asm block
+1.7 ms. Locally, against step 25 (alternating runs, `ab.py`, 18 each), two rounds: median
+183.40 and 183.54 → 179.01 and 178.44 ms, min 181.87 and 182.22 → 177.50 and 177.52 ms.
+`perf stat`: user cycles 4.39–4.44 → 4.31 G, instructions 8,392 → 8,236 M, branch misses 20.8
+→ 20.9 M. memory.peak over six alternating runs: median 40.7 → 41.6 MB. S 738 → 740. Gate:
+510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
 
 ## Experiments that did not stay
 
