@@ -50,8 +50,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 43 | A phrase candidate is first tested on one more of the phrase's terms, which the plan keeps beside the trigger, before the phrase's terms are loaded: 97.5% of the candidates stop there | run-b96f907a19fc | 0.1151 | 41.2 | 77.2 |
 | 44 | The line end's token loop prefetches each token's entry of `check_at`, which the BOOL triggers' loop reads at random, one token ahead of that loop | run-0f0011884453 | 0.1166 | 42.4 | 77.1 |
 | 45 | A token whose home slot holds another term stops there unless the slot is marked as the home of a term stored further on; a key's long bit is its byte 12's bit 5, moved by one shift | run-636a838e4422 | 0.1135 | 42.3 | 77.3 |
-| 46 | A window's matches counted and summed four words at a time from two nibble tables, instead of six masked popcounts per word | | | | |
-| 47 | A document's phrase triggers are listed in a fifth run of the token loop's slice, by a store and an add, instead of pushed to a `Vec` behind a branch | | | | |
+| 46 | A window's matches counted and summed four words at a time from two nibble tables, instead of six masked popcounts per word | run-f954cb1f35f8 | 0.1117 | 43.3 | 77.4 |
+| 47 | A document's phrase triggers are listed in a fifth run of the token loop's slice, by a store and an add, instead of pushed to a `Vec` behind a branch | run-f954cb1f35f8 | 0.1117 | 43.3 | 77.4 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
