@@ -1789,6 +1789,23 @@ to −3.1% over five rounds, −2.7% on average). memory.peak over five alternat
 
 ## Experiments that did not stay
 
+- **After step 62, the tokenizer's hash constant** (seed 1, `perf stat -r 5`, interleaved, two
+  rounds). The multiply's 64-bit constant takes a register, so the tokenizer reloads its block's
+  address from the stack per token. Freeing it:
+  - A constant that fits a sign-extended 32-bit immediate, `0xFFFF_FFFF_9E37_79B1`, so that
+    `imul` takes it inline: the block's address then stays in a register, but a short key's
+    product is small, and negated it has its top bits all set, so short keys pile into a few home
+    slots: 3,823.2 → 40,959.0 M instructions, branch misses 10.6 → 31.4 M.
+  - `_mm_crc32_u64(0, key[0])`, the hash's top bits shifted down from 32: the block's address
+    stays in a register, but a `xor` zeroes the accumulator per token. Instructions 3,823.2 →
+    3,813.5 M, cycles 2,089 and 2,088 → 2,084 and 2,087 M, branch misses 10.57 → 10.50 M.
+  - `_mm_crc32_u64(key[0], key[0])`, the key as its own accumulator: one instruction, but a linear
+    map of too low a rank, 192,796 M instructions and 46.6 M branch misses.
+- **After step 62, the probes 32-byte aligned.** The tokenizer's 32-byte store of a key takes the
+  most cycle samples of its loop, and at a 40-byte stride 3 in 8 of them cross a cache line. As a
+  `#[repr(align(32))]` struct of 64 bytes, none does: instructions 3,823.2 → 3,827.6 M, cycles
+  2,095 and 2,093 → 2,116 and 2,111 M (+0.9%), the larger buffer costing more than the splits.
+
 - **After step 61** (seed 1, `perf stat -r 5`, interleaved; `ab.py`, 31 alternating runs, medians /
   minimums, ms):
   - On step 62's packing, the probes holding the home slot's offset in bytes instead of its
