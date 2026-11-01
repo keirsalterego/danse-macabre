@@ -840,9 +840,19 @@ struct Window {
     /// word `j` of document `d` is `group[j][d]`, so a doc's rows take a store per word instead
     /// of a store per row and a load of its term's store.
     group: Vec<[u64; 64]>,
-    /// The id lists: the window's documents that contain the list's term, ascending, as
+    /// The id lists' entries in the order the documents add them, list `j` holding document
+    /// `start + i` as `j << 5 | i % 32`: a push at the end of one log, not into one of thousands
+    /// of lists whose ends lie at random, each a cache miss (PERF.md, step 57). `j` is below the
+    /// term count, below 2^27 ([`TermTable::intern`]).
+    log: Vec<u32>,
+    /// Where the log's entries of documents `start + 32 * b` to `start + 32 * b + 31` end, `b`
+    /// past the last document 0.
+    ends: [u32; 2 * WINDOW],
+    /// The id lists, the log sorted by list in [`Window::flush`]: list `j` is
+    /// `ids[at[j]..at[j + 1]]`, the window's documents that contain its term, ascending, as
     /// offsets from `start`, which take half the memory of ids.
-    lists: Vec<Vec<u16>>,
+    at: Vec<u32>,
+    ids: Vec<u16>,
 }
 
 impl Window {
@@ -863,7 +873,8 @@ impl Window {
             return &self.bits[store as usize];
         }
         *scratch = [0; WINDOW];
-        for &i in &self.lists[(store ^ LIST) as usize] {
+        let j = (store ^ LIST) as usize;
+        for &i in &self.ids[self.at[j] as usize..self.at[j + 1] as usize] {
             scratch[usize::from(i / 64)] |= 1 << (i % 64);
         }
         scratch
@@ -875,6 +886,22 @@ impl Window {
     /// On bitsets, AND, OR and NOT are the word-wise `&`, `|` and `& !`, 64 documents per
     /// operation.
     fn flush(&mut self, queries: &Queries, plan: &Plan, tally: &mut Tally) {
+        // A counting sort: list `j`'s count goes to `at[j + 2]`, the sums then make `at[j + 1]`
+        // its start, and each entry moves it on, to its end and the start of list `j + 1`.
+        self.at.fill(0);
+        (self.log.iter()).for_each(|&e| self.at[(e >> 5) as usize + 2] += 1);
+        (1..self.at.len()).for_each(|j| self.at[j] += self.at[j - 1]);
+        self.ids.resize(self.log.len(), 0);
+        let mut from = 0;
+        for (b, end) in self.ends.iter_mut().enumerate() {
+            let to = std::mem::take(end).max(from);
+            for &e in &self.log[from as usize..to as usize] {
+                let end = &mut self.at[(e >> 5) as usize + 1];
+                self.ids[*end as usize] = (32 * b) as u16 | (e % 32) as u16;
+                *end += 1;
+            }
+            from = to;
+        }
         let mut scratch = [0; WINDOW];
         for &q in &plan.sets {
             let mut acc = [0u64; WINDOW];
@@ -890,7 +917,7 @@ impl Window {
             tally.add_bits(q, self.start, acc);
         }
         self.bits.fill([0; WINDOW]);
-        self.lists.iter_mut().for_each(Vec::clear);
+        self.log.clear();
         self.start += 64 * WINDOW as u32;
     }
 }
@@ -908,7 +935,10 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
         start: ids.start,
         bits: vec![[0; WINDOW]; plan.sizes[0].next_multiple_of(64)],
         group: vec![[0; 64]; plan.sizes[0].div_ceil(64)],
-        lists: vec![Vec::new(); plan.sizes[1]],
+        log: Vec::new(),
+        ends: [0; 2 * WINDOW],
+        at: vec![0; plan.sizes[1] + 2],
+        ids: Vec::new(),
     };
     let mut tally = Tally::new(queries.len(), plan.checks.len());
     // Bit `t` is set while the current doc contains term `t`, bit 0 while it holds a token that
@@ -994,9 +1024,9 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
         if i % 64 == 63 {
             sets.spill(i / 64);
         }
-        for &t in &kept[n..lists] {
-            sets.lists[(store[t as usize] ^ LIST) as usize].push(i as u16);
-        }
+        let entry = |&t: &u32| (store[t as usize] ^ LIST) << 5 | (i % 32) as u32;
+        sets.log.extend(kept[n..lists].iter().map(entry));
+        sets.ends[i / 32] = sets.log.len() as u32;
         for at in kept[3 * n..phrases].iter().map(|&k| k as usize) {
             for &(q, offset, other, term) in plan.phrases(terms[at]) {
                 // `terms` holds this doc only, so a match never spans two docs (spec §3).

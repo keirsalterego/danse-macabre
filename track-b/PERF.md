@@ -61,6 +61,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 54 | The common terms take ids 1 up, the rows' numbers, so a doc's rows are the first words of its term bits: the line end copies those words, and every 64 docs a 64 × 64 bit transpose turns them into the rows' words; the rows run of `kept`, its store lookups and the `ROW` flag go | run-255e2729d35b | 0.1011 | 42.0 | 78.5 |
 | 55 | Reverted after three board runs (see its section). Trial: 11 threads parse the queries while the main thread counts their terms and sets up the term table, then interns each share as soon as it is parsed | run-dc45dd0a1279 | 0.1041 | 41.6 | 78.1 |
 | 56 | Trial: the probe's first test compares a key's whole second word with the slot's `tail`, so it takes no branch on a key's length, and a term past 12 bytes is found past that test; the BOOL triggers' loop reads `check_at` and writes `todo` without bounds checks | | | | |
+| 57 | The id lists' entries pushed to the end of one log, and sorted into the lists by counting at each window's flush, instead of pushed into one of 3,452 lists at random | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1544,7 +1545,62 @@ ms (−1.3% to −2.3%, −1.8% on average, so a trial). On step 55's code, agai
 104.21 ms, seed 2, 106.48 / 105.01 → 106.05 / 104.70 ms. memory.peak over five alternating runs:
 38.2–39.9 → 38.4–40.2 MB. S 823 → 821. Gate: 510 pass, 0 fail.
 
+## Step 57: the id lists from one log, sorted at the flush
+
+After step 56, a build that skipped the id lists' pushes (wrong answers, to size the stage) ran
+137 M fewer cycles (−5.9%, the flush's lists included), and `perf record` of L2 misses put 27%
+of the pass's 6.6 M on the pushes: about one per push. Seed 1 has 1.75 M of them, a doc's first
+sight of a listed term, about 7 per document, 28.7 K per window. Each loaded the term's store,
+then one of 3,452 `Vec` headers, then wrote the end of that list: the ends of thousands of lists
+lie at random, and few stay in L2 between two pushes.
+
+Now a document's entries go to the end of one log, list `j` holding document `start + i` as
+the `u32` `j << 5 | i % 32`, and the log records where each 32 documents' entries end. At the
+flush, a counting sort moves them into the lists: a count per list, the sums, and a scatter in
+log order, so that each list stays ascending; the lists are then `ids[at[j]..at[j + 1]]`. The
+log, 115 KB a window on seed 1, is written in order, and the sort's 13.8 KB of counts stay in
+L1. An entry of a `u64`, `j << 16 | i`, needs no ends, but its log took 2.5 MB more at the
+peak (memory.peak 41.2–41.3 MB) for the same cycles.
+
+Against step 56, measured after the reboot of Nov 1 with turbo off: `perf stat -r 5`,
+interleaved, instructions 4,291.4 → 4,318.8 M (+0.6%), cycles 2,364 and 2,365 → 2,301 and 2,302
+M (−2.7%), branch misses 11.2 → 11.0 M. `ab.py`, 61 alternating runs, medians / minimums: seed
+1, 103.47 / 102.07 → 101.56 / 99.99 ms; seed 2, 103.31 / 102.04 → 100.98 / 99.90 ms; seed 3,
+103.56 / 101.78 → 100.92 / 99.69 ms (−1.8% to −2.5%). The same build before `fmt` merged two
+lines: seed 1, 103.49 / 102.11 → 101.20 / 99.56 ms; seed 2, 104.00 / 101.76 → 101.33 / 99.89
+ms; seed 3, 103.70 / 101.90 → 100.90 / 99.78 ms (−2.2% to −2.7%). Against step 54, seed 1:
+105.58 / 104.06 → 101.47 / 99.69 ms (−3.9%). memory.peak over five alternating runs: 38.6–40.1
+→ 38.2–40.0 MB. S 821 → 842. Gate: 510 pass, 0 fail.
+
 ## Experiments that did not stay
+
+- **After step 56, the per-token work** (`perf stat -r 5`, interleaved, seed 1; `ab.py`, 41
+  alternating runs, medians / minimums, ms):
+  - The probe's miss test as a branch-free select in `find_from`, the miss mask hidden from
+    LLVM, which made branches of it: 22–33 M fewer instructions, cycles −0.5% at most and none
+    on top of the 32-byte checks below. Seed 1, on step 55's code, 104.05 → 103.75.
+  - A token's length clamped to 33 in `fold`, with a 0xDF byte before the mask's 0xFF bytes, so
+    that a token past 32 bytes takes a key no term has without an `Option`: 74 M fewer
+    instructions, cycles +0.3%; 104.05 → 104.15.
+  - No prefetch of a token's `check_at` entry: 37 M fewer instructions, cycles mixed; 104.05 →
+    103.67, within the noise.
+  - A [`Check`] of 32 bytes, its query index moved to a vector of its own read only for first
+    matches and at the pass's end: 7 M fewer instructions, cycles 2,357–2,362 → 2,342–2,348 M
+    (−0.6%). With it, `check_at` and `phrase_at` side by side, one prefetch per token for both:
+    +16 M instructions, cycles −0.4% to −0.8% more; plus a prefetch loop over the phrase
+    entries, +51 M instructions and +0.3 M branch misses for about −0.5%; with the term's store
+    as a third column, +95 M instructions, slower. The 32-byte checks with the pair, against
+    step 56: seed 1, 104.85 / 103.12 → 104.23 / 102.44; seed 2, 105.79 / 104.12 → 105.37 /
+    103.63. On top of step 57's log (its `u64` form): cycles −1.6% (2,310 and 2,305 → 2,273 and
+    2,237 M), but seed 1, 102.86 / 101.58 → 102.52 / 101.59; seed 2, 103.02 / 101.99 → 102.70 /
+    100.88; seed 3, 102.93 / 101.35 → 102.84 / 100.88 (61 runs, −0.1% to −0.3%), for 8 more
+    lines.
+  - A prefetch of a first match's `shown` count in `add_checks`: 20 M more cycles. The cap on
+    `shown` dropped, the first matches extended unconditionally: 10 to 41 M fewer cycles,
+    mixed, and about 3 MB more at the memory peak.
+  - Bounds (wrong answers, to size each stage): with no phrase checks, 95 M fewer cycles
+    (−4.1%); with no first matches counted, 125 M fewer (−5.4%), mostly their grouping in
+    the tally.
 
 - **After step 55, the scanning threads' setup** (`ab.py`, 41 alternating runs against step
   55, medians / minimums, ms):
