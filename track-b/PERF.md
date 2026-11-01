@@ -2343,3 +2343,13 @@ the time. Locally, on battery, the packing alone measured −1.6% to −2.4% aga
   memory.peak over four runs 52.1–53.9 MB against 41.9–43.0 MB. Of its 58.8 ms of BOOL work,
   logging took 11.5, grouping 8.3 and evaluation 39.0: at least 55 million merge steps, where
   the per-document checks run 16.9 million times.
+- **The query terms interned on every thread, after step 63** (local, turbo off). Eleven threads
+  each parse a share of `queries.txt` and intern their terms straight into one shared table: a
+  new term claims its empty slot by a compare-and-swap of the slot's `head`, takes its id from a
+  block of 64 that its thread draws from an atomic counter, and publishes the id last (Release),
+  which a probe that meets the same `head` waits for (Acquire). The pass's page-touching helper
+  threads moved into the plan's tail, two thirds of the threads. Gate 512 pass, 0 fail; 12 runs
+  of seed 1 byte-identical (8 on 12 CPUs, 4 on 4). `ab.py`, 41 interleaved runs: seed 1 median
+  92.56 → 89.94 ms (min 91.58 → 88.79), seed 3 92.37 → 90.08 ms (min 91.15 → 89.12), about
+  −2.6%. memory.peak, 3 alternating runs: 39.0–39.8 → 39.4–39.7 MB. But S 901 → 959: K ×1.004,
+  about +0.09 points, inside the runs' spread. Not kept.

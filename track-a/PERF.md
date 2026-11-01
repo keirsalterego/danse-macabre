@@ -1589,6 +1589,14 @@ and 18.36 → 18.34 ms (minimums 17.74 → 17.61, 17.77 → 17.64 and 17.86 → 
   takes 0.05 ms), and a SIMD `put_number` (the formatting's user time is 1.2 ms of the 1.55 ms
   phase; the rest is the kernel's shmem faults and `xa_lock`).
 
+- **Two of the step 57 notes' memory cuts, after step 64** (local, turbo off). (1) The
+  interner's three tables released before the names' output order is sorted, the sort comparing
+  the names the plan already holds instead of the padded copies; (2) the hour order's last
+  `2 × threads` hours reversed instead of the `threads` smallest moved to the end. memory.peak,
+  6 alternating rounds on seeds 1, 3 and 5: median 15.90 MB for step 64, 15.95 with both cuts,
+  16.00 with a third that wrote the output from the buffer's end. Within the noise of the
+  kernel's charge batches; not kept.
+
 ## Profile notes
 
 - Phase split after step 1b (native, turbo off): parse loop 18.3 ms per thread (finding line ends
