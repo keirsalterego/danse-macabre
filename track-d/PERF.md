@@ -23,6 +23,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 16 | `Queue::push` forced inline, so a relaxation no longer pays for a call: 1.8% fewer instructions | run-fc6e22635c4b | 0.1221 | 67.7 | 73.0 |
 | 17 | Pass 3 gives back the places of sorted blocks as it goes: the threads take the blocks in turn, and the 2 MB pages below the slowest one's progress are dropped with `madvise` | run-d253110190f5 | 0.1276 | 66.0 | 72.6 |
 | 18 | 30 fewer lines at the same speed: the Dockerfile without `WORKDIR`, one parser for edge and query lines, the runs cut with `split_off_mut`, the prefetches through one helper that takes an `Option`, and smaller cuts | run-e464a45452b1 | 0.1244 | 65.9 | 73.1 |
+| 19 | The query threads that run out of queries drop graph.txt's pages from the page tables, so the exit no longer unmaps them on one thread | | | | |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
@@ -510,6 +511,37 @@ Local, turbo off, against step 17, seed 1 unless named:
   and clippy report nothing. An empty queries.txt, a graph with no edges, and files without a
   final LF give the same output as step 17.
 
+## Step 19: graph.txt's pages dropped by the threads that finish first
+
+A phase timeline of step 18 (seed 1, P-cores, medians of 11 to 21 runs, ms from the spawn):
+`main` starts at 1.9-2.2; pass 1 ends at 11.5-11.8 (its last thread starts 0.9 ms after the
+first); the faulting takes 3.4-3.6, the runs set-up 1.2 (380 page faults), pass 2 12.5, pass 3
+3.4 and 3.7; the queries run from 36.7 to 124-125, and the first query thread is done 5 ms
+before the last, so the threads idle for 39-42 ms of CPU time at the end (3.5 ms each on
+average). Then the output takes 0.15 ms and the exit 2.1-3.9 ms. Kernel time is 4.6% of all
+cycles (148 M of 3.21 G).
+
+Most of that exit is graph.txt: a `munmap` of it before the exit took 2.45 ms (1.3 ms after a
+reboot, likely from the page cache's pages lying closer together), and the exit then took 1.3
+ms. Step 12's not-kept rows dropped those pages from busy threads, in pass 2 or from a 13th
+thread during the queries, which moved the cost instead of hiding it. Now each query thread,
+once the counter has no query left, drops every `threads`-th 8 MB piece of the mapping
+(`madvise(MADV_DONTNEED)`), on a CPU that would otherwise wait for the last query. The last
+thread to finish still drops its own twelfth, about 0.1-0.2 ms.
+
+`step`'s machine code is unchanged and starts 16 bytes past a line, as in step 18 (the queries'
+`Search` pair is built by an array `map`, which put it there).
+
+- `ab.py`, 41 interleaved runs, medians (minimums): seed 1 126.72 → 125.33 (124.49 → 123.37),
+  126.97 → 125.18 (124.32 → 123.50); seed 3 133.03 → 131.74 (130.69 → 129.76), 132.16 → 131.25
+  (130.82 → 129.45); seed 2, on a busy machine, 131.81 → 131.57 (126.01 → 125.54) ms. About
+  -1.0% on seeds 1 and 3.
+- Before a reboot of the machine, a first version (2 MB pieces taken from the query counter, with
+  `step` 32 bytes past a line), seed 1: 127.13 → 125.15 ms (125.26 → 123.82).
+- memory.peak, 5 alternating runs, seed 1: 61.8-63.7 → 62.1-62.5 MB (medians 62.1 → 62.2).
+- S 419 → 422. Gate: 512 pass, 0 fail; `cargo fmt --check` and clippy report nothing. An empty
+  queries.txt and a graph with no edges give the same output as step 18.
+
 ## Tried and reverted (local, turbo off, no run ID)
 
 Each row's baseline ran in the same interleaved session as the experiment, so baselines differ
@@ -577,5 +609,9 @@ between rows.
 | Step 17's pass 3 in four rounds, each its own `on_threads`, with the sorted places given back between rounds | Not built in full: one `on_threads` of 12 threads that do nothing takes 172–189 µs (average of 20, three runs), so the forward direction's three extra rounds cost about 0.55 ms | Step 17 frees as much with no extra rounds |
 | Step 17 with each thread's sorted blocks counted, and every block below 12 × the least count freed (on step 16) | memory.peak, 6 alternating runs: 62.1–62.5 against 63.9–64.3 MB | The same memory as step 17, which needs no list of block starts |
 | `Csr::heavy_weight` folded into `unpack` behind `std::hint::cold_path()`, as `Csr::row` does for wide groups, 3 lines fewer (on step 17's code with step 18's first cuts) | `perf stat`, 8 interleaved rounds: instructions 4,996 → 5,081 M (+1.7%), cycles 3,063 → 3,102 M (+1.4%), higher in all 8 | The hash lookup is laid out in the relaxation loop, where `#[cold]` keeps it out of line |
+| Step 19's pieces taken from the query counter by whichever thread is idle, in 2 MB or 8 MB pieces (one more line than step 19) | `ab.py`, 41 runs: 2 MB pieces −0.25%, −1.06%, −0.27% (seeds 1, 3, 2); 8 MB pieces −1.16, −1.12, −0.50, −1.09, −1.64, −1.04, −1.10, −0.83%; the same 8 MB claiming in its rustfmt-compliant form −0.41, +0.04, −0.78, −0.95, −0.94, −0.57, −0.84, −0.78% | No better than step 19's fixed shares, for a line more |
+| The build's faulting by `madvise(MADV_POPULATE_WRITE)` on 6 threads, with the runs set-up on the main thread at the same time (on step 18) | Phase marks, 11 runs: faulting and set-up together 4.5 → 10.6 ms, 1,700-2,250 page faults instead of 410 | The populate faulted 4 KB pages, not 2 MB ones |
+| No signal stack per thread: SIGSEGV and SIGBUS set to `SIG_IGN` from `.init_array`, before std's runtime setup, so std gives no thread an altstack (on step 18 with step 19) | Phase marks, 11 runs: the build 36.21 → 36.00 ms, the queries' end unchanged | 0.2 ms for about 9 lines |
+| The queries on 6 threads instead of 12 (on step 18) | `ab.py`, 11 runs: 125.75 → 157.77 ms | Hyperthreading is worth 1.36× in the queries |
 | Every function aligned to 64 bytes (`-C llvm-args=-align-all-functions=6`), to keep line cuts from moving the hot loops (on step 17 and on step 18) | `perf stat`, 8 interleaved rounds: cycles +16.1 M (step 17's code) and +12.9 M (step 18's), +0.4–0.5%, higher in all 8 | `step` then starts on a line, which is slower than 16 bytes past one |
 | `sort`'s degree count and prefix sum as `for_each` calls, 4 lines fewer (on step 17) | Same machine code | Pedantic clippy's `needless_for_each` rejects both; the prefix sum went in as a `fold` instead |

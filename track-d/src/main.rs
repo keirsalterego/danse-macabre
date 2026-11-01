@@ -95,12 +95,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let n = u32::try_from(number(graph_txt, &mut at)).map_err(|_| "n is over 2^32 - 1")?;
     number(graph_txt, &mut at);
     let threads = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let [forward, reverse] = build_graph(&graph_txt[at..], n as usize, threads)?;
+    let graphs = build_graph(&graph_txt[at..], n as usize, threads)?;
 
     // One `s t` line per query, no header (spec §2).
     let mut queries = Vec::new();
     for_each_line(queries_txt, |[s, t]| queries.push((s as u32, t as u32)));
-    let answers = answer(&forward, &reverse, &queries, threads);
+    let answers = answer(&graphs, graph_txt, &queries, threads);
 
     let mut out = Vec::with_capacity(answers.len() * 12);
     for answer in answers {
@@ -495,17 +495,28 @@ impl Csr {
 /// and maps allocate only while they grow. Threads take the next unanswered query from a shared
 /// counter instead of a fixed share, because query cost varies by orders of magnitude (the target
 /// is drawn by Dijkstra rank, 2 to 131,071, spec §2).
-fn answer(forward: &Csr, reverse: &Csr, queries: &[(u32, u32)], threads: usize) -> Vec<AtomicU64> {
+///
+/// `graphs` holds the forward and the reverse graph. `text` is graph.txt, which nothing reads
+/// again: a thread that finds no query left drops its share of the pages from the page tables,
+/// every `threads`-th piece of 8 MB. The process would otherwise unmap them all as it exits,
+/// 1.3 to 2.5 ms on one thread on seed 1, while the threads that finish first wait up to 5 ms
+/// for the last query.
+fn answer(graphs: &[Csr], text: &[u8], queries: &[(u32, u32)], threads: usize) -> Vec<AtomicU64> {
     // Atomics let the threads share one answer array with no `unsafe`. `Relaxed` is enough, since
     // the threads are joined before `main` reads.
     let answers: Vec<_> = queries.iter().map(|_| AtomicU64::new(0)).collect();
     let next = AtomicUsize::new(0);
-    on_threads(0..threads, |_| {
-        let (mut from_s, mut to_t) = (Search::new(forward), Search::new(reverse));
+    on_threads(0..threads, |k| {
+        let [mut from_s, mut to_t] = [0, 1].map(|i| Search::new(&graphs[i]));
         loop {
             let i = next.fetch_add(1, Relaxed);
             let Some(&(s, t)) = queries.get(i) else { break };
             answers[i].store(distance(&mut from_s, &mut to_t, s, t), Relaxed);
+        }
+        for pages in text.chunks(1 << 23).skip(k).step_by(threads) {
+            // SAFETY: the pages are an 8 MB aligned part of graph.txt's read-only mapping, which
+            // nothing reads after the build. MADV_DONTNEED (4) drops them from the page tables.
+            unsafe { madvise(pages.as_ptr().cast_mut(), pages.len(), 4) };
         }
     });
     answers
