@@ -64,7 +64,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 57 | Threads started one after another by one helper instead of by a tree, so that fewer of them wait for the interner's lock at once: 2 fewer lines | run-0899dd30b0f4 | 0.0172 | 18.4 | 86.7 |
 | 58 | Each line's id settled one line late: its name's slot is loaded as soon as the hash is known, and the name compared with the slot's padded copy after the next line's front half | run-b601b34b577c | 0.0174 | 18.0 | 86.6 |
 | 59 | The interner's pages given back once the names are sorted, before the hour pass's peak | run-b601b34b577c | 0.0174 | 18.0 | 86.6 |
-| 60 | Each thread's share of the input released right after its parse, and the whole input unmapped by one thread once all parses are done, with the interner keeping copies of the names | | | | |
+| 60 | Each thread's share of the input released right after its parse, and the whole input unmapped by one thread once all parses are done, with the interner keeping copies of the names | run-8a3bcbee7e89 | 0.0194 | 17.3 | 85.6 |
 
 ## Step 1: v1
 
