@@ -24,7 +24,7 @@
 //! 2. **Parse once.** Each thread turns every line of its chunk into a 4-byte record: endpoint
 //!    id, error bit and latency, with the rare latency too large for its 20 bits kept on a side
 //!    list ([`parse`]). Endpoint names become small integer ids through one hash table that
-//!    all threads share ([`Interner`]). The hour is not stored per line: the records stay in
+//!    all threads share ([`intern`]). The hour is not stored per line: the records stay in
 //!    file order, where lines come in long runs of one hour, and the thread notes where each
 //!    run starts ([`Chunk`]).
 //! 3. **Rank.** One thread sorts the 1,842 names bytewise. That order is also the order of the
@@ -188,11 +188,10 @@ fn summarize(log: &'static [u8], out_path: &Path) {
     // simply empty.
     let newline = |t: usize| log[..len * t / threads].iter().rposition(|&b| b == b'\n');
     let start = |t| newline(t).map_or(0, |p| p + 1);
-    // Each thread's chunk, each hour's output lines, every endpoint's id, which all threads
-    // give out as they parse, and the ids in output order.
+    // Each thread's chunk, each hour's output lines, and the endpoints' ids in output order.
     let chunks: Vec<OnceLock<Chunk>> = (0..threads).map(|_| OnceLock::new()).collect();
     let hours: Vec<OnceLock<Hour>> = (0..HOURS).map(|_| OnceLock::new()).collect();
-    let (all, sorted, [taken, done]) = (&ENDPOINTS, OnceLock::new(), [0; 2].map(AtomicUsize::new));
+    let (sorted, [taken, done]) = (OnceLock::new(), [0; 2].map(AtomicUsize::new));
     let (plan, places, barrier) = (OnceLock::new(), OnceLock::new(), Barrier::new(threads));
     let work = |t: usize| {
         // SAFETY: every chunk ends by `len`, LINE bytes before the end of `log`.
@@ -223,7 +222,7 @@ fn summarize(log: &'static [u8], out_path: &Path) {
             by_size.sort_by_cached_key(|h| runs[*h].iter().map(|run| run.0.len()).sum::<usize>());
             by_size.rotate_left(threads.min(HOURS));
             // Ids are given out in order, so the names set are those of ids 0, 1, 2 and so on.
-            let names: Vec<&[u8]> = all.names.iter().map_while(|n| n.get().copied()).collect();
+            let names: Vec<&[u8]> = NAMES.iter().map_while(|n| n.get().copied()).collect();
             let mut order: Vec<usize> = (0..names.len()).collect();
             let _ = plan.set((names, runs, by_size));
             // No hour needs the names' order before its lines, so the others start counting
@@ -235,10 +234,11 @@ fn summarize(log: &'static [u8], out_path: &Path) {
             // that agree on 64 bytes compare in full.
             // SAFETY: every id below `names.len()` had its copy written before the barrier, and
             // no thread writes one after it.
-            let padded = |id: usize| unsafe { &(*all.padded[id].get()).0 };
-            order.sort_unstable_by_key(|&id| (padded(id), all.names[id].get()));
-            // Nothing reads the interner again: its pages given back now lower the hour pass's peak.
-            release(std::slice::from_ref(all));
+            order.sort_unstable_by_key(|&id| (unsafe { &*PADDED[id].0.get() }, NAMES[id].get()));
+            // Nothing reads the interner again: its pages go back now, before the hour pass's peak.
+            release(&SLOTS);
+            release(&NAMES);
+            release(&PADDED);
             let _ = sorted.set(order);
         }
         let (names, runs, by_size) = plan.wait();
@@ -349,7 +349,7 @@ struct Chunk {
 /// latencies (see [`Chunk`]).
 const LARGE: u32 = (1 << 20) - 1;
 
-/// Parses one chunk of whole lines into records, with the endpoints' ids from [`ENDPOINTS`].
+/// Parses one chunk of whole lines into records, with the endpoints' ids from [`intern`].
 ///
 /// The spec guarantees well-formed input (§2), so we locate fields by fixed offsets and single
 /// byte checks instead of validating them. No field is scanned byte by byte. Once [`line_end`]
@@ -398,9 +398,7 @@ unsafe fn parse(log: &'static [u8], lines: Range<usize>) -> Chunk {
     // which held up the lines behind it (`PERF.md`, step 58). `last` is the line before: its
     // name, the 64 bytes from it, its slot and the slot's content, and its record without the id.
     let mut last: (&[u8], &[u8; 64], usize, u32, u32) = (&[], &[0; 64], 0, 0, 0);
-    let finish = |(name, window, slot, value, bits)| {
-        ENDPOINTS.intern(name, slot, value, window) << 21 | bits
-    };
+    let finish = |(name, window, slot, value, bits)| intern(name, slot, value, window) << 21 | bits;
     while at < end {
         // How well the hardware prefetcher kept the input in L1 depended on where the loop's
         // code landed: a change elsewhere in its function could raise the misses by half
@@ -443,7 +441,7 @@ unsafe fn parse(log: &'static [u8], lines: Range<usize>) -> Chunk {
         // `line_end` starts looking at byte MIN_LINE - 1, so `count` stays below the length the
         // records were given.
         (count > 0).then(|| unsafe { *chunk.records.get_unchecked_mut(count - 1) = finish(last) });
-        let value = ENDPOINTS.slots[slot].load(Acquire);
+        let value = SLOTS[slot].load(Acquire);
         last = (name, window, slot, value, error << 20 | micros);
         count += 1;
     }
@@ -476,7 +474,7 @@ fn line_end(line: &[u8; LINE]) -> usize {
 /// and `_mm256_movemask_epi8` gathers the top bit of each byte into a 32-bit integer. Two of
 /// those cover the 64-byte blocks. Against a block of LFs, `trailing_zeros` on the result finds
 /// the first LF ([`line_end`]); against another name, a mask of all ones means the bytes agree
-/// ([`Interner::intern`]).
+/// ([`intern`]).
 #[target_feature(enable = "avx2")]
 fn equal_mask(a: &[u8; 64], b: &[u8; 64]) -> u64 {
     // SAFETY: 64 bytes are two 256-bit vectors, and any bits make a valid vector.
@@ -548,7 +546,7 @@ fn word(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(*bytes[at..].first_chunk().expect("8 bytes at `at`"))
 }
 
-/// Hashes an endpoint name for the [`Interner`], given `first`, the 8 bytes it starts with.
+/// Hashes an endpoint name for the interner's [`SLOTS`], given `first`, the 8 bytes it starts with.
 ///
 /// Hashing every byte would need a loop whose length varies from line to line. Instead we mix
 /// the length with two 8-byte windows: the first and the last. That is a fixed amount of work,
@@ -573,7 +571,8 @@ fn hash(name: &[u8], first: u64) -> u64 {
     }
 }
 
-/// A hash table that gives every distinct endpoint name a dense id: 0, 1, 2, and so on.
+/// The endpoints' interner: a hash table that gives every distinct endpoint name a dense id: 0,
+/// 1, 2, and so on. [`intern`] looks a name up, and [`insert`] adds one.
 ///
 /// It uses open addressing with linear probing. A name's hash picks a slot, and on a collision
 /// we try the next slot until we find the name or an empty slot. The table has 16,384 slots, so
@@ -589,121 +588,113 @@ fn hash(name: &[u8], first: u64) -> u64 {
 /// thread used to fill a table of its own and merge it into a shared one after its parse. That
 /// meant twelve tables of about 190 KB, held while others still parsed, and a table from chunk
 /// ids to shared ids that the hour pass read for every record (`PERF.md`, step 33).
-struct Interner<'a> {
-    /// The table. A slot holds `id + 1`, so that 0 can mark an empty slot. Its size is part of
-    /// its type, so a probe needs no bounds check: 0.9% fewer instructions in the parse.
-    slots: [AtomicU32; 4 << 12],
-    /// Id → name, a copy: the input is unmapped once the parse is over (see [`summarize`]).
-    names: [OnceLock<&'a [u8]>; 1 << 11],
-    /// Id → the name and the space after it, zero-padded to 64 bytes, for the probes of
-    /// [`Interner::intern`]. A name of 64 bytes or more has no room for the space and keeps only
-    /// its first 64 bytes.
-    padded: [std::cell::UnsafeCell<Padded>; 1 << 11],
-    /// How many names have an id; the lock that adding a name takes.
-    count: Mutex<usize>,
-}
+///
+/// The interner's tables are statics, empty at the start, and never grow: lookups index them
+/// while other threads add names. As statics, they lie at fixed addresses, and a probe loads no
+/// pointer to them first: 3 instructions fewer per line. The slots and the padded copies start out
+/// as zeros, in `.bss`; the names' `OnceLock`s start out nonzero, so they take 48 KB of `.data` in
+/// the binary. Either way a page is read in only when touched, like the heap pages the tables took
+/// before.
+///
+/// A slot holds `id + 1`, so that 0 can mark an empty slot. The table's size is part of its
+/// type, so a probe needs no bounds check: 0.9% fewer instructions in the parse.
+static SLOTS: [AtomicU32; 4 << 12] = [const { AtomicU32::new(0) }; 4 << 12];
 
-// SAFETY: the padded copies are the only state shared without an atomic or a lock. Each is
-// written once, under the lock, before its id goes into a slot (`Interner::insert`), and read
-// only through an id loaded from a slot with `Acquire`, or after the parse.
-unsafe impl Sync for Interner<'_> {}
+/// Id → name, a copy: the input is unmapped once the parse is over (see [`summarize`]).
+static NAMES: [OnceLock<&[u8]>; 1 << 11] = [const { OnceLock::new() }; 1 << 11];
 
-/// The endpoints' interner, empty at the start. Its tables never grow: lookups index them while
-/// other threads add names. As a static, they lie at fixed addresses, and a probe loads no pointer
-/// to them first: 3 instructions fewer per line. A `OnceLock` starts out nonzero, so the tables
-/// take 249 KB of `.data` in the binary instead of `.bss`; a page of it is read in only when
-/// touched, like the heap pages the tables took before. Being in `.data` anyway, the padded copies
-/// start out as zeros at no cost, rather than uninitialized.
-static ENDPOINTS: Interner<'static> = Interner {
-    slots: [const { AtomicU32::new(0) }; 4 << 12],
-    names: [const { OnceLock::new() }; 1 << 11],
-    padded: [const { std::cell::UnsafeCell::new(Padded([0; 64])) }; 1 << 11],
-    count: Mutex::new(0),
-};
+/// Id → the name and the space after it, zero-padded to 64 bytes, for the probes of [`intern`].
+/// A name of 64 bytes or more has no room for the space and keeps only its first 64 bytes.
+static PADDED: [Padded; 1 << 11] = [const { Padded(std::cell::UnsafeCell::new([0; 64])) }; 1 << 11];
+
+/// How many names have an id; the lock that adding a name takes.
+static COUNT: Mutex<usize> = Mutex::new(0);
 
 /// A padded copy, aligned to one cache line. The allocator aligns the table to 16 bytes, so
 /// each copy used to span two lines, and every probe loaded both: 16% of the L1 misses.
 #[repr(align(64))]
-struct Padded([u8; 64]);
+struct Padded(std::cell::UnsafeCell<[u8; 64]>);
+
+// SAFETY: the padded copies are the only state shared without an atomic or a lock. Each is
+// written once, under the lock, before its id goes into a slot ([`insert`]), and read only
+// through an id loaded from a slot with `Acquire`, or after the parse.
+unsafe impl Sync for Padded {}
 
 // `intern` runs once per line. As a call, with its register saves and bounds checks, it cost
 // 9% of all instructions (about 1 ms of wall time), so it is forced inline (`inline_always` is
 // allowed in `Cargo.toml`); `insert` stays out of line.
-impl<'a> Interner<'a> {
-    /// Returns `name`'s id, assigning the next free one if the name is new.
-    ///
-    /// The probe starts at `slot`, the first slot on the name's path, and `value` is what the
-    /// caller loaded from it: [`parse`] loads it one line before it needs the id.
-    ///
-    /// `window` is 64 bytes that start with `name` and the space after it: the line itself, or a
-    /// padded copy. With them a probe compares a name of up to 63 bytes without a call to
-    /// `memcmp`. That covers 1,791 of the 1,842 endpoints of seed 1 and 94% of its lines; longer
-    /// names compare with `==`. Folding the two into one test, the window first and `==` only for
-    /// long names, cost 5% more instructions in the parse.
-    ///
-    /// Names vary in length from line to line, and the branches inside `memcmp` that pick a path
-    /// by length mispredict often; that was about a quarter of the parse loop. Here the length
-    /// never steers a branch: a probe compares all 64 bytes of `window` with the known name's
-    /// padded copy at once ([`equal_mask`]), and a name of `n` bytes matches when bytes `0..=n`,
-    /// the name and the space, all agree: when the mask starts with more than `n` ones. Counting
-    /// them, `trailing_ones() > n`, took 2 instructions fewer than masking off bits `n + 1` and up
-    /// first. Comparing the space makes the answer exact without comparing lengths. The spec rules
-    /// out spaces in endpoints (§2), so a known name longer than `n` has no space at `n`, and one
-    /// shorter has its space where the window still holds part of the name. The copies are 64
-    /// bytes, not the 125 a name can reach, because half the size keeps more of them in cache:
-    /// that was worth 0.8 ms.
-    #[inline(always)]
-    fn intern(&self, name: &'a [u8], mut slot: usize, mut value: u32, window: &[u8; 64]) -> u32 {
-        while let Some(id) = value.checked_sub(1) {
-            let found = if name.len() < 64 {
-                // SAFETY: the copy was written before `id` went into the slot, and never again.
-                // An id in a slot is below the count of names, which `insert` keeps within the
-                // 2,048 copies, so the index needs no check.
-                let known = unsafe { &*self.padded.get_unchecked(id as usize).get() };
-                // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
-                unsafe { equal_mask(window, &known.0) }.trailing_ones() as usize > name.len()
-            } else {
-                self.names[id as usize].get() == Some(&name)
-            };
-            if found {
-                return id;
-            }
-            // A second probe is rare, about 2% of lines, and marked cold (see [`parse`]).
-            std::hint::cold_path();
-            slot = (slot + 1) & (self.slots.len() - 1);
-            value = self.slots[slot].load(Acquire);
+/// Returns `name`'s id, assigning the next free one if the name is new.
+///
+/// The probe starts at `slot`, the first slot on the name's path, and `value` is what the
+/// caller loaded from it: [`parse`] loads it one line before it needs the id.
+///
+/// `window` is 64 bytes that start with `name` and the space after it: the line itself, or a
+/// padded copy. With them a probe compares a name of up to 63 bytes without a call to
+/// `memcmp`. That covers 1,791 of the 1,842 endpoints of seed 1 and 94% of its lines; longer
+/// names compare with `==`. Folding the two into one test, the window first and `==` only for
+/// long names, cost 5% more instructions in the parse.
+///
+/// Names vary in length from line to line, and the branches inside `memcmp` that pick a path
+/// by length mispredict often; that was about a quarter of the parse loop. Here the length
+/// never steers a branch: a probe compares all 64 bytes of `window` with the known name's
+/// padded copy at once ([`equal_mask`]), and a name of `n` bytes matches when bytes `0..=n`,
+/// the name and the space, all agree: when the mask starts with more than `n` ones. Counting
+/// them, `trailing_ones() > n`, took 2 instructions fewer than masking off bits `n + 1` and up
+/// first. Comparing the space makes the answer exact without comparing lengths. The spec rules
+/// out spaces in endpoints (§2), so a known name longer than `n` has no space at `n`, and one
+/// shorter has its space where the window still holds part of the name. The copies are 64
+/// bytes, not the 125 a name can reach, because half the size keeps more of them in cache:
+/// that was worth 0.8 ms.
+#[inline(always)]
+fn intern(name: &[u8], mut slot: usize, mut value: u32, window: &[u8; 64]) -> u32 {
+    while let Some(id) = value.checked_sub(1) {
+        let found = if name.len() < 64 {
+            // SAFETY: the copy was written before `id` went into the slot, and never again.
+            // An id in a slot is below the count of names, which `insert` keeps within the
+            // 2,048 copies, so the index needs no check.
+            let known = unsafe { &*PADDED.get_unchecked(id as usize).0.get() };
+            // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
+            unsafe { equal_mask(window, known) }.trailing_ones() as usize > name.len()
+        } else {
+            NAMES[id as usize].get() == Some(&name)
+        };
+        if found {
+            return id;
         }
-        self.insert(slot, name, window)
+        // A second probe is rare, about 2% of lines, and marked cold (see [`parse`]).
+        std::hint::cold_path();
+        slot = (slot + 1) & (SLOTS.len() - 1);
+        value = SLOTS[slot].load(Acquire);
     }
+    insert(slot, name, window)
+}
 
-    /// Gives `name`, which belongs in the empty `slot`, the next id. New names are rare (1,842
-    /// per seed), so it is marked cold, which keeps it out of line, away from the hot loop. It
-    /// hashes the name again instead of taking the hash from `intern`: keeping that alive through
-    /// the probe loop cost 5.8 million instructions in the parse.
-    #[cold]
-    fn insert(&self, slot: usize, name: &'a [u8], window: &[u8; 64]) -> u32 {
-        let mut count = self.count.lock().expect("panics abort");
-        // Only the lock's holder fills a slot, and none is ever emptied. If `slot` is still empty,
-        // no thread has added the name since we probed: it would have gone there. If another
-        // thread has filled the slot since, with this name or another, we probe on from it: the
-        // slots before it on the name's path hold other names, and always will.
-        let value = self.slots[slot].load(Acquire);
-        if value != 0 {
-            drop(count);
-            return self.intern(name, slot, value, window);
-        }
-        // The spec gives every seed 1,842 endpoints (§2), within the 2,048 that 11 bits hold: the
-        // index of the 2,049th name's copy would stop the program.
-        // The name, then the space if there is room for it, then zeros.
-        let padded = std::array::from_fn(|i| if i <= name.len() { window[i] } else { 0 });
-        // SAFETY: no slot holds this id yet, so no other thread reads the copy, and only the
-        // lock's holder writes one.
-        unsafe { *self.padded[*count].get() = Padded(padded) };
-        let _ = self.names[*count].set(Box::leak(name.into()));
-        *count += 1;
-        self.slots[slot].store(*count as u32, Release);
-        *count as u32 - 1
+/// Gives `name`, which belongs in the empty `slot`, the next id. New names are rare (1,842
+/// per seed), so it is marked cold, which keeps it out of line, away from the hot loop. It
+/// hashes the name again instead of taking the hash from `intern`: keeping that alive through
+/// the probe loop cost 5.8 million instructions in the parse.
+#[cold]
+fn insert(slot: usize, name: &[u8], window: &[u8; 64]) -> u32 {
+    let mut count = COUNT.lock().expect("panics abort");
+    // Only the lock's holder fills a slot, and none is ever emptied. If `slot` is still empty,
+    // no thread has added the name since we probed: it would have gone there. If another
+    // thread has filled the slot since, with this name or another, we probe on from it: the
+    // slots before it on the name's path hold other names, and always will.
+    if let value @ 1.. = SLOTS[slot].load(Acquire) {
+        drop(count);
+        return intern(name, slot, value, window);
     }
+    // The spec gives every seed 1,842 endpoints (§2), within the 2,048 that 11 bits hold: the
+    // index of the 2,049th name's copy would stop the program.
+    // The name, then the space if there is room for it, then zeros.
+    let padded = std::array::from_fn(|i| if i <= name.len() { window[i] } else { 0 });
+    // SAFETY: no slot holds this id yet, so no other thread reads the copy, and only the
+    // lock's holder writes one.
+    unsafe { *PADDED[*count].0.get() = padded };
+    let _ = NAMES[*count].set(Box::leak(name.into()));
+    *count += 1;
+    SLOTS[slot].store(*count as u32, Release);
+    *count as u32 - 1
 }
 
 /// One hour of output, ready to format: [`summarize_hour`] fills it, [`format_hour`] writes it.
@@ -822,13 +813,10 @@ fn sort_network<const R: usize>(group: &[u32], at: [usize; 3]) -> [u32; 3] {
         // SAFETY: the mask keeps the load inside `group`; masked lanes touch no memory.
         unsafe { _mm256_maskload_epi32(group.as_ptr().wrapping_add(8 * r).cast(), inside) }
     });
-    merge::<R, 1>(&mut v);
-    merge::<R, 2>(&mut v);
-    merge::<R, 3>(&mut v);
-    merge::<R, 4>(&mut v);
-    merge::<R, 5>(&mut v);
-    merge::<R, 6>(&mut v);
-    merge::<R, 7>(&mut v);
+    // A level is a const generic argument, which a loop cannot supply: the macro writes out one
+    // call per level.
+    macro_rules! merge_levels { ($($l:literal)*) => { $(merge::<R, $l>(&mut v);)* } }
+    merge_levels!(1 2 3 4 5 6 7);
     // SAFETY: both types are R·32 bytes of plain integers.
     let sorted: [[u32; 8]; R] = unsafe { std::mem::transmute_copy(&v) };
     at.map(|i| sorted.as_flattened()[i + 8 * R - group.len()])

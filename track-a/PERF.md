@@ -67,6 +67,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 60 | Each thread's share of the input released right after its parse, and the whole input unmapped by one thread once all parses are done, with the interner keeping copies of the names | run-8a3bcbee7e89 | 0.0194 | 17.3 | 85.6 |
 | 61 | Records with an 11-bit endpoint id and a 20-bit latency: the list of large latencies holds 1.2% of seed 1's lines instead of 2.6% | run-6132d5943394 | 0.0164 | 17.5 | 87.3 |
 | 62 | Each output line's endpoint id and request count in one `u32`, so the lines that wait for the formatting take 20 bytes instead of 24 | run-6132d5943394 | 0.0164 | 17.5 | 87.3 |
+| 63 | 18 fewer lines: the interner's tables as four statics with `intern` and `insert` as plain functions, the network's seven merge levels through a one-line macro, and a Dockerfile without `WORKDIR` | | | | |
 
 ## Step 1: v1
 
@@ -1142,8 +1143,51 @@ reflowed): seed 1 medians 18.59 → 18.83, 18.56 → 18.51 and 18.44 → 18.36 m
 and 18.54 → 18.47, seed 5 18.60 → 18.56 and 18.70 → 18.72, seed 7 18.72 → 18.57 and 18.60 → 18.60:
 −0.02 ms on average. S 364 → 364. Gate: 310 pass, 0 fail; clippy reports no warnings.
 
+## Step 63: 18 fewer lines
+
+- The interner's tables are four statics, `SLOTS`, `NAMES`, `PADDED` and `COUNT`, instead of the
+  fields of one static `Interner`, and `intern` and `insert` are plain functions instead of its
+  methods. The struct's definition, its initializer, which listed every field again, and the
+  `impl` block go; `Padded` now holds the `UnsafeCell` and carries the `Sync` promise, and the
+  leader releases the three tables one by one. Without `ENDPOINTS.`, the parse's `finish` closure
+  fits on one line: 11 lines in all. `Cargo.toml` drops the `large_stack_arrays` exception, which
+  clippy no longer needs, and whose comment named the interner's long-gone heap slots. The slots
+  and the padded copies are all zeros, so they move from `.data` to `.bss` (`.data` 255 → 58 KB,
+  `.bss` 24 → 220 KB). `parse` is the same machine code apart from the tables' addresses,
+  `percentiles` and `put_number` are byte-identical, and the work closure differs in the leader's
+  two extra `release` calls and in a few register and stack-slot choices.
+- `sort_network` calls its seven merge levels through a local one-line macro,
+  `merge_levels!(1 2 3 4 5 6 7)`: a level is a const generic argument, which a loop cannot supply.
+  5 lines, and `.text` is byte-identical.
+- `insert` tests the slot it loads with `if let value @ 1..` instead of binding it on a line of its
+  own: 1 line, and `.text` is byte-identical.
+- The Dockerfile's build stage runs `cd /src && cargo build` instead of setting `WORKDIR`: 1 line.
+  Built in the pinned `rust` image, the binary is still a plain static executable (ELF type 2),
+  so `.cargo/config.toml` still applies; with `--manifest-path` from `/` instead, it came out a
+  static PIE (type 3).
+
+Local, turbo off, against step 62. `perf stat`, 8 interleaved rounds of 5 runs, seed 1:
+instructions:u 631.58 → 631.35 M, cycles:u median 313.2 → 311.9 M (6 of the 8 rounds lower).
+`ab.py`, 61 interleaved runs, three rounds per seed: seed 1 medians 18.30 → 18.25, 18.36 → 18.31
+and 18.36 → 18.34 ms (minimums 17.74 → 17.61, 17.77 → 17.64 and 17.86 → 17.82), seed 3
+18.41 → 18.44, 18.39 → 18.32 and 18.50 → 18.45 ms (minimums 17.87 → 17.71, 17.83 → 17.81 and
+17.83 → 17.92): −0.04 ms (−0.2%) on average. memory.peak, 5 alternating rounds: seed 1 median
+15.8 → 15.8 MB, seed 3 16.2 → 15.9 MB. S 364 → 346 (Rust 358 → 341, Dockerfile 6 → 5). Gate:
+310 pass, 0 fail; `cargo fmt --check` and clippy report nothing.
+
 ## Experiments that did not stay
 
+- **`stage` folded into `merge`** (local, turbo off, on step 62's code), 3 lines fewer: with the
+  stage's loop inside the level's, LLVM no longer unrolled every level for a constant `m`, and
+  `percentiles` came out inlined into a `summarize_hour` of its own (19.6 KB, against 21.7 KB).
+  `perf stat`, two interleaved rounds of 5 runs: instructions:u 631.3 → 649.5 M, cycles:u
+  307.1 → 319.3 M. Not kept.
+- **Line cuts that rustfmt undoes** (on step 62's code), each spread back over more lines than it
+  saved: one `use` line for all of `std::sync` (nested braces go vertical), the parse's `Chunk`
+  built as one struct literal (a literal's fields wider than 18 characters go vertical), the
+  slot's load written into the tuple that carries a line to the next iteration, and the two
+  prefetches as one `map` over `[384, 448]` (calls, tuples and chains wider than 60 characters go
+  vertical; the bare `map` also trips `unused_must_use`).
 - **Where the hour pass's excess comes from, and an in-place sort, not built** (on step 61's code,
   from seed 1's hour sizes and the stop points above). Smallest first in rounds of twelve, round k
   holds its buffers, about its hours' size S_k in records, and the lines of every hour done so far,
