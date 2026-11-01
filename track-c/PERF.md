@@ -58,6 +58,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 51 | One worker fewer than the CPUs, so a CPU taken by another program leaves a spare one instead of halving a worker and every round | run-d27954c1c3a9 | 0.0217 | 10.7 | 82.0 |
 | 52 | 8 fewer lines at the same speed: the Dockerfile's build folded into one `RUN`, the imports in two lines, both `prctl` calls in one, `BOM` and `SPINS` written where they are used, two pairs of variables set in one statement each, and the name's range returned straight from `text_fields` | run-486577623ea1 | 0.0212 | 10.5 | 82.4 |
 | 53 | A worker on every CPU again, as in step 50: final scoring runs each batch with nothing else on the box, so step 51's spare CPU only cost time | run-f9622a221638 | 0.0195 | 11.2 | 83.0 |
+| 54 | 9 fewer lines at the same speed: the name set's probe tests a hit in one closure and takes its tag and group as bytes of the hash, a long name is told by a `let`-`else`, the slow quote scan carries its parity into bit 0, the name's quote counts are not named, the group's byte is written through its word, the mailboxes are leaked, and `main` reads the data directory where it maps the files | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1856,6 +1857,51 @@ five on an idle box are unlikely, while the spare CPU costs every run.
 22.68 → 21.44 / 21.01 ms (−6.8%); full seed 1, 22.97 / 22.40 → 21.32 / 20.70 ms (−7.2%), about
 +0.75 points. One run of step 53 on seed 12 was slow under this machine's own load (mean 26.90
 ms), the kind of run final scoring drops. S 357 → 357. Gate: 310 pass, 0 fail.
+
+## Step 54: 9 fewer lines
+
+S 357 → 348 (Rust 352 → 343), with the record loop's machine code unchanged:
+
+- `NameSet::read` tests whether a slot's entry is the name's in one closure, `hit`, which the home
+  slot's test and the probe loop share; the loop breaks with the entry's index, and one unchecked
+  `get_unchecked_mut` after it takes the entry. The slots' mask is set once with the slices, and the
+  tag and the group are bytes 14 and 15 of `high.to_le_bytes()`, as the docs number them. −3. The
+  function's machine code has the same 78 instructions, one `shr` moved.
+- `name_letter` takes the length in a `let len @ 0..=32 = … else` that calls `long_letter`, where an
+  `if` returned: `cmp $0x21; jae` for `cmp $0x20; ja`. −1.
+- `text_fields_slow` XORs the parity of the quotes before a block into bit 0 of its quote mask,
+  which carries it into every bit of the prefix XOR, instead of XORing all ones in after it: one
+  instruction fewer on that cold path. −1.
+- `text_fields` calls `before(name)` and `before(note)` in the lengths, without naming the counts;
+  the compiler computes each once, as before. −1.
+- The batch writes a record's group through `top[1].as_ptr()`, byte 7 of the letter's second word,
+  instead of casting the letter's reference to a byte pointer first. Same machine code. −1.
+- The mailboxes are one `Box::leak` split by `as_chunks`, with no `letters` binding: nothing is
+  freed anyway. −1.
+- `main` reads the data directory inside the closure that maps the files (`env::args` imported in
+  place of `fs::write`, now written in full at its one use). −1.
+
+Every function has the same instruction count as at step 53, compared function by function with
+`objdump`, except `main` (191 → 337 instructions: `args` is parsed twice, once per run) and
+`text_fields_slow` (122 → 121); the worker's 1,892 differ only in register choices. `perf stat -r 5`, interleaved, instructions:u, step 53 → step 54: full seed 1, 762.28,
+762.27 and 762.19 M → 762.10, 761.95 and 761.93 M; full seed 2, 762.37, 762.51 and 762.16 M →
+762.00, 762.06 and 764.38 M (that run also took 531.7 M cycles against 485–493 M for the others, a
+busy CPU). cycles:u 488.6, 488.1 and 486.3 M → 487.0, 483.6 and 483.6 M on seed 1. `ab.py`, turbo
+off, 21 interleaved runs, medians / minimums: full seed 1, 21.89 / 21.39 → 21.59 / 21.26 and 21.84 /
+21.43 → 22.05 / 21.37 ms; full seed 2, 21.94 / 21.36 → 21.93 / 21.37 ms, the same within noise. No
+allocation changed. The gate passes (310 of 310), and clippy reports no warnings.
+
+Measured and not kept:
+- **`text_fields` with the note's comma from `let note @ 0..64 = … else`**: −1 line, but the test
+  became `tzcnt; cmp $0x40; jae` after the `blsr` whose flags the `je` used, one instruction more
+  per record.
+- **The posted letter's slot read through `sent`'s reference** at each use, without `slot`: −1
+  line, but the worker grew from 1,892 to 1,907 instructions (the slot is loaded again after the
+  letter's store).
+- **The input's prefetch in one statement**: rustfmt splits it over three lines (104 columns).
+- Left for clarity: `format_output` written into the last worker's tail (−3), `map_file` as a
+  closure in `main` (−1), the rehash without its filter of empty slots, which would place each as
+  entry 0 into an empty slot, a no-op (−1).
 
 ## Experiments that did not stay
 

@@ -86,7 +86,7 @@
 #![no_main]
 
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering, Ordering::Relaxed};
-use std::{arch::x86_64::*, fs::write, io::Write, ops::Range, os::fd::AsRawFd, path::Path, thread};
+use std::{arch::x86_64::*, env::args, io::Write, ops::Range, os::fd::AsRawFd, path::Path, thread};
 
 /// Zero bytes that [`map_file`] puts after the last byte of each file. Every position a parse
 /// reaches lies before them, so the fixed-size reads of [`number`] (8 bytes), [`region_amount`]
@@ -166,11 +166,10 @@ extern "C" fn main() -> ! {
     // SAFETY: the calls take plain integers and only change this process's page-size policy and
     // this thread's timer slack, which threads inherit.
     _ = [41, 29].map(|option| unsafe { prctl(option, 1u64, 0u64, 0u64, 0u64) });
-    let data_dir = std::env::args().nth(1).unwrap_or("/data".into());
-    let out = Path::new(&std::env::args().nth(2).unwrap_or("/out".into())).join("aggregates.txt");
+    let out = Path::new(&args().nth(2).unwrap_or("/out".into())).join("aggregates.txt");
     // A worker on every CPU: final scoring runs with nothing else on the box (PERF.md, step 53).
     let threads = thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let file = |name| map_file(&Path::new(&data_dir).join(name));
+    let file = |name| map_file(&Path::new(&args().nth(1).unwrap_or("/data".into())).join(name));
     join(file("records.csv"), file("regions.csv"), threads, &out)
 }
 
@@ -265,12 +264,12 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
     let rounds = (bounds.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0)).div_ceil(ROUND_BYTES);
     // SAFETY: `AtomicU64` has the same layout as `u64`, and all-zero bits are a valid 0.
     let zeroed = |len| unsafe { Box::<[AtomicU64]>::new_zeroed_slice(len).assume_init() };
-    let letters = zeroed(2 * threads * threads * MAILBOX * 2);
+    // Leaked, as nothing is freed: the exit unmaps it all (see `work`).
+    let (boxes, _) = Box::leak(zeroed(2 * threads * threads * MAILBOX * 2)).as_chunks::<2>();
     let (ends, arrived) = (zeroed(2 * threads * threads), AtomicU64::new(0));
     let mailbox = |half: usize, from: usize, to: usize| (half * threads + from) * threads + to;
-    let boxes = letters.as_chunks::<2>().0;
     let mail = |mb: usize| &boxes[mb * MAILBOX..ends[mb].load(Relaxed) as usize];
-    // The region table (see above): the codes that occur, as bits, and the group of each id.
+    // The region table (see above): the group of each id, and of each country code.
     let last_row = (regions[..regions.len() - PAD - 1].iter()).rposition(|&b| b == b'\n');
     // SAFETY: the LF lies before the pad, so the 8 bytes past it end inside the pad.
     let ids = 1 + last_row.map_or(0, |p| unsafe { number(regions, p + 1, b',') }.0 as usize);
@@ -428,13 +427,13 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
                     // Records also reference ids past the table's largest (§2.2), so the lookup
                     // is bounds-checked; those ids are unmatched like the holes inside the table.
                     let group = by_id.get(region_id as usize).map_or(0, |&g| g as usize);
-                    // The group goes into byte 15 of the letter, the top byte of its hash, which
-                    // no owner reads as hash (see [`NameSet`]). Storing the byte alone takes one
-                    // instruction and no load, where an OR into the word took three.
-                    let byte = std::ptr::from_ref(top).cast_mut().cast::<u8>();
+                    // The group goes into byte 15 of the letter, the top byte of its hash and of
+                    // its second word, which no owner reads as hash (see [`NameSet`]). Storing the
+                    // byte alone takes one instruction and no load, where an OR into the word took
+                    // three.
                     // SAFETY: the byte is inside the letter's atomics, writable through a shared
                     // reference, and no other thread reads or writes them before the barrier.
-                    unsafe { byte.add(15).write(group as u8) };
+                    unsafe { top[1].as_ptr().cast::<u8>().add(7).write(group as u8) };
                     let record = [1, id as i64, cents, name_len, note_len, 0, cents, cents];
                     // A group is a byte and `groups` holds 256, so the index needs no check.
                     merge(&mut groups[group], &record);
@@ -482,7 +481,7 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
         let codes: Vec<_> = codes.filter(|&(_, group)| group > 0).collect();
         // Every part numbers its groups as `groups` does, so the parts merge into it pairwise.
         (all.1.iter()).for_each(|q| (groups.iter_mut().zip(q)).for_each(|(g, p)| merge(g, p)));
-        write(out, format_output(&*groups, &codes)).expect("a writable output directory");
+        std::fs::write(out, format_output(&*groups, &codes)).expect("a writable output directory");
         std::process::exit(0)
     };
     // One thread per worker, and main is worker 0 once it has started the others: waiting for
@@ -701,9 +700,8 @@ unsafe fn text_fields(data: &[u8], at: usize) -> (Range<usize>, i64, i64, usize)
     // SAFETY: the build targets Alder Lake, which has BMI2 (see `.cargo/config.toml`).
     let before = |i: usize| unsafe { _bzhi_u64(quotes, i as u32) }.count_ones() as usize;
     let (q1, q2) = ((quotes & 1) as usize, (quotes >> (name + 1) & 1) as usize);
-    let (in_name, in_both) = (before(name), before(note));
-    let name_len = (name - in_name / 2 - q1) as i64;
-    let note_len = (note - name - 1 - (in_both - in_name) / 2 - q2) as i64;
+    let name_len = (name - before(name) / 2 - q1) as i64;
+    let note_len = (note - name - 1 - (before(note) - before(name)) / 2 - q2) as i64;
     (at + q1..at + name - q1, name_len, note_len, at + note + 1)
 }
 
@@ -717,9 +715,9 @@ fn text_fields_slow(data: &[u8], at: usize) -> (Range<usize>, i64, i64, usize) {
     while found < 2 {
         let bytes = data[block..].first_chunk().expect("the input is padded");
         let quotes = byte_mask(bytes, b'"');
-        // The block starts inside quotes when an odd number of quotes come before it.
-        let inside = prefix_xor(quotes) ^ (seen as u64 & 1).wrapping_neg();
-        let mut commas = byte_mask(bytes, b',') & !inside;
+        // The block starts inside quotes when an odd number of quotes come before it. That
+        // parity, XORed into bit 0, carries into every bit of the prefix XOR.
+        let mut commas = byte_mask(bytes, b',') & !prefix_xor(quotes ^ (seen as u64 & 1));
         while commas != 0 && found < 2 {
             let i = commas.trailing_zeros() as usize;
             let before = seen + (quotes & ((1 << i) - 1)).count_ones() as usize;
@@ -790,11 +788,10 @@ fn byte_mask(bytes: &[u8; 64], byte: u8) -> u64 {
 /// a byte of the input, so the read is not checked again: its check took four instructions per
 /// record (step 39).
 unsafe fn name_letter(data: &[u8], Range { start, end }: Range<usize>) -> [u64; 2] {
-    let len = end - start;
-    if len > 32 {
+    let len @ 0..=32 = end - start else {
         // SAFETY: the caller keeps the contract of `long_letter`, which is this one.
         return unsafe { long_letter(data, start, end) };
-    }
+    };
     // SAFETY: the caller keeps the 32 bytes from `start` in `data`, and the 32 bytes of `KEEP`
     // from `32 - len` on lie in it. The build targets Alder Lake, which has AVX2 and AES-NI (see
     // `.cargo/config.toml`), and `loadu` needs no alignment. `__m256i` is 32 bytes, as the two
@@ -884,13 +881,12 @@ impl NameSet {
     /// for every letter, 15 M instructions per run (PERF.md, step 46).
     #[inline(never)]
     fn read(&mut self, mut letters: &[[AtomicU64; 2]], groups: &mut [Group; 256]) {
-        let (slots, entries) = (&self.slots[..], &mut self.entries[..]);
+        let (slots, entries, mask) = (&self.slots[..], &mut self.entries[..], self.slots.len() - 2);
         while let [[key, high], ..] = letters {
             let (key, high) = (key.load(Relaxed), high.load(Relaxed));
-            // A group fits in a byte (see [`join`]), so the bit's word is one of four with no
-            // bounds check.
-            let (mask, tag) = (slots.len() - 2, (high >> 48) as u8);
-            let (group, mut slot) = ((high >> 56) as usize, key as usize & mask);
+            // Byte 14 of the hash is the tag, and byte 15 the group. A group fits in a byte (see
+            // [`join`]), so the bit's word is one of four with no bounds check.
+            let ([.., tag, group], mut slot) = (high.to_le_bytes(), key as usize & mask);
             // The home slot and the next are read as one word, and the next is taken when the
             // home slot's tag is not the name's, with no branch. A quarter of the names sit one
             // slot past home, and the branch on the home slot's tag missed 1.6 M times per run;
@@ -901,30 +897,27 @@ impl NameSet {
             let found = std::hint::select_unpredictable(pair as u8 == tag, pair, pair >> 32) as u32;
             // An empty slot leads to entry 0, whose key 0 a name with tag 0 matches only as any
             // two names match, by 72 bits of hash (see [`NameSet`]).
-            let e = (found >> 8) as usize;
+            // Whether entry `e`, from a slot with tag `t`, is the name's.
             // SAFETY: a slot holds the number of an entry pushed before it (see `insert`), or 0,
             // the number of the set's first entry, and no entry is removed.
-            let entry = if found as u8 == tag && unsafe { entries.get_unchecked(e) }.0 == key {
-                // SAFETY: as above.
-                unsafe { entries.get_unchecked_mut(e) }
-            } else {
-                loop {
+            let hit = |e: usize, t: u8| t == tag && unsafe { entries.get_unchecked(e) }.0 == key;
+            let mut e = (found >> 8) as usize;
+            if !hit(e, found as u8) {
+                e = loop {
                     // SAFETY: `mask` keeps `slot` below the slots' length. Checked, the load took
                     // two instructions per probe.
                     let found = *unsafe { slots.get_unchecked(slot) };
                     match (found >> 8) as usize {
                         0 => return self.insert(slot, letters, groups),
-                        // SAFETY: as above.
-                        e if found as u8 == tag && unsafe { entries.get_unchecked(e) }.0 == key => {
-                            // SAFETY: as above.
-                            break unsafe { entries.get_unchecked_mut(e) };
-                        }
+                        e if hit(e, found as u8) => break e,
                         _ => slot = (slot + 1) & mask,
                     }
-                }
-            };
-            let (word, bit) = (&mut entry.1[group / 64], 1 << (group % 64));
-            groups[group][5] += i64::from(*word & bit == 0);
+                };
+            }
+            // SAFETY: as for `hit`.
+            let entry = unsafe { entries.get_unchecked_mut(e) };
+            let (word, bit) = (&mut entry.1[usize::from(group / 64)], 1 << (group % 64));
+            groups[usize::from(group)][5] += i64::from(*word & bit == 0);
             (*word, letters) = (*word | bit, &letters[1..]);
         }
     }
