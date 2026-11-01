@@ -1367,6 +1367,19 @@ pass, 0 fail.
 
 ## Experiments that did not stay
 
+- **After step 51, token starts and ends relative to their block** (local, seed 1, `perf stat -r 5`,
+  interleaved), so that the walk's token loop adds no block offset to either and `key_in` loads
+  from the block's address: instructions 4,875.7 → 4,887.2 M, as the loop then held the block's
+  offset as well as its address and kept the window's bound on the stack. With the block's
+  address standing for its offset through the whole walk, 4,859.9 M and cycles 2,538 → 2,530 M,
+  the bound still on the stack, as LLVM kept the chunk's address and length in registers for the
+  token near the chunk's end; with that token's key out of line, the call cost the loop its
+  registers: 5,221.5 M instructions, cycles 2,634 M.
+- **After step 51, `classify` from two nibble tables** (`_mm256_shuffle_epi8`, as simdjson does):
+  per half block, a shift, a mask, two lookups, an AND and a compare instead of nine operations.
+  Same answers (gate 510 of 510). Instructions 4,875.9 → 4,851.6 M, cycles 2,546 → 2,536 M over
+  three rounds; `ab.py`, 41, 41 and 61 alternating runs on seeds 1, 2 and 3: medians 109.51,
+  110.53 and 110.30 → 109.36, 111.01 and 109.93 ms, for 4 more lines.
 - **After step 51, three more cuts in the line end's token loop** (local, seed 1, `perf stat -r 5`,
   interleaved). The long keys' side of the probe marked `std::hint::cold_path()`, which dropped
   the jump that the short side took at every token: instructions 4,875.4 → 4,838.5 M, cycles the
