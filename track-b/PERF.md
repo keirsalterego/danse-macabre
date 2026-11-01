@@ -65,7 +65,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 58 | Trial: of the short terms whose home slot a slot is, the one with the most sample hits moves into it, on a thread of its own during the plan's tail, so 44% fewer probes go past the home slot | run-f39c6987110f | 0.0981 | 42.3 | 78.6 |
 | 59 | Trial: the probe's first test branches on one select, the key's difference kept only when the slot has `MORE`, and the token loop at the line end no longer prefetches each token's `check_at` entry, so it keeps every address in a register | run-b6d1d5065964 | 0.0950 | 41.7 | 79.0 |
 | 60 | While the main thread interns the terms, three threads read the corpus a byte per 64 KiB, so the scanning threads' walks take no page faults on it; the chunks are freed on a thread of their own while the output is written | run-938dc27813b7 | 0.0952 | 41.3 | 79.0 |
-| 61 | The line end's token loop holds a zero in a register for its three selects, and the tokenizer takes a long token's key on a cold branch, the mask's address from the length negated, and a token's start and end as offsets from its block: 3.9 fewer instructions per token |  |  |  |  |
+| 61 | The line end's token loop holds a zero in a register for its three selects, and the tokenizer takes a long token's key on a cold branch, the mask's address from the length negated, and a token's start and end as offsets from its block: 3.9 fewer instructions per token | run-280052ffeb2c | 0.0979 | 41.8 | 78.6 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1734,6 +1734,10 @@ all.
 94.68 → 94.90 / 93.50 ms; seed 2, 96.52 / 95.26 → 94.96 / 93.22 ms (−1.2% to −1.7%).
 memory.peak over five alternating runs, seed 1: 39.2–39.7 → 39.1–40.1 MB, median 39.5 both.
 S 868 → 877. Gate: 510 pass, 0 fail.
+
+On the board (run-280052ffeb2c) this step drew 97.9 ms against step 60's 95.2 ms, but the same run was slow on
+every track: D 123.1 ms against 118.4 and A 16.9 ms against 16.65, with C unchanged. A 2% step is below what one
+board run resolves, so it stays on the local measurements above.
 
 ## Experiments that did not stay
 
