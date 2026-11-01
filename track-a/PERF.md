@@ -64,6 +64,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 57 | Threads started one after another by one helper instead of by a tree, so that fewer of them wait for the interner's lock at once: 2 fewer lines | run-0899dd30b0f4 | 0.0172 | 18.4 | 86.7 |
 | 58 | Each line's id settled one line late: its name's slot is loaded as soon as the hash is known, and the name compared with the slot's padded copy after the next line's front half | run-b601b34b577c | 0.0174 | 18.0 | 86.6 |
 | 59 | The interner's pages given back once the names are sorted, before the hour pass's peak | run-b601b34b577c | 0.0174 | 18.0 | 86.6 |
+| 60 | Each thread's share of the input released right after its parse, and the whole input unmapped by one thread once all parses are done, with the interner keeping copies of the names | | | | |
 
 ## Step 1: v1
 
@@ -1050,8 +1051,93 @@ Local, AC power, turbo off. memory.peak, alternating runs: seed 1, 20 and 15 rou
 medians 18.69 → 18.77 and 18.73 → 18.72 ms, minimums 18.15 → 18.26 and 18.11 → 18.06 ms. S 361 →
 362. Gate: 310 pass, 0 fail; clippy reports no warnings.
 
+## Step 60: the input unmapped once the parse is over
+
+A profile of step 59 (local, turbo off, seed 1; `perf record -g` of user and kernel cycles, eight
+runs) put 32% of all samples in the kernel: page faults 20% (the input's 6–8, the output's 6, the
+records' 2), `madvise` 7.8% and the TLB-shootdown interrupts it sends 1.3%. Most of it is work per
+4 KB page that the program cannot shrink: a 12-thread test that only maps the 239 MB file and
+releases it spent 1.25 ms per thread on the faults and 0.6 ms on the release, whether the pages
+were hot or cold. Two things around it were not fixed costs. The input's page tables, 0.4 MB of
+kernel memory that `MADV_DONTNEED` leaves in place, stayed until the exit, so they counted in the
+hour pass's peak. And the exit, on one thread inside the timed window, walked them and freed them.
+
+Now each thread releases its share of the input right after its parse instead of after formatting,
+and once every parse is done (the barrier) thread 1 unmaps the whole input with one `munmap`. Its
+pages are gone by then, so the call only frees the page tables: 9 µs per thread on average, about
+0.11 ms on thread 1, which the hour pass's shared queue balances out. Nothing reads the log after
+the parse, because the interner now keeps a copy of each name (`Box::leak` in `insert`, 1,842
+small allocations under the lock it already holds), which the sort and the formatting read.
+`VmPTE` at the plan: 668 → 272 kB.
+
+Phase timestamps (31 interleaved runs, medians): the last parse and its release end at 10.00 ms
+after the start of `main`, against 9.31 ms for the parse alone (the release costs a little more
+while other threads still parse); the last thread finishes formatting at 16.11 ms, where its
+input's release used to end (16.13 ms); and the wall clock is 0.12 ms shorter, which leaves the
+exit, no longer walking and freeing the input's page tables. Local, turbo off. `ab.py`, 61
+interleaved runs: seed 1, medians 18.45 → 18.45 and 18.51 → 18.36 ms, minimums 18.13 → 17.73 and
+17.99 → 17.94 ms (and 18.68 → 18.36 ms in a round of 41); seed 3, 18.63 → 18.48, 18.74 → 18.61
+and 18.81 → 18.59 ms, minimums 17.68 → 17.81, 18.02 → 17.82 and 18.02 → 17.63 ms; seed 5,
+19.01 → 18.85 and 19.01 → 18.75 ms, minimums 18.22 → 18.19 and 18.45 → 18.11 ms; seed 7,
+18.62 → 18.53 and 18.63 → 18.56 ms, minimums 17.94 → 17.77 and 18.14 → 17.93 ms; seed 1 again,
+18.37 → 18.30 ms: −0.15 ms (−0.8%) on average over the eleven rounds. `perf stat` (10 runs, twice, interleaved): instructions:u 627.7 → 631.3 M,
+cycles:u 308.4 and 308.1 → 317.5 and 312.9 M, cycles:k 119.7 → 127.2 and 124.2 M, context
+switches 264 and 284 → 426 and 368. memory.peak, alternating runs: seed 1, 16.60 → 16.27 MB (6
+rounds) and 16.54 → 16.18 MB (8 rounds, the same code before its comments); seed 3, 17.02 → 16.48
+MB (6 rounds); seed 5, 17.00 → 16.33 MB (6 rounds); seed 7, 16.55 → 16.37 MB (6 rounds): about
+−0.4 MB. S 362 → 364. Gate: 310 pass,
+0 fail; clippy reports no warnings.
+
 ## Experiments that did not stay
 
+- **Each thread unmapping its own share of the input after its parse** (local, turbo off, on step
+  59's code, names copied as in step 60). `munmap` holds the address space's lock, in read mode
+  while it frees the pages, so the twelve calls queued behind each other: 2.8 ms per call on
+  average, the last parse ended at 14.65 ms instead of 9.03 ms, and `ab.py` medians went
+  18.37 → 22.79 and 18.39 → 22.73 ms (61 runs, two rounds), for 0.74 MB less memory.peak. With
+  each share released by `MADV_DONTNEED` first, so that each `munmap` only frees page tables:
+  `ab.py` median 18.55 → 18.70 and 18.58 → 18.75 ms (+0.9%), memory.peak −0.14 and −0.27 MB.
+  Splitting the input's one mapping stalls the page faults of the threads still parsing it. Step
+  60 unmaps once, after the barrier. The release after the parse alone, without any `munmap`:
+  medians 18.44 → 18.41 and 18.58 → 18.49 ms, memory.peak unchanged. Not kept.
+- **The input read with `pread` instead of mapped** (a 12-thread test in C, not built into the
+  program): each thread reading its 20 MB share in 64 KB blocks into a buffer and touching every
+  cache line took 6.87 ms; mapping it and touching every cache line took 6.3 ms, plus 0.6 ms to
+  release it. Both stream at about 38 GB/s, so the faults are not the bound, and the copy would
+  not overlap with the parse the way the mapped reads do. Not built.
+- **The hour pass without its record releases** (local, turbo off, on step 59's code), to bound
+  what batching them could save: `release(&records[..0])`, `ab.py` median 18.56 → 18.43 ms
+  (−0.7%, 41 runs). The 222 calls that free pages each interrupt the other eleven threads, but the
+  records of an hour lie in about three runs in different chunks, so they cannot be freed in fewer
+  calls without the 4.9 MB that keeping them costs. Not built.
+- **The chunk's records released before the output is mapped, not after** (local, turbo off, on
+  step 60's code), so that eleven threads release while one maps: `ab.py` medians 18.51 → 18.50,
+  18.57 → 18.44 and 18.58 → 18.60 ms (61 runs, three rounds). Not kept.
+- **The latency buffer allocated before the first barrier instead of after the plan** (local, turbo
+  off, on step 60's code), so that its `mmap` falls in the wait for the slowest parse rather than
+  at the hour pass's start, where twelve such calls and the input's `munmap` queue for the address
+  space's lock: `ab.py` medians 18.73 → 18.75 and 18.64 → 18.67 ms (61 runs, seeds 1 and 3). Not
+  kept.
+- **One malloc arena for all threads** (`mallopt(M_ARENA_MAX, 1)`, 2 lines, local, turbo off, on
+  step 60's code), to spare the twelve arenas' `mmap`, `munmap` and `mprotect` calls, about 40
+  sleeps on the address space's lock a run (`perf record` of context switches): `ab.py` medians
+  18.47 → 19.16 and 18.61 → 19.30 ms (+3.7%), memory.peak 16.33 → 16.13 MB (6 rounds). Not kept.
+- **Each hour's place in the output populated with `MADV_POPULATE_WRITE` before it is formatted**
+  (local, turbo off, on step 60's code), to replace 35 page faults an hour with one call: `ab.py`
+  medians 18.51 → 19.19 and 18.63 → 19.35 ms (+3.8%, 61 runs, seeds 1 and 3). Not kept.
+- **The name's copy made before `insert` takes the lock** (local, turbo off, on step 60's code), so
+  that the lock is not held through `malloc`: context switches 391 → 329 (`perf stat`, 10 runs),
+  cycles:u unchanged, `ab.py` medians 18.44 → 18.41 and 18.65 → 18.59 ms. 1 line. Not kept.
+- **`MADV_SEQUENTIAL` on the input** (local, turbo off, on step 60's code), so that its release
+  skips marking each page accessed: cycles:k 124.9 → 122.8 M (`perf stat`, 10 runs), page faults
+  unchanged, `ab.py` medians 18.62 → 18.58 and 18.65 → 18.71 ms. 1 line. Not kept.
+- **Each hour's lines released once formatted, again** (local, turbo off, on step 60's code):
+  memory.peak 16.22 → 16.17 MB (6 rounds). The hour pass's start still sets the peak. Not timed.
+- **Where the kernel's time goes, at step 59** (`perf record -g`, eight runs): of the output's page
+  faults (6.1% of all samples), 1.1% is threads spinning on the file's page-cache lock in
+  `shmem_add_to_page_cache`, since all twelve add pages to one file at once; nothing in user space
+  changes that short of fewer threads formatting. The input's faults spend 2.9% in
+  `next_uptodate_folio`, which reads each page's `struct page` while it maps 16 pages per fault.
 - **The input released once a thread's hours are done, before the second barrier** (local, turbo
   off, on step 58's code), to use the wait for the slowest worker: `ab.py`, 41 interleaved runs,
   median 18.81 → 19.66 ms (+4.5%). The release's shootdowns reach the workers still in the hour

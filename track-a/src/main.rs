@@ -51,7 +51,8 @@
 //!   buffer (170 KB) stays in the core's L2 cache during the counting sort and the selection.
 //! - **No teardown.** We exit right after the write, without running destructors, and the threads
 //!   hand their records and their share of the input mapping back to the kernel themselves, in
-//!   parallel ([`release`]), instead of leaving it all to the exit.
+//!   parallel ([`release`]), instead of leaving it all to the exit. Once every parse is done, the
+//!   input is unmapped, which frees the page tables that mapped it before memory peaks.
 //!
 //! Every step's measurements are in `PERF.md`.
 
@@ -92,6 +93,7 @@ const LINE: usize = 256;
 unsafe extern "C" {
     fn prctl(option: i32, ...) -> i32;
     fn madvise(addr: *const u8, len: usize, advice: i32) -> i32;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
 }
 
@@ -150,8 +152,9 @@ fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn std::error::Error>> {
     let len = usize::try_from(file.metadata()?.len())?;
     let ptr = map(null_mut(), len + LINE, 1, 0x22, -1)?; // PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS
     map(ptr, len, 1, 0x12, file.as_raw_fd())?; // PROT_READ, MAP_PRIVATE | MAP_FIXED
-    // SAFETY: the mappings hold `len + LINE` readable bytes and are never unmapped, so they
-    // outlive every borrow. /data is mounted read-only, so the bytes cannot change under us.
+    // SAFETY: the mappings hold `len + LINE` readable bytes and stay mapped until every parse
+    // is over, after which nothing reads them ([`summarize`] unmaps them then; the interner keeps
+    // copies of the names). /data is mounted read-only, so the bytes cannot change under us.
     Ok(unsafe { std::slice::from_raw_parts(ptr, len + LINE) })
 }
 
@@ -194,6 +197,9 @@ fn summarize(log: &'static [u8], out_path: &Path) {
     let work = |t: usize| {
         // SAFETY: every chunk ends by `len`, LINE bytes before the end of `log`.
         let _ = chunks[t].set(unsafe { parse(log, start(t)..start(t + 1)) });
+        // Nothing reads the log after the parse, so its pages go back now, all threads at once,
+        // and the single `munmap` below has only page tables left to free.
+        release(&log[len * t / threads..len * (t + 1) / threads]);
         // One thread, the barrier's leader, plans the hour pass while the others wait.
         if barrier.wait().is_leader() {
             let mut runs: Vec<Vec<Run>> = vec![Vec::new(); HOURS];
@@ -236,6 +242,12 @@ fn summarize(log: &'static [u8], out_path: &Path) {
             let _ = sorted.set(order);
         }
         let (names, runs, by_size) = plan.wait();
+        // One thread unmaps the input, every page of which is released by now: that frees the
+        // 0.4 MB of page tables that mapped it before the hour pass's peak. One call, since
+        // `munmap` holds the address space's lock: twelve, one per chunk, queued (+4.4 ms).
+        // SAFETY: every parse has ended (the barrier), and none of `log`'s bytes is read after
+        // it: the interner holds copies of the names.
+        (t == 1).then(|| unsafe { munmap(log.as_ptr().cast_mut(), log.len()) });
         // Room for every line, so any hour fits. glibc's malloc gives a request this large its
         // own mapping of fresh zero pages, and `vec!` (calloc) does not write them again: a page
         // takes memory only once a latency lands in it. Growing the buffer with `resize` wrote
@@ -257,14 +269,11 @@ fn summarize(log: &'static [u8], out_path: &Path) {
         });
         // The threads format in parallel, taking the next hour from the queue until none is
         // left. Each first frees the rest of its chunk's records, the pages that two runs
-        // share, which `summarize_hour` had to keep: no hour needs them any more. Releasing
-        // the input waits until the end, because freeing pages interrupts every other thread to
-        // flush its TLB, which cost 3 ms in the hour pass.
+        // share, which `summarize_hour` had to keep: no hour needs them any more.
         let chunk = chunks[t].get().expect("parsed");
         let _ = [&chunk.records, &chunk.large].map(|v| release(v));
         std::iter::from_fn(|| queue.lock().expect("panics abort").next())
             .for_each(|(index, (hour, place))| format_hour(index, &hour.wait().0, names, place));
-        release(&log[len * t / threads..len * (t + 1) / threads]);
         // The output is complete once the last thread gets here: skip joining the others.
         (done.fetch_add(1, Relaxed) + 1 == threads).then(|| std::process::exit(0));
     };
@@ -584,7 +593,7 @@ struct Interner<'a> {
     /// The table. A slot holds `id + 1`, so that 0 can mark an empty slot. Its size is part of
     /// its type, so a probe needs no bounds check: 0.9% fewer instructions in the parse.
     slots: [AtomicU32; 4 << 12],
-    /// Id → name. Names borrow the mapped file, so none are copied.
+    /// Id → name, a copy: the input is unmapped once the parse is over (see [`summarize`]).
     names: [OnceLock<&'a [u8]>; 1 << 12],
     /// Id → the name and the space after it, zero-padded to 64 bytes, for the probes of
     /// [`Interner::intern`]. A name of 64 bytes or more has no room for the space and keeps only
@@ -690,7 +699,7 @@ impl<'a> Interner<'a> {
         // SAFETY: no slot holds this id yet, so no other thread reads the copy, and only the
         // lock's holder writes one.
         unsafe { *self.padded[*count].get() = Padded(padded) };
-        let _ = self.names[*count].set(name);
+        let _ = self.names[*count].set(Box::leak(name.into()));
         *count += 1;
         self.slots[slot].store(*count as u32, Release);
         *count as u32 - 1
