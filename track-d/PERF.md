@@ -24,7 +24,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 17 | Pass 3 gives back the places of sorted blocks as it goes: the threads take the blocks in turn, and the 2 MB pages below the slowest one's progress are dropped with `madvise` | run-d253110190f5 | 0.1276 | 66.0 | 72.6 |
 | 18 | 30 fewer lines at the same speed: the Dockerfile without `WORKDIR`, one parser for edge and query lines, the runs cut with `split_off_mut`, the prefetches through one helper that takes an `Option`, and smaller cuts | run-e464a45452b1 | 0.1244 | 65.9 | 73.1 |
 | 19 | The query threads that run out of queries drop graph.txt's pages from the page tables, so the exit no longer unmaps them on one thread | run-f3c4ed0faa3c | 0.1246 | 65.6 | 73.1 |
-| 20 | The build's serial parts shortened: `split_runs` hands out the runs as they are asked for instead of collecting them, and the heavy-edge maps hash with `NodeHash` instead of `SipHash` | | | | |
+| 20 | The build's serial parts shortened: `split_runs` hands out the runs as they are asked for instead of collecting them, and the heavy-edge maps hash with `NodeHash` instead of `SipHash` | run-3416bb90eca1 | 0.1221 | 64.9 | 73.3 |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
