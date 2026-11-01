@@ -1776,6 +1776,48 @@ and at most 2.5% of instructions go.
 
 ## Experiments that did not stay
 
+- **Where step 50 stands** (local, P-cores, turbo off, an instrumented copy with a timestamp at
+  each phase of each worker, 21 runs, medians, ms from the harness's spawn of the process).
+  `main` starts at 1.2 to 1.7 ms (an empty static program: 1.6 ms) and `join` 0.09 ms later.
+  The first spawn returns 0.35 ms after `join` starts (the region table's `MADV_POPULATE_WRITE`
+  and the cuts), the last 0.73 ms after; the workers start over 0.25 to 0.3 ms, and the first
+  round starts when the last of them has parsed its share of the rows, 0.95 to 1.0 ms after
+  `join` starts. The 129 rounds take 18.2 ms: per worker 13.1 ms of parse, 3.9 ms of marking
+  and 0.9 to 1.0 ms at the barriers; in half the rounds the arrivals spread over less than
+  5 µs, and the barrier lets everyone go within 0.3 µs of the last arrival. Then the release,
+  0.53 to 0.6 ms, the entries 0.07 ms, the merge 0.04, the format 0.13 and the write 0.04 ms.
+  The process is gone 0.7 ms after the write, where an empty static program exits in 0.18 ms;
+  an empty program with 11 parked threads takes 0.42 ms, and one that maps and touches the
+  input and gives it back with `MADV_DONTNEED` 0.20 ms. In the kernel profile (`cycles:k`, 10
+  runs), `madvise` is 20% of kernel cycles, the barrier's sleeps 15% and the exit 0.7%.
+- **The region rows in shares taken in turn** (on step 50's code): 128 shares of
+  `regions.csv`, each worker taking the next from an atomic counter and cutting its share
+  itself, so that the workers that start first parse more of the rows and the last to start
+  finds them done. With the 96 cuts made by `main` before the spawns, its page faults on
+  `regions.csv` made the spawns 0.1 ms slower and ate the gain. The instrumented copy put the
+  first round 1.005 → 0.866 ms after `join` starts. `ab.py`, 61 interleaved runs, medians:
+  seed 1, 21.95 → 21.83, 21.96 → 21.87 and 21.96 → 21.83 ms; seed 2, 22.06 → 21.98, 22.04 →
+  21.97 and 21.99 → 21.95 ms; two more sets of six rounds, three- and four-way, −0.49% and
+  −0.31%. About −0.4% for +3 lines (S 365 → 368), worth +0.01 points at most. 96 or 48 shares:
+  the same within noise. The gate passes (310 of 310).
+- **Workers that end their own thread** with the `exit` syscall instead of parking, so the
+  last worker's exit kills no thread (on step 50's code): the time from the write to the end
+  fell 0.70 → 0.62 ms in the instrumented copy, but `ab.py`, six rounds of 61 runs on seeds 1
+  and 2, medians averaged 22.04 ms for step 50 and 22.06 ms for this. +2 lines.
+- **The input given back in shares that all workers take**, so that the last worker's merge,
+  format and write (0.22 ms) overlap the others giving back its run: giving back pages that
+  another core faulted in is much slower, and the last share was given back 1.64 ms after the
+  last round against 0.6 ms. The merge and format also slowed, 0.17 → 0.28 ms, beside the
+  siblings' `madvise`.
+- **A long spin at the first barrier only** (50 × `SPINS`), so that the workers that start
+  first do not sleep through the last arrival: `ab.py`, six rounds of 61 runs on seeds 1 and
+  2, 22.01 → 22.05 ms (medians averaged).
+- **`pread` into a small buffer instead of the mapping**, costed with a test program (12
+  threads on the P-cores, each streaming its twelfth of `records.csv`, 5 runs): through the
+  mapping 5.1 ms of faults and reads plus 0.6 to 0.7 ms of `MADV_DONTNEED`, through `pread`
+  into a 16 to 128 KiB buffer 5.7 to 6.0 ms with nothing to give back. A wash, and the buffers
+  would add 0.2 to 1.5 MB of memory.
+
 - **The input mapped in up front** (local, turbo off, on step 47's code): each worker called
   `madvise(MADV_POPULATE_READ)` on its run before the region table, so that the rounds would
   not fault. Page faults 4,724 → 1,654, but cycles:k 59.0 → 63.5 M and `ab.py`, 41 interleaved
