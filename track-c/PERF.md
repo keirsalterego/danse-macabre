@@ -1800,6 +1800,21 @@ points.
 
 ## Experiments that did not stay
 
+- **Rounds cut into chunks that the workers claim, with 12 workers again** (after step 51; local,
+  P-cores, turbo off). Each run's 128 KiB share of a round became 8 chunks of 16 KiB, claimed
+  from per-run atomic counters, own run first; a worker took another run's chunk only while each
+  mailbox it writes to had room for one more chunk. With a busy loop pinned to CPU 3 the kernel
+  put two of our workers on one other CPU, and a 60 µs barrier spin starved the second one, so a
+  worker that shared its CPU with another worker marked first, yielded after each chunk and
+  yielded instead of spinning. `ab.py`, 61 runs, medians: 21.76 and 22.16 ms on seeds 1 and 2,
+  against 21.78 and 22.12 for step 50 and 23.49 and 23.78 for step 51. With the busy CPU: 25.3 ms
+  against 22.1 quiet (+14.5%), where step 51 stays flat and step 50 takes 57.3. It costs 31 lines
+  and 0.6 MB, so it nets about +0.16 points on a quiet run and about +0.04 once busy runs are
+  counted. A worker that the scheduler leaves on the same CPU as another program gets no special
+  handling, a placement that never happened locally but would bring back step 50's slowdown.
+  Chunks with the spinning barrier took 48.5 to 50.0 ms under the busy CPU; 4 or 16 chunks per
+  round 28.2 and 28.9 against 25.5 for 8; handing a name set to the worker on the same CPU 25.5,
+  1% slower quiet, and one wrong hand-off in 20 runs.
 - **Where step 50 stands** (local, P-cores, turbo off, an instrumented copy with a timestamp at
   each phase of each worker, 21 runs, medians, ms from the harness's spawn of the process).
   `main` starts at 1.2 to 1.7 ms (an empty static program: 1.6 ms) and `join` 0.09 ms later.
