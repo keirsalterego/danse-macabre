@@ -59,7 +59,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 52 | The line end sets a doc's bits in its terms' rows without bounds checks on the term's store or the row | run-9069c200f6e8 | 0.1086 | 42.4 | 77.7 |
 | 53 | 37 fewer code lines in code that runs once or once per thread, with the pass's instructions unchanged | run-d502f3e18c27 | 0.1050 | 42.0 | 78.2 |
 | 54 | The common terms take ids 1 up, the rows' numbers, so a doc's rows are the first words of its term bits: the line end copies those words, and every 64 docs a 64 × 64 bit transpose turns them into the rows' words; the rows run of `kept`, its store lookups and the `ROW` flag go | run-255e2729d35b | 0.1011 | 42.0 | 78.5 |
-| 55 | Trial: 11 threads parse the queries while the main thread counts their terms and sets up the term table, then interns each share as soon as it is parsed | | | | |
+| 55 | Trial: 11 threads parse the queries while the main thread counts their terms and sets up the term table, then interns each share as soon as it is parsed | run-dc45dd0a1279 | 0.1041 | 41.6 | 78.1 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
