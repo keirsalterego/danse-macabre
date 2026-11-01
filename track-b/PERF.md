@@ -67,6 +67,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 60 | While the main thread interns the terms, three threads read the corpus a byte per 64 KiB, so the scanning threads' walks take no page faults on it; the chunks are freed on a thread of their own while the output is written | run-938dc27813b7 | 0.0952 | 41.3 | 79.0 |
 | 61 | The line end's token loop holds a zero in a register for its three selects, and the tokenizer takes a long token's key on a cold branch, the mask's address from the length negated, and a token's start and end as offsets from its block: 3.9 fewer instructions per token | run-280052ffeb2c | 0.0979 | 41.8 | 78.6 |
 | 62 | Reverted after two board runs (see its section). Trial: the line end's token loop stores each token's flags only, and a doc's terms kept in lists, BOOL triggers and phrase triggers are packed into their runs 8 tokens at a time by a permutation table, 10 instructions fewer per token in the loop for 4.25 in the packing; a key's home slot comes from its first word alone, two instructions fewer per token in the tokenizer | run-e89cc599f8ef | 0.1054 | 40.9 | 77.7 |
+| 63 | Trial: step 62's packing of a doc's runs, 8 tokens at a time, with step 61's hash of the key's first two words |  |  |  |  |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1793,6 +1794,15 @@ packing only and this step: seed 1, 94.88 / 93.27, 92.74 / 91.31 and 91.91 / 90.
 91.94 / 90.75; seed 1, 94.45 / 93.18 → 92.55 / 91.01; seed 3, 94.46 / 93.11 → 91.82 / 90.49 (−2.0%
 to −3.1% over five rounds, −2.7% on average). memory.peak over five alternating runs, seed 1:
 39.1–39.5 → 39.5–40.0 MB, median 39.5 → 39.6. S 877 → 901. Gate: 510 pass, 0 fail.
+
+## Step 63 (trial): step 62's packing alone
+
+Step 62 put two changes on the board at once and ran about 7% slower there than step 61. The
+packing is computation on the line end's own data; the hash of the key's first word alone puts
+terms that share their first 8 bytes on one home slot, so more probes go past it into the term
+table. This step keeps the packing and step 61's hash, to tell on the board which of the two cost
+the time. Locally, on battery, the packing alone measured −1.6% to −2.4% against step 61 over eight
+`ab.py` rounds (step 62's section). Gate: 510 pass, 0 fail. S 877 → 899.
 
 ## Experiments that did not stay
 
