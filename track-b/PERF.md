@@ -1802,7 +1802,7 @@ packing is computation on the line end's own data; the hash of the key's first w
 terms that share their first 8 bytes on one home slot, so more probes go past it into the term
 table. This step keeps the packing and step 61's hash, to tell on the board which of the two cost
 the time. Locally, on battery, the packing alone measured −1.6% to −2.4% against step 61 over eight
-`ab.py` rounds (step 62's section). Gate: 510 pass, 0 fail. S 877 → 899.
+`ab.py` rounds (step 62's section). Gate: 510 pass, 0 fail. S 877 → 901 (static_axes).
 
 ## Experiments that did not stay
 
