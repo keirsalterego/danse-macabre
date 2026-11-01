@@ -57,6 +57,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 50 | A token's probe carries its home slot's address instead of its index, and a probe past its home slot runs out of line, so the line end's token loop holds no register for the term table and keeps two values on the stack instead of four | run-086c324cb377 | 0.1064 | 41.2 | 77.9 |
 | 51 | A probe compares a short key's bytes 8 to 11 with its slot's `tail` as they are, without building the long bit, which only a key past 12 bytes, on its own branch, needs | run-086c324cb377 | 0.1064 | 41.2 | 77.9 |
 | 52 | The line end sets a doc's bits in its terms' rows without bounds checks on the term's store or the row | run-9069c200f6e8 | 0.1086 | 42.4 | 77.7 |
+| 53 | 37 fewer code lines in code that runs once or once per thread, with the pass's instructions unchanged | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1381,8 +1382,45 @@ Local, against step 51 (`ab.py`, 41 alternating runs), medians / minimums: seed 
 110.41 / 108.89 → 109.55 / 108.26 ms; seed 3, as committed, 110.22 / 108.37 → 110.13 / 107.86 ms
 (−0.1% to −0.8%). The same allocations. S 825 → 826. Gate: 510 pass, 0 fail.
 
+## Step 53: 37 fewer lines, the same pass
+
+Cuts in code that runs once or once per thread; the hot loops are as they were:
+
+- **The parse.** A thread's share of the lines is a `Queries<Key>`, the same layout as the
+  merged queries with each term still its key, so the `Lines` struct goes, and the merge
+  offsets each part's `at` instead of summing a per-query length (−8). A malformed line's error
+  comes from `ok_or_else` (−1).
+- **The plan.** A term's cost is a `u32` that fits on one line (−2); the per-thread plans are
+  unzipped in a statement of their own (−1); a BOOL query's check is compiled first and kept
+  when no cover term is common (−1); the store and row counts share one `let`, and the row and
+  list counts are one field, `sizes` (−3); the term flags are `u32`, and `TermTable::mark`'s
+  loop, now one `for_each` without casts, sits where it runs, in `Plan::new` (−5);
+  `Plan::phrases` joins the other `impl Plan` (−2).
+- **The rest.** One `use` line (−3); `MADV_DONTNEED` named in a comment at its call, like the
+  other advice values (−2); `key_hash` inside `TermTable::home`, its only caller (−2); the
+  sample makes each new part the sum and adds the old sum into it, with no branch for the first
+  part (−3); `intern`'s push on one line, and the sample's and the scan's per-thread locals
+  declared together (−4).
+
+Against step 52 (`perf stat -r 5`, interleaved, three rounds, seed 1): instructions 4,829.8 →
+4,828.4 M (the plan and the sample), cycles 2,525, 2,480 and 2,523 → 2,488, 2,525 and 2,523 M.
+Local, against step 52 (`ab.py`, 41 alternating runs), medians / minimums: seed 1, 109.13 /
+107.73 → 108.83 / 107.13 ms; seed 2, 109.46 / 108.24 → 109.47 / 107.76 ms; a second round, seed
+1, 109.10 / 107.69 → 109.15 / 107.64 ms; seed 3, 110.02 / 108.60 → 109.79 / 108.02 ms. memory.peak
+over five alternating runs: median 39.9 → 39.5 MB. S 826 → 789. Gate: 510 pass, 0 fail.
+
 ## Experiments that did not stay
 
+- **After step 52, line cuts that moved the pass** (local, seed 1, `perf stat -r 5`). The
+  scanning thread's code is one function, so a cut in its cold start or end can change how
+  LLVM allocates the hot loops' registers. Each of these added instructions and was put back:
+  `Tally::take_first` inlined at its one call, 4,829.8 → 4,853.8 M (`group` then inlines into
+  the scan); `group_into`'s counts and prefix sums as `for_each` one-liners, 4,828.5 → 4,852.1 M,
+  and 4,851.2 M with `take_first` kept out of line; the checks' cells added to their queries'
+  by one `for_each` after the walk, 4,828.5 → 4,856.8 M. In the walk's token loop, the block's
+  first start dropped by `starts &= select_unpredictable(carry, !0, starts - 1)`: 4,828.7 →
+  4,832.9 M, cycles the same. Each would have saved 1 to 4 lines. `#[target_feature(enable =
+  "avx2")]` cannot go either: the build's `target-cpu` does not make the intrinsics safe to call.
 - **After step 52, where the cycles and the wall go** (local, seed 1, turbo off). Topdown: retiring
   55%, bad speculation 14%, frontend 13%, backend 18%, of which memory about 8%; the kernel takes
   6.6% of all cycles. A build with timestamps, in ms since `main`: the queries are parsed and
