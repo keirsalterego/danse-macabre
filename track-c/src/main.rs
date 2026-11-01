@@ -331,7 +331,10 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
         // the barrier, which orders every write before every read. Atomic loads would keep the
         // compiler from holding anything else in a register across them.
         let by_id = unsafe { &*(&raw const *by_id as *const [u8]) };
-        let (mut at, end, mut groups) = (bounds[me], bounds[me + 1], Box::new([EMPTY; 256]));
+        let (mut at, end) = (bounds[me], bounds[me + 1]);
+        // Built where it lives: `Box::new([EMPTY; 256])` built the 16 KiB on the stack first, and
+        // the stack's pages stayed mapped, 0.2 MB over 12 threads.
+        let mut groups: Box<[Group; 256]> = vec![EMPTY; 256].try_into().unwrap();
         // Full scale draws from 100,000 names (spec §2.2) in 202 MB (§5), about one per 2 KiB,
         // and a thread owns a share of them. The set grows when a file has more.
         let mut names = NameSet::new(data.len() / 2048 / threads);
@@ -488,9 +491,14 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
         write(out, format_output(&*groups, &codes)).expect("a writable output directory");
         std::process::exit(0)
     };
-    // One thread per worker. The scope never ends: the last worker to finish ends the process,
-    // which also ends the others.
-    thread::scope(|s| (0..threads).for_each(|me| _ = s.spawn(move || work(me))));
+    // One thread per worker, and main is worker 0 once it has started the others: waiting for
+    // them instead took one spawn more before the first round, 0.5% of the runs (PERF.md, step
+    // 50). The scope never ends: the last worker to finish ends the process, which also ends the
+    // others.
+    thread::scope(|s| {
+        (1..threads).for_each(|me| _ = s.spawn(move || work(me)));
+        work(0);
+    });
     unreachable!("the last worker ends the process")
 }
 

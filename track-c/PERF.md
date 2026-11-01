@@ -54,6 +54,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 47 | `NameSet::read` reads a name's home slot and the next as one word and takes the next, with a `cmov`, when the home slot's tag is not the name's, so a name one slot past home no longer mispredicts; only names further on take the probe loop | run-ef37700846c7 | 0.0202 | 11.5 | 82.3 |
 | 48 | The region table in one pass: a code's group is the next number when its first row is read, given under a lock, so the second parse of the rows, its scans of the codes and one barrier go, and the output walks the codes in bytewise order to their groups | run-bb0b48a41b0b | 0.0217 | 11.3 | 81.6 |
 | 49 | 23 fewer lines at the same speed: the region rows parsed in the worker, with their shares cut by the same closure as the runs; `mallopt` dropped, since no large buffer is freed any more; `map_file` panics with the path; the slow paths of `number`, `text_fields` and the rehash, `values`, `prefix_xor` and the output line written shorter | | | | |
+| 50 | Each worker's 256 groups built on the heap, where `Box::new` built their 16 KiB on the stack first and the stack's pages stayed mapped, and `main` runs worker 0 itself once it has started the others | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1706,6 +1707,72 @@ Measured and not kept:
   is 7,702 bytes against 8,837 with the `fold`, which LLVM unrolls, yet `ab.py` measured 22.11,
   22.13 and 22.12 ms against 22.01, 21.99 and 22.04 ms with it (61 runs, interleaved with step
   48 at 22.03, 21.92 and 22.00 ms): the layout of the hot loop moved.
+
+## Step 50: groups built on the heap, and main as worker 0
+
+What is live at the peak, the end of the last round (step 49's code, full seed 1, P-cores, an
+instrumented copy that reads `/proc/self/pagemap` and `memory.stat` there; 4 KiB pages):
+
+| Block | Pages | MB |
+|---|---|---|
+| name-set entries, 12 × ~8,400 names × 40 bytes | 988 | 4.05 |
+| mailbox pages, 2 × 144 mailboxes × 1 page | 288 | 1.18 |
+| region table, 1 byte per id | 245 | 1.00 |
+| name-set slots, 12 × 16,385 × 4 bytes | 204 | 0.84 |
+| thread stacks, 12 × 6 pages | 72 | 0.29 |
+| groups, 12 × 16 KiB | 48 | 0.20 |
+| heap, binary, main's stack, `group_of` | ~15 | 0.06 |
+| page tables (memory.stat) | | 0.72 |
+| kernel stacks, 13 threads | | 0.21 |
+| slab | | 0.13 |
+| memory.current less all of the above | 540–610 | 2.2–2.5 |
+
+The last row is memcg's per-CPU charge stock: a CPU that charges a page takes 64 at a time
+from the counter and keeps the rest for its next charges, so each of the 12 CPUs holds 0 to 63
+pages that memory.peak counts and no page uses (plus the `bash` wrapper's own, in this
+measurement). Of the input's page tables, about 97 pages are the 202 MB mapping.
+
+- **Groups on the heap.** The worker's frame was 16.9 KB: `Box::new([EMPTY; 256])` built the
+  16 KiB of groups on the stack and copied them into the box, and the stack probes touched every
+  page of the frame, which stayed mapped. `vec![EMPTY; 256]` builds them in place; the frame is
+  664 bytes and each stack touches 2 pages instead of 6. anon 7.96 → 7.77 MB in the same dump.
+  +1 line.
+- **Main as worker 0.** `main` spawned all 12 workers and slept in the scope. Now it spawns 11
+  and runs worker 0: one spawn fewer before the first round and one thread fewer. +3 lines.
+
+Both alone, `ab.py`, 61 interleaved runs, medians: groups on the heap 22.03 → 22.02, 22.04 →
+22.02 and 22.08 → 22.00 ms; main as worker 0 on top of it 22.16 → 21.96, 22.28 → 22.33, 22.04 →
+21.94, 22.11 → 21.89, 22.07 → 21.89, 22.03 → 21.91 ms, and on full seed 2 22.14 → 22.05 ms.
+
+Together, step 49 → step 50, medians / minimums: full seed 1, 22.08 / 21.58 → 21.88 / 21.53,
+22.04 / 21.44 → 21.98 / 21.51 and 22.05 / 21.66 → 21.93 / 21.56 ms; full seed 2, 22.00 / 21.53 →
+21.95 / 21.57 and 22.16 / 21.58 → 21.95 / 21.57 ms (−0.6%). instructions:u 761.9 and 762.5 M →
+762.2 and 763.0 M. memory.peak, the brief's `systemd-run`, 8 alternating runs: 10.2–10.6 MiB
+(median 10.4) → 9.9–10.7 MiB (median 10.15); in the `bash` wrapper, 20 runs, medians 11.52 →
+11.46 MB. S 361 → 365. The gate passes (310 of 310), and clippy reports no warnings.
+
+Costed and not built, for memory:
+- **36-byte entries**, a 32-bit key: the rehash places a slot by its entry's key, so the key
+  must hold the home bits, and 32 bits of key with the 8-bit tag leave 40 bits to tell two names
+  apart, about 1 in 2,600 runs merging two names at full scale. −0.4 MB.
+- **Mailboxes packed below a page**: a mailbox holds the worst case, every record of a round to
+  one owner, so they are a page or more apart and each touches a page per half. With 8-byte
+  letters (56 bits of hash) and 2 KiB boxes, with an overflow area for the worst case, the
+  mailboxes would take 144 pages instead of 288, −0.59 MB, for a test per post and about 20
+  lines.
+- **The input's page tables freed during the rounds** by unmapping each 2 MB the worker has
+  parsed: about −0.3 MB, but `munmap` takes the address space's lock for writing, which the
+  workers' unmaps then take one at a time (step 38 measured 0.7 ms for the name sets'), and
+  the input would need one mapping per run.
+- **The charge stock**: memcg drains it only under reclaim, at a limit or when another cgroup
+  charges on that CPU, none of which the program controls.
+
+Costed and not built, for speed: **the id and the region's amount in one 256-bit chain**
+(`vinserti128` of the two windows, then one subtract, shuffle and multiply-add chain for both).
+It saves 3 to 5 of the ~205 instructions a record takes (3.72 M records, 762 M instructions),
+for 10 to 15 lines and a slow path that must undo the pairing when either field is long or
+carries the byte-order mark. At 0.011 points a line it must win more than 1.2% of T to pay,
+and at most 2.5% of instructions go.
 
 ## Experiments that did not stay
 
