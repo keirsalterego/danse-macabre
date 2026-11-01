@@ -56,6 +56,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 49 | Step 48's first-match list undone, since B's memory sits at the cap; the long terms' keys stay off huge pages, and a term is common from one sampled document in 48 instead of 32 | run-ec587c6dcef4 | 0.1131 | 41.7 | 77.3 |
 | 50 | A token's probe carries its home slot's address instead of its index, and a probe past its home slot runs out of line, so the line end's token loop holds no register for the term table and keeps two values on the stack instead of four | run-086c324cb377 | 0.1064 | 41.2 | 77.9 |
 | 51 | A probe compares a short key's bytes 8 to 11 with its slot's `tail` as they are, without building the long bit, which only a key past 12 bytes, on its own branch, needs | run-086c324cb377 | 0.1064 | 41.2 | 77.9 |
+| 52 | The line end sets a doc's bits in its terms' rows without bounds checks on the term's store or the row | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1364,6 +1365,21 @@ Local, against step 50 (`ab.py`, 41 alternating runs), medians / minimums: seed 
 110.80 / 109.11 ms and 111.90 / 110.24 → 110.68 / 109.06 ms (−1.1% to −2.1%). memory.peak over 3
 alternating runs: 38.5–39.5 → 39.1–40.0 MiB, with the same allocations. S 826 → 825. Gate: 510
 pass, 0 fail.
+
+## Step 52: the rows' bits set without bounds checks
+
+After step 51, the line end's loop that sets the doc's bit in the row of each of its terms kept
+in rows, `bits[store[t]][i / 64] |= 1 << (i % 64)`, took 9 instructions per term, two of them
+bounds checks: one on `store[t]` and one on the row. A term id is below `store.len()`, and a term
+with the `ROW` flag has a store below the row count, so both reads go unchecked. 1 more line.
+
+Against step 51 (`perf stat -r 5`, interleaved, two rounds): instructions 4,875.4 → 4,832.1 M
+(−0.9%), cycles 2,546 and 2,545 → 2,522 and 2,518 M (−1.0%).
+
+Local, against step 51 (`ab.py`, 41 alternating runs), medians / minimums: seed 1, 109.66 /
+108.43 → 109.38 / 107.66 ms, and 109.70 / 108.57 → 109.04 / 107.80 ms as committed; seed 2,
+110.41 / 108.89 → 109.55 / 108.26 ms; seed 3, as committed, 110.22 / 108.37 → 110.13 / 107.86 ms
+(−0.1% to −0.8%). The same allocations. S 825 → 826. Gate: 510 pass, 0 fail.
 
 ## Experiments that did not stay
 

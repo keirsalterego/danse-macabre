@@ -965,7 +965,10 @@ fn scan(text: &[u8], ids: Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
         let (i, store) = ((doc - sets.start) as usize, &plan.store[..]);
         let bits = &mut sets.bits[..];
         for &t in &kept[n..rows] {
-            bits[store[t as usize] as usize][i / 64] |= 1 << (i % 64);
+            // SAFETY: `t` is a term id, below `store.len()`, and a term kept in a row has a store
+            // below `plan.rows`, the row count.
+            let row = unsafe { bits.get_unchecked_mut(*store.get_unchecked(t as usize) as usize) };
+            row[i / 64] |= 1 << (i % 64);
         }
         for &t in &kept[2 * n..lists] {
             sets.lists[(store[t as usize] ^ LIST) as usize].push(i as u16);
