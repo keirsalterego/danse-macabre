@@ -1805,6 +1805,39 @@ to −3.1% over five rounds, −2.7% on average). memory.peak over five alternat
   most cycle samples of its loop, and at a 40-byte stride 3 in 8 of them cross a cache line. As a
   `#[repr(align(32))]` struct of 64 bytes, none does: instructions 3,823.2 → 3,827.6 M, cycles
   2,095 and 2,093 → 2,116 and 2,111 M (+0.9%), the larger buffer costing more than the splits.
+- **After step 62, the time outside the walks** (local, turbo off, on battery; timelines from a
+  build with timestamps on step 61's code, seed 1, medians of 12 runs, ms since `main`; `ab.py`
+  on step 62's code, 25 or 31 alternating runs, medians / minimums, ms):
+  - The timeline: parsed 2.17, table set up 3.04, interned 5.86, sample joined 7.53, renumbered
+    8.39, planned 9.31, the plan's tail ends 11.21, the scanning threads start setting up at
+    11.74–12.06 and walk from 12.48–13.11, the walks end at 84.48–87.67, the tails at
+    88.55–90.71, formatted at 92.05, written at 92.65; `ab.py`'s wall 95.77. At the exit 21.7 MB
+    is still mapped (18.5 MB anonymous), with 688 KB of page tables and 89 mappings.
+  - Ranked by walk end, the first thread to end its walk took 4.9 ms over its tail and the last
+    3.4 ms: the walks end over 2.8 ms (84.10–86.93) and the tails over 1.4 ms (88.99–90.36). The
+    last thread's tail: corpus pages dropped 0.89, last flush 0.43, window freed 0.08, merge
+    0.22, first matches grouped 1.41 (allocations 0.13, counting 0.21, placing 1.00, the list
+    freed 0.08). The format threads start 0.08–0.24 ms after the join and take 0.93 ms each.
+    Over 12 runs each of the 12 chunks was the last to end its walk in some run, so no static
+    split of the corpus evens the walks out.
+  - The last walk to end leaving its corpus pages to the exit (a counter passed to `scan`), 4
+    more lines: seed 1, 92.79 / 90.67 → 92.61 / 90.78 and 92.03 / 91.27 → 91.95 / 90.94; seed
+    2, 92.50 / 91.29 → 93.19 / 91.13 and 92.38 / 90.97 → 92.71 / 91.40, within the noise. The
+    drop moved out of `scan`, after the grouping, the last one again skipped: seed 1, 95.30 /
+    93.97, seed 2, 96.60 / 93.62, +2.7% and +4.4%.
+  - Each format thread's output reserved once, 64 bytes a line, instead of grown, with the same
+    lines: seed 1, 92.03 / 91.27 → 91.90 / 91.13, 92.38 / 90.80 → 91.89 / 90.42 (31 runs) and
+    91.96 / 90.90 → 92.23 / 90.54; seed 2, 92.38 / 90.97 → 92.09 / 90.96 and 92.43 / 91.37 →
+    92.13 / 90.85: −0.2% on average, within the noise; memory.peak median 39.5 → 39.6 MB over
+    five alternating runs; gate 510 pass. With the plan and the queries also freed on the
+    thread that frees the chunks: seed 1, 91.86 / 91.00, seed 2, 92.16 / 91.04.
+  - Not built: the terms deduplicated by each parse thread before the intern, as seed 1's 12
+    shares hold 115,788 distinct terms between them against 152,904 occurrences, so the main
+    thread would intern 24% fewer for a table per parse thread; and an intern on every thread
+    into the shared table by compare-and-swap, each thread taking ids `t + threads * k` and the
+    renumbering skipping the gaps, about 3 ms off the start for some 30 to 40 lines, which then
+    also needs the term table set up during the parse (step 55) and the prefaulting threads
+    moved out of the intern's time.
 
 - **After step 61** (seed 1, `perf stat -r 5`, interleaved; `ab.py`, 31 alternating runs, medians /
   minimums, ms):
