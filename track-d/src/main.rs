@@ -84,9 +84,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // seed 1 the peak fell from 91-96 MB to 82 MB, at the same wall time.
     // SAFETY: sets a malloc parameter; no other thread exists yet.
     unsafe { mallopt(-3, 64 << 10) };
-    let mut args = std::env::args().skip(1);
-    let data_dir = args.next().unwrap_or_else(|| "/data".into());
-    let out_dir = args.next().unwrap_or_else(|| "/out".into());
+    let arg = |i, default: &str| std::env::args().nth(i).unwrap_or(default.into());
+    let (data_dir, out_dir) = (arg(1, "/data"), arg(2, "/out"));
     let graph_txt = map_file(&Path::new(&data_dir).join("graph.txt"))?;
     let queries_txt = map_file(&Path::new(&data_dir).join("queries.txt"))?;
 
@@ -99,10 +98,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let [forward, reverse] = build_graph(&graph_txt[at..], n as usize, threads)?;
 
     // One `s t` line per query, no header (spec §2).
-    let (mut queries, mut at) = (Vec::new(), 0);
-    while at < queries_txt.len() {
-        queries.push((number(queries_txt, &mut at), number(queries_txt, &mut at)));
-    }
+    let mut queries = Vec::new();
+    for_each_line(queries_txt, |[s, t]| queries.push((s as u32, t as u32)));
     let answers = answer(&forward, &reverse, &queries, threads);
 
     let mut out = Vec::with_capacity(answers.len() * 12);
@@ -124,13 +121,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn map_file(path: &Path) -> Result<&'static [u8], Box<dyn Error>> {
     let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let len = usize::try_from(file.metadata()?.len())?;
-    if len == 0 {
-        return Ok(&[]); // mmap rejects a zero length, and an empty queries.txt is legal (spec §2)
-    }
     // PROT_READ (1): the pages may only be read. MAP_PRIVATE (2): we never write to them, so the
-    // mapping shares the page cache's pages.
+    // mapping shares the page cache's pages. mmap rejects a zero length, so an empty file (an
+    // empty queries.txt is legal, spec §2) maps a page past its end, which nothing reads.
     // SAFETY: a new read-only private mapping of an open fd; the kernel picks the address.
-    let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0) };
+    let ptr = unsafe { mmap(std::ptr::null_mut(), len.max(1), 1, 2, file.as_raw_fd(), 0) };
     if ptr.addr() == usize::MAX {
         return Err(format!("mmap {}: {}", path.display(), io::Error::last_os_error()).into());
     }
@@ -181,26 +176,24 @@ fn number(bytes: &[u8], at: &mut usize) -> u64 {
     value
 }
 
-/// Splits `text` into `parts` chunks of whole lines. Each split point starts at an even share of
-/// the bytes and moves forward to the next line start, so every line lands in exactly one chunk.
+/// Splits `text` into `parts` chunks of whole lines. Split point i starts at an even share of
+/// the bytes, `at`, and moves forward to the first line start from there on: the byte after the
+/// first LF from `at - 1` on. So every line lands in exactly one chunk.
 fn line_chunks(text: &[u8], parts: usize) -> Vec<&[u8]> {
-    let mut bounds = vec![0];
-    for i in 1..parts {
-        let at = text.len() * i / parts;
-        let newline = text[at..].iter().position(|&b| b == b'\n');
-        bounds.push(newline.map_or(text.len(), |p| at + p + 1));
-    }
-    bounds.push(text.len());
-    bounds.windows(2).map(|w| &text[w[0]..w[1]]).collect()
+    let newline = |from: usize| text[from..].iter().position(|&b| b == b'\n');
+    let split = |i| match text.len() * i / parts {
+        0 => 0,
+        at => newline(at - 1).map_or(text.len(), |p| at + p),
+    };
+    (0..parts).map(|i| &text[split(i)..split(i + 1)]).collect()
 }
 
-/// Parses every `u v w` edge line of one chunk and calls `visit(tail, head, weight)` on it.
-fn for_each_edge(chunk: &[u8], mut visit: impl FnMut(usize, usize, u64)) {
+/// Parses every line of `N` numbers in `text`, such as an `s t` query or a `u v w` edge, and
+/// calls `visit` on its numbers.
+fn for_each_line<const N: usize>(text: &[u8], mut visit: impl FnMut([u64; N])) {
     let mut at = 0;
-    while at < chunk.len() {
-        let tail = number(chunk, &mut at) as usize;
-        let head = number(chunk, &mut at) as usize;
-        visit(tail, head, number(chunk, &mut at));
+    while at < text.len() {
+        visit(std::array::from_fn(|_| number(text, &mut at)));
     }
 }
 
@@ -247,9 +240,9 @@ fn build_graph(body: &[u8], n: usize, threads: usize) -> Result<[Csr; 2], Box<dy
     let mut counts = vec![[vec![0; blocks], vec![0; blocks]]; chunks.len()];
     let work = chunks.iter().zip(&mut counts);
     on_threads(work, |(chunk, [by_tail, by_head])| {
-        for_each_edge(chunk, |tail, head, _| {
-            by_tail[tail / BLOCK] += 1;
-            by_head[head / BLOCK] += 1;
+        for_each_line(chunk, |[tail, head, _]| {
+            by_tail[tail as usize / BLOCK] += 1;
+            by_head[head as usize / BLOCK] += 1;
         });
     });
     let in_block = |direction: usize, block: usize| counts.iter().map(move |c| c[direction][block]);
@@ -292,13 +285,13 @@ fn build_graph(body: &[u8], n: usize, threads: usize) -> Result<[Csr; 2], Box<dy
     let mut heavy = vec![Vec::new(); chunks.len()];
     let work = chunks.iter().zip(runs).zip(&mut heavy);
     on_threads(work, |((chunk, [mut by_tail, mut by_head]), heavy)| {
-        for_each_edge(chunk, |tail, head, weight| {
+        for_each_line(chunk, |[tail, head, weight]| {
             if weight >= mark {
                 heavy.push((tail as u32, head as u32, weight));
             }
             let field = weight.min(mark) << id_bits;
-            append(&mut by_tail, tail, (field | head as u64) as u32);
-            append(&mut by_head, head, (field | tail as u64) as u32);
+            append(&mut by_tail, tail as usize, (field | head) as u32);
+            append(&mut by_head, head as usize, (field | tail) as u32);
         });
     });
     for &(tail, head, weight) in heavy.iter().flatten() {
@@ -348,11 +341,7 @@ fn build_graph(body: &[u8], n: usize, threads: usize) -> Result<[Csr; 2], Box<dy
 
 /// Cuts `slots` into consecutive runs of the given lengths.
 fn split_runs<T>(mut slots: &mut [T], lens: impl IntoIterator<Item = usize>) -> Vec<&mut [T]> {
-    let cut = |len| {
-        let (run, rest) = std::mem::take(&mut slots).split_at_mut(len);
-        slots = rest;
-        run
-    };
+    let cut = |len| slots.split_off_mut(..len).expect("lengths add up");
     lens.into_iter().map(cut).collect()
 }
 
@@ -382,13 +371,11 @@ fn sort(run: &mut [u32], places: &[u16], rows: &mut [u64], first: u32, wide: &mu
     // Degrees first, then an exclusive prefix sum turns them into each node's next slot. Node k
     // counts in `next[k + 1]`, one place up, so that the loop below leaves `next[k]` where node
     // k's edges start.
-    let (mut next, mut at) = (vec![0; 4 * rows.len() + 1], 0);
+    let mut next = vec![0; 4 * rows.len() + 1];
     for &place in places {
         next[usize::from(place) + 1] += 1;
     }
-    for next in &mut next {
-        at += std::mem::replace(next, at);
-    }
+    next.iter_mut().fold(0, |s, c| s + std::mem::replace(c, s));
     // A copy to read from, since the loop overwrites `run` in sorted order.
     let packed = run.to_vec();
     for (edge, &place) in packed.into_iter().zip(places) {
@@ -410,9 +397,10 @@ fn sort(run: &mut [u32], places: &[u16], rows: &mut [u64], first: u32, wide: &mu
 /// The rows of the wide groups of one block, as [`sort`] finds them, for [`Csr::wide`].
 type Wide = Vec<((u64, u32), (usize, usize))>;
 
-/// Asks the CPU to start loading the cache line that holds `item` into L1, and returns without
-/// waiting for it.
-fn prefetch<T>(item: &T) {
+/// Asks the CPU to start loading the cache line that holds `item`, if there is one, into L1, and
+/// returns without waiting for it.
+fn prefetch<T>(item: Option<&T>) {
+    let Some(item) = item else { return };
     let line = std::ptr::from_ref(item).cast();
     // SAFETY: a prefetch is a hint that never faults and changes no state, and `line` comes from a
     // reference, so it points into live memory anyway.
@@ -458,16 +446,6 @@ impl Csr {
         (at(node % 4), at(node % 4 + 1))
     }
 
-    /// Starts loading the first cache line of `node`'s edges into L1, without waiting for it.
-    /// At full scale a node has 2.9 edges on average, 12 bytes, so one 64-byte line usually
-    /// holds them all (prefetching the last line as well measured no faster even with 8-byte
-    /// edges). The group read here can miss too, but nothing waits for it.
-    fn prefetch(&self, node: u32) {
-        if let Some(edge) = self.edges.get(self.row(node).0) {
-            prefetch(edge);
-        }
-    }
-
     /// The packed edges of `node`. A row of up to 8 edges, one 32-byte load, is copied into
     /// `copy` and returned from there. At full scale a node has 2.9 edges on average.
     ///
@@ -490,10 +468,10 @@ impl Csr {
 
     /// Returns a function that unpacks one of `node`'s edges into its other end and its weight.
     /// It works out the field layout once, so a loop over the edges keeps it in registers.
-    fn unpack(&self, node: u32) -> impl Fn(u32) -> (u32, u64) {
+    fn unpack(&self, node: u32) -> impl Fn(&u32) -> (u32, u64) {
         let (bits, mask) = (self.id_bits, (1 << self.id_bits) - 1);
         let all_ones = u64::from(u32::MAX) >> bits;
-        move |edge| {
+        move |&edge| {
             let (other, weight) = ((u64::from(edge) & mask) as u32, u64::from(edge) >> bits);
             if weight == all_ones {
                 return (other, self.heavy_weight(node, other));
@@ -517,7 +495,7 @@ impl Csr {
 /// and maps allocate only while they grow. Threads take the next unanswered query from a shared
 /// counter instead of a fixed share, because query cost varies by orders of magnitude (the target
 /// is drawn by Dijkstra rank, 2 to 131,071, spec §2).
-fn answer(forward: &Csr, reverse: &Csr, queries: &[(u64, u64)], threads: usize) -> Vec<AtomicU64> {
+fn answer(forward: &Csr, reverse: &Csr, queries: &[(u32, u32)], threads: usize) -> Vec<AtomicU64> {
     // Atomics let the threads share one answer array with no `unsafe`. `Relaxed` is enough, since
     // the threads are joined before `main` reads.
     let answers: Vec<_> = queries.iter().map(|_| AtomicU64::new(0)).collect();
@@ -527,8 +505,7 @@ fn answer(forward: &Csr, reverse: &Csr, queries: &[(u64, u64)], threads: usize) 
         loop {
             let i = next.fetch_add(1, Relaxed);
             let Some(&(s, t)) = queries.get(i) else { break };
-            let d = distance(&mut from_s, &mut to_t, s as u32, t as u32);
-            answers[i].store(d, Relaxed);
+            answers[i].store(distance(&mut from_s, &mut to_t, s, t), Relaxed);
         }
     });
     answers
@@ -554,13 +531,11 @@ fn answer(forward: &Csr, reverse: &Csr, queries: &[(u64, u64)], threads: usize) 
 /// nodes. That side has settled everything it can reach, so `best` is the answer, `UNREACHABLE`
 /// included.
 fn distance(from_s: &mut Search, to_t: &mut Search, s: u32, t: u32) -> u64 {
-    from_s.start(s);
-    to_t.start(t);
     // A path may have zero edges, even on a node with no edges (spec §3). For s == t, best starts
     // at 0 and the loop never runs, since no queue top is below 0. Starting from UNREACHABLE
     // instead would answer a round trip, or -1 on a node with no edges.
     let mut best = if s == t { 0 } else { UNREACHABLE };
-    let (mut top_f, mut top_b) = (from_s.queue.top(), to_t.queue.top());
+    let (mut top_f, mut top_b) = (from_s.start(s), to_t.start(t));
     // Saturating, because an empty queue's top is u64::MAX.
     while top_f.saturating_add(top_b) < best {
         // Advance the smaller frontier, not the one with the smaller top key: a source with no
@@ -594,14 +569,15 @@ impl<'g> Search<'g> {
         Self { graph, queue, dist }
     }
 
-    /// Resets the search to a single label, `node` at distance 0. Clearing keeps the capacity
-    /// the queue and the map grew to in earlier queries.
-    fn start(&mut self, node: u32) {
+    /// Resets the search to a single label, `node` at distance 0, and returns the new top of its
+    /// queue, 0. Clearing keeps the capacity the queue and the map grew to in earlier queries.
+    fn start(&mut self, node: u32) -> u64 {
         self.queue.clear();
         self.queue.push(0, node);
         self.dist.0.clear();
         self.dist.1.clear();
         self.dist.0.insert(node, 0);
+        self.queue.top()
     }
 
     /// Settles the node on top of the queue, which [`Queue::top`] found, and relaxes its edges.
@@ -617,17 +593,16 @@ impl<'g> Search<'g> {
         // `rows`, then its edges, both at random spots in big arrays. The queue knows its next
         // pops (a push below may still cut in), so this fetches the edges of the node two pops
         // ahead and the group of the node three ahead. The previous step fetched the next node's
-        // edges. Of the depths tried, this one measured fastest.
+        // edges. Of the depths tried, this one measured fastest. At full scale a node has 2.9
+        // edges on average, 12 bytes, so the first 64-byte line of a row usually holds them all
+        // (prefetching the last line as well measured no faster even with 8-byte edges). The
+        // group read for it can miss too, but nothing waits for it.
         if let [_, Some(second), third] = self.queue.upcoming(d) {
-            self.graph.prefetch(second);
-            if let Some(third) = third {
-                prefetch(&self.graph.rows[third as usize / 4]);
-            }
+            prefetch(self.graph.edges.get(self.graph.row(second).0));
+            prefetch(third.map(|third| &self.graph.rows[third as usize / 4]));
         }
-        let unpack = self.graph.unpack(node);
-        let mut copy = [0; 8];
-        for &edge in self.graph.edges(node, &mut copy) {
-            let (next, weight) = unpack(edge);
+        let (unpack, mut copy) = (self.graph.unpack(node), [0; 8]);
+        for (next, weight) in self.graph.edges(node, &mut copy).iter().map(&unpack) {
             let via = d + weight;
             // A new label starts at `u32::MAX`, which a `via` below 2^32 - 1 beats with one compare.
             let label = self.dist.0.entry(next).or_insert(u32::MAX);
@@ -687,14 +662,13 @@ const NIL: u32 = u32::MAX;
 
 impl Queue {
     fn new() -> Self {
-        let (links, far) = Default::default();
         Self {
             heads: vec![NIL; RING],
             full: [0; RING / 64],
-            links,
+            links: Vec::new(),
             free: NIL,
             cur: 0,
-            far,
+            far: BinaryHeap::new(),
             len: 0,
         }
     }
@@ -732,8 +706,8 @@ impl Queue {
 
     /// The first key from `from` on whose bucket is full, scanning the ring once at most.
     fn ahead(&self, from: u64) -> Option<u64> {
-        let p = from as usize % RING;
-        let (w, bit) = (p / 64, p % 64);
+        // The word and the bit of bucket `from % RING`; RING is a multiple of 64.
+        let (w, bit) = (from as usize % RING / 64, from as usize % 64);
         if self.full[w] >> bit != 0 {
             return Some(from + u64::from((self.full[w] >> bit).trailing_zeros()));
         }

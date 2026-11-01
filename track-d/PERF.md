@@ -22,6 +22,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 15 | 1 fewer line with the same machine code: `sort`'s counters and its running sum declared together | run-5194056b1310 | 0.1244 | 68.4 | 72.7 |
 | 16 | `Queue::push` forced inline, so a relaxation no longer pays for a call: 1.8% fewer instructions | run-fc6e22635c4b | 0.1221 | 67.7 | 73.0 |
 | 17 | Pass 3 gives back the places of sorted blocks as it goes: the threads take the blocks in turn, and the 2 MB pages below the slowest one's progress are dropped with `madvise` | run-d253110190f5 | 0.1276 | 66.0 | 72.6 |
+| 18 | 30 fewer lines at the same speed: the Dockerfile without `WORKDIR`, one parser for edge and query lines, the runs cut with `split_off_mut`, the prefetches through one helper that takes an `Option`, and smaller cuts | | | | |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
@@ -458,6 +459,57 @@ arrays and both place arrays, 57.2 MiB, with about 4.5 MiB of process, page tabl
 cgroup's per-CPU charge batches), the forward pass 3, and the queries. A lower M needs all three
 to fall, and the places only shrink with a slower build (the transposed build below took 6.5 ms).
 
+## Step 18: 30 fewer lines
+
+S counts code lines after rustfmt, and the Dockerfile's lines too. rustfmt's defaults break a chain,
+a call's arguments or a tuple past 60 characters, so most cuts below are forms that stay under
+those widths rather than longer lines. Net code lines per change:
+
+- The Dockerfile's build stage runs `cd /src && cargo build` with the context mounted, as track A
+  does, instead of setting `WORKDIR` and copying it: 7 → 5. Built with `docker build
+  --network=none`, the binary is byte-identical to the local cargo build (ef900b06).
+- `for_each_line::<N>` parses a line of N numbers into an array, so the edge lines and the query
+  lines share it: −4. The queries are kept as `u32` pairs, so `answer` stores `distance` with no
+  binding: −1.
+- `split_runs` cuts with `split_off_mut`: −4. `sort`'s prefix sum is a `fold`: −2.
+- `map_file` maps at least one byte, so an empty file (an empty queries.txt) needs no branch: the
+  mapping of an empty file succeeds and the empty slice never reads it. −3.
+- `line_chunks` computes each split point in a closure, from `at - 1` on: −2. Its chunks differ
+  from step 17's by at most a line at each split, which only reorders edges inside a row.
+- `prefetch` takes an `Option` and `Csr::prefetch` is gone, so `step` makes its two prefetches in
+  two lines: −6.
+- Smaller ones, −1 each: the two arguments through one closure (track A's form), `start` returns
+  the queue's top as `step` does, `unpack` mapped over the row, `unpack` and the row copy declared
+  together, `Queue::new` without its `Default::default()` binding, and `ahead`'s word and bit read
+  from `from` directly.
+
+`step`, with `push` and `pop` inlined, has the same machine code as step 17's, and pass 1 too but
+for one equivalent compare (`cmp 9; ja` for `cmp 10; jae`) in its slow digit loop. Pass 2 has one
+more instruction per line: LLVM now lays the heavy-weight test out as a not-taken branch and a jump
+instead of a taken branch. Pass 3's prefix sum and the per-query code changed.
+
+Code placement mattered. A first version had `step`'s start 32 bytes past a 64-byte line instead
+of 16, with the same machine code, and that cost 0.4–0.5% of cycles (`perf stat`, 8 and 10
+interleaved rounds, never lower than step 17; `perf record` put all of it in `step`). With every
+function aligned to 64 bytes (`-C llvm-args=-align-all-functions=6`, for this control only), step
+17's code and this step's both lost 0.4–0.5% too. Reading the arguments through one closure moves
+`step` back to 16, and that is the version kept.
+
+Local, turbo off, against step 17, seed 1 unless named:
+
+- `perf stat`, 10 interleaved rounds of 5 runs: instructions:u 4,991.5 → 4,996.2 M (+0.09%, pass
+  2's extra instruction), cycles:u median 3,056.4 → 3,059.3 M (+0.1%, lower in 3 of the 10 rounds).
+- `ab.py`, 41 interleaved runs, medians (minimums): seed 1 127.17 → 127.45 (125.01 → 126.47),
+  127.40 → 127.64 (125.52 → 125.41) and 127.69 → 127.42 ms (124.65 → 126.06); seed 3 133.02 →
+  133.32 (131.07 → 131.46), 132.59 → 132.72 (131.06 → 130.80) and 133.26 → 133.10 ms (131.56 →
+  131.01). In the third round a second copy of step 17's binary ran too: 127.60 and 133.46 ms.
+  About +0.07% on average, within the spread of the two copies.
+- memory.peak, alternating runs: seed 1 median 62.4 → 62.1 MB (5 runs each), seed 3 62.2 →
+  62.35 MB (10 runs each, 61.8–63.0 against 61.8–63.7).
+- S 449 → 419 (Rust 442 → 414, Dockerfile 7 → 5). Gate: 512 pass, 0 fail; `cargo fmt --check`
+  and clippy report nothing. An empty queries.txt, a graph with no edges, and files without a
+  final LF give the same output as step 17.
+
 ## Tried and reverted (local, turbo off, no run ID)
 
 Each row's baseline ran in the same interleaved session as the experiment, so baselines differ
@@ -524,3 +576,6 @@ between rows.
 | The forward CSR built first, then the reverse one by transposing it, so the two place arrays are never live together (on step 15) | memory.peak, 6 runs: median 67.78 → 64.88 MB, highest 67.97 → 65.52. `ab.py`, 31 runs: median 130.61 → 137.06 ms, min 128.61 → 135.52. Build 34.5 → 42.7 ms (forward count 9.1, fault 3.6, scatter 10.9, sort 3.2; reverse count 3.1, fault 1.6, scatter 5.4, sort 3.5) | 2.9 MB saved for 6.5 ms: the queries' own peak, about 64–65 MB, then caps the saving, and the second scatter costs more than pass 2 saves |
 | Step 17's pass 3 in four rounds, each its own `on_threads`, with the sorted places given back between rounds | Not built in full: one `on_threads` of 12 threads that do nothing takes 172–189 µs (average of 20, three runs), so the forward direction's three extra rounds cost about 0.55 ms | Step 17 frees as much with no extra rounds |
 | Step 17 with each thread's sorted blocks counted, and every block below 12 × the least count freed (on step 16) | memory.peak, 6 alternating runs: 62.1–62.5 against 63.9–64.3 MB | The same memory as step 17, which needs no list of block starts |
+| `Csr::heavy_weight` folded into `unpack` behind `std::hint::cold_path()`, as `Csr::row` does for wide groups, 3 lines fewer (on step 17's code with step 18's first cuts) | `perf stat`, 8 interleaved rounds: instructions 4,996 → 5,081 M (+1.7%), cycles 3,063 → 3,102 M (+1.4%), higher in all 8 | The hash lookup is laid out in the relaxation loop, where `#[cold]` keeps it out of line |
+| Every function aligned to 64 bytes (`-C llvm-args=-align-all-functions=6`), to keep line cuts from moving the hot loops (on step 17 and on step 18) | `perf stat`, 8 interleaved rounds: cycles +16.1 M (step 17's code) and +12.9 M (step 18's), +0.4–0.5%, higher in all 8 | `step` then starts on a line, which is slower than 16 bytes past one |
+| `sort`'s degree count and prefix sum as `for_each` calls, 4 lines fewer (on step 17) | Same machine code | Pedantic clippy's `needless_for_each` rejects both; the prefix sum went in as a `fold` instead |
