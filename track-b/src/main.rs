@@ -600,7 +600,7 @@ fn id_at(docs: &[u8], at: usize) -> Result<u32, String> {
 /// oldest open start, and a token still open at a block's end carries into the next block.
 /// A line starts with its id, digits that look like a token, so a line's first token is left
 /// out: document text only begins after the TAB.
-fn walk(chunk: &[u8], terms: &TermTable, mut on_line_end: impl FnMut(&[(Key, usize)])) {
+fn walk(chunk: &[u8], terms: &TermTable, mut on_line_end: impl FnMut(&[(Key, *const Slot)])) {
     let (mut padded, tail) = ([0; 64], chunk.as_chunks::<64>().1);
     padded[..tail.len()].copy_from_slice(tail);
     // Before the first block: block -1, which holds nothing.
@@ -628,14 +628,14 @@ impl Tokens<'_> {
     /// [`scan`]'s loop, the token loop kept 4 of its values on the stack, as the line end's held
     /// the registers (PERF.md, step 42).
     #[inline(never)]
-    fn line(&mut self, terms: &TermTable, probes: &mut Vec<(Key, usize)>) -> Option<usize> {
+    fn line(&mut self, terms: &TermTable, probes: &mut Vec<(Key, *const Slot)>) -> Option<usize> {
         let (chunk, mut n) = (self.chunk, 0);
         let (mut base, mut starts, mut ends, mut lfs, mut next, mut prev_bit) = self.at;
         loop {
             // Room for 32 more tokens, the most that one block ends, so that the slice's address
             // and `n` stay in registers: a `Vec` pushed per token was reloaded and stored after
             // each push (PERF.md, step 41).
-            probes.resize(probes.len().max(n + 32), ([0; MAX_TERM / 8], 0));
+            probes.resize(probes.len().max(n + 32), (Key::default(), std::ptr::null()));
             let room = &mut probes[..];
             // A token never spans an LF, so the ends up to the block's next LF, the LF's own bit
             // included, close the line's tokens. Without an LF, `lfs ^ (lfs - 1)` takes all of
@@ -1277,11 +1277,11 @@ impl TermTable {
     ///
     /// # Safety
     ///
-    /// `at` is below the slot count, as [`TermTable::home`] is.
+    /// `at` points to a slot of `slots`, as [`TermTable::prefetch`] returns.
     #[inline(always)]
-    unsafe fn find_from(&self, key: &Key, at: usize) -> Slot {
-        // SAFETY: `at` is below the slot count, as the caller ensures.
-        let slot = unsafe { *self.slots.get_unchecked(at) };
+    unsafe fn find_from(&self, key: &Key, at: *const Slot) -> Slot {
+        // SAFETY: `at` points to a slot, as the caller ensures.
+        let slot = unsafe { *at };
         // A token whose home slot holds another term is no query term unless the slot has
         // `MORE`, which an empty slot never has: 29% of the tokens that are no term found their
         // home slot taken, and each of them mispredicted the probe's first test.
@@ -1293,7 +1293,22 @@ impl TermTable {
             let flags = std::hint::select_unpredictable(found, slot.flags, 0);
             return Slot { flags, ..slot };
         }
-        let next = (at + 1) & (self.slots.len() - 1);
+        // SAFETY: `at` points into `slots`, as the caller ensures.
+        unsafe { self.find_past(key, at) }
+    }
+
+    /// [`TermTable::find_from`] past the home slot `at`, out of line, so that the token loops
+    /// keep no register for the table's address and size.
+    ///
+    /// # Safety
+    ///
+    /// `at` points to a slot of `slots`.
+    #[cold]
+    #[inline(never)]
+    unsafe fn find_past(&self, key: &Key, at: *const Slot) -> Slot {
+        // SAFETY: `at` points into `slots`, as the caller ensures.
+        let next =
+            unsafe { at.offset_from_unsigned(self.slots.as_ptr()) + 1 } & (self.slots.len() - 1);
         // SAFETY: the slot count is a power of two, so `next` is below it, as is the index
         // `position` returns.
         unsafe { *self.slots.get_unchecked(self.position(key, next)) }
@@ -1307,9 +1322,9 @@ impl TermTable {
 
     /// Returns [`TermTable::home`] and starts loading that slot into L1, so that the load
     /// overlaps other work until [`TermTable::find_from`] needs it.
-    fn prefetch(&self, key: &Key) -> usize {
-        let at = self.home(key);
-        prefetch(self.slots.as_ptr().wrapping_add(at));
+    fn prefetch(&self, key: &Key) -> *const Slot {
+        let at = self.slots.as_ptr().wrapping_add(self.home(key));
+        prefetch(at);
         at
     }
 

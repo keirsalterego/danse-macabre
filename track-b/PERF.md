@@ -54,6 +54,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 47 | A document's phrase triggers are listed in a fifth run of the token loop's slice, by a store and an add, instead of pushed to a `Vec` behind a branch | run-f954cb1f35f8 | 0.1117 | 43.3 | 77.4 |
 | 48 | Memory: a chunk's first matches kept as query indices, each doc's followed by its id, 4 bytes per match instead of 8; the long terms' keys kept off transparent huge pages | run-f91848d73390 | 0.1134 | 37.6 | 77.2 |
 | 49 | Step 48's first-match list undone, since B's memory sits at the cap; the long terms' keys stay off huge pages, and a term is common from one sampled document in 48 instead of 32 | run-ec587c6dcef4 | 0.1131 | 41.7 | 77.3 |
+| 50 | A token's probe carries its home slot's address instead of its index, and a probe past its home slot runs out of line, so the line end's token loop holds no register for the term table and keeps two values on the stack instead of four | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1314,8 +1315,42 @@ Full seed 1, step 47 → step 49, `ab.py`, 41 interleaved runs, medians / minimu
 memory.peak (systemd-run, alternating): 40.2, 37.6, 40.6 → 39.8, 39.6, 39.1 MiB, under the cap
 with about 2 MB to spare at the board's usual reading. S 818 → 820. The gate passes (510 of 510).
 
+## Step 50: the probes carry their slots' addresses
+
+After step 49, the line end's token loop, which probes each token's home slot
+([`TermTable::find_from`]) and marks the doc's terms, ran 57 instructions per token, 7 of them
+stack accesses. For the probe that goes on past its home slot, the loop held the slots' address,
+their count's mask and the long keys' address, so it reloaded the addresses of `check_at`, `seen`
+and `kept` from the stack at every token, and kept the phrase triggers' cursor there, a load and a
+store per token; LLVM also hoisted the slow path's reloads of the slots' address and mask above
+the probe's branch.
+
+- **The slot's address in the probe.** [`TermTable::prefetch`] returns the home slot's address
+  instead of its index, and the walk stores it beside the key, so the probe loads its slot with
+  no shift and no table address. The walk's token loop takes the same number of instructions.
+- **Past the home slot out of line.** `TermTable::find_past` takes the probes that go on past a
+  home slot, `#[cold]` and never inlined. Only the call needs the table, so the token loop keeps
+  every value but two in registers: 52 instructions per token, 3 of them stack accesses (the
+  address of `check_at`, and the lists' cursor, loaded and stored), as only the six registers a
+  call preserves hold values across it.
+
+`perf stat -r 5`, interleaved, two rounds: instructions 5,191.3 → 4,949.2 M (−4.7%), cycles 2,652
+and 2,647 → 2,591 and 2,588 M (−2.2%), branch misses 11.41 → 11.40 M. The address alone: 5,078.3 M
+instructions, cycles 2,650 and 2,647 → 2,596 and 2,595 M.
+
+Local, against step 49 (`ab.py`, 41 alternating runs on the P-cores, turbo off), medians /
+minimums: seed 1, 113.31 / 111.51 → 111.27 / 109.58 ms and 113.30 / 111.73 → 111.50 / 110.06 ms;
+seed 2, 114.00 / 112.49 → 111.92 / 110.26 ms and 114.09 / 112.50 → 111.80 / 110.44 ms (−1.6% to
+−2.0%). memory.peak over 5 alternating runs: 38.6–39.8 → 38.8–39.6 MiB, with the same
+allocations. S 820 → 826. Gate: 510 pass, 0 fail.
+
 ## Experiments that did not stay
 
+- **After step 50, a token past 32 bytes keyed 0 by a conditional move** (local, seed 1), instead
+  of a branch to a key of 0xFF bytes: a length of 0 masks every byte off, and the key 0 probes to
+  an empty slot, id 0. Instructions 4,949.7 → 4,944.9 M, but cycles 2,584 and 2,584 → 2,630 and
+  2,635 M (+1.8%): the walk's token loop, one register short, then rebuilt the hash's constant at
+  every token.
 - **The scanning threads' tails mapping and unmapping nothing** (on step 49). The tail's wall time was
   1.5–6 ms against 1.3–2.2 ms of CPU: each `munmap` and `mmap` waited on the memory-map lock while
   other threads dropped their 21 MB of corpus pages with `MADV_DONTNEED`. Releasing the window bits,
