@@ -973,9 +973,6 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
         for (k, (key, at)) in probes.iter().enumerate() {
             // SAFETY: `at` is the key's home slot, from [`TermTable::prefetch`].
             let slot = unsafe { table.find_from(key, *at) };
-            // The BOOL triggers' loop below reads `check_at`, 303 KB, at random: every token's
-            // entry starts loading here, each trigger's among them (PERF.md, step 44).
-            prefetch(plan.check_at.as_ptr().wrapping_add(slot.id() as usize));
             let (t, bit) = (slot.id() as usize / 64, 1 << (slot.id() % 64));
             // The term's flags if the doc did not hold it yet, else none: a term is kept and
             // triggers once per doc.
@@ -1337,17 +1334,18 @@ impl TermTable {
         // `MORE`, which an empty slot never has: 29% of the tokens that are no term found their
         // home slot taken, and each of them mispredicted the probe's first test. The key's whole
         // second word against the `tail`, with no branch on the key's length: a key or a term
-        // past 12 bytes never matches here, and the term's home slot has `MORE`.
-        let found = (slot.head ^ key[0]) | (u64::from(slot.tail) ^ key[1]) == 0;
-        let mut stop = u8::from(found) | u8::from(slot.flags & Slot::MORE == 0);
+        // past 12 bytes never matches here, and the term's home slot has `MORE`. The probe goes on
+        // when `on` is not 0: one select, where `found || !more` took two more instructions.
+        let diff = (slot.head ^ key[0]) | (u64::from(slot.tail) ^ key[1]);
+        let mut on = std::hint::select_unpredictable(slot.flags & Slot::MORE != 0, diff, 0);
         // SAFETY: the asm block is empty; it keeps the test one branch, as in `position`.
-        unsafe { asm!("/* {} */", inout(reg_byte) stop, options(pure, nomem)) };
-        if stop != 0 {
-            let flags = std::hint::select_unpredictable(found, slot.flags, 0);
-            return Slot { flags, ..slot };
+        unsafe { asm!("/* {} */", inout(reg) on, options(pure, nomem)) };
+        if on != 0 {
+            // SAFETY: `at` points into `slots`, as the caller ensures.
+            return unsafe { self.find_past(key, at) };
         }
-        // SAFETY: `at` points into `slots`, as the caller ensures.
-        unsafe { self.find_past(key, at) }
+        let flags = std::hint::select_unpredictable(diff == 0, slot.flags, 0);
+        Slot { flags, ..slot }
     }
 
     /// [`TermTable::find_from`] from the home slot `at` on, with the full compare, out of line,

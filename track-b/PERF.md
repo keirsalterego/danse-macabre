@@ -63,6 +63,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 56 | Trial: the probe's first test compares a key's whole second word with the slot's `tail`, so it takes no branch on a key's length, and a term past 12 bytes is found past that test; the BOOL triggers' loop reads `check_at` and writes `todo` without bounds checks | run-e8e81cdefaa9 | 0.0977 | 41.8 | 78.8 |
 | 57 | The id lists' entries pushed to the end of one log, and sorted into the lists by counting at each window's flush, instead of pushed into one of 3,452 lists at random | run-e8e81cdefaa9 | 0.0977 | 41.8 | 78.8 |
 | 58 | Trial: of the short terms whose home slot a slot is, the one with the most sample hits moves into it, on a thread of its own during the plan's tail, so 44% fewer probes go past the home slot | run-f39c6987110f | 0.0981 | 42.3 | 78.6 |
+| 59 | Trial: the probe's first test branches on one select, the key's difference kept only when the slot has `MORE`, and the token loop at the line end no longer prefetches each token's `check_at` entry, so it keeps every address in a register | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1603,7 +1604,49 @@ tightened: seed 1, 101.50 / 100.32 → 99.71 / 98.29 ms; seed 2, 101.09 / 99.98 
 ms; seed 3, 101.23 / 99.53 → 99.72 / 98.06 ms. memory.peak over five alternating runs: 39.2–39.5
 → 39.0–39.7 MB. S 842 → 864. Gate: 510 pass, 0 fail.
 
+## Step 59: the probe's first test as one select, and no prefetch of `check_at`
+
+`find_from` went on to `find_past` unless `found || !more`, two `sete`, an `or` and a `test`
+behind an empty `asm` block that kept LLVM from making two branches of it, and the flags' select
+then tested `found` once more. Now `on` is the key's difference when the slot has `MORE` and 0
+otherwise, one `cmov`, and the branch tests it: two instructions fewer per token in both token
+loops. Alone, against step 58: instructions 4,279.9 → 4,243.1 M, cycles 2,256–2,262 → 2,202–2,232
+M; `ab.py`, 61 alternating runs, seed 1, 99.17 / 98.15 → 98.37 / 97.24 ms; seed 2, 99.13 / 98.16
+→ 98.53 / 97.17 ms (−0.6% to −0.8%).
+
+The token loop at the line end also prefetched each token's `check_at` entry for the BOOL
+triggers' loop (step 44), and with every register taken it reloaded `check_at`'s address from
+the stack for it, per token. Without the prefetch: 65 M fewer instructions (1.8 per token), and
+the triggers' loop now waits on loads of `check_at` that are mostly L2 hits; cycles 2,216–2,235
+→ 2,193–2,221 M on top of the select. After step 56 the prefetch's removal alone was within the
+noise (below).
+
+Against step 58: `perf stat -r 5`, interleaved, instructions 4,279.9 → 4,178.0 M, cycles 2,255
+and 2,255 → 2,220 and 2,217 M (−1.6%), branch misses 10.1 M both. `ab.py`, 61 alternating runs,
+medians / minimums: seed 1, 99.64 / 98.41 → 98.34 / 97.12 ms; seed 2, 99.63 / 98.42 → 98.14 /
+96.67 ms; seed 3, 99.19 / 98.14 → 97.71 / 96.19 ms; seed 1, 99.91 / 98.40 → 98.06 / 96.77 ms;
+seed 2, 99.75 / 98.32 → 98.23 / 97.05 ms (−1.3% to −1.9%, −1.5% on average, so a trial). memory.peak over five alternating runs: 38.8–39.7 → 38.3–39.4 MB. S 864 → 863.
+Gate: 510 pass, 0 fail.
+
 ## Experiments that did not stay
+
+- **After step 58** (seed 1 unless noted; `perf stat -r 5`, interleaved; `ab.py`, 61
+  alternating runs, medians / minimums, ms):
+  - Where the loads wait, by source line: of the 6.0 M loads that miss L2, `add_checks` takes
+    40%, the phrase candidates' loop 20% and the log's `store` lookup 16%; of the 38.7 M loads
+    that hit a fill buffer (a load under way), `add_checks` takes 35% and the probe's slot load
+    26%.
+  - The table's slots marked by `threads` scoped threads, a share each, instead of on the main
+    thread: seed 1, 99.84 / 98.64 → 99.55 / 98.42; seed 2, 99.54 / 98.37 → 99.31 / 97.80
+    (−0.3%), for 5 more lines.
+  - Each doc's checks run at the next doc's line end, so that the lines its triggers prefetch
+    have a whole line of tokens to arrive: two of `seen`, `todo` and `kept`, swapped per doc.
+    Fill-buffer hits 39.0 → 51.7 M and L1 load misses 45.7 → 59.1 M, as the lines left L1
+    again before their use; cycles 2,255–2,259 → 2,250–2,283 M. With the triggers' prefetches
+    into L2 only (T1): 2,250–2,276 against 2,260–2,261 M.
+  - The log's entries without their `store` lookup (wrong answers, as a bound): cycles 2,252–
+    2,258 → 2,230–2,235 M (−1.0%). Too little for entries keyed by term id, whose counting sort
+    at each flush would run over 75,748 starts instead of the 3,452 lists'.
 
 - **After step 57** (`ab.py`, 61 alternating runs, medians / minimums, ms):
   - Each scanning thread groups its 121,600 or so first matches at its end in 1.2–3.8 ms: 0.3
