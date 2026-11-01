@@ -66,7 +66,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 59 | Trial: the probe's first test branches on one select, the key's difference kept only when the slot has `MORE`, and the token loop at the line end no longer prefetches each token's `check_at` entry, so it keeps every address in a register | run-b6d1d5065964 | 0.0950 | 41.7 | 79.0 |
 | 60 | While the main thread interns the terms, three threads read the corpus a byte per 64 KiB, so the scanning threads' walks take no page faults on it; the chunks are freed on a thread of their own while the output is written | run-938dc27813b7 | 0.0952 | 41.3 | 79.0 |
 | 61 | The line end's token loop holds a zero in a register for its three selects, and the tokenizer takes a long token's key on a cold branch, the mask's address from the length negated, and a token's start and end as offsets from its block: 3.9 fewer instructions per token | run-280052ffeb2c | 0.0979 | 41.8 | 78.6 |
-| 62 | The line end's token loop stores each token's flags only, and a doc's terms kept in lists, BOOL triggers and phrase triggers are packed into their runs 8 tokens at a time by a permutation table, 10 instructions fewer per token in the loop for 4.25 in the packing; a key's home slot comes from its first word alone, two instructions fewer per token in the tokenizer | run-e89cc599f8ef | 0.1054 | 40.9 | 77.7 |
+| 62 | Reverted after two board runs (see its section). Trial: the line end's token loop stores each token's flags only, and a doc's terms kept in lists, BOOL triggers and phrase triggers are packed into their runs 8 tokens at a time by a permutation table, 10 instructions fewer per token in the loop for 4.25 in the packing; a key's home slot comes from its first word alone, two instructions fewer per token in the tokenizer | run-e89cc599f8ef | 0.1054 | 40.9 | 77.7 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1740,7 +1740,12 @@ On the board (run-280052ffeb2c) this step drew 97.9 ms against step 60's 95.2 ms
 every track: D 123.1 ms against 118.4 and A 16.9 ms against 16.65, with C unchanged. A 2% step is below what one
 board run resolves, so it stays on the local measurements above.
 
-## Step 62: a doc's runs packed 8 tokens at a time, and the home slot from the key's first word
+## Step 62 (reverted): a doc's runs packed 8 tokens at a time, and the home slot from the key's first word
+
+Reverted to step 61's code after two board runs: 105.4 and 106.3 ms (run-e89cc599f8ef,
+run-63da3c47097b) against step 61's 97.9 and 95.1 ms, although it was 2.7% faster locally over
+five rounds, measured on battery power. In the first run A, C and D ran within 2% of their usual
+times; in the second, A ran 42% and C 23% slow. Below is the step as it was measured.
 
 `perf record` of step 61 (seed 1, turbo off): the line end's token loop is 37 instructions per
 token and 24% of all cycles, at 2.6 instructions per cycle on each of a core's two threads, so

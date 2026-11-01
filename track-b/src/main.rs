@@ -978,10 +978,11 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
     // under way ([`TermTable::prefetch`]), instead of each stalling in turn.
     walk(text, &plan.terms, |probes| {
         let n = probes.len();
-        kept.resize(kept.len().max(4 * n + 32), 0);
-        let (kept, table, seen) = (&mut kept[..4 * n + 32], &plan.terms, &mut seen[..]);
+        kept.resize(kept.len().max(4 * n), 0);
+        let (kept, mut lists, mut bools, mut phrases) = (&mut kept[..4 * n], n, 2 * n, 3 * n);
+        let (table, seen) = (&plan.terms, &mut seen[..]);
         // A zero the optimizer cannot see, held in a register for the token loop's selects: with
-        // a constant 0, it set a register to 0 before each of two selects per token.
+        // a constant 0, it set a register to 0 before each of three selects per token.
         let mut zero = 0u64;
         // SAFETY: the asm block is empty.
         unsafe { asm!("/* {} */", inout(reg) zero, options(pure, nomem)) };
@@ -992,23 +993,31 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
             // SAFETY: `at` is the key's home slot, from [`TermTable::prefetch`].
             let slot = unsafe { table.find_from(key, *at, zero) };
             let (t, bit) = (slot.id() as usize / 64, 1 << (slot.id() % 64));
+            // The term's flags if the doc did not hold it yet, else none: a term is kept and
+            // triggers once per doc.
             // SAFETY: a slot's id is 0 or a term's, below `plan.terms.len()`, so its word `t` lies
             // below `seen.len()`, as asserted where `seen` is sized.
             let word = unsafe { seen.get_unchecked_mut(t) };
-            // The term's flags, but `LISTED` and `BOOL` only if the doc did not hold it yet: a term
-            // is kept and triggers once per doc.
-            let once = slot.flags & !(Slot::LISTED | Slot::BOOL);
-            let flags = std::hint::select_unpredictable(*word & bit == 0, slot.flags, once);
+            let new = std::hint::select_unpredictable(*word & bit == 0, slot.flags, zero as u32);
             *word |= bit;
-            // SAFETY: `k < n`, below the length of `kept`.
-            unsafe { *kept.get_unchecked_mut(k) = flags };
+            // SAFETY: `kept` holds `4 * n` entries, as the slicing above checks. `k < n`, and each
+            // cursor has moved at most `k` times from the start of its run of `n` entries, so it
+            // is still inside the run.
+            unsafe {
+                *kept.get_unchecked_mut(k) = slot.id();
+                *kept.get_unchecked_mut(lists) = slot.id();
+                *kept.get_unchecked_mut(bools) = slot.id();
+                *kept.get_unchecked_mut(phrases) = k as u32;
+            }
+            lists += usize::from(new & Slot::LISTED != 0);
+            bools += usize::from(new & Slot::BOOL != 0);
+            phrases += usize::from(slot.flags & Slot::PHRASE != 0);
         }
-        let [lists, bools, phrases] = pack(kept, n);
         let terms = &kept[..n];
         // As locals, their addresses stay in registers across the stores to `todo`.
         let (check_at, checks, cells) = (&plan.check_at[..], &plan.checks[..], &tally.checks[..]);
         let mut triggered = 0;
-        for &t in &kept[2 * n + 16..bools] {
+        for &t in &kept[2 * n..bools] {
             // Term `t` triggers the checks `checks[check_at[t]..check_at[t + 1]]`.
             // SAFETY: a trigger is a term id, below `plan.terms.len()`, and `check_at` holds one
             // entry more.
@@ -1035,9 +1044,9 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
             sets.spill(i / 64);
         }
         let entry = |&t: &u32| (store[t as usize] ^ LIST) << 5 | (i % 32) as u32;
-        sets.log.extend(kept[n + 8..lists].iter().map(entry));
+        sets.log.extend(kept[n..lists].iter().map(entry));
         sets.ends[i / 32] = sets.log.len() as u32;
-        for at in kept[3 * n + 24..phrases].iter().map(|&k| k as usize) {
+        for at in kept[3 * n..phrases].iter().map(|&k| k as usize) {
             for &(q, offset, other, term) in plan.phrases(terms[at]) {
                 // `terms` holds this doc only, so a match never spans two docs (spec §3).
                 let start = at.checked_sub(offset as usize);
@@ -1161,50 +1170,6 @@ fn window_cell(start: u32, bits: &[u64; WINDOW]) -> u64 {
     let [n, sum]: [u64; 2] = [n, sum].map(|lanes| lanes.iter().sum());
     // The low halves add up to less than 2^32: a window's positions do.
     n << SUM_BITS | (u64::from(start) * n + (sum & 0xFFFF_FFFF) + (sum >> 32))
-}
-
-/// Turns the [`Slot::flags`] of a doc's `n` tokens, `kept[..n]`, into their term ids, and packs
-/// the doc's terms kept in lists, its BOOL triggers and the positions of its phrase triggers into
-/// three runs, from `kept[n + 8]`, `kept[2 * n + 16]` and `kept[3 * n + 24]` to the ends returned:
-/// 8 tokens at a time, without a branch. In the token loop, a store and an add per run and token
-/// took 8 more instructions per token. A store writes 8 entries, so a run's room is 8 more.
-fn pack(kept: &mut [u32], n: usize) -> [usize; 3] {
-    // Entry `m` holds, from its low byte up, the positions of the bits set in `m`: its lowest
-    // bit's, then those of `m` without that bit.
-    const ORDER: [u64; 256] = {
-        let (mut table, mut m) = ([0; 256], 1);
-        while m < 256 {
-            (table[m], m) = (table[m & (m - 1)] << 8 | m.trailing_zeros() as u64, m + 1);
-        }
-        table
-    };
-    let mut runs = [n + 8, 2 * n + 16, 3 * n + 24];
-    // SAFETY: the binary targets alderlake (.cargo/config.toml), which has AVX2.
-    let mut at = unsafe { _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7) };
-    // The last 8 tokens' load reads up to 7 entries past `n`: zero, they join no run.
-    kept[n..n + 8].fill(0);
-    let p = kept[..4 * n + 32].as_mut_ptr();
-    for k in (0..n).step_by(8) {
-        // SAFETY: AVX2, as above. `kept` holds `4 * n + 32` entries; `k + 8 <= n + 8`, and each
-        // run's cursor stays 8 below the next run's start, as it moves on by at most 8 per 8.
-        unsafe {
-            let flags = _mm256_loadu_si256(p.add(k).cast());
-            let ids = _mm256_srli_epi32::<5>(flags);
-            _mm256_storeu_si256(p.add(k).cast(), ids);
-            let lanes = [(Slot::LISTED, ids), (Slot::BOOL, ids), (Slot::PHRASE, at)];
-            for (run, (bit, from)) in runs.iter_mut().zip(lanes) {
-                // The flag moved to the top bit of each lane, which `movemask` takes.
-                let shift = _mm256_set1_epi32(bit.leading_zeros().cast_signed());
-                let top = _mm256_castsi256_ps(_mm256_sllv_epi32(flags, shift));
-                let m = _mm256_movemask_ps(top).cast_unsigned() as usize;
-                let order = _mm256_cvtepu8_epi32(_mm_loadl_epi64(ORDER.as_ptr().add(m).cast()));
-                _mm256_storeu_si256(p.add(*run).cast(), _mm256_permutevar8x32_epi32(from, order));
-                *run += m.count_ones() as usize;
-            }
-            at = _mm256_add_epi32(at, _mm256_set1_epi32(8));
-        }
-    }
-    runs
 }
 
 /// Starts loading the cache line that holds `item` into L1. A pointer, so that callers need no
@@ -1432,12 +1397,13 @@ impl TermTable {
     /// Where the probe for `key` starts: below the slot count, a power of two of 2 or more, as
     /// the hash is shifted down to the count's bits.
     ///
-    /// The hash multiplies the key's first word, and slots come from its top bits. Keys whose
-    /// first 8 bytes agree share a home slot, told apart by the probe, and the most frequent
-    /// of their terms takes it ([`TermTable::settle`]): the exclusive or of the first two words
-    /// cost the tokenizer two instructions per token (PERF.md, step 62).
+    /// The hash multiplies the exclusive or of the key's first two words, one multiply rather
+    /// than one per word. Slots come from its top bits, which depend on both words. A key of 16
+    /// bytes or less hashes as it would on all four words, which are zero past its end; longer
+    /// tokens are rare, and those whose first 16 bytes agree share a home slot, told apart by the
+    /// probe.
     fn home(&self, key: &Key) -> usize {
-        let hash = key[0].wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let hash = (key[0] ^ key[1]).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         (hash >> (64 - self.slots.len().trailing_zeros())) as usize
     }
 
