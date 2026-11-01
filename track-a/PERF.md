@@ -67,7 +67,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 60 | Each thread's share of the input released right after its parse, and the whole input unmapped by one thread once all parses are done, with the interner keeping copies of the names | run-8a3bcbee7e89 | 0.0194 | 17.3 | 85.6 |
 | 61 | Records with an 11-bit endpoint id and a 20-bit latency: the list of large latencies holds 1.2% of seed 1's lines instead of 2.6% | run-6132d5943394 | 0.0164 | 17.5 | 87.3 |
 | 62 | Each output line's endpoint id and request count in one `u32`, so the lines that wait for the formatting take 20 bytes instead of 24 | run-6132d5943394 | 0.0164 | 17.5 | 87.3 |
-| 63 | 18 fewer lines: the interner's tables as four statics with `intern` and `insert` as plain functions, the network's seven merge levels through a one-line macro, and a Dockerfile without `WORKDIR` | | | | |
+| 63 | 18 fewer lines: the interner's tables as four statics with `intern` and `insert` as plain functions, the network's seven merge levels through a one-line macro, and a Dockerfile without `WORKDIR` | run-f322558253fc | 0.0165 | 17.3 | 87.5 |
 
 ## Step 1: v1
 

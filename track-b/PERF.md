@@ -57,7 +57,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 50 | A token's probe carries its home slot's address instead of its index, and a probe past its home slot runs out of line, so the line end's token loop holds no register for the term table and keeps two values on the stack instead of four | run-086c324cb377 | 0.1064 | 41.2 | 77.9 |
 | 51 | A probe compares a short key's bytes 8 to 11 with its slot's `tail` as they are, without building the long bit, which only a key past 12 bytes, on its own branch, needs | run-086c324cb377 | 0.1064 | 41.2 | 77.9 |
 | 52 | The line end sets a doc's bits in its terms' rows without bounds checks on the term's store or the row | run-9069c200f6e8 | 0.1086 | 42.4 | 77.7 |
-| 53 | 37 fewer code lines in code that runs once or once per thread, with the pass's instructions unchanged | | | | |
+| 53 | 37 fewer code lines in code that runs once or once per thread, with the pass's instructions unchanged | run-d502f3e18c27 | 0.1050 | 42.0 | 78.2 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
