@@ -1745,7 +1745,9 @@ board run resolves, so it stays on the local measurements above.
 Reverted to step 61's code after two board runs: 105.4 and 106.3 ms (run-e89cc599f8ef,
 run-63da3c47097b) against step 61's 97.9 and 95.1 ms, although it was 2.7% faster locally over
 five rounds, measured on battery power. In the first run A, C and D ran within 2% of their usual
-times; in the second, A ran 42% and C 23% slow. Below is the step as it was measured.
+times; in the second, A ran 42% and C 23% slow. Step 61's code, back on the board, ran 98.1 ms
+(run-35a813ada612) in a run where A and C ran 4% and 7% slow, so step 62 cost about 7% there. Below is
+the step as it was measured.
 
 `perf record` of step 61 (seed 1, turbo off): the line end's token loop is 37 instructions per
 token and 24% of all cycles, at 2.6 instructions per cycle on each of a core's two threads, so
