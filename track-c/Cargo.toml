@@ -30,6 +30,8 @@ cast_possible_truncation = "allow"
 # 2^63, made `i64` for the group sums. `From` and `cast_signed` would only lengthen the lines.
 cast_lossless = "allow"
 cast_possible_wrap = "allow"
+# `join` is the whole parallel pipeline, its setup, rounds and tail, and reads best in one place.
+too_many_lines = "allow"
 # Forced only where a measurement showed the call's cost (see `number`).
 inline_always = "allow"
 # `use std::arch::x86_64::*`: the SIMD code takes 27 intrinsics and types from it.

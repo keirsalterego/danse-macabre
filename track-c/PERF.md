@@ -53,6 +53,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 46 | `NameSet::read` leaves its loop at a new name, and `insert` calls it again from that letter, so the loop keeps the set's slots, mask and entries in registers instead of loading them for every letter; and `number` parses on a 16-byte SSE window, with the shuffle and multiply-adds of `region_amount` | run-9d22ed670100 | 0.0208 | 11.6 | 82.0 |
 | 47 | `NameSet::read` reads a name's home slot and the next as one word and takes the next, with a `cmov`, when the home slot's tag is not the name's, so a name one slot past home no longer mispredicts; only names further on take the probe loop | run-ef37700846c7 | 0.0202 | 11.5 | 82.3 |
 | 48 | The region table in one pass: a code's group is the next number when its first row is read, given under a lock, so the second parse of the rows, its scans of the codes and one barrier go, and the output walks the codes in bytewise order to their groups | run-bb0b48a41b0b | 0.0217 | 11.3 | 81.6 |
+| 49 | 23 fewer lines at the same speed: the region rows parsed in the worker, with their shares cut by the same closure as the runs; `mallopt` dropped, since no large buffer is freed any more; `map_file` panics with the path; the slow paths of `number`, `text_fields` and the rehash, `values`, `prefix_xor` and the output line written shorter | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1665,6 +1666,46 @@ lines were trimmed (the same code): seed 1, 22.31 / 21.84 → 22.19 / 21.15 and 
 All eight medians lower, by 0.5% to 1.6% (about 1.0%). memory.peak, 5 alternating runs:
 10.3–10.7 MB for step 47 and 10.2–10.6 MB for this step. The gate passes (310 of 310), full seeds
 1 and 2 give the reference hashes, and clippy reports no warnings.
+
+## Step 49: 23 fewer lines
+
+S 384 → 361, in code that runs once per worker, once per round or off the hot path:
+
+- `region_rows`, called once, is written into the worker, and the shares of `regions.csv` come
+  from the closure that cuts `records.csv` into runs: a row starts with a digit, so the first
+  line after a cut that starts with a digit or a BOM is a row. Its code is one `fold`. −5.
+- `mallopt(M_MMAP_THRESHOLD)` goes. It was there because the regions parse freed its lists and
+  glibc then raised its threshold; nothing that large is freed now, and the name sets' entries,
+  the mailboxes and the region table are past glibc's default 128 KiB either way. memory.peak,
+  20 alternating runs, medians 11.48 → 11.50 MB (in a `bash` wrapper, so about 1 MB above the
+  brief's figure), and `ab.py` 22.03 / 22.09 / 22.09 / 22.13 → 21.99 / 22.02 / 21.93 / 22.26 ms.
+  −2.
+- `map_file` panics with the error and the path instead of returning a `Result` that `main`
+  unwrapped, so the mapping's check is one line. −2.
+- `ENTRY`, used once, goes (its doc moves to `NameSet::slots`). The rehash finds its empty slot
+  with `find`. The round's mailbox ends are stored with one `for_each` over `0..threads`. The
+  output line takes its key through `escape_ascii` instead of a separate `extend_from_slice`.
+  `values` shuffles in two statements instead of one split over four lines, `prefix_xor` is two
+  `unsafe` expressions, `number` takes its length with `trailing_ones`, and its loop for long
+  fields is a `position` and a `fold`. `region_amount` tests the sign inline, and
+  `text_fields_slow` takes the parity at a block's start from its count of quotes so far. −14.
+- `too_many_lines` is allowed in `Cargo.toml`: `join` went past clippy's 100 lines.
+
+`perf stat -r 10`, full seed 1, interleaved: instructions:u 762.2, 762.6, 763.2 and 762.1 M at
+step 48, 761.9 and 763.7 M here. `ab.py`, turbo off, 61 interleaved runs per round, medians /
+minimums, step 48 → step 49: full seed 1, 21.99 / 21.51 → 21.93 / 21.42, 22.01 / 21.58 → 22.00 /
+21.46 and 22.01 / 21.49 → 21.96 / 21.46 ms; full seed 2, 22.08 / 21.60 → 22.13 / 21.64 and
+22.02 / 21.50 → 22.01 / 21.57 ms, the same within noise. memory.peak, 20 alternating runs,
+medians 11.56 → 11.54 MB. The gate passes (310 of 310), and clippy reports no warnings.
+
+Measured and not kept:
+- **The two tails of `text_fields` as one**: the slow path returned the two ends with their
+  quote counts and the fast path's tail computed the lengths for both. −3 lines, but
+  instructions:u 762.0 → 794.9 M (+4.3%).
+- **`number`'s loop for long fields kept as it was**, with the other cuts: the worker's function
+  is 7,702 bytes against 8,837 with the `fold`, which LLVM unrolls, yet `ab.py` measured 22.11,
+  22.13 and 22.12 ms against 22.01, 21.99 and 22.04 ms with it (61 runs, interleaved with step
+  48 at 22.03, 21.92 and 22.00 ms): the layout of the hot loop moved.
 
 ## Experiments that did not stay
 
