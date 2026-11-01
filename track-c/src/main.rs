@@ -28,7 +28,7 @@
 //!    walks the codes in bytewise order to their groups, so no sort is needed at the end. Group 0
 //!    is `_UNMATCHED`, and it is also what every id missing from the table reads as.
 //! 2. **The records are split even though fields contain newlines.** The file is cut into one
-//!    run per hardware thread, and a cut can land inside a quoted note, where an LF is data and
+//!    run per worker, and a cut can land inside a quoted note, where an LF is data and
 //!    not a record end. Each run starts at the first LF after its cut that a digit or a BOM
 //!    follows (see [`join`]), so no pass over the file comes first.
 //! 3. **Each thread walks its records field by field.** [`join`] parses each record in
@@ -174,7 +174,10 @@ extern "C" fn main() -> ! {
     unsafe { prctl(29, 1u64, 0u64, 0u64, 0u64) }; // PR_SET_TIMERSLACK
     let data_dir = std::env::args().nth(1).unwrap_or("/data".into());
     let out = Path::new(&std::env::args().nth(2).unwrap_or("/out".into())).join("aggregates.txt");
-    let threads = thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    // One worker fewer than the CPUs. Every round waits for its slowest worker, so with a worker
+    // on every CPU, another program that takes one CPU halves one worker and every round: 57.6
+    // ms instead of 21.9. With a CPU to spare, the run takes 23.7 ms (PERF.md, step 51).
+    let threads = thread::available_parallelism().map_or(1, |n| n.get().max(2) - 1);
     let file = |name| map_file(&Path::new(&data_dir).join(name));
     join(file("records.csv"), file("regions.csv"), threads, &out)
 }

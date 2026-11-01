@@ -55,6 +55,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 48 | The region table in one pass: a code's group is the next number when its first row is read, given under a lock, so the second parse of the rows, its scans of the codes and one barrier go, and the output walks the codes in bytewise order to their groups | run-bb0b48a41b0b | 0.0217 | 11.3 | 81.6 |
 | 49 | 23 fewer lines at the same speed: the region rows parsed in the worker, with their shares cut by the same closure as the runs; `mallopt` dropped, since no large buffer is freed any more; `map_file` panics with the path; the slow paths of `number`, `text_fields` and the rehash, `values`, `prefix_xor` and the output line written shorter | run-606261c589b8 | 0.0200 | 11.6 | 82.5 |
 | 50 | Each worker's 256 groups built on the heap, where `Box::new` built their 16 KiB on the stack first and the stack's pages stayed mapped, and `main` runs worker 0 itself once it has started the others | run-606261c589b8 | 0.0200 | 11.6 | 82.5 |
+| 51 | One worker fewer than the CPUs, so a CPU taken by another program leaves a spare one instead of halving a worker and every round | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1773,6 +1774,29 @@ It saves 3 to 5 of the ~205 instructions a record takes (3.72 M records, 762 M i
 for 10 to 15 lines and a slow path that must undo the pairing when either field is long or
 carries the byte-order mark. At 0.011 points a line it must win more than 1.2% of T to pay,
 and at most 2.5% of instructions go.
+
+## Step 51: one worker fewer than the CPUs
+
+Two of eleven board runs of steps 48 to 50 took 47 to 49 ms instead of about 20. Locally, with a
+busy loop pinned to one of the twelve CPUs, step 50 takes 57.6 ms (median of 31, full seed 1)
+instead of 21.9: the worker on that CPU gets half of it, every one of the 129 rounds waits for that
+worker at the barrier, and the scheduler leaves it where it is because it is cache-hot. The same
+busy loop costs A, B and D 17 to 28%, since they meet at a barrier only a few times.
+
+The final score is the mean of the middle three of five runs, and a batch is re-run only when they
+spread by more than 50 ms, which a 47 ms run does not reach. At two slow runs in eleven, about one
+batch in five would hold two, and the mean of the middle three would then be about 29 ms, 4 points
+less. With one worker fewer, a busy CPU leaves a spare one:
+
+| Binary (full seed 1, 31 runs each) | No busy CPU, median | One busy CPU, median |
+|---|---|---|
+| Step 50, 12 workers | 21.9 ms (2 of 31 runs above 1.5x) | 57.6 ms |
+| Step 51, 11 workers | 24.0 ms (1 of 31) | 23.7 ms |
+
+`ab.py`, 41 interleaved runs on full seed 1, step 50 against step 51: medians 22.63 against 23.95
+ms (+5.8%, about 0.6 points), means 33.79 against 24.68 ms, because step 50 had slow runs under the
+machine's own load. The cost is paid on every run. It buys out a one-in-five chance of about 4
+points.
 
 ## Experiments that did not stay
 
