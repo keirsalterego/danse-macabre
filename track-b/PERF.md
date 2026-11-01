@@ -55,6 +55,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 48 | Memory: a chunk's first matches kept as query indices, each doc's followed by its id, 4 bytes per match instead of 8; the long terms' keys kept off transparent huge pages | run-f91848d73390 | 0.1134 | 37.6 | 77.2 |
 | 49 | Step 48's first-match list undone, since B's memory sits at the cap; the long terms' keys stay off huge pages, and a term is common from one sampled document in 48 instead of 32 | run-ec587c6dcef4 | 0.1131 | 41.7 | 77.3 |
 | 50 | A token's probe carries its home slot's address instead of its index, and a probe past its home slot runs out of line, so the line end's token loop holds no register for the term table and keeps two values on the stack instead of four | | | | |
+| 51 | A probe compares a short key's bytes 8 to 11 with its slot's `tail` as they are, without building the long bit, which only a key past 12 bytes, on its own branch, needs | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1344,8 +1345,40 @@ seed 2, 114.00 / 112.49 → 111.92 / 110.26 ms and 114.09 / 112.50 → 111.80 / 
 −2.0%). memory.peak over 5 alternating runs: 38.6–39.8 → 38.8–39.6 MiB, with the same
 allocations. S 820 → 826. Gate: 510 pass, 0 fail.
 
+## Step 51: a short key's tail as it is
+
+After step 50, each probe built the key's `tail` ([`Slot::tail`]) before comparing it with the
+slot's: its bytes 8 to 11 and, in the top bit, whether it runs past 12 bytes, four instructions
+per token. The probe branches on that same long bit anyway, for the long keys' full compare, and
+LLVM had already split `found & long` into a branch on `long` first. On the short side the top
+bit is 0, so [`TermTable::holds`] now compares the low half of `key[1]` with the slot's `tail` as
+it is, and builds the tail only on the long side. Same answers: a short key's tail is that low
+half. The loop takes two instructions fewer per token, as the new layout jumps over the long
+side at every token. One line fewer.
+
+Against step 50 (`perf stat -r 5`, interleaved, two rounds): instructions 4,949.7 → 4,875.4 M
+(−1.5%), cycles 2,585 and 2,584 → 2,536 and 2,541 M (−1.8%), branch misses 11.40 → 11.38 M.
+
+Local, against step 50 (`ab.py`, 41 alternating runs), medians / minimums: seed 1, 111.29 /
+109.86 → 109.85 / 108.60 ms and 111.45 / 110.06 → 110.11 / 108.09 ms; seed 2, 113.15 / 110.19 →
+110.80 / 109.11 ms and 111.90 / 110.24 → 110.68 / 109.06 ms (−1.1% to −2.1%). memory.peak over 3
+alternating runs: 38.5–39.5 → 39.1–40.0 MiB, with the same allocations. S 826 → 825. Gate: 510
+pass, 0 fail.
+
 ## Experiments that did not stay
 
+- **After step 51, three more cuts in the line end's token loop** (local, seed 1, `perf stat -r 5`,
+  interleaved). The long keys' side of the probe marked `std::hint::cold_path()`, which dropped
+  the jump that the short side took at every token: instructions 4,875.4 → 4,838.5 M, cycles the
+  same over five rounds (2,510–2,547 against 2,509–2,543 M), `ab.py` median 109.78 → 109.94 ms.
+  The probes past a home slot listed in a sixth run by a store and an add and run after the loop,
+  with the per-token work in a closure that both loops call: the closure's cursors stayed in
+  memory, loaded and stored at every token, and branch misses rose 11.38 → 19.53 M; cycles 2,501
+  → 2,890 M. `find_past` inlined, with the table behind `black_box` so that its address and size
+  are read only on that path: instructions 4,875.6 → 4,923.9 M, cycles 2,538 → 2,544 M.
+- **After step 51, the probes' buffer grown only when it is short** (`if probes.len() < n + 32`),
+  instead of `resize` to the larger length at every block: instructions 4,875.3 → 4,870.6 M,
+  cycles 2,538 → 2,539 M, for 2 more lines.
 - **After step 50, a token past 32 bytes keyed 0 by a conditional move** (local, seed 1), instead
   of a branch to a key of 0xFF bytes: a length of 0 masks every byte off, and the key 0 probes to
   an empty slot, id 0. Instructions 4,949.7 → 4,944.9 M, but cycles 2,584 and 2,584 → 2,630 and

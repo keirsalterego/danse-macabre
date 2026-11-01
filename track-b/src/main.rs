@@ -1365,15 +1365,14 @@ impl TermTable {
 
     /// Whether `slot` holds `key`. No `&&`: whether a token is a query term follows no pattern,
     /// so a probe takes one branch, mostly taken, ending at the term or an empty slot; long keys
-    /// take one more.
+    /// take one more, on which a short key's `tail` is its word's low half, with no long bit.
     fn holds(&self, slot: &Slot, key: &Key) -> bool {
-        let found = (slot.head ^ key[0]) | u64::from(slot.tail ^ Slot::tail(key)) == 0;
-        let long = key[1] & 1 << 37 != 0;
-        if found & long {
+        if key[1] & 1 << 37 != 0 {
+            let found = (slot.head ^ key[0]) | u64::from(slot.tail ^ Slot::tail(key)) == 0;
             // SAFETY: `keys` holds an entry per term occurrence and one more, so past every id.
-            return unsafe { self.keys.get_unchecked(slot.id() as usize) } == key;
+            return found && unsafe { self.keys.get_unchecked(slot.id() as usize) } == key;
         }
-        found
+        (slot.head ^ key[0]) | u64::from(slot.tail ^ key[1] as u32) == 0
     }
 
     /// The slot holding `key`, or the empty slot where it belongs, probing linearly from `at`.
