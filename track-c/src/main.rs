@@ -85,13 +85,9 @@
 
 #![no_main]
 
-use std::arch::x86_64::*;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering, Ordering::Relaxed};
-use std::{fs::write, io::Write, ops::Range, os::fd::AsRawFd, path::Path, thread, time::Duration};
+use std::{arch::x86_64::*, fs::write, io::Write, ops::Range, os::fd::AsRawFd, path::Path, thread};
 
-/// The UTF-8 byte order mark, U+FEFF. At the start of the file or of a record it is skipped, and
-/// anywhere else it is data (spec §2.1).
-const BOM: &[u8] = b"\xEF\xBB\xBF";
 /// Zero bytes that [`map_file`] puts after the last byte of each file. Every position a parse
 /// reaches lies before them, so the fixed-size reads of [`number`] (8 bytes), [`region_amount`]
 /// (16), [`name_letter`] (32) and [`byte_mask`] (64) always fit in the input, and none of them
@@ -111,8 +107,6 @@ const ROUND_BYTES: usize = 128 << 10;
 /// of one page, where mailboxes that started mid-page mostly touched two and peaked 1.7 MiB
 /// higher.
 const MAILBOX: usize = (ROUND_BYTES / 11 + 1).next_multiple_of(256);
-/// Spins of a worker that waits at the barrier before it starts to sleep (see [`barrier`]).
-const SPINS: usize = 2000;
 /// The country codes. They are `[A-Z]{3}` (spec §2.3), so a code read as a base-26 number is
 /// below 26³, and that number sorts like the code's bytes.
 const CODES: usize = 26 * 26 * 26;
@@ -163,15 +157,15 @@ const EMPTY: Group = [0, 0, 0, 0, 0, 0, i64::MAX, i64::MIN];
 /// `main`.
 #[unsafe(no_mangle)]
 extern "C" fn main() -> ! {
-    // Transparent huge pages would charge a whole 2 MB page to a buffer that uses a few 4 KB
-    // pages of it, such as the mailboxes, of which the rounds touch a few percent. If the call
-    // fails, only that is lost, so its result is not checked.
-    // SAFETY: the call takes plain integers and only changes this process's page-size policy.
-    unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) }; // PR_SET_THP_DISABLE
-    // A sleep may run 50 µs past its end by default, and a worker that slept too long at the
-    // barrier was late for its next round (see [`barrier`]). 1 ns is the least slack there is.
-    // SAFETY: as above; the call only changes this thread's timer slack, which threads inherit.
-    unsafe { prctl(29, 1u64, 0u64, 0u64, 0u64) }; // PR_SET_TIMERSLACK
+    // Both options are set to 1. `PR_SET_THP_DISABLE` (41): transparent huge pages would charge
+    // a whole 2 MB page to a buffer that uses a few 4 KB pages of it, such as the mailboxes, of
+    // which the rounds touch a few percent. `PR_SET_TIMERSLACK` (29), in ns: a sleep may run
+    // 50 µs past its end by default, and a worker that slept too long at the barrier was late for
+    // its next round (see [`barrier`]); 1 ns is the least slack there is. If a call fails, only
+    // that is lost, so the results are not checked.
+    // SAFETY: the calls take plain integers and only change this process's page-size policy and
+    // this thread's timer slack, which threads inherit.
+    _ = [41, 29].map(|option| unsafe { prctl(option, 1u64, 0u64, 0u64, 0u64) });
     let data_dir = std::env::args().nth(1).unwrap_or("/data".into());
     let out = Path::new(&std::env::args().nth(2).unwrap_or("/out".into())).join("aggregates.txt");
     // One worker fewer than the CPUs. Every round waits for its slowest worker, so with a worker
@@ -340,8 +334,8 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
         let mut groups: Box<[Group; 256]> = vec![EMPTY; 256].try_into().unwrap();
         // Full scale draws from 100,000 names (spec §2.2) in 202 MB (§5), about one per 2 KiB,
         // and a thread owns a share of them. The set grows when a file has more.
-        let mut names = NameSet::new(data.len() / 2048 / threads);
-        let mut sent = vec![0; threads];
+        // `sent[to]` is where this worker posts its next letter to `to` in this round.
+        let (mut names, mut sent) = (NameSet::new(data.len() / 2048 / threads), vec![0; threads]);
         // The batch of the record loop (see below). Zeroed at the start of every batch, it took
         // seven more instructions per four records. An entry holds its record's letter by
         // reference, so the group's store takes no second bounds check. The compiler lays out a
@@ -351,7 +345,9 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
         // waited for both to reach the cache, 0.44 to 0.64 M times per run (PERF.md, step 36).
         let mut batch = [(0, 0, 0, 0, 0, &boxes[0]); 4];
         for round in 0..=rounds {
-            let half = round % 2;
+            // SAFETY: the call takes no arguments and only reads which CPU runs this thread. A
+            // thread that moves to another CPU still marks the round once, before or after.
+            let (half, odd) = (round % 2, unsafe { sched_getcpu() } % 2 == 1);
             // The letters of the round before. A worker on an even CPU marks them before it
             // parses this round, and one on an odd CPU after, so the two hyperthreads of a core
             // (CPUs 2k and 2k + 1) mostly run the marking, which waits on loads, next to a parse,
@@ -360,9 +356,6 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
             let read = |names: &mut NameSet, groups: &mut [Group; 256]| {
                 (0..threads).for_each(|from| names.read(mail(mailbox(1 - half, from, me)), groups));
             };
-            // SAFETY: the call takes no arguments and only reads which CPU runs this thread. A
-            // thread that moves to another CPU still marks the round once, before or after.
-            let odd = unsafe { sched_getcpu() } % 2 == 1;
             (round > 0 && !odd).then(|| read(&mut names, &mut groups));
             (sent.iter_mut().enumerate()).for_each(|(to, s)| *s = mailbox(half, me, to) * MAILBOX);
             let round_end = end.min(at + ROUND_BYTES);
@@ -378,18 +371,18 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
                     let ahead = data.as_ptr().wrapping_add(at + 448);
                     // SAFETY: a prefetch reads nothing the program sees, and never faults.
                     unsafe { _mm_prefetch::<_MM_HINT_T0>(ahead.cast()) };
-                    // A BOM at the start of a record is not data (§2.1). It sits in front of the
-                    // id, so missing it would show up in `id_sum`. A record starts with a digit
-                    // or a BOM, so a first byte of 0xEF is a BOM. The id's word already holds
-                    // that byte, so the test takes no load, and only after a BOM is the id parsed
-                    // twice.
+                    // A BOM, the 3 bytes `EF BB BF` of U+FEFF, at the start of a record is not data
+                    // (§2.1); anywhere else it is. It sits in front of the id, so missing it would
+                    // show up in `id_sum`. A record starts with a digit or a BOM, so a first byte
+                    // of 0xEF is a BOM. The id's word already holds that byte, so the test takes
+                    // no load, and only after a BOM is the id parsed twice.
                     // SAFETY: `at` is below `end`, at most the input's length, so the 8 bytes from
                     // it, and from the 3 past it after a BOM, end inside the pad.
                     let (mut id, mut comma) = unsafe { number(data, at, b',') };
                     // SAFETY: as above. Checked, the byte took two more instructions.
-                    if unsafe { *data.get_unchecked(at) } == BOM[0] {
+                    if unsafe { *data.get_unchecked(at) } == 0xEF {
                         // SAFETY: as above.
-                        (id, comma) = unsafe { number(data, at + BOM.len(), b',') };
+                        (id, comma) = unsafe { number(data, at + 3, b',') };
                     }
                     // SAFETY: the id's stop is its first byte below `0`, so at the latest the pad's
                     // first byte, or its fourth after a BOM at the input's last byte: the 64 bytes
@@ -507,20 +500,20 @@ fn join(data: &[u8], regions: &[u8], threads: usize, out: &Path) -> ! {
 
 /// Arrives at the barrier that `arrived` counts, and waits until `all` workers have arrived.
 ///
-/// The `Release` add passes this worker's writes on, and a waiter's `Acquire` load that sees
-/// every worker's add sees every write made before it. Workers usually arrive within
-/// microseconds of each other, so a waiter spins first. A worker that is late because the
-/// scheduler put it aside would keep every spinner busy for whole time slices, and busy CPUs
-/// never look idle enough for the scheduler to move it. So a waiter that has spun long sleeps in
-/// steps of 10 µs, which frees its CPU. Steps of 50 µs, with the default timer slack, let a
-/// sleeper leave about 180 µs after it arrived, late for its next round, so its waiters slept in
-/// turn, in runs of up to 20 rounds; spinning 1 ms instead was as fast, but with one CPU busy
-/// with another program a run took 173 ms instead of 39 (PERF.md, step 43).
+/// The `Release` add passes this worker's writes on, and a waiter's `Acquire` load that sees every
+/// worker's add sees every write made before it. Workers usually arrive within microseconds of each
+/// other, so a waiter spins first. A worker that is late because the scheduler put it aside would
+/// keep every spinner busy for whole time slices, and busy CPUs never look idle enough for the
+/// scheduler to move it. So a waiter that has spun 2,000 times, about 60 µs, sleeps in steps of
+/// 10 µs, which frees its CPU. Steps of 50 µs, with the default timer slack, let a sleeper
+/// leave about 180 µs after it arrived, late for its next round, so its waiters slept in turn, in
+/// runs of up to 20 rounds; spinning 1 ms instead was as fast, but with one CPU busy with another
+/// program a run took 173 ms instead of 39 (PERF.md, step 43).
 fn barrier(arrived: &AtomicU64, all: usize) {
     arrived.fetch_add(1, Ordering::Release);
-    for spins in (0..).take_while(|_| (arrived.load(Ordering::Acquire) as usize) < all) {
+    for spins in (0usize..).take_while(|_| (arrived.load(Ordering::Acquire) as usize) < all) {
         std::hint::spin_loop();
-        (spins > SPINS).then(|| thread::sleep(Duration::from_micros(10)));
+        (spins > 2000).then(|| thread::sleep(std::time::Duration::from_micros(10)));
     }
 }
 
@@ -699,21 +692,21 @@ unsafe fn text_fields(data: &[u8], at: usize) -> (Range<usize>, i64, i64, usize)
     let bytes = unsafe { &*data.as_ptr().add(at).cast() };
     let (quotes, commas) = (byte_mask(bytes, b'"'), byte_mask(bytes, b','));
     let ends = commas & !prefix_xor(quotes);
-    let (first, rest) = (ends.trailing_zeros() as usize, ends & ends.wrapping_sub(1));
+    // The offsets from `at` of the commas that end the name and the note.
+    let (name, rest) = (ends.trailing_zeros() as usize, ends & ends.wrapping_sub(1));
     if rest == 0 {
         return text_fields_slow(data, at);
     }
-    let second = rest.trailing_zeros() as usize;
+    let note = rest.trailing_zeros() as usize;
     // `bzhi` keeps the bits below `i`. As `(1 << i) - 1` the count was first masked to 63, since
-    // the compiler does not know that `first` is below 64: two more instructions per record.
+    // the compiler does not know that `name` is below 64: two more instructions per record.
     // SAFETY: the build targets Alder Lake, which has BMI2 (see `.cargo/config.toml`).
     let before = |i: usize| unsafe { _bzhi_u64(quotes, i as u32) }.count_ones() as usize;
-    let (q1, q2) = ((quotes & 1) as usize, (quotes >> (first + 1) & 1) as usize);
-    let (in_name, in_both) = (before(first), before(second));
-    let name_len = (first - in_name / 2 - q1) as i64;
-    let note_len = (second - first - 1 - (in_both - in_name) / 2 - q2) as i64;
-    let name = at + q1..at + first - q1;
-    (name, name_len, note_len, at + second + 1)
+    let (q1, q2) = ((quotes & 1) as usize, (quotes >> (name + 1) & 1) as usize);
+    let (in_name, in_both) = (before(name), before(note));
+    let name_len = (name - in_name / 2 - q1) as i64;
+    let note_len = (note - name - 1 - (in_both - in_name) / 2 - q2) as i64;
+    (at + q1..at + name - q1, name_len, note_len, at + note + 1)
 }
 
 /// [`text_fields`] for a record whose note ends past the window: the same masks, 64 bytes at a

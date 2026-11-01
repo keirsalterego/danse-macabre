@@ -56,6 +56,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 49 | 23 fewer lines at the same speed: the region rows parsed in the worker, with their shares cut by the same closure as the runs; `mallopt` dropped, since no large buffer is freed any more; `map_file` panics with the path; the slow paths of `number`, `text_fields` and the rehash, `values`, `prefix_xor` and the output line written shorter | run-606261c589b8 | 0.0200 | 11.6 | 82.5 |
 | 50 | Each worker's 256 groups built on the heap, where `Box::new` built their 16 KiB on the stack first and the stack's pages stayed mapped, and `main` runs worker 0 itself once it has started the others | run-606261c589b8 | 0.0200 | 11.6 | 82.5 |
 | 51 | One worker fewer than the CPUs, so a CPU taken by another program leaves a spare one instead of halving a worker and every round | run-d27954c1c3a9 | 0.0217 | 10.7 | 82.0 |
+| 52 | 8 fewer lines at the same speed: the Dockerfile's build folded into one `RUN`, the imports in two lines, both `prctl` calls in one, `BOM` and `SPINS` written where they are used, two pairs of variables set in one statement each, and the name's range returned straight from `text_fields` | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1797,6 +1798,50 @@ less. With one worker fewer, a busy CPU leaves a spare one:
 ms (+5.8%, about 0.6 points), means 33.79 against 24.68 ms, because step 50 had slow runs under the
 machine's own load. The cost is paid on every run. It buys out a one-in-five chance of about 4
 points.
+
+## Step 52: 8 fewer lines
+
+S 365 → 357 (Rust 359 → 352, the Dockerfile 6 → 5), in code outside the record loop or with the
+same machine code inside it:
+
+- The build stage runs `RUN --mount=type=bind,target=/src cd /src && cargo build …`, as tracks A
+  and D do, instead of `WORKDIR /src` and then the mount. Both stages stay. The image's `/app/join`
+  has the local build's sha256. −1.
+- The three `use` lines are two: `arch::x86_64::*` joins the `std::{…}` list, and `Duration`, used
+  once, is written `std::time::Duration` there. −1.
+- Both `prctl` calls set their option to 1, so they are one `map` over `[41, 29]`, with one
+  comment for the two options. −1.
+- `BOM` and `SPINS`, each used in one place, are written there: the record loop tests for `0xEF`
+  and parses the id again 3 bytes on, and the barrier sleeps after 2,000 spins, its counter typed
+  `usize` as `SPINS` made it. The comments keep what their docs said. −2.
+- `half` and `odd` are set in one statement, and so are `names` and `sent`. −2.
+- `text_fields` names the offsets of its two commas `name` and `note`, as `text_fields_slow`
+  does, which makes the returned tuple short enough to take the name's range directly. −1.
+
+Every cut but one leaves the machine code as it was. `names` and `sent` in one statement change
+the worker's code (9,250 → 9,328 bytes) but not what it runs: with one worker (`taskset -c 2`),
+instructions:u 753,563,908 at step 51 and 753,563,915 here. `perf stat -r 20` on the P-cores,
+interleaved: instructions:u 765.1, 765.1 and 765.1 M → 765.2, 765.0 and 765.1 M; cycles:u 481.5,
+480.7 and 481.5 M → 481.7, 480.1 and 480.5 M. `ab.py`, turbo off, 61 interleaved runs, medians /
+minimums, step 51 → step 52: full seed 1, 23.03 / 22.49 → 23.02 / 22.55 and 23.08 / 22.28 →
+23.04 / 22.54 ms; full seed 2, 23.04 / 22.67 → 23.09 / 22.62 and 23.07 / 22.66 → 23.11 / 22.73 ms.
+memory.peak, the brief's `systemd-run`, 5 alternating runs: medians 9.7 → 9.7 MiB on full seeds 1
+and 3; no allocation changed. The gate passes (310 of 310), and clippy reports no warnings.
+
+Measured and not kept:
+- **Each output line as one `format!`**, the lines collected into a `String`: −2 lines, but with
+  one worker 753.56 → 754.12 M instructions (+551 k per run, about 2,300 per line, since each
+  `format!` starts with no capacity and grows), all of it in the last worker's tail after the
+  rounds.
+- **`text_fields` returning the note's comma**, the caller adding 1: −1 line, instructions:u
+  765.4 → 768.5 M (+0.4%).
+- **`region_amount_slow` written into `region_amount`'s branch** behind `std::hint::cold_path()`:
+  −3 lines, but the worker grew from 9.3 to 10.3 KB and instructions:u went 765.4 → 778.4 M
+  (+1.7%).
+- **`long_letter` written into `name_letter`**, not built: `name_letter` would then call itself,
+  and LLVM does not inline a recursive function, here into the record loop.
+- Left for clarity: `NameSet::new` written into the worker (−2), `main` and `join` as one function
+  (−2), the `ALIGN` loop's `i += 1` folded into a tuple assignment (−1).
 
 ## Experiments that did not stay
 
