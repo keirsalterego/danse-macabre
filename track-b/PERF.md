@@ -59,7 +59,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 52 | The line end sets a doc's bits in its terms' rows without bounds checks on the term's store or the row | run-9069c200f6e8 | 0.1086 | 42.4 | 77.7 |
 | 53 | 37 fewer code lines in code that runs once or once per thread, with the pass's instructions unchanged | run-d502f3e18c27 | 0.1050 | 42.0 | 78.2 |
 | 54 | The common terms take ids 1 up, the rows' numbers, so a doc's rows are the first words of its term bits: the line end copies those words, and every 64 docs a 64 × 64 bit transpose turns them into the rows' words; the rows run of `kept`, its store lookups and the `ROW` flag go | run-255e2729d35b | 0.1011 | 42.0 | 78.5 |
-| 55 | Trial: 11 threads parse the queries while the main thread counts their terms and sets up the term table, then interns each share as soon as it is parsed | run-dc45dd0a1279 | 0.1041 | 41.6 | 78.1 |
+| 55 | Reverted after three board runs (see its section). Trial: 11 threads parse the queries while the main thread counts their terms and sets up the term table, then interns each share as soon as it is parsed | run-dc45dd0a1279 | 0.1041 | 41.6 | 78.1 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1437,7 +1437,12 @@ Local, against step 53 (`ab.py`, 41 alternating runs), medians / minimums: seed 
 memory.peak over five alternating runs: median 38.7 → 38.8 MB (the rows round up to a multiple
 of 64, and each thread keeps 4.6 KB of blocks). S 789 → 823. Gate: 510 pass, 0 fail.
 
-## Step 55: the terms interned while the queries are parsed
+## Step 55 (reverted): the terms interned while the queries are parsed
+
+Reverted to step 54's code after three board runs: 104.1, 103.9 and 120.4 ms (run-dc45dd0a1279,
+run-3dca0206aaaf, run-001fa0eb6f48) against step 54's 101.1 and 100.4 ms, although it was 0.76%
+faster locally over nine rounds. The first two board runs came in a spell when D also ran 20%
+slow; in the third, A, C and D ran at their usual times. Below is the step as it was measured.
 
 A timeline of step 54 (a build with timestamps, ms since `main`, medians of 12 runs, seed 1,
 turbo off, 12 threads on the P-cores). Only the main thread works from 2.3 to 6.0 ms and in the
