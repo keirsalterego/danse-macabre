@@ -68,6 +68,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 61 | The line end's token loop holds a zero in a register for its three selects, and the tokenizer takes a long token's key on a cold branch, the mask's address from the length negated, and a token's start and end as offsets from its block: 3.9 fewer instructions per token | run-280052ffeb2c | 0.0979 | 41.8 | 78.6 |
 | 62 | Reverted after two board runs (see its section). Trial: the line end's token loop stores each token's flags only, and a doc's terms kept in lists, BOOL triggers and phrase triggers are packed into their runs 8 tokens at a time by a permutation table, 10 instructions fewer per token in the loop for 4.25 in the packing; a key's home slot comes from its first word alone, two instructions fewer per token in the tokenizer | run-e89cc599f8ef | 0.1054 | 40.9 | 77.7 |
 | 63 | Trial: step 62's packing of a doc's runs, 8 tokens at a time, with step 61's hash of the key's first two words | run-51792bbbc94f | 0.0929 | 41.9 | 79.1 |
+| 64 | Trial: the query terms interned on every thread into one shared table, a new term's slot claimed by a compare-and-swap of its `head` and its id taken from a block of 64; the page-touching helpers moved into the plan's tail | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -2351,5 +2352,7 @@ the time. Locally, on battery, the packing alone measured −1.6% to −2.4% aga
   threads moved into the plan's tail, two thirds of the threads. Gate 512 pass, 0 fail; 12 runs
   of seed 1 byte-identical (8 on 12 CPUs, 4 on 4). `ab.py`, 41 interleaved runs: seed 1 median
   92.56 → 89.94 ms (min 91.58 → 88.79), seed 3 92.37 → 90.08 ms (min 91.15 → 89.12), about
-  −2.6%. memory.peak, 3 alternating runs: 39.0–39.8 → 39.4–39.7 MB. But S 901 → 959: K ×1.004,
-  about +0.09 points, inside the runs' spread. Not kept.
+  −2.6%. memory.peak, 3 alternating runs: 39.0–39.8 → 39.4–39.7 MB. But S 901 → 961 as pushed:
+  K ×1.004, about +0.08 points, inside the local runs' spread. As step 62 ran 7% slower on the
+  board than here, it goes to the board as a trial (step 64), kept only if two board runs beat
+  step 63's 91–93 ms by more than their noise.
