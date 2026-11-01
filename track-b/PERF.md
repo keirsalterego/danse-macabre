@@ -63,7 +63,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 56 | Trial: the probe's first test compares a key's whole second word with the slot's `tail`, so it takes no branch on a key's length, and a term past 12 bytes is found past that test; the BOOL triggers' loop reads `check_at` and writes `todo` without bounds checks | run-e8e81cdefaa9 | 0.0977 | 41.8 | 78.8 |
 | 57 | The id lists' entries pushed to the end of one log, and sorted into the lists by counting at each window's flush, instead of pushed into one of 3,452 lists at random | run-e8e81cdefaa9 | 0.0977 | 41.8 | 78.8 |
 | 58 | Trial: of the short terms whose home slot a slot is, the one with the most sample hits moves into it, on a thread of its own during the plan's tail, so 44% fewer probes go past the home slot | run-f39c6987110f | 0.0981 | 42.3 | 78.6 |
-| 59 | Trial: the probe's first test branches on one select, the key's difference kept only when the slot has `MORE`, and the token loop at the line end no longer prefetches each token's `check_at` entry, so it keeps every address in a register | | | | |
+| 59 | Trial: the probe's first test branches on one select, the key's difference kept only when the slot has `MORE`, and the token loop at the line end no longer prefetches each token's `check_at` entry, so it keeps every address in a register | run-b6d1d5065964 | 0.0950 | 41.7 | 79.0 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
