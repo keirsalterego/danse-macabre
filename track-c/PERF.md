@@ -1859,6 +1859,12 @@ ms), the kind of run final scoring drops. S 357 → 357. Gate: 310 pass, 0 fail.
 
 ## Experiments that did not stay
 
+- **One malloc arena for all threads** (after step 53; local, seed 1): `mallopt(M_ARENA_MAX, 1)`
+  at startup. `/proc/<pid>/smaps` at the peak showed twelve 132 KiB arena heaps, one per worker,
+  at 84 KiB resident each, 1 MB in all, beside a 116 KiB main heap. With one arena the same pages
+  were touched in the main heap, so the 84 KiB are the workers' own data and not the arenas' slack:
+  memory.peak over five alternating `systemd-run`s, medians 10.3 → 10.3 MB. `ab.py`, 41 interleaved
+  runs: 21.36 → 24.09 ms (+12.8%), the workers' allocations serialized on one lock. Not kept.
 - **Rounds cut into chunks that the workers claim, with 12 workers again** (after step 51; local,
   P-cores, turbo off). Each run's 128 KiB share of a round became 8 chunks of 16 KiB, claimed
   from per-run atomic counters, own run first; a worker took another run's chunk only while each
