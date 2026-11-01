@@ -64,6 +64,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 57 | The id lists' entries pushed to the end of one log, and sorted into the lists by counting at each window's flush, instead of pushed into one of 3,452 lists at random | run-e8e81cdefaa9 | 0.0977 | 41.8 | 78.8 |
 | 58 | Trial: of the short terms whose home slot a slot is, the one with the most sample hits moves into it, on a thread of its own during the plan's tail, so 44% fewer probes go past the home slot | run-f39c6987110f | 0.0981 | 42.3 | 78.6 |
 | 59 | Trial: the probe's first test branches on one select, the key's difference kept only when the slot has `MORE`, and the token loop at the line end no longer prefetches each token's `check_at` entry, so it keeps every address in a register | run-b6d1d5065964 | 0.0950 | 41.7 | 79.0 |
+| 60 | While the main thread interns the terms, three threads read the corpus a byte per 64 KiB, so the scanning threads' walks take no page faults on it; the chunks are freed on a thread of their own while the output is written | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1628,7 +1629,92 @@ medians / minimums: seed 1, 99.64 / 98.41 → 98.34 / 97.12 ms; seed 2, 99.63 / 
 seed 2, 99.75 / 98.32 → 98.23 / 97.05 ms (−1.3% to −1.9%, −1.5% on average, so a trial). memory.peak over five alternating runs: 38.8–39.7 → 38.3–39.4 MB. S 864 → 863.
 Gate: 510 pass, 0 fail.
 
+## Step 60: the corpus faulted in during the intern, and the chunks freed during the write
+
+A timeline of step 58 (step 59 changed only the token loop), in a build with timestamps as in
+step 55's section (ms since `main`, medians of 12 runs, turbo off), and of this step in the same
+build, interleaved with it:
+
+| What | Step 58, seed 1 | Step 60, seed 1 | Step 58, seed 2 | Step 60, seed 2 |
+|---|---|---|---|---|
+| the queries parsed | 2.15 | 2.03 | 2.07 | 2.17 |
+| the term table set up (main only) | 3.01 | 2.92 | 2.97 | 3.10 |
+| the terms interned (main only) | 5.95 | 5.76 | 5.86 | 5.95 |
+| the sample joined | 7.62 | 7.48 | 7.79 | 7.73 |
+| renumbered (main only) | 8.45 | 8.34 | 8.57 | 8.49 |
+| planned | 9.37 | 9.30 | 9.68 | 9.41 |
+| the plan's tail ends (3 threads) | 11.48 | 11.22 | 11.64 | 11.37 |
+| the walks start | 12.76–13.24 | 12.42–12.83 | 12.97–13.56 | 12.59–13.00 |
+| a walk takes | 75.15–76.01 | 74.01–75.32 | 74.91–76.01 | 74.01–74.67 |
+| the walks end | 87.78–89.99 | 86.34–89.19 | 87.73–89.85 | 86.50–88.82 |
+| the scanning threads' tails end | 91.85–93.86 | 90.44–92.68 | 92.19–93.67 | 90.49–92.29 |
+| formatted | 95.22 | 94.09 | 95.10 | 93.62 |
+| `exit` called | 95.81 | 94.76 | 95.75 | 94.26 |
+| the process gone | 97.28 | 95.77 | 97.39 | 95.14 |
+
+From the parse to the walks, only the main thread works for 3.8 ms (the table and the intern)
+and 0.9 ms (the renumbering), and three threads for 1.9 ms (the plan's tail). At the end, the
+walks end 2.1–2.6 ms apart (medians of the spread), and every scanning thread's tail takes
+3.9–4.8 ms: the last one's, on step 58, is the corpus pages dropped 0.72, the flush 0.53, the
+window freed 0.92, the merge 0.33 and its first matches grouped 1.61 (placing them 1.08). The
+exit takes 1.55–1.65 ms, against 0.13 for a process that exits at once.
+
+The walk's first touch of each 64 KiB of the mapped corpus is a page fault even when the file
+is cached: the fault maps the 16 pages around it. Seed 1 draws about 3,900 of them, some 2.7 µs
+each, in the middle of the walks. So, as soon as the queries are parsed, `answer_all` starts
+`threads / 4` threads (3 of 12) that read the corpus a byte per 64 KiB, each a third of it, and
+are never joined. They run from 2.06–2.09 to 5.45–5.54 ms (seed 1), inside the intern, which
+does not slow. With more of them, one shares the main thread's core and the intern slows. A
+walk takes 1.0 ms less. The faults are as many (17,320 → 17,337 a run, `perf stat -r 10`, two
+rounds), but kernel cycles go 159.0 and 158.4 → 145.7 and 145.3 M. After step 38, helper
+threads reading a byte per 4 KiB page from the start, at nice 19, slowed the parse, the sample
+and the plan by about 2 ms (its entry in the list below); these read 16 times fewer bytes, and
+only while one thread works.
+
+The chunks, which `answer_all` never freed (step 38), are now freed on a detached thread once
+they are formatted, while `main` writes the output: the exit then has less to unmap, 1.65 →
+1.10 ms (seed 1) and 1.55 → 0.94 ms (seed 2). Freed on the main thread, they took 0.84 ms and
+saved 0.91 ms of the exit.
+
+Local, against step 59 (`ab.py`, 61 alternating runs), medians / minimums: seed 1, 98.18 / 96.97
+→ 96.73 / 95.55 ms; seed 2, 98.08 / 96.44 → 96.60 / 95.22 ms; seed 1, 97.88 / 96.53 → 96.78 /
+95.36 ms; seed 2, 97.94 / 96.96 → 96.49 / 94.54 ms (−1.1% to −1.5%). Before, against step 58:
+seed 1, 99.84 / 98.22 → 97.97 / 96.89; seed 2, 99.34 / 98.51 → 98.18 / 97.14; seed 1, 101.63 /
+98.33 → 99.68 / 96.72; seed 2, 99.58 / 98.19 → 98.41 / 96.73 (−1.2% to −1.9%). First measured
+on step 54, against it: seed 1, 105.58 / 104.39 → 104.06 / 102.57; seed 2, 106.14 / 104.31 →
+104.66 / 102.39; seed 1, 105.61 / 104.12 → 103.88 / 102.59; seed 2, 105.12 / 103.95 → 103.46 /
+102.16 (−1.4% to −1.6%); the prefaulting alone, three rounds: seed 1, −0.95%, −1.39%, −0.95%;
+seed 2, −0.78%, −0.34%, −1.31%. memory.peak over five alternating runs, seed 1: 38.8–39.4 →
+39.4–40.2 MB, median 39.3 → 39.7. S 863 → 868. Gate: 510 pass, 0 fail.
+
 ## Experiments that did not stay
+
+- **After step 60** (on step 58, `ab.py`, medians / minimums, ms; timelines from builds with timestamps,
+  seed 1, medians of 12 runs):
+  - `parallel` as a tree: each thread spawns the upper half of its share and runs the lower
+    half, so the last of 12 starts after 4 spawns, for 4 more lines. With `work` as a `dyn Fn`,
+    61 runs, two rounds: seed 1, 98.73 / 97.02 → 98.37 / 95.13 and 98.02 / 96.62 → 98.25 /
+    96.12; seed 2, 98.51 / 97.00 → 98.08 / 96.20 and 97.93 / 96.22 → 97.75 / 96.15 (−0.4% to
+    +0.2%). Generic over `work` and a `Range`, scan's line end compiles inside `parallel`'s
+    last step instead of the spawned closure, and keeps 0 in a register for the probe's
+    `cmove`: one instruction less per token, 4,280.6 → 4,242.4 M instructions, cycles 2,229 and
+    2,269 → 2,236 and 2,235 M. Four rounds (41 or 61 runs): seed 1, −2.3%, −1.2%, −0.9%, −1.0%;
+    seed 2, −1.2%, −1.0%, −1.4%, −1.4%. On top of step 59 and this step it still saves the
+    instruction (4,178.7 → 4,136.3 M, cycles 2,222 and 2,226 → 2,208 and 2,214 M), but the
+    wall no longer moves: seed 1, 96.53 / 95.01 → 96.47 / 94.50 and 96.66 / 95.53 → 96.49 /
+    94.15; seed 2, 96.76 / 95.06 → 96.38 / 93.58 and 96.36 / 95.24 → 96.43 / 94.64. Not kept.
+    The token loop sets a register to zero for each of three selects per token; held in a
+    register across the loop, one of them would go.
+  - The corpus pages dropped in pieces of 2 MiB or 512 KiB, so that the other threads' frees,
+    which wait on the memory-map lock while a drop holds it, get in between: the last thread's
+    window freed in 0.27 or 0.07 ms instead of 0.70, but its drop took 2.33 or 1.89 ms instead
+    of 0.64, behind those frees; wall medians 98.66 → 98.72 and 99.99.
+  - A smaller sample, `SAMPLE_SHARE` 96 or 128 instead of 64 (41 runs): seed 1, 98.22 / 96.80
+    → 98.44 / 96.90 and 98.40 / 97.21; seed 2, 98.27 / 96.60 → 97.75 / 96.86 and 98.18 / 96.73.
+  - Bounds on the intern (2.87 ms on step 58, wrong answers): without the length of each key
+    2.69 ms, without the `MORE` flag on the home slot 2.69, without the long key's store 2.93,
+    without all three 2.46. The rest is the probe and the loop, about 100 instructions per
+    occurrence with a dozen stack spills, and no single hot spot.
 
 - **After step 58** (seed 1 unless noted; `perf stat -r 5`, interleaved; `ab.py`, 61
   alternating runs, medians / minimums, ms):
@@ -1685,6 +1771,27 @@ Gate: 510 pass, 0 fail.
   - Bounds (wrong answers, to size each stage): with no phrase checks, 95 M fewer cycles
     (−4.1%); with no first matches counted, 125 M fewer (−5.4%), mostly their grouping in
     the tally.
+
+- **After step 54, the serial start and the end of the pass** (local, seed 1 unless stated;
+  timelines from builds with timestamps, ms since `main`; `ab.py` medians / minimums, ms):
+  - Prefaulting threads, by count (20 alternating runs each, one build, wall medians): none
+    105.62; 3 threads 104.05; 4, 104.30; 5, 104.42; 6, 104.89; 5 reading a byte per 4 KiB,
+    104.57; 5 started at `main`'s start, before the parse, 106.87 (they slow the parse). Seed 2,
+    30 runs: none 105.56; 2 threads 105.39; 3, 104.35; 4, 104.48. 11 threads at `SCHED_IDLE`,
+    105.36; 5 at `SCHED_IDLE`, 104.55.
+  - `MADV_SEQUENTIAL` on both mapped files, for a larger fault-around: 105.75 / 104.24 →
+    105.82 / 103.73 (41 runs).
+  - Each format thread freeing its own chunk after a `Barrier`, so that none frees a chunk
+    another still reads: 105.92 / 104.40 → 106.75 / 104.89. Twelve threads unmapping at once
+    contend for the memory-map lock and its TLB shootdowns.
+  - The plan's temporaries freed on a detached thread, on top of the prefaulting: 104.63 /
+    103.18 → 104.68 / 102.77.
+  - The scanning threads' corpus pages not dropped (`MADV_DONTNEED`) at the end of the walk: on
+    the last thread to finish only, the wall 106.72 → 106.42 but the exit 0.22 ms longer; on the
+    last two, 107.35; on all, 109.64.
+  - Not built: the term table's 4 MiB written a word per 4 KiB instead of whole would save about
+    0.12 ms of its 0.68; marking the slots on more threads at most 0.26 ms, as the grouping
+    thread ends at 11.09–11.21 against the main thread's 11.73.
 
 - **After step 55, the scanning threads' setup** (`ab.py`, 41 alternating runs against step
   55, medians / minimums, ms):

@@ -102,14 +102,33 @@ fn map_file(path: &Path) -> Result<&'static [u8], String> {
 }
 
 /// Returns the output in pieces, one per thread, to be written in order.
-fn answer_all(query_text: &[u8], docs: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+fn answer_all(query_text: &[u8], docs: &'static [u8]) -> Result<Vec<Vec<u8>>, String> {
     if docs.last().is_some_and(|&b| b != b'\n') {
         return Err("docs.txt: the last line has no LF (spec §2.1)".into());
     }
     let threads = thread::available_parallelism().map_or(1, usize::from);
-    let (mut queries, terms) = parse_queries(query_text, threads)?;
-    // The plan and the chunks are never freed: the process exits once the output is written
-    // ([`main`]), and the exit unmaps their blocks faster than freeing did (PERF.md, step 38).
+    let parts = parse_queries(query_text, threads)?;
+    // While this thread interns the terms, a thread per four CPUs reads a share of the corpus, a
+    // byte per 64 KiB, the span that a fault on a cached file page maps, so that the pass takes
+    // no faults on it. More of them would share this thread's core (PERF.md, step 60).
+    let helpers = threads / 4;
+    for part in docs.chunks(docs.len() / helpers.max(1) + 1).take(helpers) {
+        thread::spawn(move || part.iter().step_by(1 << 16).fold(0, |x, &b| x ^ b));
+    }
+    // One thread gives each distinct term its id, in file order.
+    let occurrences = parts.iter().map(|part| part.terms.len()).sum();
+    let (mut queries, mut terms) = (Queries::default(), TermTable::new(occurrences));
+    queries.at.push(0);
+    for part in parts {
+        // A part's `at` counts from its own first term.
+        let base = queries.terms.len() as u32;
+        (queries.at).extend(part.at[1..].iter().map(|&at| base + at));
+        queries.phrase.extend(part.phrase);
+        queries.ops.extend(part.ops);
+        (queries.terms).extend((0..part.terms.len()).map(|i| terms.intern(&part.terms, i)));
+    }
+    // The plan is never freed: the process exits once the output is written ([`main`]), and the
+    // exit unmaps its blocks faster than freeing did (PERF.md, step 38); the chunks, below.
     let plan = std::mem::ManuallyDrop::new(Plan::new(&mut queries, terms, docs, threads));
     let bounds = line_bounds(docs, threads);
     // Line `i` holds id `i` (spec §2.1), so the id at a chunk's first line numbers all of its
@@ -126,7 +145,11 @@ fn answer_all(query_text: &[u8], docs: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         scan(text, ids, &queries, &plan)
     }));
     let range = |t| queries.len() * t / threads..queries.len() * (t + 1) / threads;
-    Ok(parallel(threads, &|t| format_range(range(t), &chunks)))
+    let parts = parallel(threads, &|t| format_range(range(t), &chunks));
+    // The chunks are freed on a thread of their own while [`main`] writes the output, and the
+    // exit unmaps what is left: on one thread, freeing them took as long as the exit then saved.
+    thread::spawn(move || drop(std::mem::ManuallyDrop::into_inner(chunks)));
+    Ok(parts)
 }
 
 /// Runs `work(i)` for each `i` in `0..n`, each on a thread of its own, and returns the results
@@ -194,24 +217,12 @@ impl Queries {
     }
 }
 
-/// Parses `queries.txt` (grammar in spec §2.3). Every thread parses a share of the lines; then
-/// one thread gives each distinct term its id, in file order.
-fn parse_queries(text: &[u8], threads: usize) -> Result<(Queries, TermTable), String> {
+/// Parses `queries.txt` (grammar in spec §2.3), every thread a share of the lines, in order;
+/// [`answer_all`] then gives each distinct term its id.
+fn parse_queries(text: &[u8], threads: usize) -> Result<Vec<Queries<Key>>, String> {
     let bounds = line_bounds(text, threads);
     let parts = parallel(threads, &|i| parse_lines(&text[bounds[i]..bounds[i + 1]]));
-    let parts = parts.into_iter().collect::<Result<Vec<_>, _>>()?;
-    let occurrences = parts.iter().map(|part| part.terms.len()).sum();
-    let (mut queries, mut table) = (Queries::default(), TermTable::new(occurrences));
-    queries.at.push(0);
-    for part in parts {
-        // A part's `at` counts from its own first term.
-        let base = queries.terms.len() as u32;
-        (queries.at).extend(part.at[1..].iter().map(|&at| base + at));
-        queries.phrase.extend(part.phrase);
-        queries.ops.extend(part.ops);
-        (queries.terms).extend((0..part.terms.len()).map(|i| table.intern(&part.terms, i)));
-    }
-    Ok((queries, table))
+    parts.into_iter().collect()
 }
 
 /// Parses whole lines of `queries.txt`.
