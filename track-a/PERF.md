@@ -65,8 +65,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 58 | Each line's id settled one line late: its name's slot is loaded as soon as the hash is known, and the name compared with the slot's padded copy after the next line's front half | run-b601b34b577c | 0.0174 | 18.0 | 86.6 |
 | 59 | The interner's pages given back once the names are sorted, before the hour pass's peak | run-b601b34b577c | 0.0174 | 18.0 | 86.6 |
 | 60 | Each thread's share of the input released right after its parse, and the whole input unmapped by one thread once all parses are done, with the interner keeping copies of the names | run-8a3bcbee7e89 | 0.0194 | 17.3 | 85.6 |
-| 61 | Records with an 11-bit endpoint id and a 20-bit latency: the list of large latencies holds 1.2% of seed 1's lines instead of 2.6% | | | | |
-| 62 | Each output line's endpoint id and request count in one `u32`, so the lines that wait for the formatting take 20 bytes instead of 24 | | | | |
+| 61 | Records with an 11-bit endpoint id and a 20-bit latency: the list of large latencies holds 1.2% of seed 1's lines instead of 2.6% | run-6132d5943394 | 0.0164 | 17.5 | 87.3 |
+| 62 | Each output line's endpoint id and request count in one `u32`, so the lines that wait for the formatting take 20 bytes instead of 24 | run-6132d5943394 | 0.0164 | 17.5 | 87.3 |
 
 ## Step 1: v1
 
