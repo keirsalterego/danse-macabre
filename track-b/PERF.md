@@ -67,7 +67,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 60 | While the main thread interns the terms, three threads read the corpus a byte per 64 KiB, so the scanning threads' walks take no page faults on it; the chunks are freed on a thread of their own while the output is written | run-938dc27813b7 | 0.0952 | 41.3 | 79.0 |
 | 61 | The line end's token loop holds a zero in a register for its three selects, and the tokenizer takes a long token's key on a cold branch, the mask's address from the length negated, and a token's start and end as offsets from its block: 3.9 fewer instructions per token | run-280052ffeb2c | 0.0979 | 41.8 | 78.6 |
 | 62 | Reverted after two board runs (see its section). Trial: the line end's token loop stores each token's flags only, and a doc's terms kept in lists, BOOL triggers and phrase triggers are packed into their runs 8 tokens at a time by a permutation table, 10 instructions fewer per token in the loop for 4.25 in the packing; a key's home slot comes from its first word alone, two instructions fewer per token in the tokenizer | run-e89cc599f8ef | 0.1054 | 40.9 | 77.7 |
-| 63 | Trial: step 62's packing of a doc's runs, 8 tokens at a time, with step 61's hash of the key's first two words |  |  |  |  |
+| 63 | Trial: step 62's packing of a doc's runs, 8 tokens at a time, with step 61's hash of the key's first two words | run-51792bbbc94f | 0.0929 | 41.9 | 79.1 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
