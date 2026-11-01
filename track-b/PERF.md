@@ -59,6 +59,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 52 | The line end sets a doc's bits in its terms' rows without bounds checks on the term's store or the row | run-9069c200f6e8 | 0.1086 | 42.4 | 77.7 |
 | 53 | 37 fewer code lines in code that runs once or once per thread, with the pass's instructions unchanged | run-d502f3e18c27 | 0.1050 | 42.0 | 78.2 |
 | 54 | The common terms take ids 1 up, the rows' numbers, so a doc's rows are the first words of its term bits: the line end copies those words, and every 64 docs a 64 × 64 bit transpose turns them into the rows' words; the rows run of `kept`, its store lookups and the `ROW` flag go | run-255e2729d35b | 0.1011 | 42.0 | 78.5 |
+| 55 | Trial: 11 threads parse the queries while the main thread counts their terms and sets up the term table, then interns each share as soon as it is parsed | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1436,7 +1437,94 @@ Local, against step 53 (`ab.py`, 41 alternating runs), medians / minimums: seed 
 memory.peak over five alternating runs: median 38.7 → 38.8 MB (the rows round up to a multiple
 of 64, and each thread keeps 4.6 KB of blocks). S 789 → 823. Gate: 510 pass, 0 fail.
 
+## Step 55: the terms interned while the queries are parsed
+
+A timeline of step 54 (a build with timestamps, ms since `main`, medians of 12 runs, seed 1,
+turbo off, 12 threads on the P-cores). Only the main thread works from 2.3 to 6.0 ms and in the
+plan's tail, and only it and one more from 9.9 to 11.9:
+
+| From | To | What | On |
+|---|---|---|---|
+| 0.12 | 0.82 | 12 parse threads spawned, the last at 0.82 | main |
+| 0.25 | 1.68–2.29 | the queries parsed, about 1.45 ms a share | 12 threads |
+| 2.31 | 3.15 | the term table set up: its huge pages' faults and zeroing 0.68, `MADV_COLLAPSE` 0.17 | main |
+| 3.15 | 5.98 | 152,904 term occurrences interned, 18.5 ns each | main |
+| 5.98 | 8.01 | the sample: spawned by 6.11–6.32, counted in 1.05–1.35 ms a thread, 0.22 ms from the last sum to the join | 12 threads |
+| 8.01 | 8.87 | the renumbering: the partition 0.25, the id map 0.23, `hits` and `lens` 0.21, the long keys 0.06, the queries' terms 0.08 | main |
+| 8.94 | 9.86 | the queries planned, 0.6 ms a share, joined 0.13 ms after the last | 12 threads |
+| 9.86 | 11.93 | the plan's tail: the checks' block 0.47 and grouping 0.88 on their thread; the phrases 0.6 (the spawn included), the flags 0.32, the stores 0.29 and marking the slots 0.84 on main | 2 threads |
+| 11.93 | 12.21 | the plan's lists freed | main |
+| 12.31 | 13.14–13.68 | 12 scanning threads spawned by 12.51, each 0.8–1.2 ms setting up (`Tally::new` 0.6–0.9) | 12 threads |
+
+The largest serial piece is the intern, and the table it needs took 0.84 ms more on the main
+thread while the other threads had nothing to do. The table's size needs only the term count,
+and a term follows every space but those before an operator, the only capitals after a space,
+exactly for every line that parses (checked on all 510 gate inputs). So 11 threads now parse,
+while the main thread counts the terms (one pass over pairs of bytes summed in `u32`, 0.2 ms)
+and sets up the table; it then joins the shares in order and interns each as soon as it is
+parsed, so the ids stay in file order. A line that does not parse stops the parse, as before;
+an invalid line counts zero or more terms, so the table holds every term of the shares that
+parse. In the same build, interleaved with step 54 (12 runs each): the table is ready at 2.07 ms
+instead of 3.02, the intern ends at 5.12 instead of 5.87, the plan at 10.94 instead of 11.89,
+the walks start at 12.00–12.44 instead of 13.09–13.80, and the output is written at 102.60
+instead of 103.62 ms.
+
+Local, against step 54 (`ab.py`, 41 alternating runs), medians / minimums, nine rounds: seed 1,
+106.51 / 104.86 → 105.41 / 104.33 ms; seed 2, 106.85 / 105.29 → 106.28 / 104.70 ms; seed 3,
+106.73 / 105.75 → 106.05 / 104.50 ms; seed 1, 106.63 / 105.23 → 105.57 / 104.24 ms; seed 1,
+106.50 / 105.09 → 106.02 / 104.34 ms; seed 3, 106.94 / 105.02 → 106.02 / 104.86 ms; seed 2,
+106.64 / 105.09 → 105.74 / 103.96 ms; seed 4, 107.80 / 106.00 → 106.58 / 105.30 ms; seed 1,
+106.15 / 105.17 → 105.77 / 104.41 ms: −0.36% to −1.13%, −0.76% on average, so a trial.
+memory.peak over five alternating runs: median 39.2 → 39.0 MB. S 823 → 829. Gate: 510 pass,
+0 fail.
+
 ## Experiments that did not stay
+
+- **After step 55, the scanning threads' setup** (`ab.py`, 41 alternating runs against step
+  55, medians / minimums, ms):
+  - All of the tallies' cells on huge pages ([`huge`]), one block for the 12 tallies made by a
+    helper thread during the plan's tail, each scanning thread taking a ready `Tally`: the walks
+    start at 11.58–12.03 instead of 12.02–12.63 ms (the helper ends 0.2 ms after the tail), and
+    the walks are a little shorter. Seed 1, 105.58 / 103.65 → 104.42 / 103.12; seed 2, 106.10 /
+    104.48 → 104.71 / 103.34; seed 1, 105.36 / 104.04 → 104.43 / 102.98; seed 2, 105.97 /
+    104.83 → 104.46 / 103.59; seed 3, 106.39 / 104.75 → 105.22 / 103.64: −0.9% to −1.4%. But
+    memory.peak 38.8 → 44.2 MB. The peak falls at the end of the scans, where each tally's
+    check cells, a vector of their own, went back to the system at its merge; on huge pages they
+    cannot, as a part of a huge page given back stays charged until the page is split, and the
+    whole pages round 8.7 MB of cells up to 10.5. With the check cells in a block of their own,
+    given back whole once every scan is done: 43.5–44.8 MB, as the peak comes before that.
+  - Only the query cells on huge pages: 105.36 → 105.85 and 105.97 → 105.90, and +1.6 MB. Only
+    the check cells: seed 3, 106.39 / 104.75 → 105.88 / 104.28, and +4.6 MB.
+  - The plan's per-thread check lists freed on the grouping thread, which now owns them, with
+    the BOOL flags set before it starts: in the timeline the plan ends 0.46 ms sooner, but seed
+    1, 105.67 / 104.71 → 105.83 / 104.82 and seed 2, 106.16 / 104.25 → 106.47 / 104.62. With
+    the tallies also made on 4 KiB pages during the tail, by 12 threads the grouping thread
+    spawns: 105.32 / 103.77 and 105.48 / 104.28, −0.3% and −0.6%.
+
+- **After step 54, more of the serial start** (local, seed 1, builds with timestamps, ms since
+  `main`, medians of 10 to 12 runs, unless stated):
+  - The terms counted on the main thread with `split` per line and a `starts_with` per line: 3.6
+    ms, as the 13th thread on 12 CPUs. Counted with `filter().count()`, a `usize` per pair: 0.44
+    ms against 0.23 for the `u32` sum on a quiet core, and the table ready 0.28 ms later.
+  - The count and the table on a thread of their own, or each parse thread counting its share
+    and sending it over a channel: the intern ends at 5.13–5.23 ms against 5.21, for 3 to 5 more
+    lines. With 12 parse threads instead of 11, the count and the table competed for a CPU:
+    5.53–5.64 ms. With 10, 5.23 ms.
+  - The scanning threads' `Tally` cells written during the plan's tail, by 12 threads that the
+    grouping thread spawns, each scanning thread taking one: its walk started 0.5 ms sooner, but
+    the main thread's tail ran 0.4 ms slower with the page faults beside it, and `ab.py` (41
+    alternating runs, seeds 1 and 2) drew medians 106.04 and 106.26 ms against 105.94 and 106.21
+    without it, for 7 more lines.
+  - `lens` written at each id in an array sized like `keys`, instead of pushed and cut back:
+    `parse_queries` alone, 40 times in a loop, 4.72–4.85 → 4.69–4.71 ms, for 2 more lines.
+  - In a microbenchmark, 12 threads each writing 726 KB of new cells (a `Tally`): the slowest
+    took 0.81 ms; zeroed by `calloc` and faulted in by `MADV_POPULATE_WRITE`, 1.27 ms. A 4 MiB
+    block on huge pages, one thread: `alloc` and `write_bytes` 0.71 ms, `mmap` and a write per
+    page 0.59 ms; the kernel's zeroing of the huge pages is most of it.
+  - Not built: an intern on every thread, each taking the terms whose home slot is in its part
+    of the table and deferring a probe that runs past it, then every thread reading its share's
+    ids back from the table. About 0.7 ms a thread against 2.9, but three parallel steps and
+    their joins on the main thread, and about 40 lines.
 
 - **After step 53, the rows renumbered after the plan instead of before it.** The same pass as
   step 54, but the plan numbered the rows first and then renumbered the checks (on the grouping

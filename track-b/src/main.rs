@@ -194,24 +194,33 @@ impl Queries {
     }
 }
 
-/// Parses `queries.txt` (grammar in spec §2.3). Every thread parses a share of the lines; then
-/// one thread gives each distinct term its id, in file order.
+/// Parses `queries.txt` (grammar in spec §2.3). Every other thread parses a share of the lines,
+/// while this one counts their terms and sets up the term table, then gives each distinct term
+/// its id, in file order, a share at a time as soon as it is parsed.
 fn parse_queries(text: &[u8], threads: usize) -> Result<(Queries, TermTable), String> {
-    let bounds = line_bounds(text, threads);
-    let parts = parallel(threads, &|i| parse_lines(&text[bounds[i]..bounds[i + 1]]));
-    let parts = parts.into_iter().collect::<Result<Vec<_>, _>>()?;
-    let occurrences = parts.iter().map(|part| part.terms.len()).sum();
-    let (mut queries, mut table) = (Queries::default(), TermTable::new(occurrences));
-    queries.at.push(0);
-    for part in parts {
-        // A part's `at` counts from its own first term.
-        let base = queries.terms.len() as u32;
-        (queries.at).extend(part.at[1..].iter().map(|&at| base + at));
-        queries.phrase.extend(part.phrase);
-        queries.ops.extend(part.ops);
-        (queries.terms).extend((0..part.terms.len()).map(|i| table.intern(&part.terms, i)));
-    }
-    Ok((queries, table))
+    let parsers = threads.max(2) - 1;
+    let bounds = &line_bounds(text, parsers);
+    thread::scope(|s| {
+        let parse = |i| s.spawn(move || parse_lines(&text[bounds[i]..bounds[i + 1]]));
+        let parts: Vec<_> = (0..parsers).map(parse).collect();
+        // A term follows every space but those before an operator, the only capitals after one. A
+        // line that does not parse stops the parse, so the table holds every term interned.
+        let pairs = text.iter().zip(&text[1.min(text.len())..]);
+        let terms = pairs.map(|(&a, b)| u32::from(a == b' ' && !b.is_ascii_uppercase()));
+        let mut table = TermTable::new(terms.sum::<u32>() as usize);
+        let mut queries = Queries::default();
+        queries.at.push(0);
+        for part in parts {
+            let part = part.join().expect("a panic aborts the process")?;
+            // A part's `at` counts from its own first term.
+            let base = queries.terms.len() as u32;
+            (queries.at).extend(part.at[1..].iter().map(|&at| base + at));
+            queries.phrase.extend(part.phrase);
+            queries.ops.extend(part.ops);
+            (queries.terms).extend((0..part.terms.len()).map(|i| table.intern(&part.terms, i)));
+        }
+        Ok((queries, table))
+    })
 }
 
 /// Parses whole lines of `queries.txt`.
