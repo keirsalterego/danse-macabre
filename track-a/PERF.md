@@ -65,6 +65,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 58 | Each line's id settled one line late: its name's slot is loaded as soon as the hash is known, and the name compared with the slot's padded copy after the next line's front half | run-b601b34b577c | 0.0174 | 18.0 | 86.6 |
 | 59 | The interner's pages given back once the names are sorted, before the hour pass's peak | run-b601b34b577c | 0.0174 | 18.0 | 86.6 |
 | 60 | Each thread's share of the input released right after its parse, and the whole input unmapped by one thread once all parses are done, with the interner keeping copies of the names | run-8a3bcbee7e89 | 0.0194 | 17.3 | 85.6 |
+| 61 | Records with an 11-bit endpoint id and a 20-bit latency: the list of large latencies holds 1.2% of seed 1's lines instead of 2.6% | | | | |
 
 ## Step 1: v1
 
@@ -1088,8 +1089,59 @@ MB (6 rounds); seed 5, 17.00 → 16.33 MB (6 rounds); seed 7, 16.55 → 16.37 MB
 −0.4 MB. S 362 → 364. Gate: 310 pass,
 0 fail; clippy reports no warnings.
 
+## Step 61: a 20-bit latency field
+
+What is live at the peak, on step 60's code (local, turbo off, seed 1). Copies that exit at chosen
+points, timed by the same systemd-run memory.peak, 15 alternating rounds: 15.70 MB when every
+parse is done, 16.09 MB after the first 12 hours, 16.22 MB for the whole run. A copy of
+`/proc/self/smaps` when every parse is done: 13,216 kB of anonymous memory, 12,488 kB of it the
+records (12,109 kB) and the lists of large latencies (about 314 kB), 244 kB the interner's `.data`;
+`VmPTE` 676 kB, 272 kB after the unmap. With about 0.2 MB of kernel stacks that is 13.8 MB in use
+against a peak of 15.7 MB: the rest is the kernel's charge batches, 64 pages at a time per
+CPU, of which each of the twelve CPUs keeps the unused part, so memory.current reads up to 3 MiB
+above the pages in use in every phase alike. The records are three quarters of the peak.
+
+A record spent 12 bits on the endpoint's id, room for 4,096 names, but the spec fixes every seed's
+catalogue at exactly 1,842 (§2), which 11 bits hold. The freed bit goes to the latency: with 20 bits
+a record keeps every latency under 1.05 s, and the lists of large latencies shrink from 2.59 to
+1.18% of the lines on seed 1, 4.42 to 2.09% on seed 3, 4.08 to 1.86% on seed 5 and 1.94 to 0.89% on
+seed 7: 0.17, 0.28, 0.27 and 0.13 MiB fewer pages from the parse to the end of the hour pass. The
+interner's names and padded copies, indexed by id, shrink to 2,048 entries (`.data` 426 → 249 KB,
+the same pages touched), and a 2,049th name still stops the program at the index of its copy. Only
+constants change, so S does not.
+
+Local, turbo off. memory.peak, 5 alternating rounds each: seed 1 16.18 → 15.98 MB, seed 3 16.54 →
+16.14, seed 5 16.50 → 16.08, seed 7 15.98 → 15.90: −0.28 MB (−1.7%) on average. `ab.py`, 61
+interleaved runs: seed 1 medians 18.39 → 18.40 and 18.56 → 18.56 ms, seed 3 18.65 → 18.57 and
+18.68 → 18.56 ms, seed 5 18.82 → 18.74 ms, seed 7 18.50 → 18.59 ms (−0.03 ms on average; a seventh
+round under outside load left out). S 364 → 364. Gate: 310 pass, 0 fail; clippy reports no
+warnings.
+
+The same stop points after the change (seed 1, 10 rounds): 15.53 MB when every parse is done, 15.75
+after 12 hours, 16.07 after 24 and 16.02 for the whole run. The peak is now the second round of
+hours: each worker's buffer has grown to its second hour (29,000 to 39,700 lines, against 18,300 to
+23,700 in the first), and the output lines of 24 hours, about 40 KB each, are held, while only the
+first round's records have been freed.
+
 ## Experiments that did not stay
 
+- **Where the hour pass's excess comes from, and an in-place sort, not built** (on step 61's code,
+  from seed 1's hour sizes and the stop points above). Smallest first in rounds of twelve, round k
+  holds its buffers, about its hours' size S_k in records, and the lines of every hour done so far,
+  less the records of the rounds before it: 250,049 lines in round 1, 416,539 in round 2 against
+  250,049 freed, and about 40 KB of lines per hour on top. An in-place sort of each worker's first
+  hour would leave round 2 as high as it is (at most 0.36 MB off); in place for every hour, about
+  1 MB, it needs an in-place permutation across an hour's runs in different chunks and each large
+  latency paired with its endpoint, tens of lines against 6% of M. Two scatter passes of half the
+  endpoints each, to halve every buffer: one more read of every record, about the count pass's 3.5%
+  of the samples, for 0.65 MB. Output lines of 20 bytes, the id and the count in one `u32`: 0.16 MB
+  in round 2. Not built.
+- **Pages that two finished runs share, released once both hours are done** (simulated on seed 1's
+  runs in the kept order). A run's release frees only the pages wholly inside it, so a page shared
+  with a run of another hour stays until formatting. Pages whose every run is done but which are
+  still held: 21 after 12 hours, 72 after 24 (0.08 and 0.28 MiB), 291 after all 72 (1.14 MiB). At
+  the peak, between 12 and 24 hours, under 0.3 MiB, for the bookkeeping of which neighbouring runs
+  are done. Not built.
 - **Each thread unmapping its own share of the input after its parse** (local, turbo off, on step
   59's code, names copied as in step 60). `munmap` holds the address space's lock, in read mode
   while it frees the pages, so the twelve calls queued behind each other: 2.8 ms per call on

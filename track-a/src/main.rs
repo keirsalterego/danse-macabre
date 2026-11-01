@@ -22,7 +22,7 @@
 //! 1. **Map and split.** We `mmap` the log instead of reading it ([`map_file`]) and cut it into
 //!    one chunk per thread at line breaks ([`summarize`]).
 //! 2. **Parse once.** Each thread turns every line of its chunk into a 4-byte record: endpoint
-//!    id, error bit and latency, with the rare latency too large for its 19 bits kept on a side
+//!    id, error bit and latency, with the rare latency too large for its 20 bits kept on a side
 //!    list ([`parse`]). Endpoint names become small integer ids through one hash table that
 //!    all threads share ([`Interner`]). The hour is not stored per line: the records stay in
 //!    file order, where lines come in long runs of one hour, and the thread notes where each
@@ -319,12 +319,12 @@ fn release<T>(items: &[T]) {
 ///
 /// | bits    | field                                                  |
 /// |---------|--------------------------------------------------------|
-/// | 31 – 20 | the endpoint's id (12 bits)                            |
-/// | 19      | 1 if the status is 500–599                             |
-/// | 18 – 0  | the latency in microseconds, or [`LARGE`]              |
+/// | 31 – 21 | the endpoint's id (11 bits: every seed has 1,842, §2)  |
+/// | 20      | 1 if the status is 500–599                             |
+/// | 19 – 0  | the latency in microseconds, or [`LARGE`]              |
 ///
-/// The spec allows any 32-bit latency, but 97.5% of seed 1's lines took under half a second,
-/// which fits in 19 bits. A latency of [`LARGE`] or more goes to the `large` list instead, in
+/// The spec allows any 32-bit latency, but 98.8% of seed 1's lines took under 1.05 seconds,
+/// which fits in 20 bits. A latency of [`LARGE`] or more goes to the `large` list instead, in
 /// line order, and its record holds [`LARGE`]: whoever reads the records in order takes the
 /// next value from `large` each time they meet it.
 ///
@@ -345,9 +345,9 @@ struct Chunk {
     runs: Vec<(usize, usize, usize)>,
 }
 
-/// The value of a record's 19-bit latency field that sends readers to the chunk's list of large
+/// The value of a record's 20-bit latency field that sends readers to the chunk's list of large
 /// latencies (see [`Chunk`]).
-const LARGE: u32 = (1 << 19) - 1;
+const LARGE: u32 = (1 << 20) - 1;
 
 /// Parses one chunk of whole lines into records, with the endpoints' ids from [`ENDPOINTS`].
 ///
@@ -399,7 +399,7 @@ unsafe fn parse(log: &'static [u8], lines: Range<usize>) -> Chunk {
     // name, the 64 bytes from it, its slot and the slot's content, and its record without the id.
     let mut last: (&[u8], &[u8; 64], usize, u32, u32) = (&[], &[0; 64], 0, 0, 0);
     let finish = |(name, window, slot, value, bits)| {
-        ENDPOINTS.intern(name, slot, value, window) << 20 | bits
+        ENDPOINTS.intern(name, slot, value, window) << 21 | bits
     };
     while at < end {
         // How well the hardware prefetcher kept the input in L1 depended on where the loop's
@@ -444,7 +444,7 @@ unsafe fn parse(log: &'static [u8], lines: Range<usize>) -> Chunk {
         // records were given.
         (count > 0).then(|| unsafe { *chunk.records.get_unchecked_mut(count - 1) = finish(last) });
         let value = ENDPOINTS.slots[slot].load(Acquire);
-        last = (name, window, slot, value, error << 19 | micros);
+        last = (name, window, slot, value, error << 20 | micros);
         count += 1;
     }
     (count > 0).then(|| chunk.records[count - 1] = finish(last));
@@ -579,8 +579,8 @@ fn hash(name: &[u8], first: u64) -> u64 {
 /// we try the next slot until we find the name or an empty slot. The table has 16,384 slots, so
 /// with the 1,842 endpoints of a seed it is about an eighth full. Of seed 1's lines, 7.7% would
 /// need a second probe, each a mispredicted branch, at half full, 4.0% at a quarter and 2.5% at
-/// an eighth (simulated). It never grows: ids have 12 bits in a record, so a table takes at most
-/// 4,096 names, and at that it is a quarter full and probes still end.
+/// an eighth (simulated). It never grows: ids have 11 bits in a record, so a table takes at most
+/// 2,048 names, and at that it is an eighth full.
 ///
 /// All threads share one table while they parse, so a name has the same id in every chunk.
 /// Lookups take no lock: a thread that adds a name writes its entry first and only then its id
@@ -594,11 +594,11 @@ struct Interner<'a> {
     /// its type, so a probe needs no bounds check: 0.9% fewer instructions in the parse.
     slots: [AtomicU32; 4 << 12],
     /// Id → name, a copy: the input is unmapped once the parse is over (see [`summarize`]).
-    names: [OnceLock<&'a [u8]>; 1 << 12],
+    names: [OnceLock<&'a [u8]>; 1 << 11],
     /// Id → the name and the space after it, zero-padded to 64 bytes, for the probes of
     /// [`Interner::intern`]. A name of 64 bytes or more has no room for the space and keeps only
     /// its first 64 bytes.
-    padded: [std::cell::UnsafeCell<Padded>; 1 << 12],
+    padded: [std::cell::UnsafeCell<Padded>; 1 << 11],
     /// How many names have an id; the lock that adding a name takes.
     count: Mutex<usize>,
 }
@@ -611,13 +611,13 @@ unsafe impl Sync for Interner<'_> {}
 /// The endpoints' interner, empty at the start. Its tables never grow: lookups index them while
 /// other threads add names. As a static, they lie at fixed addresses, and a probe loads no pointer
 /// to them first: 3 instructions fewer per line. A `OnceLock` starts out nonzero, so the tables
-/// take 426 KB of `.data` in the binary instead of `.bss`; a page of it is read in only when
+/// take 249 KB of `.data` in the binary instead of `.bss`; a page of it is read in only when
 /// touched, like the heap pages the tables took before. Being in `.data` anyway, the padded copies
 /// start out as zeros at no cost, rather than uninitialized.
 static ENDPOINTS: Interner<'static> = Interner {
     slots: [const { AtomicU32::new(0) }; 4 << 12],
-    names: [const { OnceLock::new() }; 1 << 12],
-    padded: [const { std::cell::UnsafeCell::new(Padded([0; 64])) }; 1 << 12],
+    names: [const { OnceLock::new() }; 1 << 11],
+    padded: [const { std::cell::UnsafeCell::new(Padded([0; 64])) }; 1 << 11],
     count: Mutex::new(0),
 };
 
@@ -658,7 +658,7 @@ impl<'a> Interner<'a> {
             let found = if name.len() < 64 {
                 // SAFETY: the copy was written before `id` went into the slot, and never again.
                 // An id in a slot is below the count of names, which `insert` keeps within the
-                // 4,096 copies, so the index needs no check.
+                // 2,048 copies, so the index needs no check.
                 let known = unsafe { &*self.padded.get_unchecked(id as usize).get() };
                 // SAFETY: the binary targets alderlake (.cargo/config.toml), which always has AVX2.
                 unsafe { equal_mask(window, &known.0) }.trailing_ones() as usize > name.len()
@@ -692,8 +692,8 @@ impl<'a> Interner<'a> {
             drop(count);
             return self.intern(name, slot, value, window);
         }
-        // The spec gives every seed 1,842 endpoints (§2), well below the 4,096 that 12 bits hold:
-        // the index of the 4,097th name's copy would stop the program.
+        // The spec gives every seed 1,842 endpoints (§2), within the 2,048 that 11 bits hold: the
+        // index of the 2,049th name's copy would stop the program.
         // The name, then the space if there is room for it, then zeros.
         let padded = std::array::from_fn(|i| if i <= name.len() { window[i] } else { 0 });
         // SAFETY: no slot holds this id yet, so no other thread reads the copy, and only the
@@ -743,14 +743,14 @@ fn summarize_hour(runs: &[Run], order: &Order, names: &[&[u8]], buffer: &mut [u3
     let (mut start, mut errors) = (vec![0u32; names.len() + 1], vec![0u32; names.len()]);
     for &(records, _) in runs {
         for &r in records {
-            start[(r >> 20) as usize] += 1;
-            errors[(r >> 20) as usize] += r >> 19 & 1;
+            start[(r >> 21) as usize] += 1;
+            errors[(r >> 21) as usize] += r >> 20 & 1;
         }
     }
     (1..start.len()).for_each(|e| start[e] += start[e - 1]);
     for (records, mut large) in runs.iter().map(|&(records, large)| (records, large.iter())) {
         for &r in records {
-            let (e, small) = ((r >> 20) as usize, Some(r & LARGE).filter(|&v| v < LARGE));
+            let (e, small) = ((r >> 21) as usize, Some(r & LARGE).filter(|&v| v < LARGE));
             start[e] -= 1;
             buffer[start[e] as usize] = small.unwrap_or_else(|| *large.next().expect("parsed"));
         }
