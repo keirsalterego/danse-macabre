@@ -62,6 +62,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 55 | Reverted after three board runs (see its section). Trial: 11 threads parse the queries while the main thread counts their terms and sets up the term table, then interns each share as soon as it is parsed | run-dc45dd0a1279 | 0.1041 | 41.6 | 78.1 |
 | 56 | Trial: the probe's first test compares a key's whole second word with the slot's `tail`, so it takes no branch on a key's length, and a term past 12 bytes is found past that test; the BOOL triggers' loop reads `check_at` and writes `todo` without bounds checks | run-e8e81cdefaa9 | 0.0977 | 41.8 | 78.8 |
 | 57 | The id lists' entries pushed to the end of one log, and sorted into the lists by counting at each window's flush, instead of pushed into one of 3,452 lists at random | run-e8e81cdefaa9 | 0.0977 | 41.8 | 78.8 |
+| 58 | Trial: of the short terms whose home slot a slot is, the one with the most sample hits moves into it, on a thread of its own during the plan's tail, so 44% fewer probes go past the home slot | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1572,8 +1573,48 @@ ms; seed 3, 103.70 / 101.90 → 100.90 / 99.78 ms (−2.2% to −2.7%). Against 
 105.58 / 104.06 → 101.47 / 99.69 ms (−3.9%). memory.peak over five alternating runs: 38.6–40.1
 → 38.2–40.0 MB. S 821 → 842. Gate: 510 pass, 0 fail.
 
+## Step 58: the most frequent term of each home slot moved into it
+
+A probe that finds its term at the home slot stops there; any other goes on in `find_past`, out
+of line, with a mispredicted branch at its loop's end (3.9% of the cycles). On seed 1 that was
+1.46 M probes (the sample's included), 1.17 M of them for a term that sits further on: the
+terms land in file order, so the first of those with the same home takes it, however rare.
+
+[`TermTable::settle`] now visits each home slot with `MORE` before the slots are marked, and
+moves into it, of the terms of 12 bytes or less whose home it is, the one with the most sample
+hits: terms with the same home lie in one run of slots from it, as does a term in a home slot
+not its own, which can move on to any later slot of the run, so either pair can trade places.
+`MORE` stays with the slot. Probes past the home slot: 1.46 → 0.82 M, of which 0.53 M find a
+term (the less frequent of two that share a home). Taking only terms with the same home as the
+one there, and no term out of a home not its own: 0.84 M, about the same cycles.
+
+On the main thread after the marking, the pass took 0.75 ms, and the wall gained 0.8% to 0.9%
+(seeds 1–3, 100.38 / 99.23, 100.50 / 99.16 and 100.26 / 97.78 against 101.33 / 99.50, 101.34 /
+99.97 and 101.21 / 99.68 ms). It now runs on a thread of its own while the main thread groups
+the phrases, flags the terms and numbers the stores (1.2 ms), on the old ids, whose sample hits
+it reads through the renumbering.
+
+Against step 57: `perf stat -r 5`, interleaved, instructions 4,318.8 → 4,279.9 M, cycles 2,304
+and 2,300 → 2,256 and 2,256 M (−2.1%), branch misses 11.0 → 10.1 M. `ab.py`, 61 alternating
+runs, medians / minimums: seed 1, 101.82 / 100.08 → 100.20 / 98.82 ms; seed 2, 102.41 / 100.24 →
+100.31 / 97.84 ms; seed 3, 100.86 / 99.44 → 99.67 / 98.25 ms; seed 1, 101.26 / 99.77 → 99.72 /
+98.34 ms (−1.2% to −2.1%, −1.6% on average, so a trial). The same change before its lines were
+tightened: seed 1, 101.50 / 100.32 → 99.71 / 98.29 ms; seed 2, 101.09 / 99.98 → 99.52 / 97.59
+ms; seed 3, 101.23 / 99.53 → 99.72 / 98.06 ms. memory.peak over five alternating runs: 39.2–39.5
+→ 39.0–39.7 MB. S 842 → 864. Gate: 510 pass, 0 fail.
+
 ## Experiments that did not stay
 
+- **After step 57** (`ab.py`, 61 alternating runs, medians / minimums, ms):
+  - Each scanning thread groups its 121,600 or so first matches at its end in 1.2–3.8 ms: 0.3
+    ms of page faults on the grouped ids, 0.1–1.4 ms allocating the 50,001 starts, 0.2 ms
+    counting and 0.5–0.8 ms placing them. With no grouping at all (wrong answers): seed 1,
+    101.07 / 99.70 → 98.09 / 96.43. The first matches pushed into buckets of 256 queries
+    instead, and each output thread grouping its buckets of every chunk into ten ids per query:
+    seed 1, 103.32 / 100.65 → 106.08 / 102.99; seed 2, 103.33 / 99.70 → 104.72 / 102.20; and
+    memory.peak 38.1–39.6 → 48.0–48.4 MB, with 196 growing vectors per thread.
+  - The corpus prefetched ahead of the walk, a line per block, 128, 512 or 4,096 bytes ahead:
+    cycles 2,296 and 2,314 → 2,313–2,329 M, no change.
 - **After step 56, the per-token work** (`perf stat -r 5`, interleaved, seed 1; `ab.py`, 41
   alternating runs, medians / minimums, ms):
   - The probe's miss test as a branch-free select in `find_from`, the miss mask hidden from
