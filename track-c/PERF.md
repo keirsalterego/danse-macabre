@@ -57,7 +57,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 50 | Each worker's 256 groups built on the heap, where `Box::new` built their 16 KiB on the stack first and the stack's pages stayed mapped, and `main` runs worker 0 itself once it has started the others | run-606261c589b8 | 0.0200 | 11.6 | 82.5 |
 | 51 | One worker fewer than the CPUs, so a CPU taken by another program leaves a spare one instead of halving a worker and every round | run-d27954c1c3a9 | 0.0217 | 10.7 | 82.0 |
 | 52 | 8 fewer lines at the same speed: the Dockerfile's build folded into one `RUN`, the imports in two lines, both `prctl` calls in one, `BOM` and `SPINS` written where they are used, two pairs of variables set in one statement each, and the name's range returned straight from `text_fields` | run-486577623ea1 | 0.0212 | 10.5 | 82.4 |
-| 53 | A worker on every CPU again, as in step 50: final scoring runs each batch with nothing else on the box, so step 51's spare CPU only cost time | | | | |
+| 53 | A worker on every CPU again, as in step 50: final scoring runs each batch with nothing else on the box, so step 51's spare CPU only cost time | run-f9622a221638 | 0.0195 | 11.2 | 83.0 |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so

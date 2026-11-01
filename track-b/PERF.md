@@ -60,8 +60,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 53 | 37 fewer code lines in code that runs once or once per thread, with the pass's instructions unchanged | run-d502f3e18c27 | 0.1050 | 42.0 | 78.2 |
 | 54 | The common terms take ids 1 up, the rows' numbers, so a doc's rows are the first words of its term bits: the line end copies those words, and every 64 docs a 64 × 64 bit transpose turns them into the rows' words; the rows run of `kept`, its store lookups and the `ROW` flag go | run-255e2729d35b | 0.1011 | 42.0 | 78.5 |
 | 55 | Reverted after three board runs (see its section). Trial: 11 threads parse the queries while the main thread counts their terms and sets up the term table, then interns each share as soon as it is parsed | run-dc45dd0a1279 | 0.1041 | 41.6 | 78.1 |
-| 56 | Trial: the probe's first test compares a key's whole second word with the slot's `tail`, so it takes no branch on a key's length, and a term past 12 bytes is found past that test; the BOOL triggers' loop reads `check_at` and writes `todo` without bounds checks | | | | |
-| 57 | The id lists' entries pushed to the end of one log, and sorted into the lists by counting at each window's flush, instead of pushed into one of 3,452 lists at random | | | | |
+| 56 | Trial: the probe's first test compares a key's whole second word with the slot's `tail`, so it takes no branch on a key's length, and a term past 12 bytes is found past that test; the BOOL triggers' loop reads `check_at` and writes `todo` without bounds checks | run-e8e81cdefaa9 | 0.0977 | 41.8 | 78.8 |
+| 57 | The id lists' entries pushed to the end of one log, and sorted into the lists by counting at each window's flush, instead of pushed into one of 3,452 lists at random | run-e8e81cdefaa9 | 0.0977 | 41.8 | 78.8 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
