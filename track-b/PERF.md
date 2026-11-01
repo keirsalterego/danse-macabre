@@ -56,7 +56,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 49 | Step 48's first-match list undone, since B's memory sits at the cap; the long terms' keys stay off huge pages, and a term is common from one sampled document in 48 instead of 32 | run-ec587c6dcef4 | 0.1131 | 41.7 | 77.3 |
 | 50 | A token's probe carries its home slot's address instead of its index, and a probe past its home slot runs out of line, so the line end's token loop holds no register for the term table and keeps two values on the stack instead of four | run-086c324cb377 | 0.1064 | 41.2 | 77.9 |
 | 51 | A probe compares a short key's bytes 8 to 11 with its slot's `tail` as they are, without building the long bit, which only a key past 12 bytes, on its own branch, needs | run-086c324cb377 | 0.1064 | 41.2 | 77.9 |
-| 52 | The line end sets a doc's bits in its terms' rows without bounds checks on the term's store or the row | | | | |
+| 52 | The line end sets a doc's bits in its terms' rows without bounds checks on the term's store or the row | run-9069c200f6e8 | 0.1086 | 42.4 | 77.7 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
