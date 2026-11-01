@@ -68,7 +68,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 61 | Records with an 11-bit endpoint id and a 20-bit latency: the list of large latencies holds 1.2% of seed 1's lines instead of 2.6% | run-6132d5943394 | 0.0164 | 17.5 | 87.3 |
 | 62 | Each output line's endpoint id and request count in one `u32`, so the lines that wait for the formatting take 20 bytes instead of 24 | run-6132d5943394 | 0.0164 | 17.5 | 87.3 |
 | 63 | 18 fewer lines: the interner's tables as four statics with `intern` and `insert` as plain functions, the network's seven merge levels through a one-line macro, and a Dockerfile without `WORKDIR` | run-f322558253fc | 0.0165 | 17.3 | 87.5 |
-| 64 | 2 fewer lines: the leader releases the interner's three tables in one statement; the machine code is unchanged |  |  |  |  |
+| 64 | 2 fewer lines: the leader releases the interner's three tables in one statement; the machine code is unchanged | run-4626d7369bff | 0.0167 | 17.5 | 87.3 |
 
 ## Step 1: v1
 
