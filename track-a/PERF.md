@@ -68,6 +68,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 61 | Records with an 11-bit endpoint id and a 20-bit latency: the list of large latencies holds 1.2% of seed 1's lines instead of 2.6% | run-6132d5943394 | 0.0164 | 17.5 | 87.3 |
 | 62 | Each output line's endpoint id and request count in one `u32`, so the lines that wait for the formatting take 20 bytes instead of 24 | run-6132d5943394 | 0.0164 | 17.5 | 87.3 |
 | 63 | 18 fewer lines: the interner's tables as four statics with `intern` and `insert` as plain functions, the network's seven merge levels through a one-line macro, and a Dockerfile without `WORKDIR` | run-f322558253fc | 0.0165 | 17.3 | 87.5 |
+| 64 | 2 fewer lines: the leader releases the interner's three tables in one statement; the machine code is unchanged |  |  |  |  |
 
 ## Step 1: v1
 
@@ -1175,6 +1176,14 @@ and 18.36 → 18.34 ms (minimums 17.74 → 17.61, 17.77 → 17.64 and 17.86 → 
 15.8 → 15.8 MB, seed 3 16.2 → 15.9 MB. S 364 → 346 (Rust 358 → 341, Dockerfile 6 → 5). Gate:
 310 pass, 0 fail; `cargo fmt --check` and clippy report nothing.
 
+## Step 64: 2 fewer lines
+
+- The leader releases `SLOTS`, `NAMES` and `PADDED` in one statement,
+  `let _ = (release(&SLOTS), release(&NAMES), release(&PADDED));`, instead of three: rustfmt keeps
+  the tuple on one line (52 characters, under its width of 60). `objdump -d` of the whole binary
+  is identical to step 63's (`.text` 994,455 bytes), so T and M cannot move. S 346 → 344. Gate:
+  310 pass, 0 fail; `cargo fmt --check` and clippy report nothing.
+
 ## Experiments that did not stay
 
 - **`stage` folded into `merge`** (local, turbo off, on step 62's code), 3 lines fewer: with the
@@ -1547,6 +1556,39 @@ and 18.36 → 18.34 ms (minimums 17.74 → 17.61, 17.77 → 17.64 and 17.86 → 
   spike is gone and cost 0.18 ms before. A counting sort holds its source and its destination at
   once, so removing the spike needs an in-place sort of each first hour. Not built.
 
+- **Where step 63's time goes** (local, seed 1, a copy that stamps `CLOCK_MONOTONIC` and
+  `ru_minflt` at each phase of each thread; `perf record -c 200000` with the samples binned by
+  those stamps). See the profile notes. Every idea below aims at a piece of that timeline, and
+  none reached 0.8%.
+- **The latency buffers leaked** (no `munmap` when a thread ends; local, on step 63's code):
+  `ab.py`, 61 interleaved runs, seed 1, medians 18.22 → 18.20 ms and 18.51 → 18.51 ms. The process
+  exit unmaps them anyway, and the exit is on the critical path either way. Not kept.
+- **Each place's output released after the format loop** (`MADV_DONTNEED` on the shared output
+  mapping): 18.45 → 18.67 ms. The release sends TLB-shootdown IPIs to every thread still
+  formatting. Not kept.
+- **A final barrier, then each thread releasing 1/12 of the output** so the exit tears down a
+  mostly empty mapping: the exit call to the parent's `wait` falls from 0.576 to 0.356 ms, but the
+  12 simultaneous slice releases take 0.089 ms under `mmap_lock` and IPI contention, and the
+  barrier waits for the slowest formatter. `ab.py`, 61 runs, four rounds: seed 1 18.47 → 18.34,
+  18.40 → 18.44 and 18.51 → 18.38 ms, seed 3 18.50 → 18.35 ms (−0.09 ms, −0.5%, on average),
+  for 4–5 more lines. Not kept.
+- **The input released after the first barrier, the last releaser unmapping it** (instead of each
+  thread releasing its share straight after its parse): 18.43 → 18.56 and 18.39 → 18.61 ms. A
+  release right after a parse overlaps its SMT sibling's parse (kernel work against compute);
+  12 releases at once contend on the same locks. Not kept.
+- **128-byte padded copies in the interner** (so names up to 127 bytes compare without `memcmp`):
+  cycles:u +1% in interleaved `perf stat`; the extra 64 bytes per line cost more than the rare
+  long-name `memcmp` saves. Not kept.
+- **Two 64-byte tables for long names** (the second 64 bytes of a name in a table of its own):
+  instructions:u −12.6 M, cycles:u −0.8%, but `ab.py` seed 1 18.49 → 18.45 ms and seed 3
+  18.38 → 18.48 ms, for 4 more lines. Not kept.
+- **Each thread's latency buffer allocated before its parse** (its `mmap` away from the input's
+  `munmap` and the shared release): seed 3 18.62 → 18.76 ms. Not kept.
+- **Not built, bounded by the timeline:** stealing release work from the slowest parser (all of
+  the first barrier's mean wait is 0.157 ms), mapping the output before the hour pass (map_output
+  takes 0.05 ms), and a SIMD `put_number` (the formatting's user time is 1.2 ms of the 1.55 ms
+  phase; the rest is the kernel's shmem faults and `xa_lock`).
+
 ## Profile notes
 
 - Phase split after step 1b (native, turbo off): parse loop 18.3 ms per thread (finding line ends
@@ -1555,3 +1597,15 @@ and 18.36 → 18.34 ms (minimums 17.74 → 17.61, 17.77 → 17.64 and 17.86 → 
 - Unmapping the input at exit, timed with an explicit `munmap`: 3.9 ms on one thread.
 - `perf record` after step 2: parse loop 37% of cycles, `Interner::intern` 14%,
   `select_nth_unstable` 11%, hour-pass loop 9%, libc `memcmp`/`memcpy` about 9%.
+- Timeline of step 63 (local, seed 1, a stamped copy, per-thread medians in ms from `main`'s
+  start, 12 threads on 0-11): parse 8.6 (spread 0.40 across threads), share released 0.7, wait
+  at the first barrier 0.157 on average, the leader's plan 0.06 (it ends 0.006 after the last
+  release), unmap and latency buffer about 0.1, hour pass 4.0 (threads end within 0.29 of each
+  other), latencies released, wait at the second barrier 0.141, `map_output` 0.05, `relchk`
+  0.04, formatting 1.55 (end spread 0.07), then the exit call to the parent's `wait` 0.55.
+  Kernel share of each phase (perf, cycles per run): parse 26% (`next_uptodate_folio`,
+  fault-around), share release 100% (`unmap_page_range`), hour pass 21% (TLB-shootdown IPIs from
+  the other threads' releases, first-touch faults), output placement 99% (IPIs, spinlocks),
+  formatting 47% (`shmem` faults, `xa_lock` contention in `shmem_add_to_page_cache`), exit 60–70%
+  (`osq_lock`, IPIs). The waits at the two barriers and the leader's serial plan add up to 0.36 ms
+  (2.2%); the largest pieces left are the parse's user time and its fault-around.

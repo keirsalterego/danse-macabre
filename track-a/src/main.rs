@@ -236,9 +236,7 @@ fn summarize(log: &'static [u8], out_path: &Path) {
             // no thread writes one after it.
             order.sort_unstable_by_key(|&id| (unsafe { &*PADDED[id].0.get() }, NAMES[id].get()));
             // Nothing reads the interner again: its pages go back now, before the hour pass's peak.
-            release(&SLOTS);
-            release(&NAMES);
-            release(&PADDED);
+            let _ = (release(&SLOTS), release(&NAMES), release(&PADDED));
             let _ = sorted.set(order);
         }
         let (names, runs, by_size) = plan.wait();
