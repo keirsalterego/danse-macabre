@@ -970,19 +970,22 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
         let mut triggered = 0;
         for &t in &kept[2 * n..bools] {
             // Term `t` triggers the checks `checks[check_at[t]..check_at[t + 1]]`.
-            let range = check_at[t as usize] as usize..check_at[t as usize + 1] as usize;
+            // SAFETY: a trigger is a term id, below `plan.terms.len()`, and `check_at` holds one
+            // entry more.
+            let [start, end] = unsafe { *check_at.as_ptr().add(t as usize).cast::<[u32; 2]>() };
             // Start loading its checks and their cells now, to use below.
-            prefetch(checks.as_ptr().wrapping_add(range.start));
-            prefetch(cells.as_ptr().wrapping_add(range.start));
+            prefetch(checks.as_ptr().wrapping_add(start as usize));
+            prefetch(cells.as_ptr().wrapping_add(start as usize));
             // Four indices written at once, the cursor then moved on by the range's length: a
             // loop per trigger would mispredict its exit, as the lengths follow no pattern.
-            let start = range.start as u32;
-            todo[triggered..triggered + 4].copy_from_slice(&[0, 1, 2, 3].map(|i| start + i));
-            triggered += range.len().min(4);
-            for c in range.skip(4) {
-                todo[triggered] = c as u32;
-                triggered += 1;
+            // SAFETY: the triggers' ranges are disjoint, so `triggered + end - start` is at most
+            // the check count, and `todo` holds 4 entries more.
+            unsafe {
+                let at = todo.as_mut_ptr().add(triggered);
+                *at.cast::<[u32; 4]>() = [0, 1, 2, 3].map(|i| start + i);
+                (4..end - start).for_each(|i| *at.add(i as usize) = start + i);
             }
+            triggered += (end - start) as usize;
         }
         // As locals, their addresses stay in registers across the stores below.
         let (i, store) = ((doc - sets.start) as usize, &plan.store[..]);
@@ -1197,8 +1200,8 @@ impl Slot {
     const BOOL: u32 = 2;
     /// The corpus pass keeps the term's documents in an id list ([`Store`]).
     const LISTED: u32 = 8;
-    /// A term whose home slot this is lies further on, so a probe from here must go on past a
-    /// slot that holds another term ([`TermTable::find_from`]).
+    /// A term whose home slot this is lies further on or runs past 12 bytes, so a probe from
+    /// here must go on with the full compare ([`TermTable::find_from`]).
     const MORE: u32 = 16;
 
     /// The term id.
@@ -1299,8 +1302,10 @@ impl TermTable {
         let slot = unsafe { *at };
         // A token whose home slot holds another term is no query term unless the slot has
         // `MORE`, which an empty slot never has: 29% of the tokens that are no term found their
-        // home slot taken, and each of them mispredicted the probe's first test.
-        let found = self.holds(&slot, key);
+        // home slot taken, and each of them mispredicted the probe's first test. The key's whole
+        // second word against the `tail`, with no branch on the key's length: a key or a term
+        // past 12 bytes never matches here, and the term's home slot has `MORE`.
+        let found = (slot.head ^ key[0]) | (u64::from(slot.tail) ^ key[1]) == 0;
         let mut stop = u8::from(found) | u8::from(slot.flags & Slot::MORE == 0);
         // SAFETY: the asm block is empty; it keeps the test one branch, as in `position`.
         unsafe { asm!("/* {} */", inout(reg_byte) stop, options(pure, nomem)) };
@@ -1312,8 +1317,8 @@ impl TermTable {
         unsafe { self.find_past(key, at) }
     }
 
-    /// [`TermTable::find_from`] past the home slot `at`, out of line, so that the token loops
-    /// keep no register for the table's address and size.
+    /// [`TermTable::find_from`] from the home slot `at` on, with the full compare, out of line,
+    /// so that the token loops keep no register for the table's address and size.
     ///
     /// # Safety
     ///
@@ -1322,11 +1327,9 @@ impl TermTable {
     #[inline(never)]
     unsafe fn find_past(&self, key: &Key, at: *const Slot) -> Slot {
         // SAFETY: `at` points into `slots`, as the caller ensures.
-        let next =
-            unsafe { at.offset_from_unsigned(self.slots.as_ptr()) + 1 } & (self.slots.len() - 1);
-        // SAFETY: the slot count is a power of two, so `next` is below it, as is the index
-        // `position` returns.
-        unsafe { *self.slots.get_unchecked(self.position(key, next)) }
+        let home = unsafe { at.offset_from_unsigned(self.slots.as_ptr()) };
+        // SAFETY: `home` is below the slot count, as is the index `position` returns.
+        unsafe { *self.slots.get_unchecked(self.position(key, home)) }
     }
 
     /// Where the probe for `key` starts: below the slot count, a power of two of 2 or more, as
@@ -1366,7 +1369,7 @@ impl TermTable {
         let more = self.slots[at].flags & Slot::MORE;
         let (head, tail, flags) = (key[0], Slot::tail(&key), id << 5 | more);
         self.slots[at] = Slot { head, tail, flags };
-        self.slots[home].flags |= u32::from(at != home) * Slot::MORE;
+        self.slots[home].flags |= u32::from(at != home || key[1] >> 32 != 0) * Slot::MORE;
         // A key's length is its count of nonzero bytes.
         (self.lens).push(key.iter().map(|w| 8 - w.leading_zeros() as u8 / 8).sum());
         self.lens.truncate(n + usize::from(new));

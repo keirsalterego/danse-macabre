@@ -60,6 +60,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 53 | 37 fewer code lines in code that runs once or once per thread, with the pass's instructions unchanged | run-d502f3e18c27 | 0.1050 | 42.0 | 78.2 |
 | 54 | The common terms take ids 1 up, the rows' numbers, so a doc's rows are the first words of its term bits: the line end copies those words, and every 64 docs a 64 × 64 bit transpose turns them into the rows' words; the rows run of `kept`, its store lookups and the `ROW` flag go | run-255e2729d35b | 0.1011 | 42.0 | 78.5 |
 | 55 | Reverted after three board runs (see its section). Trial: 11 threads parse the queries while the main thread counts their terms and sets up the term table, then interns each share as soon as it is parsed | run-dc45dd0a1279 | 0.1041 | 41.6 | 78.1 |
+| 56 | Trial: the probe's first test compares a key's whole second word with the slot's `tail`, so it takes no branch on a key's length, and a term past 12 bytes is found past that test; the BOOL triggers' loop reads `check_at` and writes `todo` without bounds checks | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1482,6 +1483,66 @@ Local, against step 54 (`ab.py`, 41 alternating runs), medians / minimums, nine 
 106.15 / 105.17 → 105.77 / 104.41 ms: −0.36% to −1.13%, −0.76% on average, so a trial.
 memory.peak over five alternating runs: median 39.2 → 39.0 MB. S 823 → 829. Gate: 510 pass,
 0 fail.
+
+## Step 56: the probe without a branch on a key's length, and the triggers' loop unchecked
+
+Where the pass goes, measured on step 55's code, whose pass is step 54's (`perf record` of cycles,
+instructions and branch misses on the `profiling` build, seed 1, turbo off; `perf stat`: 4,678.8
+M instructions, 2,424 M cycles and
+11.13 M mispredicted branches, 129 instructions and 67 cycles per token). Counted by a build
+with counters: 36.28 M tokens, 28.72 M of them query terms, 22.24 M a doc's first of a term,
+7.18 M BOOL triggers, 1.75 M first sights of a listed term, 0.92 M phrase triggers, 12.94 M
+checks, and 1.37 M probes past the home slot (`find_past`).
+
+| Stage | Cycles | Instructions | Mispredicts |
+|---|---|---|---|
+| `Tokens::line`: token ends, keys, hashes, prefetches | 26.9% | 30.8%, 39.7 a token | 37% |
+| The line end's token loop: probes, seen bits, runs | 26.7% | 31.7%, 40.9 a token | 1% |
+| `find_past` | 3.8% | 1.4% | 17.6% |
+| The BOOL triggers' loop | 5.4% | 5.9%, 38 a trigger | 3.7% |
+| `add_checks` | 11.6% | 7.5%, 27 a check | 3.5% |
+| `seen` cleared, first matches | 4.6% | 3.6% | 10.2% |
+| The lists' pushes and the phrases | 5.4% | 1.9% | 3.6% |
+| `flush` and `spill` | 6.4% | 4.6% | 7% |
+
+The two token loops run at about 2.2 instructions per cycle on each of a core's two threads, so
+what they cost is mostly their instructions. In `Tokens::line`, most mispredicts are the exit
+of the per-block loop over a block's 9.1 token ends on average, about once per block.
+
+- **The probe's first test.** [`TermTable::find_from`] compared a key's bytes 8 to 11 with the
+  slot's `tail` and branched first on whether the key runs past 12 bytes, for which it built
+  the long bit and compared the whole key: a `bt`, a branch and a jump over the long side at
+  every token. It now XORs the key's whole second word with the `tail`, zero-extended. A key
+  past 12 bytes has bytes 12 to 15 that are not zero and never matches there, nor does a term
+  past 12 bytes, whose `tail` has its top bit set. [`TermTable::intern`] gives such a term's
+  home slot `MORE`, and `find_past` now starts at the home slot itself, with the full compare
+  ([`TermTable::holds`], as before). Seed 1 has 13 such terms, and 0.19% of its tokens run past
+  12 bytes. Instructions 4,474.6 → 4,294.4 M, cycles 2,416, 2,386 and 2,418 → 2,354, 2,351 and
+  2,356 M, branch misses the same (11.2 M), over three interleaved rounds of `perf stat -r 5`.
+  The same with the line at 12 or more bytes, which kept a key of exactly 12 bytes off the
+  first test too: 4,333.6 M instructions but 12.6 M branch misses and the same cycles, as seed
+  1 has 3,809 terms of exactly 12 bytes (of 75,747).
+- **The triggers' loop.** It loaded `check_at[t]` and `check_at[t + 1]` with a bounds check
+  each, wrote its four indices to `todo` behind two more, and took the range's length through
+  two conditional moves, about 38 instructions per trigger with four values reloaded from the
+  stack. The two entries are now one unchecked `[u32; 2]` load, the four indices one store, and
+  the cursor moves on by the range's length, which a loop past the first four fills: the
+  ranges of a doc's triggers are disjoint, so `todo`'s 4 spare entries cover the store.
+  Instructions 4,678.8 → 4,474.6 M (−4.4%), cycles 2,398, 2,423 and 2,425 → 2,392, 2,390 and
+  2,417 M: the loop waits on its loads of `check_at` more than it runs.
+
+Both parts were built and measured on step 55's code first, then moved onto step 54's when step
+55 was reverted; neither touches what step 55 changed. Against step 54 (`perf stat -r 5`,
+interleaved, three rounds): instructions 4,676.2 → 4,291.4 M (−8.2%), cycles 2,397, 2,425 and
+2,427 → 2,361, 2,358 and 2,359 M (−2.3%), branch misses 11.2 M both. `ab.py`, 41 alternating
+runs, medians / minimums: seed 1, 106.62 / 105.06 → 104.17 / 102.96 ms; seed 2, 106.85 / 105.30
+→ 105.47 / 103.73 ms and 106.92 / 105.63 → 104.94 / 103.49 ms; seed 3, 107.14 / 105.17 → 105.31 /
+103.38 ms; seed 1, 106.40 / 104.74 → 104.25 / 103.08 ms; seed 3, 107.07 / 105.20 → 105.09 / 103.92
+ms (−1.3% to −2.3%, −1.8% on average, so a trial). On step 55's code, against step 55: seed 1,
+105.90 / 103.26 → 103.11 / 101.92 ms; seed 2, 106.40 / 104.50 → 103.71 / 102.82 ms; seed 3,
+106.56 / 105.30 → 104.13 / 103.04 ms; the triggers' loop alone, seed 1, 105.67 / 104.56 → 105.24 /
+104.21 ms, seed 2, 106.48 / 105.01 → 106.05 / 104.70 ms. memory.peak over five alternating runs:
+38.2–39.9 → 38.4–40.2 MB. S 823 → 821. Gate: 510 pass, 0 fail.
 
 ## Experiments that did not stay
 
