@@ -66,6 +66,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 59 | Trial: the probe's first test branches on one select, the key's difference kept only when the slot has `MORE`, and the token loop at the line end no longer prefetches each token's `check_at` entry, so it keeps every address in a register | run-b6d1d5065964 | 0.0950 | 41.7 | 79.0 |
 | 60 | While the main thread interns the terms, three threads read the corpus a byte per 64 KiB, so the scanning threads' walks take no page faults on it; the chunks are freed on a thread of their own while the output is written | run-938dc27813b7 | 0.0952 | 41.3 | 79.0 |
 | 61 | The line end's token loop holds a zero in a register for its three selects, and the tokenizer takes a long token's key on a cold branch, the mask's address from the length negated, and a token's start and end as offsets from its block: 3.9 fewer instructions per token | run-280052ffeb2c | 0.0979 | 41.8 | 78.6 |
+| 62 | The line end's token loop stores each token's flags only, and a doc's terms kept in lists, BOOL triggers and phrase triggers are packed into their runs 8 tokens at a time by a permutation table, 10 instructions fewer per token in the loop for 4.25 in the packing; a key's home slot comes from its first word alone, two instructions fewer per token in the tokenizer |  |  |  |  |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1739,7 +1740,62 @@ On the board (run-280052ffeb2c) this step drew 97.9 ms against step 60's 95.2 ms
 every track: D 123.1 ms against 118.4 and A 16.9 ms against 16.65, with C unchanged. A 2% step is below what one
 board run resolves, so it stays on the local measurements above.
 
+## Step 62: a doc's runs packed 8 tokens at a time, and the home slot from the key's first word
+
+`perf record` of step 61 (seed 1, turbo off): the line end's token loop is 37 instructions per
+token and 24% of all cycles, at 2.6 instructions per cycle on each of a core's two threads, so
+its cost is its instructions. Twelve of the 37 kept the four runs of `kept`: four stores, the
+three cursors' tests and adds, and the select of the flags of a term new in the doc.
+
+The loop now stores one value per token: the slot's `flags`, the term's id times 32 and its
+flags, with `LISTED` and `BOOL` dropped by the select when the doc already held the term. Then
+[`pack`] takes the doc's tokens 8 at a time: the 8 flags shifted down make the ids, and for each
+run the flag shifted to each lane's top bit makes an 8-bit mask, whose entry in a 256-entry
+table (2 KB, built at compile time) is the permutation that moves the marked lanes to the front;
+one store writes them at the run's cursor, which moves on by the mask's popcount. The lists and
+BOOL runs take the ids, the phrase run the positions. A store writes 8 entries, so each run starts
+8 past the room of the last, and the 8 entries past the doc's tokens are zeroed, as the last load
+reads them. The token loop is 27 instructions, the packing 34 per 8 tokens, with no branch but
+the loop's exit, once per doc (+0.28 M mispredicts). The table's permutation built per mask by
+`pdep` and `pext` instead took about 7 instructions more per run and 8 tokens: 4,037.1 → 3,986.0 M
+instructions, cycles the same as step 61 (2,137 and 2,142 → 2,139 and 2,139 M).
+
+[`TermTable::home`] hashed the exclusive or of the key's first two words, a `vpshufd` and a
+`vpxor` before the `vmovq` in the tokenizer, per token. It now multiplies the first word alone:
+terms whose first 8 bytes agree share a home slot, and [`TermTable::settle`] moves the most
+frequent into it. Mispredicts +0.16 M, from the probes past it.
+
+`perf stat -r 5`, interleaved, instructions, cycles and branch misses (M):
+
+| Build | instructions | cycles | branch misses |
+|---|---|---|---|
+| step 61 | 4,037.1 | 2,118, 2,132 | 10.12 |
+| the packing only | 3,892.7 | 2,106, 2,109 | 10.41 |
+| the packing only | 3,892.7 | 2,111, 2,111 | 10.40 |
+| the packing and the hash | 3,823.2 | 2,096, 2,090 | 10.56 |
+| step 61, seeds 1, 2, 3 (cycles: means of two) | 4,037.1, 4,038.1, 4,040.4 | 2,161, 2,159, 2,153 | 10.11 |
+| this step, seeds 1, 2, 3 (cycles: means of two) | 3,823.2, 3,823.1, 3,825.9 | 2,073, 2,079, 2,084 | 10.56 |
+
+`ab.py`, 31 alternating runs, medians / minimums, ms. The packing only, against step 61: seed 1,
+94.21 / 92.92 → 92.09 / 90.75; seed 2, 94.42 / 93.15 → 92.85 / 91.68; seed 1, 94.60 / 93.26 →
+92.98 / 91.01; seed 2, 94.80 / 93.58 → 92.69 / 91.18; seed 3, 93.84 / 92.91 → 91.91 / 90.30; seed
+1, 94.68 / 93.19 → 92.43 / 91.78; seed 1, 96.86 / 94.50 → 95.12 / 92.60; seed 3, 95.95 / 94.23 →
+94.09 / 92.68 (−1.6% to −2.4%, −2.0% on average). Three-way, step 61, the
+packing only and this step: seed 1, 94.88 / 93.27, 92.74 / 91.31 and 91.91 / 90.91; seed 3, 94.32
+/ 93.07, 92.61 / 91.09 and 91.85 / 90.05. This step against step 61: seed 2, 94.63 / 92.91 →
+91.94 / 90.75; seed 1, 94.45 / 93.18 → 92.55 / 91.01; seed 3, 94.46 / 93.11 → 91.82 / 90.49 (−2.0%
+to −3.1% over five rounds, −2.7% on average). memory.peak over five alternating runs, seed 1:
+39.1–39.5 → 39.5–40.0 MB, median 39.5 → 39.6. S 877 → 901. Gate: 510 pass, 0 fail.
+
 ## Experiments that did not stay
+
+- **After step 61** (seed 1, `perf stat -r 5`, interleaved; `ab.py`, 31 alternating runs, medians /
+  minimums, ms):
+  - On step 62's packing, the probes holding the home slot's offset in bytes instead of its
+    address, which the line end's loop, with three cursors gone, has a register for: the
+    tokenizer's `lea` per token goes, 3,892.7 → 3,860.2 M instructions, but cycles 2,109 and
+    2,110 → 2,086 and 2,120 M, and seed 1, 92.98 / 91.01 → 93.44 / 91.70; seed 2, 92.69 / 91.18 →
+    93.73 / 91.94. The tokenizer still reloads its block's address from the stack per token.
 
 - **After step 60** (on step 58, `ab.py`, medians / minimums, ms; timelines from builds with timestamps,
   seed 1, medians of 12 runs):
