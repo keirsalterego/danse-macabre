@@ -56,7 +56,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 49 | 23 fewer lines at the same speed: the region rows parsed in the worker, with their shares cut by the same closure as the runs; `mallopt` dropped, since no large buffer is freed any more; `map_file` panics with the path; the slow paths of `number`, `text_fields` and the rehash, `values`, `prefix_xor` and the output line written shorter | run-606261c589b8 | 0.0200 | 11.6 | 82.5 |
 | 50 | Each worker's 256 groups built on the heap, where `Box::new` built their 16 KiB on the stack first and the stack's pages stayed mapped, and `main` runs worker 0 itself once it has started the others | run-606261c589b8 | 0.0200 | 11.6 | 82.5 |
 | 51 | One worker fewer than the CPUs, so a CPU taken by another program leaves a spare one instead of halving a worker and every round | run-d27954c1c3a9 | 0.0217 | 10.7 | 82.0 |
-| 52 | 8 fewer lines at the same speed: the Dockerfile's build folded into one `RUN`, the imports in two lines, both `prctl` calls in one, `BOM` and `SPINS` written where they are used, two pairs of variables set in one statement each, and the name's range returned straight from `text_fields` | | | | |
+| 52 | 8 fewer lines at the same speed: the Dockerfile's build folded into one `RUN`, the imports in two lines, both `prctl` calls in one, `BOM` and `SPINS` written where they are used, two pairs of variables set in one statement each, and the name's range returned straight from `text_fields` | run-486577623ea1 | 0.0212 | 10.5 | 82.4 |
+| 53 | A worker on every CPU again, as in step 50: final scoring runs each batch with nothing else on the box, so step 51's spare CPU only cost time | | | | |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1842,6 +1843,19 @@ Measured and not kept:
   and LLVM does not inline a recursive function, here into the record loop.
 - Left for clarity: `NameSet::new` written into the worker (−2), `main` and `join` as one function
   (−2), the `ALIGN` loop's `i += 1` folded into a tuple assignment (−1).
+
+## Step 53: a worker on every CPU again
+
+Step 51 gave up a worker so that a CPU taken by another program would not halve one worker and
+every round. That load came from the shared live board and from this machine's other programs.
+The board README says final scoring is "five runs on the hidden holdout seed, with the box to
+itself", one run at a time, and the highest of the five is dropped. Two slow runs in one batch of
+five on an idle box are unlikely, while the spare CPU costs every run.
+
+`ab.py`, 61 interleaved runs, step 52 against step 53, medians / minimums: full seed 12, 23.00 /
+22.68 → 21.44 / 21.01 ms (−6.8%); full seed 1, 22.97 / 22.40 → 21.32 / 20.70 ms (−7.2%), about
++0.75 points. One run of step 53 on seed 12 was slow under this machine's own load (mean 26.90
+ms), the kind of run final scoring drops. S 357 → 357. Gate: 310 pass, 0 fail.
 
 ## Experiments that did not stay
 

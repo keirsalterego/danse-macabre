@@ -168,10 +168,8 @@ extern "C" fn main() -> ! {
     _ = [41, 29].map(|option| unsafe { prctl(option, 1u64, 0u64, 0u64, 0u64) });
     let data_dir = std::env::args().nth(1).unwrap_or("/data".into());
     let out = Path::new(&std::env::args().nth(2).unwrap_or("/out".into())).join("aggregates.txt");
-    // One worker fewer than the CPUs. Every round waits for its slowest worker, so with a worker
-    // on every CPU, another program that takes one CPU halves one worker and every round: 57.6
-    // ms instead of 21.9. With a CPU to spare, the run takes 23.7 ms (PERF.md, step 51).
-    let threads = thread::available_parallelism().map_or(1, |n| n.get().max(2) - 1);
+    // A worker on every CPU: final scoring runs with nothing else on the box (PERF.md, step 53).
+    let threads = thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let file = |name| map_file(&Path::new(&data_dir).join(name));
     join(file("records.csv"), file("regions.csv"), threads, &out)
 }
