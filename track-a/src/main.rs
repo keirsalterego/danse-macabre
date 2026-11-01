@@ -708,11 +708,14 @@ impl<'a> Interner<'a> {
 
 /// One hour of output, ready to format: [`summarize_hour`] fills it, [`format_hour`] writes it.
 ///
-/// First its lines, one entry per output line in output order: the endpoint's id, then the
-/// request count, the p50, p95 and p99 latencies and the error count. Then the exact length of
-/// the formatted hour, in bytes, so that its place in the output file is known before any hour
-/// is formatted.
-type Hour = (Vec<[u32; 6]>, usize);
+/// First its lines, one entry per output line in output order: the endpoint's id in the top 11
+/// bits over the request count, then the p50, p95 and p99 latencies and the error count. The
+/// count fits in 21 bits: the most popular endpoint draws about 12% of the 3.1 million lines
+/// (Zipf, §2), and seed 1's largest hour has 73,244. The lines of every hour wait for the
+/// formatting, so their 20 bytes instead of 24 lower the hour pass's peak (`PERF.md`, step 62).
+/// Then the exact length of the formatted hour, in bytes, so that its place in the output file is
+/// known before any hour is formatted.
+type Hour = (Vec<[u32; 5]>, usize);
 
 /// One run of lines from one hour: their records, and their chunk's large latencies from the
 /// run's first one on (see [`Chunk`]).
@@ -762,7 +765,7 @@ fn summarize_hour(runs: &[Run], order: &Order, names: &[&[u8]], buffer: &mut [u3
     for &e in order.wait().iter().filter(|&&e| start[e] < start[e + 1]) {
         let group = &mut buffer[start[e] as usize..start[e + 1] as usize];
         let [p50, p95, p99] = percentiles(group);
-        let line = [e as u32, group.len() as u32, p50, p95, p99, errors[e]];
+        let line = [(e << 21 | group.len()) as u32, p50, p95, p99, errors[e]];
         // The six numbers, the label and its space, the name, and the LF.
         len += numbers(&line).iter().map(width).sum::<usize>() + 21 + names[e].len() + 1;
         lines.push(line);
@@ -860,8 +863,8 @@ fn stage<const R: usize>(v: &mut [__m256i; R], m: usize) {
 
 /// The six numbers an output line prints after the endpoint's name (spec §4): the request
 /// count, p50, p95, p99, the error count and the errors per million requests, rounded down.
-fn numbers(&[_, count, p50, p95, p99, errors]: &[u32; 6]) -> [u64; 6] {
-    let [count, p50, p95, p99, errors] = [count, p50, p95, p99, errors].map(u64::from);
+fn numbers(&[c, p50, p95, p99, errors]: &[u32; 5]) -> [u64; 6] {
+    let [count, p50, p95, p99, errors] = [c & 0x1F_FFFF, p50, p95, p99, errors].map(u64::from);
     [count, p50, p95, p99, errors, errors * 1_000_000 / count]
 }
 
@@ -874,12 +877,12 @@ fn numbers(&[_, count, p50, p95, p99, errors]: &[u32; 6]) -> [u64; 6] {
 /// the label from line to line. A `Vec` instead cost a capacity check and a length update for
 /// every number, and a whole hour's buffer per thread kept 1.6 MB more in memory while the
 /// output filled up.
-fn format_hour(hour: usize, lines: &[[u32; 6]], names: &[&[u8]], mut place: &mut [u8]) {
+fn format_hour(hour: usize, lines: &[[u32; 5]], names: &[&[u8]], mut place: &mut [u8]) {
     let (mut text, day, hh) = ([0; 256], (hour + 18) / 24, (hour + 18) % 24);
     text[..21].copy_from_slice(format!("2026-{}T{hh:02}:00:00Z ", DAYS[day]).as_bytes());
     for line in lines {
-        let mut end = 21 + names[line[0] as usize].len();
-        text[21..end].copy_from_slice(names[line[0] as usize]);
+        let mut end = 21 + names[(line[0] >> 21) as usize].len();
+        text[21..end].copy_from_slice(names[(line[0] >> 21) as usize]);
         let _ = numbers(line).map(|value| end = put_number(&mut text, end, value));
         text[end] = b'\n';
         // This fails if the hour's length, computed in `summarize_hour`, was short.

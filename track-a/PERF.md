@@ -66,6 +66,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 59 | The interner's pages given back once the names are sorted, before the hour pass's peak | run-b601b34b577c | 0.0174 | 18.0 | 86.6 |
 | 60 | Each thread's share of the input released right after its parse, and the whole input unmapped by one thread once all parses are done, with the interner keeping copies of the names | run-8a3bcbee7e89 | 0.0194 | 17.3 | 85.6 |
 | 61 | Records with an 11-bit endpoint id and a 20-bit latency: the list of large latencies holds 1.2% of seed 1's lines instead of 2.6% | | | | |
+| 62 | Each output line's endpoint id and request count in one `u32`, so the lines that wait for the formatting take 20 bytes instead of 24 | | | | |
 
 ## Step 1: v1
 
@@ -1123,6 +1124,24 @@ hours: each worker's buffer has grown to its second hour (29,000 to 39,700 lines
 23,700 in the first), and the output lines of 24 hours, about 40 KB each, are held, while only the
 first round's records have been freed.
 
+## Step 62: 20-byte output lines
+
+After step 61 the peak is the hour pass's second round, which holds the output lines of every hour
+done so far. A line kept six `u32`: the endpoint's id, the request count, the three percentiles and
+the error count. The id has 11 bits (step 61), and a count fits in the other 21: the most popular
+endpoint draws about 12% of the 3.1 million lines (Zipf, §2), and seed 1's largest hour has 73,244.
+So the two share one `u32`, and a line takes 20 bytes instead of 24: with 1,500 to 1,800 lines an
+hour, about 0.15 MB less after 24 hours, and 0.5 MB less once all 72 wait for the formatting. The
+code lines stay the same, with a shift and a mask.
+
+Local, turbo off. memory.peak against step 61, two sets of 5 alternating rounds: seed 1 16.10 →
+15.72 and 16.10 → 15.98 MB, seed 3 16.16 → 16.16 and 16.00 → 16.16, seed 5 16.14 → 15.94 and
+16.18 → 15.90, seed 7 16.08 → 15.94 and 15.94 → 15.88: −0.13 MB (−0.8%) on average, nothing on seed
+3. `ab.py`, 61 interleaved runs, nine rounds (the first four on the same code before a comment was
+reflowed): seed 1 medians 18.59 → 18.83, 18.56 → 18.51 and 18.44 → 18.36 ms, seed 3 18.56 → 18.47
+and 18.54 → 18.47, seed 5 18.60 → 18.56 and 18.70 → 18.72, seed 7 18.72 → 18.57 and 18.60 → 18.60:
+−0.02 ms on average. S 364 → 364. Gate: 310 pass, 0 fail; clippy reports no warnings.
+
 ## Experiments that did not stay
 
 - **Where the hour pass's excess comes from, and an in-place sort, not built** (on step 61's code,
@@ -1134,8 +1153,7 @@ first round's records have been freed.
   1 MB, it needs an in-place permutation across an hour's runs in different chunks and each large
   latency paired with its endpoint, tens of lines against 6% of M. Two scatter passes of half the
   endpoints each, to halve every buffer: one more read of every record, about the count pass's 3.5%
-  of the samples, for 0.65 MB. Output lines of 20 bytes, the id and the count in one `u32`: 0.16 MB
-  in round 2. Not built.
+  of the samples, for 0.65 MB. Not built.
 - **Pages that two finished runs share, released once both hours are done** (simulated on seed 1's
   runs in the kept order). A run's release frees only the pages wholly inside it, so a page shared
   with a run of another hour stays until formatting. Pages whose every run is done but which are
