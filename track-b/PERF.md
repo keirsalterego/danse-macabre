@@ -58,6 +58,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 51 | A probe compares a short key's bytes 8 to 11 with its slot's `tail` as they are, without building the long bit, which only a key past 12 bytes, on its own branch, needs | run-086c324cb377 | 0.1064 | 41.2 | 77.9 |
 | 52 | The line end sets a doc's bits in its terms' rows without bounds checks on the term's store or the row | run-9069c200f6e8 | 0.1086 | 42.4 | 77.7 |
 | 53 | 37 fewer code lines in code that runs once or once per thread, with the pass's instructions unchanged | run-d502f3e18c27 | 0.1050 | 42.0 | 78.2 |
+| 54 | The common terms take ids 1 up, the rows' numbers, so a doc's rows are the first words of its term bits: the line end copies those words, and every 64 docs a 64 × 64 bit transpose turns them into the rows' words; the rows run of `kept`, its store lookups and the `ROW` flag go | | | | |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1409,8 +1410,48 @@ Local, against step 52 (`ab.py`, 41 alternating runs), medians / minimums: seed 
 1, 109.10 / 107.69 → 109.15 / 107.64 ms; seed 3, 110.02 / 108.60 → 109.79 / 108.02 ms. memory.peak
 over five alternating runs: median 39.9 → 39.5 MB. S 826 → 789. Gate: 510 pass, 0 fail.
 
+## Step 54: the rows from the docs' term bits, 64 docs at a time
+
+Of the 36.28 M tokens of seed 1, 28.72 M are query terms, and 11.11 M of those are a doc's first
+of a term kept in a bitset row. Each paid a store into the rows run of `kept` and a cursor add in
+the token loop, then at the line end a load of its term's store and a read-modify-write of one
+bit in a 512-byte row, at random among about 540 rows. The doc's `seen` bits already hold the
+same facts, one bit per term id.
+
+So the plan, right after the sample, renumbers the terms: the common ones (543 on seed 1, of
+which 532 have a row) take ids 1 up, and a common term in a set query keeps the row of its id.
+The others follow in their old order. `hits`, `lens`, the long keys and the queries' terms move
+to the new ids at once; the slots take theirs in the pass that marks them, which runs anyway.
+A doc's rows are then the first `ceil(rows / 64)` words of `seen` (9 on seed 1). The line end
+copies them into `Window::group`, one word per block of 64 rows, and the 64th doc transposes each
+64 × 64 block (six vectorized steps) into word `i / 64` of its 64 rows and zeroes it. The pass's
+end spills the last, partial 64. A common term in no set query keeps a row nobody reads.
+
+Against step 53 (`perf stat -r 5`, interleaved, two rounds, seed 1): instructions 4,828.4 →
+4,676.3 M (−3.1%), cycles 2,523 and 2,523 → 2,424 and 2,426 M (−3.9%), branch misses 11.4 →
+11.2 M. The renumbering takes under 1 ms on the main thread before the plan.
+
+Local, against step 53 (`ab.py`, 41 alternating runs), medians / minimums: seed 1, 109.06 /
+107.61 → 106.50 / 105.33 ms; seed 2, 110.26 / 108.56 → 107.60 / 105.87 ms (−2.4%).
+memory.peak over five alternating runs: median 38.7 → 38.8 MB (the rows round up to a multiple
+of 64, and each thread keeps 4.6 KB of blocks). S 789 → 823. Gate: 510 pass, 0 fail.
+
 ## Experiments that did not stay
 
+- **After step 53, the rows renumbered after the plan instead of before it.** The same pass as
+  step 54, but the plan numbered the rows first and then renumbered the checks (on the grouping
+  thread, which sent the BOOL flags back over a channel), the phrases, the queries, the long keys
+  and the stores. Seed 1, 108.98 / 107.70 → 106.88 / 105.37 ms, as fast as step 54, but S 789 →
+  845. Renumbering before the plan with new `keys` and an extra pass over the slots: S 818, but
+  2.3–3.1 ms on the main thread, 1.5 ms slower than step 54.
+- **After step 53, the rows set from a per-doc log of events**: each token's flags pushed to one
+  event list, walked at the line end. Instructions +186 M, cycles +1.4%.
+- **After step 53, the rows' read-modify-writes through a 64-doc buffer**, without the
+  renumbering (each row term's bit gathered from `seen` by its id): cycles the same, instructions
+  +24 M. With the spill's writes into the rows left out (wrong answers, as a bound) the cycles
+  did not move either: the rows' stores are not what costs, the per-term work is.
+- **After step 53, the phrases grouped on a thread of their own**, and the sample's `hits`
+  reused for the renumbering: no change in the time to the end of the plan.
 - **After step 52, line cuts that moved the pass** (local, seed 1, `perf stat -r 5`). The
   scanning thread's code is one function, so a cut in its cold start or end can change how
   LLVM allocates the hot loops' registers. Each of these added instructions and was put back:

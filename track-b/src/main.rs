@@ -107,10 +107,10 @@ fn answer_all(query_text: &[u8], docs: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         return Err("docs.txt: the last line has no LF (spec §2.1)".into());
     }
     let threads = thread::available_parallelism().map_or(1, usize::from);
-    let (queries, terms) = parse_queries(query_text, threads)?;
+    let (mut queries, terms) = parse_queries(query_text, threads)?;
     // The plan and the chunks are never freed: the process exits once the output is written
     // ([`main`]), and the exit unmaps their blocks faster than freeing did (PERF.md, step 38).
-    let plan = std::mem::ManuallyDrop::new(Plan::new(&queries, terms, docs, threads));
+    let plan = std::mem::ManuallyDrop::new(Plan::new(&mut queries, terms, docs, threads));
     let bounds = line_bounds(docs, threads);
     // Line `i` holds id `i` (spec §2.1), so the id at a chunk's first line numbers all of its
     // lines, and the id after the last line is the number of documents.
@@ -279,7 +279,7 @@ struct Plan {
     checks: &'static mut [Check],
     /// Per term: how its documents are kept.
     store: Vec<Store>,
-    /// The number of bitset rows and the number of id lists.
+    /// The number of bitset rows, counting row 0, which no term keeps, and the number of id lists.
     sizes: [usize; 2],
     /// The queries evaluated on sets ([`Window::flush`]) rather than per document, in file order.
     sets: Vec<u32>,
@@ -295,13 +295,32 @@ impl Plan {
     /// terms keep a bitset and the others an id list ([`DENSE_SHARE`]). A term absent from
     /// the corpus never fires and keeps an empty list, so its queries see it as the empty
     /// set, with no special case.
-    fn new(queries: &Queries, terms: TermTable, docs: &[u8], threads: usize) -> Self {
+    fn new(queries: &mut Queries, mut terms: TermTable, docs: &[u8], threads: usize) -> Self {
         let (hits, sampled) = sample_hits(docs, &terms, threads);
+        // A bitset takes a bit per document and a list 16 bits per document holding the term.
+        let common = |t: u32| hits[t as usize] as usize * DENSE_SHARE >= sampled.max(1);
+        // The common terms take the ids from 1 up, those of the bitset rows, so that a doc's rows
+        // are the first words of its term bits ([`Window::group`]); the others follow them. The
+        // slots take theirs as they are marked, below, and only a long term's key is read.
+        let (mut old, rest): (Vec<u32>, Vec<_>) =
+            (0..terms.len() as u32).partition(|&t| t == 0 || common(t));
+        let rows = old.len();
+        old.extend(rest);
+        let mut id = vec![0; old.len()];
+        (old.iter().enumerate()).for_each(|(k, &t)| id[t as usize] = k as u32);
+        let hits: Vec<_> = old.iter().map(|&t| hits[t as usize]).collect();
+        terms.lens = old.iter().map(|&t| terms.lens[t as usize]).collect();
+        let long = (1..old.len()).filter(|&k| terms.lens[k] > 12);
+        let long: Vec<_> = long.map(|k| (k, terms.keys[old[k] as usize])).collect();
+        for (k, key) in long {
+            terms.keys[k] = key;
+        }
+        queries.terms.iter_mut().for_each(|t| *t = id[*t as usize]);
         // Fewer sample hits cost less. Among equals (often zero hits), longer terms tend to be
         // rarer, so they cost a little less: 32 (`MAX_TERM`) less their length.
         let cost = |t: u32| 64 * hits[t as usize] + 32 - u32::from(terms.lens[t as usize]);
-        // A bitset takes a bit per document and a list 16 bits per document holding the term.
-        let common = |t: u32| hits[t as usize] as usize * DENSE_SHARE >= sampled.max(1);
+        // Renumbered, the common terms are those below `rows` (0 is no query's term).
+        let common = |t: u32| (t as usize) < rows;
         // Each thread plans a share of the queries: its (trigger term, phrase) and (trigger term,
         // check) pairs and its queries on sets, each in query order.
         let parts = parallel(threads, &|p| {
@@ -346,22 +365,23 @@ impl Plan {
             let phrase = |at: &[u32]| u32::from(at[0] < at[1]) * Slot::PHRASE;
             let mut flags: Vec<_> = phrase_at.windows(2).map(phrase).collect();
             (checks.iter().flatten()).for_each(|&(t, _)| flags[t as usize] |= Slot::BOOL);
-            // Each term's store, and how many bitset rows and id lists are numbered so far.
-            let (mut store, mut sizes) = (vec![NO_STORE; n], [0; 2]);
+            // Each term's store, and how many bitset rows and id lists there are so far.
+            let (mut store, mut sizes) = (vec![NO_STORE; n], [rows, 0]);
             let sets = sets.concat();
             for &t in sets.iter().flat_map(|&q| queries.terms(q as usize)) {
                 if store[t as usize] == NO_STORE {
-                    // A common term keeps a bitset row, any other an id list: the next of its
-                    // kind.
+                    // A common term keeps the bitset row of its id, any other the next id list.
                     let kind = usize::from(!common(t));
-                    store[t as usize] = sizes[kind] as u32 + LIST * kind as u32;
-                    sizes[kind] += 1;
-                    flags[t as usize] |= [Slot::ROW, Slot::LISTED][kind];
+                    store[t as usize] = [t, sizes[1] as u32 + LIST][kind];
+                    sizes[1] += kind;
+                    flags[t as usize] |= [0, Slot::LISTED][kind];
                 }
             }
-            // Each term `id` takes `flags[id]`. An empty slot, id 0, takes `flags[0]`, which is 0:
-            // a test for empty slots, which lie at random, would mispredict often.
-            (terms.slots.iter_mut()).for_each(|slot| slot.flags |= flags[slot.id() as usize]);
+            // Each term, old id `t`, takes its new id and that id's flags. An empty slot, id 0,
+            // takes 0: a test for empty slots, which lie at random, would mispredict often.
+            let flags: Vec<_> = id.iter().map(|&t| t << 5 | flags[t as usize]).collect();
+            (terms.slots.iter_mut())
+                .for_each(|slot| slot.flags = flags[slot.id() as usize] | slot.flags & Slot::MORE);
             let (check_at, checks) = grouping.join().expect("a panic aborts the process");
             Self {
                 terms,
@@ -655,6 +675,22 @@ impl Tokens<'_> {
     }
 }
 
+/// Transposes the 64 × 64 bit matrix `a`: bit `c` of `a[r]` moves to bit `r` of `a[c]`. Each step
+/// swaps the off-diagonal blocks of every `2j × 2j` block, `j` from 32 down to 1.
+fn transpose(a: &mut [u64; 64]) {
+    for j in [32, 16, 8, 4, 2, 1] {
+        // The low `j` bits of every `2j`; the two runs of `j` words side by side vectorize.
+        let m = u64::MAX / ((1 << j) + 1);
+        for pair in a.chunks_exact_mut(2 * j) {
+            let (low, high) = pair.split_at_mut(j);
+            for (x, y) in low.iter_mut().zip(high) {
+                let t = (*x >> j ^ *y) & m;
+                (*x, *y) = (*x ^ t << j, *y ^ t);
+            }
+        }
+    }
+}
+
 /// Clears the lowest set bit of `bits`, which is not 0, and returns its position.
 fn pop(bits: &mut u64) -> usize {
     std::mem::replace(bits, *bits & (*bits - 1)).trailing_zeros() as usize
@@ -796,14 +832,30 @@ struct Chunk {
 struct Window {
     /// The window's first document.
     start: u32,
-    /// The bitset rows: bit `i` of row `k` is set when document `start + i` holds row `k`'s term.
+    /// The bitset rows: bit `i` of row `k` is set when document `start + i` holds row `k`'s term,
+    /// whose id is `k` ([`Plan::new`]). A row is kept per id below the next multiple of 64; those
+    /// that are no row's are never read.
     bits: Vec<[u64; WINDOW]>,
+    /// The first words of the term bits of the current 64 documents, which hold their rows' bits:
+    /// word `j` of document `d` is `group[j][d]`, so a doc's rows take a store per word instead
+    /// of a store per row and a load of its term's store.
+    group: Vec<[u64; 64]>,
     /// The id lists: the window's documents that contain the list's term, ascending, as
     /// offsets from `start`, which take half the memory of ids.
     lists: Vec<Vec<u16>>,
 }
 
 impl Window {
+    /// Moves the current 64 documents' bits into word `g` of the rows, and zeroes them for the
+    /// next 64: [`transpose`] turns the docs' words `j` into those of rows `64 * j` and up.
+    fn spill(&mut self, g: usize) {
+        for (j, block) in self.group.iter_mut().enumerate() {
+            transpose(block);
+            let (rows, words) = (&mut self.bits[64 * j..], std::mem::replace(block, [0; 64]));
+            (rows.iter_mut().zip(words)).for_each(|(row, word)| row[g] = word);
+        }
+    }
+
     /// The window's documents that contain a term kept as `store`, as a bitset. A list is
     /// spread into `scratch` first.
     fn row<'a>(&'a self, store: Store, scratch: &'a mut [u64; WINDOW]) -> &'a [u64; WINDOW] {
@@ -854,7 +906,8 @@ impl Window {
 fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) -> Chunk {
     let mut sets = Window {
         start: ids.start,
-        bits: vec![[0; WINDOW]; plan.sizes[0]],
+        bits: vec![[0; WINDOW]; plan.sizes[0].next_multiple_of(64)],
+        group: vec![[0; 64]; plan.sizes[0].div_ceil(64)],
         lists: vec![Vec::new(); plan.sizes[1]],
     };
     let mut tally = Tally::new(queries.len(), plan.checks.len());
@@ -868,9 +921,9 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
     // trigger's four writes below may run past its own.
     let mut todo = vec![0; plan.checks.len() + 4];
     // `found`: the phrases the current doc matched, so none counts twice. `kept`: for the current
-    // doc's `n` tokens, five runs of `n` entries: each token's term id (0 for the rest), then the
-    // doc's distinct terms kept in rows, in lists, and BOOL triggers, and the positions of its
-    // phrase triggers, up to the cursors `rows`, `lists`, `bools` and `phrases`. Keeping a term
+    // doc's `n` tokens, four runs of `n` entries: each token's term id (0 for the rest), then the
+    // doc's distinct terms kept in lists and BOOL triggers, and the positions of its phrase
+    // triggers, up to the cursors `lists`, `bools` and `phrases`. Keeping a term
     // takes a store and an add, not a branch, and one slice without bounds checks leaves the loop
     // registers to spare.
     let (mut found, mut kept, mut doc) = (Vec::new(), Vec::new(), ids.start);
@@ -878,13 +931,12 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
     // under way ([`TermTable::prefetch`]), instead of each stalling in turn.
     walk(text, &plan.terms, |probes| {
         let n = probes.len();
-        kept.resize(kept.len().max(5 * n), 0);
-        let (kept, mut rows, mut lists) = (&mut kept[..5 * n], n, 2 * n);
-        let (mut bools, mut phrases) = (3 * n, 4 * n);
+        kept.resize(kept.len().max(4 * n), 0);
+        let (kept, mut lists, mut bools, mut phrases) = (&mut kept[..4 * n], n, 2 * n, 3 * n);
         let (table, seen) = (&plan.terms, &mut seen[..]);
         // No branch on what a token is, a query term or not, new in the doc or not, kept in a
-        // row or a list, a BOOL or a phrase trigger: none of it follows a pattern. A phrase
-        // trigger pushed to a `Vec` behind a branch held 1 M mispredicts (PERF.md, step 47).
+        // list, a BOOL or a phrase trigger: none of it follows a pattern. A phrase trigger pushed
+        // to a `Vec` behind a branch held 1 M mispredicts (PERF.md, step 47).
         for (k, (key, at)) in probes.iter().enumerate() {
             // SAFETY: `at` is the key's home slot, from [`TermTable::prefetch`].
             let slot = unsafe { table.find_from(key, *at) };
@@ -899,17 +951,15 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
             let word = unsafe { seen.get_unchecked_mut(t) };
             let new = std::hint::select_unpredictable(*word & bit == 0, slot.flags, 0);
             *word |= bit;
-            // SAFETY: `kept` holds `5 * n` entries, as the slicing above checks. `k < n`, and each
+            // SAFETY: `kept` holds `4 * n` entries, as the slicing above checks. `k < n`, and each
             // cursor has moved at most `k` times from the start of its run of `n` entries, so it
             // is still inside the run.
             unsafe {
                 *kept.get_unchecked_mut(k) = slot.id();
-                *kept.get_unchecked_mut(rows) = slot.id();
                 *kept.get_unchecked_mut(lists) = slot.id();
                 *kept.get_unchecked_mut(bools) = slot.id();
                 *kept.get_unchecked_mut(phrases) = k as u32;
             }
-            rows += usize::from(new & Slot::ROW != 0);
             lists += usize::from(new & Slot::LISTED != 0);
             bools += usize::from(new & Slot::BOOL != 0);
             phrases += usize::from(slot.flags & Slot::PHRASE != 0);
@@ -918,7 +968,7 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
         // As locals, their addresses stay in registers across the stores to `todo`.
         let (check_at, checks, cells) = (&plan.check_at[..], &plan.checks[..], &tally.checks[..]);
         let mut triggered = 0;
-        for &t in &kept[3 * n..bools] {
+        for &t in &kept[2 * n..bools] {
             // Term `t` triggers the checks `checks[check_at[t]..check_at[t + 1]]`.
             let range = check_at[t as usize] as usize..check_at[t as usize + 1] as usize;
             // Start loading its checks and their cells now, to use below.
@@ -936,17 +986,15 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
         }
         // As locals, their addresses stay in registers across the stores below.
         let (i, store) = ((doc - sets.start) as usize, &plan.store[..]);
-        let bits = &mut sets.bits[..];
-        for &t in &kept[n..rows] {
-            // SAFETY: `t` is a term id, below `store.len()`, and a term kept in a row has a store
-            // below `plan.sizes[0]`, the row count.
-            let row = unsafe { bits.get_unchecked_mut(*store.get_unchecked(t as usize) as usize) };
-            row[i / 64] |= 1 << (i % 64);
+        // A doc's rows are the bits of its terms 1 to `plan.sizes[0] - 1`.
+        (sets.group.iter_mut().zip(&*seen)).for_each(|(block, &word)| block[i % 64] = word);
+        if i % 64 == 63 {
+            sets.spill(i / 64);
         }
-        for &t in &kept[2 * n..lists] {
+        for &t in &kept[n..lists] {
             sets.lists[(store[t as usize] ^ LIST) as usize].push(i as u16);
         }
-        for at in kept[4 * n..phrases].iter().map(|&k| k as usize) {
+        for at in kept[3 * n..phrases].iter().map(|&k| k as usize) {
             for &(q, offset, other, term) in plan.phrases(terms[at]) {
                 // `terms` holds this doc only, so a match never spans two docs (spec §3).
                 let start = at.checked_sub(offset as usize);
@@ -988,6 +1036,8 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
     // fault the same bytes back in if read again, as a neighbouring chunk's first or last page
     // may be; outside a mapping, madvise fails and changes nothing.
     unsafe { madvise(text.as_ptr().wrapping_sub(offset), offset + text.len(), 4) }; // MADV_DONTNEED
+    // The last documents' rows: their 64 is not full. The words of no doc are still zero.
+    sets.spill((doc - sets.start) as usize / 64);
     sets.flush(queries, plan, &mut tally);
     // The window's bitsets go back to the kernel before the first matches are grouped, when
     // memory peaks.
@@ -1145,9 +1195,7 @@ impl Slot {
     const PHRASE: u32 = 1;
     /// The term triggers per-document BOOL checks.
     const BOOL: u32 = 2;
-    /// The corpus pass keeps the term's documents in a bitset row ([`Store`]).
-    const ROW: u32 = 4;
-    /// The corpus pass keeps the term's documents in an id list.
+    /// The corpus pass keeps the term's documents in an id list ([`Store`]).
     const LISTED: u32 = 8;
     /// A term whose home slot this is lies further on, so a probe from here must go on past a
     /// slot that holds another term ([`TermTable::find_from`]).
