@@ -564,7 +564,7 @@ fn count_hits(sample: &[u8], terms: &TermTable) -> (Vec<u32>, usize) {
         for (key, at) in probes {
             // A token that is no query term counts at id 0, which no query reads.
             // SAFETY: `at` is the key's home slot, from [`TermTable::prefetch`].
-            let cell = &mut cells[unsafe { terms.find_from(key, *at) }.id() as usize];
+            let cell = &mut cells[unsafe { terms.find_from(key, *at, 0) }.id() as usize];
             *cell = (*cell & !0xFFFF | low) + (u32::from(*cell & 0xFFFF != low) << 16);
         }
         doc += 1;
@@ -625,7 +625,8 @@ struct Tokens<'a> {
     /// The last block, short of 64 bytes, padded with zero bytes, which are separators.
     padded: [u8; 64],
     /// The current block's offset in `chunk`; its token starts, token ends and LFs not taken
-    /// yet; the start of the token that its next end closes; and 1 when its last byte is a token
+    /// yet; the start of the token that its next end closes, as an offset from the block's, below
+    /// 0, wrapped, for a token that began in an earlier block; and 1 when its last byte is a token
     /// byte.
     at: (usize, u64, u64, u64, usize, u64),
 }
@@ -652,11 +653,12 @@ impl Tokens<'_> {
             let mut line = ends & upto;
             ends &= !upto;
             while line != 0 {
-                let end = base + pop(&mut line);
-                let start = std::mem::replace(&mut next, base + starts.trailing_zeros() as usize);
+                // The token's end and start as offsets from `base`, which takes no add for either.
+                let end = pop(&mut line);
+                let start = std::mem::replace(&mut next, starts.trailing_zeros() as usize);
                 starts &= starts.wrapping_sub(1);
                 // A token past `MAX_TERM` bytes takes a key of 0xFF bytes, which no term has.
-                let key = key_in(chunk, start, end).unwrap_or([!0; MAX_TERM / 8]);
+                let key = key_in(chunk, base, start, end).unwrap_or([!0; MAX_TERM / 8]);
                 // SAFETY: `n` has grown by at most one per end since `room` held 32 entries more
                 // than `n`, and those ends lie in one block, which holds at most 32, as each
                 // follows a token byte.
@@ -677,9 +679,10 @@ impl Tokens<'_> {
             // The start of the token that the block's next end closes: the one open since an
             // earlier block, if any, which `next` holds, else the block's first start. It is
             // picked once per block, by a conditional move, as whether a token runs on follows no
-            // pattern, so that the loop above takes no test on it.
-            let (first, carry) = (base + starts.trailing_zeros() as usize, prev_bit != 0);
-            next = std::hint::select_unpredictable(carry, next, first);
+            // pattern, so that the loop above takes no test on it. An open token's start moves 64
+            // back, as the offsets count from the new block.
+            let (first, carry) = (starts.trailing_zeros() as usize, prev_bit != 0);
+            next = std::hint::select_unpredictable(carry, next.wrapping_sub(64), first);
             starts =
                 std::hint::select_unpredictable(carry, starts, starts & starts.wrapping_sub(1));
             prev_bit = token >> 63;
@@ -978,19 +981,24 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
         kept.resize(kept.len().max(4 * n), 0);
         let (kept, mut lists, mut bools, mut phrases) = (&mut kept[..4 * n], n, 2 * n, 3 * n);
         let (table, seen) = (&plan.terms, &mut seen[..]);
+        // A zero the optimizer cannot see, held in a register for the token loop's selects: with
+        // a constant 0, it set a register to 0 before each of three selects per token.
+        let mut zero = 0u64;
+        // SAFETY: the asm block is empty.
+        unsafe { asm!("/* {} */", inout(reg) zero, options(pure, nomem)) };
         // No branch on what a token is, a query term or not, new in the doc or not, kept in a
         // list, a BOOL or a phrase trigger: none of it follows a pattern. A phrase trigger pushed
         // to a `Vec` behind a branch held 1 M mispredicts (PERF.md, step 47).
         for (k, (key, at)) in probes.iter().enumerate() {
             // SAFETY: `at` is the key's home slot, from [`TermTable::prefetch`].
-            let slot = unsafe { table.find_from(key, *at) };
+            let slot = unsafe { table.find_from(key, *at, zero) };
             let (t, bit) = (slot.id() as usize / 64, 1 << (slot.id() % 64));
             // The term's flags if the doc did not hold it yet, else none: a term is kept and
             // triggers once per doc.
             // SAFETY: a slot's id is 0 or a term's, below `plan.terms.len()`, so its word `t` lies
             // below `seen.len()`, as asserted where `seen` is sized.
             let word = unsafe { seen.get_unchecked_mut(t) };
-            let new = std::hint::select_unpredictable(*word & bit == 0, slot.flags, 0);
+            let new = std::hint::select_unpredictable(*word & bit == 0, slot.flags, zero as u32);
             *word |= bit;
             // SAFETY: `kept` holds `4 * n` entries, as the slicing above checks. `k < n`, and each
             // cursor has moved at most `k` times from the start of its run of `n` entries, so it
@@ -1181,26 +1189,38 @@ const MAX_TERM: usize = 32;
 fn key(token: &[u8]) -> Option<Key> {
     let mut bytes = [0; MAX_TERM];
     bytes.get_mut(..token.len())?.copy_from_slice(token);
-    Some(fold(&bytes, token.len()))
+    Some(fold(&bytes, token.len().wrapping_neg()))
 }
 
-/// The key of the token at `chunk[start..end]`, read as one 32-byte load from `chunk` and
-/// masked to the token's length, or `None` past `MAX_TERM` bytes. Copying the token into a
-/// zeroed buffer first would call `memcpy` and then stall the load that reads the buffer
-/// back, once per token.
-fn key_in(chunk: &[u8], start: usize, end: usize) -> Option<Key> {
-    // One test for the start and the 32 bytes from it, against a bound that stays in a register:
-    // `chunk.get(start..start + MAX_TERM)` also tested whether the sum wraps around.
-    if start < chunk.len().saturating_sub(MAX_TERM - 1) {
-        // SAFETY: `start + MAX_TERM <= chunk.len()`, as just tested.
-        let window = unsafe { &*chunk.as_ptr().add(start).cast::<[u8; MAX_TERM]>() };
-        return (end - start <= MAX_TERM).then(|| fold(window, end - start));
+/// The key of the token at `chunk[base + start..base + end]`, read as one 32-byte load from
+/// `chunk` and masked to the token's length, or `None` past `MAX_TERM` bytes. `start` and `end`
+/// are offsets from `base`, `start` below 0, wrapped, for a token that began in an earlier
+/// block. Copying the token into a zeroed buffer first would call `memcpy` and then stall the
+/// load that reads the buffer back, once per token.
+fn key_in(chunk: &[u8], base: usize, start: usize, end: usize) -> Option<Key> {
+    // One test for the start and the 32 bytes from it, against a bound that stays in a register
+    // within a block, signed, as `start` may be below 0: `chunk.get(start..start + MAX_TERM)`
+    // also tested whether the sum wraps around.
+    let room = chunk.len().saturating_sub(MAX_TERM - 1).wrapping_sub(base);
+    if start.cast_signed() < room.cast_signed() {
+        let block = chunk.as_ptr().wrapping_add(base);
+        // SAFETY: `base + start + MAX_TERM <= chunk.len()`, as just tested.
+        let window = unsafe { &*block.wrapping_add(start).cast::<[u8; MAX_TERM]>() };
+        // Minus the length, so that the mask's address is one add. Past `MAX_TERM` bytes, on a
+        // cold branch: else each token set a register to the key of 0xFF bytes, just in case.
+        let neg = start.wrapping_sub(end);
+        if neg < MAX_TERM.wrapping_neg() {
+            std::hint::cold_path();
+            return None;
+        }
+        return Some(fold(window, neg));
     }
-    key(&chunk[start..end]) // within 32 bytes of the chunk's end
+    key(&chunk[base.wrapping_add(start)..base + end]) // within 32 bytes of the chunk's end
 }
 
-/// Lowercases the first `len` bytes of `window`, all letters and digits, and zeroes the rest.
-fn fold(window: &[u8; MAX_TERM], len: usize) -> Key {
+/// Lowercases the first `len` bytes of `window`, all letters and digits, and zeroes the rest,
+/// given `neg`, `len` negated, wrapped.
+fn fold(window: &[u8; MAX_TERM], neg: usize) -> Key {
     // Flattened, `ONES` is 32 bytes of 0xFF then 32 zeros, so `len` bytes of 0xFF, then zeros,
     // start at `MAX_TERM - len`. On one 64-byte cache line, that 32-byte load never splits
     // across two; unaligned, the table sat wherever the rest of the constants left it, and a
@@ -1208,7 +1228,7 @@ fn fold(window: &[u8; MAX_TERM], len: usize) -> Key {
     #[repr(align(64))]
     struct Line([[u8; MAX_TERM]; 2]);
     const ONES: Line = Line([[0xFF; MAX_TERM], [0; MAX_TERM]]);
-    let mask: &[u8; MAX_TERM] = ONES.0.as_flattened()[MAX_TERM - len..]
+    let mask: &[u8; MAX_TERM] = ONES.0.as_flattened()[MAX_TERM.wrapping_add(neg)..]
         .first_chunk()
         .expect("len <= MAX_TERM");
     std::array::from_fn(|i| {
@@ -1336,9 +1356,9 @@ impl TermTable {
     ///
     /// # Safety
     ///
-    /// `at` points to a slot of `slots`, as [`TermTable::prefetch`] returns.
+    /// `at` points to a slot of `slots`, as [`TermTable::prefetch`] returns, and `zero` is 0.
     #[inline(always)]
-    unsafe fn find_from(&self, key: &Key, at: *const Slot) -> Slot {
+    unsafe fn find_from(&self, key: &Key, at: *const Slot, zero: u64) -> Slot {
         // SAFETY: `at` points to a slot, as the caller ensures.
         let slot = unsafe { *at };
         // A token whose home slot holds another term is no query term unless the slot has
@@ -1348,14 +1368,14 @@ impl TermTable {
         // past 12 bytes never matches here, and the term's home slot has `MORE`. The probe goes on
         // when `on` is not 0: one select, where `found || !more` took two more instructions.
         let diff = (slot.head ^ key[0]) | (u64::from(slot.tail) ^ key[1]);
-        let mut on = std::hint::select_unpredictable(slot.flags & Slot::MORE != 0, diff, 0);
+        let mut on = std::hint::select_unpredictable(slot.flags & Slot::MORE != 0, diff, zero);
         // SAFETY: the asm block is empty; it keeps the test one branch, as in `position`.
         unsafe { asm!("/* {} */", inout(reg) on, options(pure, nomem)) };
         if on != 0 {
             // SAFETY: `at` points into `slots`, as the caller ensures.
             return unsafe { self.find_past(key, at) };
         }
-        let flags = std::hint::select_unpredictable(diff == 0, slot.flags, 0);
+        let flags = std::hint::select_unpredictable(diff == 0, slot.flags, zero as u32);
         Slot { flags, ..slot }
     }
 

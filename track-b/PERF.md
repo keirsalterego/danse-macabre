@@ -65,6 +65,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 58 | Trial: of the short terms whose home slot a slot is, the one with the most sample hits moves into it, on a thread of its own during the plan's tail, so 44% fewer probes go past the home slot | run-f39c6987110f | 0.0981 | 42.3 | 78.6 |
 | 59 | Trial: the probe's first test branches on one select, the key's difference kept only when the slot has `MORE`, and the token loop at the line end no longer prefetches each token's `check_at` entry, so it keeps every address in a register | run-b6d1d5065964 | 0.0950 | 41.7 | 79.0 |
 | 60 | While the main thread interns the terms, three threads read the corpus a byte per 64 KiB, so the scanning threads' walks take no page faults on it; the chunks are freed on a thread of their own while the output is written | run-938dc27813b7 | 0.0952 | 41.3 | 79.0 |
+| 61 | The line end's token loop holds a zero in a register for its three selects, and the tokenizer takes a long token's key on a cold branch, the mask's address from the length negated, and a token's start and end as offsets from its block: 3.9 fewer instructions per token |  |  |  |  |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1687,6 +1688,53 @@ on step 54, against it: seed 1, 105.58 / 104.39 → 104.06 / 102.57; seed 2, 106
 seed 2, −0.78%, −0.34%, −1.31%. memory.peak over five alternating runs, seed 1: 38.8–39.4 →
 39.4–40.2 MB, median 39.3 → 39.7. S 863 → 868. Gate: 510 pass, 0 fail.
 
+## Step 61: a zero in a register for the line end's selects, and four instructions fewer per token in the tokenizer
+
+The token loop at the line end takes three `cmov`s against 0 per token, and LLVM set a register
+to 0 before each (`mov $0`), as none was free to hold one across the loop. A zero made once per
+line behind an empty `asm` block, which the optimizer cannot see through, now stays in a
+register for all three: 43 M fewer instructions. Alone, on step 59: cycles 2,216–2,226 → 2,204
+M (−0.8%); `ab.py`, 61 alternating runs, seed 1, 98.13 / 96.86 → 97.52 / 96.06 ms; seed 2,
+97.97 / 96.68 → 97.41 / 96.03 ms; seed 3, 97.96 / 96.56 → 97.15 / 95.89 ms (−0.6% to −0.8%),
+under the bar alone. On step 60: 4,178.7 → 4,135.8 M instructions, cycles 2,225 and 2,221 →
+2,213 and 2,205 M.
+
+`Tokens::line` took 28 µops per token, three of them for a token past 32 bytes, which is rare.
+Before the length test, the loop set a register to the key of 0xFF bytes (`vpcmpeqd`) for every
+token, so that the test could jump straight to where both paths meet; and the mask's address
+took a `mov` of the table's address and a `sub` of the length. The length test is now marked
+cold (`std::hint::cold_path`), so that the 0xFF key is set on its own path only, and `fold`
+takes the length negated, `start - end`, so that the mask's address is that plus a constant,
+folded into the `vpand`: 74 M fewer instructions, 2 per token. Then the token's start and end,
+each `base` plus a bit's position, are offsets from the block instead: the start of a token
+open since an earlier block lies below 0, wrapped, and moves back 64 per block, and the test
+that a token's 32 bytes lie in the chunk compares, signed, against a bound fixed within a block.
+25 M fewer instructions; short of registers, LLVM keeps the block's address on the stack and
+loads it per token.
+
+`perf stat -r 5`, interleaved, seed 1, instructions and cycles (M):
+
+| Build | instructions | cycles |
+|---|---|---|
+| step 60 | 4,178.7 | 2,225, 2,221 |
+| the key's length test and mask only | 4,104.5 | 2,198, 2,204 |
+| the zero only | 4,135.8 | 2,213, 2,205 |
+| both | 4,061.6 | 2,178, 2,185 |
+| step 60, again | 4,178.7 | 2,222, 2,225 |
+| both, and the offsets (this step) | 4,037.1 | 2,159, 2,161 |
+
+On seed 2: 4,179.6 → 4,038.1 M instructions, cycles 2,189 → 2,161 M. Branch misses 10.1 M in
+all.
+
+`ab.py`, 61 alternating runs, medians / minimums, step 60 → this step: seed 2, 97.69 / 96.00 →
+95.58 / 93.42 ms; seed 1, 96.64 / 94.94 → 94.65 / 93.10 ms; seed 3, 96.32 / 94.81 → 94.22 /
+92.51 ms; the same code before its comments: seed 1, 96.55 / 94.96 → 94.70 / 92.76 ms; seed 3,
+96.27 / 94.86 → 93.72 / 92.56 ms (−1.9% to −2.6%, −2.2% on average). Without the offsets: seed
+1, 96.30 / 95.11 → 94.88 / 93.36 ms; seed 2, 96.71 / 95.08 → 95.05 / 93.37 ms; seed 3, 96.01 /
+94.68 → 94.90 / 93.50 ms; seed 2, 96.52 / 95.26 → 94.96 / 93.22 ms (−1.2% to −1.7%).
+memory.peak over five alternating runs, seed 1: 39.2–39.7 → 39.1–40.1 MB, median 39.5 both.
+S 868 → 877. Gate: 510 pass, 0 fail.
+
 ## Experiments that did not stay
 
 - **After step 60** (on step 58, `ab.py`, medians / minimums, ms; timelines from builds with timestamps,
@@ -1716,6 +1764,29 @@ seed 2, −0.78%, −0.34%, −1.31%. memory.peak over five alternating runs, se
     without all three 2.46. The rest is the probe and the loop, about 100 instructions per
     occurrence with a dozen stack spills, and no single hot spot.
 
+- **After step 59** (seed 1; `perf stat -r 5`, interleaved; `ab.py`, 61 alternating runs,
+  medians / minimums, ms):
+  - The zero that step 61 holds in a register, for `add_checks`'s select and its first-match
+    cap too: cycles unchanged, as its loop then reloaded `seen`'s address from the stack. A long
+    token's key of 0xFF bytes held in a register: its `vpcmpeqd` became a register move, cycles
+    unchanged (step 61 moves it off the common path instead).
+  - The probes' room for 32 more tokens, tested once per block, grown by a cold function: 21 M
+    fewer instructions, cycles 2,200–2,204 → 2,198–2,202 M.
+  - The probes holding the home slot's offset instead of its address: the token loop then kept
+    one of its cursors on the stack. Not timed.
+  - The gather masked to the real terms' lanes, with a pad id of `u32::MAX`, whose top bit
+    drops its lane: +28 M instructions, cycles 2,212–2,218 → 2,225–2,230 M.
+  - A line's token count added once per block (the popcount of its ends), and the probes
+    written through a pointer, so that the token loop keeps no count: 7 M fewer instructions,
+    cycles 2,223–2,225 → 2,236–2,244 M.
+  - The phrase triggers' `phrase_at` entries prefetched after the token loop, and their first
+    phrase entries after the triggers' loop: +7 M instructions, +0.3 M branch misses, cycles
+    2,220 → 2,240–2,246 M.
+  - Of the 12.94 M checks run, 9.20 M hit (71%), and 4.59 M (35%) hold whenever their trigger
+    is present (`table & HAS[j] == HAS[j]`, `j` the trigger's lane), so that their gather tells
+    nothing; 91% have four distinct terms or fewer. Not built: those checks without the gather
+    (a second range per trigger would cost the triggers' loop more), or two checks of four
+    terms in one eight-lane gather.
 - **After step 58** (seed 1 unless noted; `perf stat -r 5`, interleaved; `ab.py`, 61
   alternating runs, medians / minimums, ms):
   - Where the loads wait, by source line: of the 6.0 M loads that miss L2, `add_checks` takes
