@@ -1383,6 +1383,48 @@ Local, against step 51 (`ab.py`, 41 alternating runs), medians / minimums: seed 
 
 ## Experiments that did not stay
 
+- **After step 52, where the cycles and the wall go** (local, seed 1, turbo off). Topdown: retiring
+  55%, bad speculation 14%, frontend 13%, backend 18%, of which memory about 8%; the kernel takes
+  6.6% of all cycles. A build with timestamps, in ms since `main`: the queries are parsed and
+  interned at 6.0–6.6, sampled at 8.7–8.9 and planned at 11.8–12.4, and the walks start at
+  12.8–13.5. A walk takes 85.6–89.5 ms, and the slowest chunk is a different one in each run (end
+  spread 2.7–4.1 ms). The last thread's tail takes 2.3–4.3 ms: last flush 0.4–0.6, the window's
+  free 0.2–1.5, merging the cells 0.2–1.0, grouping 1.1–2.4. Formatting then takes 1.5 ms and
+  the write 0.5. Cycle cuts in the pass reached the wall at about a third or half of their size,
+  as below.
+- **After step 52, frequent terms moved into their home slots.** After the sample, a term stored
+  past its home slot swaps with the term there when it was sampled in more documents. The swap
+  keeps every probe's run free of empty slots, and each slot keeps its `MORE`. Term tokens probed
+  past their home slot fell from 1.10 to 0.48 M; the rest are a long tail of terms whose home
+  holds a more frequent term. Branch misses went 11.4 → 10.6 M, instructions 4,829.8 → 4,800.2 M,
+  cycles 2,499 and 2,521 → 2,477 and 2,477 M. Run over all 262,144 slots, the settle took 1.57 ms
+  on the main thread, the plan's critical path, and the wall moved −0.2%. Over only the 11,026
+  slots the intern recorded, it took 0.18 ms. `ab.py`, medians / minimums: seed 1, 109.01 /
+  107.80 → 108.47 / 107.13 ms; seed 2, 110.11 / 107.92 → 109.80 / 106.95 ms; seed 3, 61 runs,
+  109.66 / 108.12 → 109.09 / 107.56 ms (−0.3% to −0.5%), for about 20 lines.
+- **After step 52, the rows' loop** (local, seed 1, `perf stat -r 5`, interleaved; plain `b-0`
+  drew 2,482–2,526 M cycles). The rows hold 532 of 75,748 terms, and a doc sets 45 bits in them.
+  With the loop skipped (wrong answers), L1 load misses went 81.3 → 57.0 M and cycles fell 1.3% to
+  2.8%. With a row picked from the term id instead of `store` (wrong answers), L1 load misses went
+  81.3 → 70.6 M and cycles fell 0.5% to 1.0%. None of these paid:
+  - Each row one line longer (576 bytes), so that a doc's words in the rows spread over all 64 L1
+    sets instead of 8: L1 load misses 80.6 → 82.1 M, cycles 2,493 and 2,490 → 2,513 and 2,517 M.
+    Held to 8 sets, the rows did not evict the rest of L1.
+  - `store` beside `check_at`, as one `Vec<(u32, Store)>`, so that the token loop's prefetch of
+    `check_at` brings each term's store: L1 load misses 81.2 → 75.1 M. But the token loop then
+    reloaded `kept`'s address and kept a second cursor on the stack: instructions 4,829.8 →
+    4,888.1 M, cycles 2,518 and 2,528 → 2,546 and 2,548 M.
+  - The stores of a doc's row terms prefetched before the BOOL triggers' loop: L1 load misses
+    81.3 → 76.1 M, instructions +56 M, cycles 2,482 and 2,524 → 2,551 and 2,543 M.
+- **After step 52, `check_at`'s prefetch with another hint**, T1, T2 or NTA instead of T0: cycles
+  2,525 and 2,524 M → 2,525 and 2,526 (T1), 2,525 and 2,523 (T2), 2,549 and 2,549 M (NTA).
+- **After step 52, `DENSE_SHARE` 56, 64 and 80** (`ab.py`, 41 alternating runs, seed 1): medians
+  109.02 → 108.92, 108.45 and 108.61 ms; 64 on seed 3 (61 runs): 109.66 → 109.22 ms (−0.4%),
+  for about 1.9 MB more at the peak (step 44's measure).
+- **After step 52, the tail's blocks released by `MADV_DONTNEED`** and never freed (the window's
+  bits, the check cells and the first-match list), so that no `munmap` takes the address space's
+  lock for writing, without reserving `at` and `ids` before the walk as the experiment after step
+  49 did: medians 110.60 → 112.26 and 109.25 → 110.32 ms (+1%).
 - **After step 51, token starts and ends relative to their block** (local, seed 1, `perf stat -r 5`,
   interleaved), so that the walk's token loop adds no block offset to either and `key_in` loads
   from the block's address: instructions 4,875.7 → 4,887.2 M, as the loop then held the block's
