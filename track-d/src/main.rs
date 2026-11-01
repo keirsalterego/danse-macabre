@@ -95,12 +95,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let n = u32::try_from(number(graph_txt, &mut at)).map_err(|_| "n is over 2^32 - 1")?;
     number(graph_txt, &mut at);
     let threads = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let graphs = build_graph(&graph_txt[at..], n as usize, threads)?;
+    let [forward, reverse] = build_graph(&graph_txt[at..], n as usize, threads)?;
 
     // One `s t` line per query, no header (spec §2).
     let mut queries = Vec::new();
     for_each_line(queries_txt, |[s, t]| queries.push((s as u32, t as u32)));
-    let answers = answer(&graphs, graph_txt, &queries, threads);
+    let answers = answer(&[forward, reverse], graph_txt, &queries, threads);
 
     let mut out = Vec::with_capacity(answers.len() * 12);
     for answer in answers {
@@ -254,7 +254,7 @@ fn build_graph(body: &[u8], n: usize, threads: usize) -> Result<[Csr; 2], Box<dy
         wide: HashMap::new(),
         edges: vec![0; m],
         id_bits,
-        heavy: HashMap::new(),
+        heavy: HashMap::default(),
     });
     let mut places = [(); 2].map(|()| vec![0; m]);
     // Zeroed allocations come from the kernel as untouched pages, which it zeroes on the first
@@ -275,7 +275,7 @@ fn build_graph(body: &[u8], n: usize, threads: usize) -> Result<[Csr; 2], Box<dy
     let mut runs: Vec<[Vec<Run>; 2]> = chunks.iter().map(|_| Default::default()).collect();
     for (direction, (graph, places)) in graphs.iter_mut().zip(&mut places).enumerate() {
         let lens = || (0..blocks).flat_map(|block| in_block(direction, block));
-        let edge_runs = split_runs(&mut graph.edges, lens()).into_iter();
+        let edge_runs = split_runs(&mut graph.edges, lens());
         for (i, (edges, places)) in edge_runs.zip(split_runs(places, lens())).enumerate() {
             runs[i % chunks.len()][direction].push((edges.iter_mut(), places.iter_mut()));
         }
@@ -308,7 +308,7 @@ fn build_graph(body: &[u8], n: usize, threads: usize) -> Result<[Csr; 2], Box<dy
     for (direction, (graph, mut places)) in graphs.iter_mut().zip(places).enumerate() {
         on_threads(graph.rows.chunks_mut(1 << 18), |rows| rows[0] = 0);
         let lens = || (0..blocks).map(|block| in_block(direction, block).sum());
-        let block_runs = split_runs(&mut graph.edges, lens()).into_iter().enumerate();
+        let block_runs = split_runs(&mut graph.edges, lens()).enumerate();
         let freed = AtomicUsize::new(places.as_ptr().addr().next_multiple_of(1 << 21));
         let block_places = block_runs.zip(split_runs(&mut places, lens()));
         let (mut work, mut first) = ((0..threads).map(|_| Vec::new()).collect::<Vec<_>>(), 0);
@@ -339,10 +339,13 @@ fn build_graph(body: &[u8], n: usize, threads: usize) -> Result<[Csr; 2], Box<dy
     Ok(graphs)
 }
 
-/// Cuts `slots` into consecutive runs of the given lengths.
-fn split_runs<T>(mut slots: &mut [T], lens: impl IntoIterator<Item = usize>) -> Vec<&mut [T]> {
-    let cut = |len| slots.split_off_mut(..len).expect("lengths add up");
-    lens.into_iter().map(cut).collect()
+/// Cuts `slots` into consecutive runs of the given lengths, as they are asked for. Collecting
+/// them first took 160 more page faults in pass 2's set-up, 0.5 ms on its one thread (PERF.md).
+fn split_runs<T>(
+    mut slots: &mut [T],
+    lens: impl Iterator<Item = usize>,
+) -> impl Iterator<Item = &mut [T]> {
+    lens.map(move |len| slots.split_off_mut(..len).expect("lengths add up"))
 }
 
 /// Nodes per block, the unit of work of pass 3 in [`build_graph`]. 2,048 keeps a block's edges
@@ -428,8 +431,9 @@ struct Csr {
     /// `32 - id_bits` bits above them.
     id_bits: u32,
     /// The weights too big for the weight field, by (node, other end). Of parallel heavy edges it
-    /// keeps the lightest, the only one a shortest path can use (spec §3).
-    heavy: HashMap<(u32, u32), u64>,
+    /// keeps the lightest, the only one a shortest path can use (spec §3). Hashed by [`NodeHash`],
+    /// which [`build_graph`] fills it with in a third of the time `SipHash` took.
+    heavy: HashMap<(u32, u32), u64, std::hash::BuildHasherDefault<NodeHash>>,
 }
 
 impl Csr {
@@ -507,7 +511,7 @@ fn answer(graphs: &[Csr], text: &[u8], queries: &[(u32, u32)], threads: usize) -
     let answers: Vec<_> = queries.iter().map(|_| AtomicU64::new(0)).collect();
     let next = AtomicUsize::new(0);
     on_threads(0..threads, |k| {
-        let [mut from_s, mut to_t] = [0, 1].map(|i| Search::new(&graphs[i]));
+        let (mut from_s, mut to_t) = (Search::new(&graphs[0]), Search::new(&graphs[1]));
         loop {
             let i = next.fetch_add(1, Relaxed);
             let Some(&(s, t)) = queries.get(i) else { break };
@@ -786,7 +790,8 @@ type Labels = (Short, HashMap<u32, u64>);
 /// The first map of [`Labels`].
 type Short = HashMap<u32, u32, std::hash::BuildHasherDefault<NodeHash>>;
 
-/// The hasher for [`Labels`]: Fibonacci hashing, one multiply by 2^64 divided by the golden ratio.
+/// The hasher for [`Labels`] and [`Csr::heavy`]: Fibonacci hashing, one multiply by 2^64 divided
+/// by the golden ratio.
 ///
 /// std's default `SipHash` resists hash flooding, which costs dozens of cycles per key, and none
 /// of it is needed for node ids from a fixed file. The multiply keeps the low bits a bijection of
@@ -797,15 +802,16 @@ type Short = HashMap<u32, u32, std::hash::BuildHasherDefault<NodeHash>>;
 struct NodeHash(u64);
 
 impl std::hash::Hasher for NodeHash {
-    /// The hash of the one id written since the hasher was created.
+    /// The hash of the ids written since the hasher was created.
     fn finish(&self) -> u64 {
         self.0
     }
 
-    /// Hashes one node id. [`Labels`] keys are `u32`, and std's `write_u32` passes their 4 bytes
-    /// here.
+    /// Hashes one more node id into the state. [`Labels`] keys are `u32`, and std's `write_u32`
+    /// passes their 4 bytes here; a [`Csr::heavy`] key passes two. For one id the state is 0, so
+    /// the xor is the id itself.
     fn write(&mut self, id: &[u8]) {
         let id = u32::from_ne_bytes(id.try_into().expect("a u32 node id"));
-        self.0 = u64::from(id).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = (self.0 ^ u64::from(id)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
 }

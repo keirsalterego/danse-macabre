@@ -24,6 +24,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 17 | Pass 3 gives back the places of sorted blocks as it goes: the threads take the blocks in turn, and the 2 MB pages below the slowest one's progress are dropped with `madvise` | run-d253110190f5 | 0.1276 | 66.0 | 72.6 |
 | 18 | 30 fewer lines at the same speed: the Dockerfile without `WORKDIR`, one parser for edge and query lines, the runs cut with `split_off_mut`, the prefetches through one helper that takes an `Option`, and smaller cuts | run-e464a45452b1 | 0.1244 | 65.9 | 73.1 |
 | 19 | The query threads that run out of queries drop graph.txt's pages from the page tables, so the exit no longer unmaps them on one thread | | | | |
+| 20 | The build's serial parts shortened: `split_runs` hands out the runs as they are asked for instead of collecting them, and the heavy-edge maps hash with `NodeHash` instead of `SipHash` | | | | |
 
 Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
@@ -541,6 +542,30 @@ thread to finish still drops its own twelfth, about 0.1-0.2 ms.
 - memory.peak, 5 alternating runs, seed 1: 61.8-63.7 → 62.1-62.5 MB (medians 62.1 → 62.2).
 - S 419 → 422. Gate: 512 pass, 0 fail; `cargo fmt --check` and clippy report nothing. An empty
   queries.txt and a graph with no edges give the same output as step 18.
+
+## Step 20: the build's serial parts
+
+Step 19's timeline has two serial steps on the main thread between the parallel passes: pass
+2's runs set-up, 1.1-1.2 ms with 380 page faults, and the heavy edges' two maps, 0.3 ms.
+
+- `split_runs` returned a `Vec` of its runs. Pass 2's set-up collects four of them, 10,200
+  slices of 16 bytes each, and at 163 KB each is a fresh `mmap` under step 5's threshold, so
+  each costs 40 page faults and an unmap. It now returns an iterator over the runs, cut as they
+  are asked for: 380 → 207 faults, and the set-up 1.13 → 0.63 ms (phase marks, 21 runs).
+- `Csr::heavy` hashed its (node, other end) keys with std's `SipHash`. It now uses `NodeHash`,
+  whose `write` xors each id into its state before the multiply, so a label's one id hashes as
+  before (state 0) and a pair mixes both: the heavy step 0.32 → 0.15 ms. `step`'s instructions
+  are the same as step 18's; one field offset moved, as `heavy`'s hasher is now zero-sized.
+- The build ends 0.64 ms earlier (35.67 → 35.03 ms, medians of 21 runs). `step` starts 16 bytes
+  past a line (the two graphs passed as an array again, and the `Search` pair as a tuple).
+
+`ab.py`, 41 interleaved runs, medians (minimums), step 19 → step 20: seed 1 124.63 → 123.92
+(122.48 → 122.05) and 125.98 → 124.76 (123.33 → 122.44); seed 3 132.49 → 131.07 (129.41 →
+128.89) and 132.71 → 131.83 (129.92 → 129.22); seed 2 127.40 → 126.22 (125.15 → 124.02) ms. About
+-0.85%, and about -1.5% against step 18 in the same rounds. memory.peak, alternating runs: seed 1
+61.8-64.5 → 61.8-62.7 MB (medians 62.35 → 62.25, 10 runs each), seed 3 61.9-62.7 → 62.0-64.3 MB
+(medians 62.55 → 62.7, 6 runs each); both builds show the rare 64 MB runs. S 422 → 424. Gate:
+512 pass, 0 fail; `cargo fmt --check` and clippy report nothing.
 
 ## Tried and reverted (local, turbo off, no run ID)
 
