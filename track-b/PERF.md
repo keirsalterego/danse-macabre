@@ -2357,4 +2357,5 @@ the time. Locally, on battery, the packing alone measured −1.6% to −2.4% aga
   board than here, it went to the board as a trial (step 64), to be kept only if its runs beat
   step 63's 91.1 and 92.9 ms by more than their noise. Its run, run-bb4ed7d47695, read 93.4 ms,
   in a run where A, C and D read 1.5–3.4% above their best: no gain on the box against step 63,
-  for 60 more lines. Reverted to step 63's code.
+  for 60 more lines. Reverted to step 63's code, whose next run, run-79b6065fa154, read 98.1 ms
+  in a slower run still (A 18.3, D 133.6 ms).
