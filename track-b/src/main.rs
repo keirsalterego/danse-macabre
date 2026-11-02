@@ -474,12 +474,8 @@ fn group<T: Copy + Default>(keys: usize, parts: &[Vec<(u32, T)>]) -> (Vec<u32>, 
 fn group_into<T: Copy>(keys: usize, parts: &[Vec<(u32, T)>], grouped: &mut [T]) -> Vec<u32> {
     // Written here, as in [`Tally::new`], so the counts' loads find no shared zero page.
     let mut at = [0].repeat(keys + 1);
-    for &(k, _) in parts.iter().flatten() {
-        at[k as usize] += 1;
-    }
-    for k in 1..=keys {
-        at[k] += at[k - 1];
-    }
+    (parts.iter().flatten()).for_each(|&(k, _)| at[k as usize] += 1);
+    (1..=keys).for_each(|k| at[k] += at[k - 1]);
     // Each key's end moves back to its start as its items go in, last first.
     for &(k, item) in parts.iter().flatten().rev() {
         at[k as usize] -= 1;
