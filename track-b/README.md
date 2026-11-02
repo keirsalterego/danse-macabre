@@ -19,7 +19,7 @@ About 620× the reference's speed. Every step, with the board run ID that measur
 ```mermaid
 flowchart LR
     Q["queries.txt<br/>read first, as the spec allows"] --> T["term table<br/>one id per distinct query term"]
-    T --> S["sample the first 1/4 of<br/>the corpus: how rare is each term"]
+    T --> S["sample the first 1/64 of<br/>the corpus: how rare is each term"]
     S --> P["plan: triggers per query<br/>rarest term, or a bool cover"]
     D["docs.txt<br/>mapped, 12 threads"] --> W["walk: AVX2, 64 bytes<br/>at a time, tokens per line"]
     P --> C
@@ -33,7 +33,7 @@ flowchart LR
 1. **Queries first.** `queries.txt` is read before the corpus (spec §3 allows it) and every
    distinct query term gets a small id. The corpus is then indexed only for the terms the queries
    use; a token no query mentions is looked up once and forgotten.
-2. **Triggers.** Tokenising the first quarter of the corpus estimates how many documents hold each
+2. **Triggers.** Tokenising the first 1/64 of the corpus estimates how many documents hold each
    term. Each query then gets triggers: terms such that every matching document contains at least
    one of them. A phrase uses its rarest term; a boolean query uses a cover of its terms. Triggers
    decide how much work is done and never the answer, so a wrong estimate costs time, not

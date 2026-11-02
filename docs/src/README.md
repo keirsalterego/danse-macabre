@@ -17,7 +17,7 @@ line and remembering where each run starts removes a sort over 3.1 million lines
 single layout decision (step 8) freed the memory that made 4-byte records and the 17 MB peak
 possible, and the output order then falls out of one sort of the 1,842 endpoint names.
 
-**B, let a sample choose the work.** Tokenising the first quarter of the corpus estimates how many
+**B, let a sample choose the work.** Tokenising the first 1/64 of the corpus estimates how many
 documents hold each term, and each query then gets triggers: terms such that every matching
 document contains one of them. Triggers never decide the answer, so a bad estimate costs time
 rather than correctness. They are why a phrase is checked only at its rarest term's positions.
