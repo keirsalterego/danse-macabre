@@ -2,12 +2,12 @@
 
 Each kept step cites the live-board run that measured it. Numbers marked local come from a laptop (i7-13620H, turbo off) and compare two versions run side by side; changes that were measured and not kept are listed under the step they were tried after.
 
-| | Reference (step 0) | Final code (step 63), three board runs |
+| | Reference (step 0) | Final code (step 66), board run |
 |---|---|---|
-| T | 56.35 s | 90.6 ms (run-6549e04a12b0), 91.1 ms (run-97ee561ab7e6), 92.9 ms (run-51792bbbc94f) |
-| M | 2,200 MB | 41.8 MB, 42.2 MB, 41.9 MB |
-| S (lines) | 91 | 901 |
-| Points | 0 | 79.4, 79.3, 79.1 |
+| T | 56.35 s | 87.3 ms (run-33959bbbe488) |
+| M | 2,200 MB | 42.1 MB |
+| S (lines) | 91 | 961 |
+| Points | 0 | 79.6 |
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
@@ -77,7 +77,7 @@ Each kept step cites the live-board run that measured it. Numbers marked local c
 | 63 | Trial: step 62's packing of a doc's runs, 8 tokens at a time, with step 61's hash of the key's first two words | run-51792bbbc94f | 0.0929 | 41.9 | 79.1 |
 | 64 | Reverted after one board run (see the not-kept list). Trial: the query terms interned on every thread into one shared table, a new term's slot claimed by a compare-and-swap of its `head` and its id taken from a block of 64; the page-touching helpers moved into the plan's tail | run-bb4ed7d47695 | 0.0934 | 41.7 | 78.8 |
 | 65 | Reverted after two board runs (see the not-kept list). Trial, pushed as 052ab6e: 32-byte aligned checks, a branch-free `add_checks` and immediate vector shifts in `pack`, S 901 → 956 | run-e40ad8747964 | 0.0944 | 41.7 | 78.7 |
-| 66 | Trial: step 64's parallel intern again, on step 63's code (see its section) | pending | | | |
+| 66 | Step 64's parallel intern again, on step 63's code (see its section) | run-33959bbbe488 | 0.0873 | 42.1 | 79.6 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1814,7 +1814,7 @@ table. This step keeps the packing and step 61's hash, to tell on the board whic
 the time. Locally, on battery, the packing alone measured −1.6% to −2.4% against step 61 over eight
 `ab.py` rounds (step 62's section). Gate: 510 pass, 0 fail. S 877 → 901 (static_axes).
 
-## Step 66 (trial): step 64's parallel intern again
+## Step 66: step 64's parallel intern again
 
 Step 64's one board run, run-bb4ed7d47695 (93.4 ms), came in a run where A, C and D read 1.5–3.4%
 above their best, so it did not show whether the change pays on the box. Re-measured today on
@@ -1822,8 +1822,9 @@ step 63's code (local, turbo off, `ab.py`, 41 interleaved runs): seed 1 median 9
 and, in a second session, 95.05 → 92.26 ms; seed 3 93.94 → 91.22 ms, −2.9%. Gate: 524 pass, 0
 fail, now with unseen full seeds 51–54. S 901 → 961 (`static_axes`). The first push meant to carry
 it, 9c3eb3c, lost the source file to a reset of the working tree before the commit and carried
-step 65's code instead, so this is its first board trial since step 64. It is kept only if its
-board runs beat step 63's 90.6, 91.1 and 92.9 ms.
+step 65's code instead, so this is its first board trial since step 64. It was to be kept only if its
+board runs beat step 63's 90.6, 91.1 and 92.9 ms. Its run, run-33959bbbe488, read 87.3 ms, in a
+run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best run. Kept.
 
 ## Experiments that did not stay
 
@@ -2408,4 +2409,4 @@ board runs beat step 63's 90.6, 91.1 and 92.9 ms.
   step 63's 91.1 and 92.9 ms by more than their noise. Its run, run-bb4ed7d47695, read 93.4 ms,
   in a run where A, C and D read 1.5–3.4% above their best: no gain on the box against step 63,
   for 60 more lines. Reverted to step 63's code, whose next run, run-79b6065fa154, read 98.1 ms
-  in a slower run still (A 18.3, D 133.6 ms).
+  in a slower run still (A 18.3, D 133.6 ms). Step 66 tried it again and kept it.

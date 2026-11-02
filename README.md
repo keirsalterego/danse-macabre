@@ -7,7 +7,7 @@ its own performance log with the board run ID behind every change.
 | Track | What it does | Reference | This entry | Memory | Lines | Points |
 |---|---|---|---|---|---|---|
 | [A: Ingest](track-a/) | log to hourly percentiles | 32.05 s | **16.6 ms** | 16.9 MB | 344 | 87.6 |
-| [B: Index](track-b/) | 50k boolean and phrase queries | 56.35 s | **90.6 ms** | 41.8 MB | 901 | 79.4 |
+| [B: Index](track-b/) | 50k boolean and phrase queries | 56.35 s | **87.3 ms** | 42.1 MB | 961 | 79.6 |
 | [C: Join](track-c/) | hostile CSV to country aggregates | 14.44 s | **19.4 ms** | 11.4 MB | 348 | 83.1 |
 | [D: Traverse](track-d/) | 2k shortest paths on 5M edges | 72.69 s | **118.4 ms** | 65.7 MB | 424 | 73.6 |
 

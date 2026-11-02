@@ -6,12 +6,12 @@ expression evaluated strictly left to right, or an exact phrase.
 
 | | Reference | This entry |
 |---|---|---|
-| Time, full dataset, seed 1 | 56.35 s | **90.6 ms** |
-| Peak memory | 2,200 MB | **41.8 MB** |
-| Code lines | 91 | 901 |
-| Board points | 0 | **79.4** |
+| Time, full dataset, seed 1 | 56.35 s | **87.3 ms** |
+| Peak memory | 2,200 MB | **42.1 MB** |
+| Code lines | 91 | 961 |
+| Board points | 0 | **79.6** |
 
-About 620× the reference's speed. Every step, with the board run ID that measured it, is in
+About 645× the reference's speed. Every step, with the board run ID that measured it, is in
 [PERF.md](PERF.md).
 
 ## Approach
@@ -81,8 +81,8 @@ The pass costs about 113 instructions per token, and 49% of the cycles sit in th
 that consumes each line's probe list (PERF.md, after step 63). The time is spread thin: no source
 line holds more than 5.8% of the cycles. A third of the branch misses are the tokenizer's loop
 exit, once per 64-byte block, which no history predicts, and the start leaves about 6 ms of the 12
-CPUs idle; step 64 parallelised its largest piece for 2.9% locally and nothing on the board. The
-fastest B entries on the board run 64-68 ms, two of them in Rust, so the next 24 hours would go to
+CPUs idle; step 66 parallelised its largest piece, 2.9% locally and 3.6% on the board. The
+fastest B entries on the board run 64-66 ms, two of them in Rust, so the next 24 hours would go to
 a second design rather than another step on this one: each query term's documents collected in
 the pass and the queries answered on those sets afterwards, instead of a check at every line end.
 Memory has nothing to give: the final code's runs use 41.8-42.2 MB, under the 44 MB cap, so a
