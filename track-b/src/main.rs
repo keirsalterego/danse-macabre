@@ -38,6 +38,9 @@
 
 // The AVX2 intrinsics of `classify` and `Check::matches`, and the prefetch of `prefetch`.
 use std::{arch::asm, arch::x86_64::*, fs::File, io::Write, os::fd::AsRawFd, path::Path, thread};
+// The atomics through which every thread interns its query terms ([`TermTable::intern`]).
+use std::sync::atomic::Ordering::{Acquire, Release};
+use std::sync::{OnceLock, atomic::AtomicU32, atomic::AtomicU64, atomic::Ordering::Relaxed};
 
 /// The first `1 / SAMPLE_SHARE` of the corpus is tokenized up front to estimate how rare each
 /// query term is.
@@ -107,26 +110,7 @@ fn answer_all(query_text: &[u8], docs: &'static [u8]) -> Result<Vec<Vec<u8>>, St
         return Err("docs.txt: the last line has no LF (spec §2.1)".into());
     }
     let threads = thread::available_parallelism().map_or(1, usize::from);
-    let parts = parse_queries(query_text, threads)?;
-    // While this thread interns the terms, a thread per four CPUs reads a share of the corpus, a
-    // byte per 64 KiB, the span that a fault on a cached file page maps, so that the pass takes
-    // no faults on it. More of them would share this thread's core (PERF.md, step 60).
-    let helpers = threads / 4;
-    for part in docs.chunks(docs.len() / helpers.max(1) + 1).take(helpers) {
-        thread::spawn(move || part.iter().step_by(1 << 16).fold(0, |x, &b| x ^ b));
-    }
-    // One thread gives each distinct term its id, in file order.
-    let occurrences = parts.iter().map(|part| part.terms.len()).sum();
-    let (mut queries, mut terms) = (Queries::default(), TermTable::new(occurrences));
-    queries.at.push(0);
-    for part in parts {
-        // A part's `at` counts from its own first term.
-        let base = queries.terms.len() as u32;
-        (queries.at).extend(part.at[1..].iter().map(|&at| base + at));
-        queries.phrase.extend(part.phrase);
-        queries.ops.extend(part.ops);
-        (queries.terms).extend((0..part.terms.len()).map(|i| terms.intern(&part.terms, i)));
-    }
+    let (mut queries, terms) = parse_queries(query_text, threads)?;
     // The plan is never freed: the process exits once the output is written ([`main`]), and the
     // exit unmaps its blocks faster than freeing did (PERF.md, step 38); the chunks, below.
     let plan = std::mem::ManuallyDrop::new(Plan::new(&mut queries, terms, docs, threads));
@@ -217,12 +201,45 @@ impl Queries {
     }
 }
 
-/// Parses `queries.txt` (grammar in spec §2.3), every thread a share of the lines, in order;
-/// [`answer_all`] then gives each distinct term its id.
-fn parse_queries(text: &[u8], threads: usize) -> Result<Vec<Queries<Key>>, String> {
-    let bounds = line_bounds(text, threads);
-    let parts = parallel(threads, &|i| parse_lines(&text[bounds[i]..bounds[i + 1]]));
-    parts.into_iter().collect()
+/// Parses `queries.txt` (grammar in spec §2.3) and gives each distinct term its id. Every other
+/// thread parses a share of the lines and then interns its terms ([`TermTable::intern`]), while
+/// this one counts the terms and sets up the table they go into.
+fn parse_queries(text: &[u8], threads: usize) -> Result<(Queries, TermTable), String> {
+    let parsers = threads.max(2) - 1;
+    let (bounds, table) = (line_bounds(text, parsers), OnceLock::new());
+    let next = AtomicU32::new(1);
+    let parts = thread::scope(|s| {
+        let parse = |i: usize| {
+            let (text, table, next) = (&text[bounds[i]..bounds[i + 1]], &table, &next);
+            s.spawn(move || {
+                let part = parse_lines(text)?;
+                let ids = TermTable::intern(table.wait(), &part.terms, next);
+                // The keys go back to the system here, on each thread, rather than on this one.
+                Ok::<_, String>((part.phrase, part.at, part.ops, ids))
+            })
+        };
+        let parts: Vec<_> = (0..parsers).map(parse).collect();
+        // A term follows every space but those before an operator, the only capitals after one. A
+        // line that does not parse stops the parse, so the table holds every term interned.
+        let pairs = text.iter().zip(&text[1.min(text.len())..]);
+        let terms = pairs.map(|(&a, b)| u32::from(a == b' ' && !b.is_ascii_uppercase()));
+        let _ = table.set(TermTable::new(terms.sum::<u32>() as usize, parsers));
+        let join = |t: thread::ScopedJoinHandle<_>| t.join().expect("a panic aborts the process");
+        parts.into_iter().map(join).collect::<Result<Vec<_>, _>>()
+    })?;
+    let mut table = table.into_inner().expect("set above");
+    table.lens.truncate(next.into_inner() as usize);
+    let mut queries = Queries::default();
+    queries.at.push(0);
+    for (phrase, at, ops, terms) in parts {
+        // A part's `at` counts from its own first term.
+        let base = queries.terms.len() as u32;
+        (queries.at).extend(at[1..].iter().map(|&at| base + at));
+        queries.phrase.extend(phrase);
+        queries.ops.extend(ops);
+        queries.terms.extend(terms);
+    }
+    Ok((queries, table))
 }
 
 /// Parses whole lines of `queries.txt`.
@@ -306,7 +323,8 @@ impl Plan {
     /// terms keep a bitset and the others an id list ([`DENSE_SHARE`]). A term absent from
     /// the corpus never fires and keeps an empty list, so its queries see it as the empty
     /// set, with no special case.
-    fn new(queries: &mut Queries, mut terms: TermTable, docs: &[u8], threads: usize) -> Self {
+    fn new(queries: &mut Queries, terms: TermTable, docs: &'static [u8], threads: usize) -> Self {
+        let mut terms = terms;
         let (hits, sampled) = sample_hits(docs, &terms, threads);
         // A bitset takes a bit per document and a list 16 bits per document holding the term.
         let common = |t: u32| hits[t as usize] as usize * DENSE_SHARE >= sampled.max(1);
@@ -368,6 +386,14 @@ impl Plan {
         // the table, which takes as long.
         thread::scope(|s| {
             let grouping = s.spawn(|| {
+                // While the plan's tail keeps three threads busy, two thirds of the threads read
+                // a share of the corpus each, a byte per 64 KiB, the span that a fault on a
+                // cached file page maps, so that the pass takes no faults on it (PERF.md, steps
+                // 60 and 64).
+                let helpers = threads * 2 / 3;
+                for part in docs.chunks(docs.len() / helpers.max(1) + 1).take(helpers) {
+                    thread::spawn(move || part.iter().step_by(1 << 16).fold(0, |x, &b| x ^ b));
+                }
                 // SAFETY: an all-zero check is a valid one.
                 let grouped = unsafe { huge(checks.iter().map(Vec::len).sum()) };
                 (group_into(n, &checks, grouped), grouped)
@@ -1277,8 +1303,10 @@ fn fold(window: &[u8; MAX_TERM], neg: usize) -> Key {
 }
 
 /// One slot of a [`TermTable`]: a term's first 12 bytes, its id and what the corpus pass does
-/// with it, 16 bytes that one load brings in.
+/// with it, 16 bytes that one load brings in. In this order: [`TermTable::intern`] takes `tail` and
+/// `flags` as one word.
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct Slot {
     /// `key[0]`, the term's first 8 bytes; 0 marks an empty slot, as a term's first byte is
     /// never zero.
@@ -1365,12 +1393,15 @@ impl TermTable {
     /// are distinct terms, that is 262,144 slots, at most 29% full.
     ///
     /// The slots sit on huge pages of their own ([`huge`]), as the pass reads them at random.
-    fn new(occurrences: usize) -> Self {
+    /// `threads` intern into it at once, each taking blocks of 64 ids ([`TermTable::intern`]).
+    fn new(occurrences: usize, threads: usize) -> Self {
+        // Id 0, an id per distinct term, and the unused rest of a block per thread.
+        let ids = occurrences + 64 * threads + 1;
         // A term id times 32 fits in `Slot::flags`.
-        assert!(occurrences < 1 << 27, "queries.txt: too many terms");
+        assert!(ids < 1 << 27, "queries.txt: too many terms");
         // 2 slots or more, so that the shift in [`TermTable::home`] stays below 64.
         let len = (occurrences * 3 / 2 + 1).next_power_of_two().max(2);
-        let (lens, keys) = (vec![0], vec![[0; MAX_TERM / 8]; occurrences + 1]);
+        let (lens, keys) = (vec![0; ids], vec![[0; MAX_TERM / 8]; ids]);
         // Only the few long terms' keys are written (13 on seed 1), each a page of its own, which
         // under THP `always` might instead fault in a whole huge page.
         let page = (keys.as_ptr().cast::<u8>()).wrapping_sub(keys.as_ptr().addr() % 4096);
@@ -1480,30 +1511,75 @@ impl TermTable {
         at
     }
 
-    /// The id of the term `keys[i]`. A new term takes the next id and the free slot where its
-    /// probe ends. The home slot of `keys[i + 16]` starts loading meanwhile, so that its probe
-    /// seldom waits.
-    fn intern(&mut self, keys: &[Key], i: usize) -> u32 {
-        keys.get(i + 16).map(|ahead| self.prefetch(ahead));
-        let (key, home) = (keys[i], self.home(&keys[i]));
-        // SAFETY: a home slot is below the slot count.
-        let at = unsafe { self.position(&key, home) };
-        // No branch on whether the term is new, which follows no pattern: the slot is written
-        // and the length pushed either way, and the length dropped again unless the term is new.
-        let (new, n) = (self.slots[at].head == 0, self.lens.len());
-        let id = std::hint::select_unpredictable(new, n as u32, self.slots[at].id());
-        // A term met again keeps its `MORE`; a new one's slot was empty.
-        let more = self.slots[at].flags & Slot::MORE;
-        let (head, tail, flags) = (key[0], Slot::tail(&key), id << 5 | more);
-        self.slots[at] = Slot { head, tail, flags };
-        self.slots[home].flags |= u32::from(at != home || key[1] >> 32 != 0) * Slot::MORE;
-        // A key's length is its count of nonzero bytes.
-        (self.lens).push(key.iter().map(|w| 8 - w.leading_zeros() as u8 / 8).sum());
-        self.lens.truncate(n + usize::from(new));
-        // Only a new term longer than 12 bytes keeps its key; every other key goes to entry 0,
-        // which no probe reads, so that no branch is taken.
-        self.keys[usize::from(new && key[1] >> 32 != 0) * id as usize] = key;
-        id
+    /// The ids of `keys`, while other threads intern theirs into the table at once. A new term
+    /// claims the empty slot where its probe ends by a compare-and-swap of its `head`, writes the
+    /// rest of the slot, its length and, past 12 bytes, its key, and then publishes its id in the
+    /// slot's `flags`, which a probe that finds the same `head` waits for. Its id comes from a
+    /// block of 64 that the thread takes from `next`, as one id at a time would move that
+    /// counter's cache line between the cores at every new term. Ids thus follow no file
+    /// order, and the unused rest of each thread's last block is no term's: a length of 0, never
+    /// in a query or a slot. The home slot of `keys[i + 16]` starts loading meanwhile, so that its
+    /// probe seldom waits.
+    fn intern(&self, keys: &[Key], next: &AtomicU32) -> Vec<u32> {
+        let (mask, mut ids, slots) = (self.slots.len() - 1, 0..0, self.slots.as_ptr().cast_mut());
+        let (lens, long) = (self.lens.as_ptr().cast_mut(), self.keys.as_ptr().cast_mut());
+        // A slot as two words, its `head` and its `tail` with its `flags` above ([`Slot`]). While
+        // the threads intern, they read and write the slots only through these atomics, and a
+        // term's length and key are written before its id is published (Release) and read after
+        // it is seen (Acquire).
+        // SAFETY: `at` is below the slot count, and a slot is 16 bytes aligned to 8.
+        let atomic = |at: usize| unsafe { &*slots.add(at).cast::<[AtomicU64; 2]>() };
+        let id = |i: usize| {
+            keys.get(i + 16).map(|ahead| self.prefetch(ahead));
+            let (key, home) = (&keys[i], self.home(&keys[i]));
+            let mut at = home;
+            let id = loop {
+                let [head, rest] = atomic(at);
+                let mut found = head.load(Relaxed);
+                if found == 0 {
+                    found = head
+                        .compare_exchange(0, key[0], Relaxed, Relaxed)
+                        .err()
+                        .unwrap_or(0);
+                }
+                if found == 0 {
+                    if ids.is_empty() {
+                        let start = next.fetch_add(64, Relaxed);
+                        ids = start..start + 64;
+                    }
+                    let id = ids.next().expect("a block holds 64 ids");
+                    // A key's length is its count of nonzero bytes.
+                    let len = key.iter().map(|w| 8 - w.leading_zeros() as u8 / 8).sum();
+                    // SAFETY: as above; `id` is below the id count ([`TermTable::new`]), the
+                    // length of `lens` and `keys`.
+                    unsafe {
+                        *lens.add(id as usize) = len;
+                        if key[1] >> 32 != 0 {
+                            *long.add(id as usize) = *key;
+                        }
+                    }
+                    rest.fetch_or(u64::from(Slot::tail(key)) | u64::from(id) << 37, Release);
+                    break id;
+                }
+                let mut seen = rest.load(Acquire);
+                while found == key[0] && seen >> 37 == 0 {
+                    std::hint::spin_loop();
+                    seen = rest.load(Acquire);
+                }
+                // The slot from its two words: `head`, then `tail` with `flags` above it.
+                let (head, tail, flags) = (found, seen as u32, (seen >> 32) as u32);
+                if self.holds(&Slot { head, tail, flags }, key) {
+                    break (seen >> 37) as u32;
+                }
+                at = (at + 1) & mask;
+            };
+            let more = &atomic(home)[1];
+            if (at != home || key[1] >> 32 != 0) && more.load(Relaxed) & 1 << 36 == 0 {
+                more.fetch_or(u64::from(Slot::MORE) << 32, Relaxed);
+            }
+            id
+        };
+        (0..keys.len()).map(id).collect()
     }
 
     /// Whether `slot` holds `key`. No `&&`: whether a token is a query term follows no pattern,
