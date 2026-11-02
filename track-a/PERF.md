@@ -9,6 +9,19 @@ Every step I kept cites the live-board run that measured it. Numbers marked loca
 | S (lines) | 56 | 344 |
 | Points | 0 | 87.6, 87.3 |
 
+## Checking the headline
+
+Points are 50 · log10 K, where K = (Tref/T)^0.5 · min(Mref/M, 50)^0.2 · min(Sref/S, 1)^0.15 · (Dref/D)^0.15. For run-3c87f8c35a0b: (32.05 / 0.01655)^0.5 = 44.01, (228 / 16.9)^0.2 = 1.683, (56 / 344)^0.15 = 0.762, and the dependency factor is 1 because there are no crates. That makes K = 56.4, and 50 · log10 56.4 = 87.6, the board's number.
+
+## What didn't work
+
+- PGO (under step 41). A profile trained on seeds 2 to 4 cut instructions from 690 to 662 M and still made the run slower: 20.27 → 20.54 ms median on seed 1, and slower on seed 10 too, which it never saw.
+- Handing out pieces from a shared counter instead of one chunk per thread. The median went 30.68 → 31.54 ms with 16 pieces per thread and 33.78 ms with 64. It only helped on battery power, when some threads started 4 to 8 ms late.
+
+## How I worked
+
+Nothing went to the board before it beat the old version locally in interleaved runs and passed all 320 cases of my gate. Lines cost points too: past the reference's 56, every 10% fewer lines is worth about as much as 3% less time, so I weighed each change's length against its speed before keeping it.
+
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |

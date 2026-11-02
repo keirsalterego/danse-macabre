@@ -9,6 +9,19 @@ Kept steps cite the board run that measured them. Local numbers come from my i7-
 | S (lines) | 108 | 348 |
 | Points | 0 | 83.1, 83.1, 82.9 |
 
+## Checking the headline
+
+Points are 50 · log10 K, where K = (Tref/T)^0.5 · min(Mref/M, 50)^0.2 · min(Sref/S, 1)^0.15 · (Dref/D)^0.15. For run-a66fe96b626a: (14.44 / 0.019337)^0.5 = 27.33, (367 / 11.29)^0.2 = 2.006, (108 / 348)^0.15 = 0.839, and 1 for the dependencies. K = 46.0, and 50 · log10 46.0 = 83.1.
+
+## What didn't work
+
+- PGO (under step 27). Same instructions, 1.535 G, but cycles went 0.841 → 0.875 G and the median 36.35 → 37.71 ms on seed 1.
+- Keeping the empty name out of the mailboxes. Its owner gets 11% more letters than the others, but not posting them measured the same (37.33 against 37.16 ms), and keeping one bit per country for it in the batch loop cost 2.2 to 2.3 ms.
+
+## How I worked
+
+The biggest early lesson was memory accounting. Turning transparent huge pages off in step 3 took the peak from 39.0 to 15.47 MB, because the box backs half-used regions with whole 2 MB pages and memory.peak counts all of them. After that I checked memory.peak on every change as well as time, and every push first passed all 320 cases of my gate.
+
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 14.44 | 367 | 0 |

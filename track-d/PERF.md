@@ -9,6 +9,19 @@ Every kept step names its board run. A number marked local is from my laptop (i7
 | S (lines) | 43 | 424 |
 | Points | 0 | 73.6, 73.3 |
 
+## Checking the headline
+
+Points are 50 · log10 K, where K = (Tref/T)^0.5 · min(Mref/M, 50)^0.2 · min(Sref/S, 1)^0.15 · (Dref/D)^0.15. For run-4e0f7e6bd2df: (72.69 / 0.118391)^0.5 = 24.78, (893 / 65.69)^0.2 = 1.685, (43 / 424)^0.15 = 0.709, and 1 for the dependencies. K = 29.6, and 50 · log10 29.6 = 73.58.
+
+## What didn't work
+
+- Relabeling nodes in BFS order (on step 7). Queries got faster, 93.8 → 84.8 ms, but computing the order took 80 ms and permuting the graph another 52 ms.
+- Transparent huge pages off. 227 to 240 ms against 211 to 230 ms. The CSR was already mostly on huge pages, and its random reads miss the TLB more on 4 KB pages. Track C went the other way: turning them off took its peak from 39.0 to 15.47 MB.
+
+## How I worked
+
+D was my insurance track. I planned it small, so that one failed hash elsewhere would still leave three scored tracks, and Sref is only 43 here, which makes every line expensive. That's why steps 8, 14, 15 and 18 only remove lines. Every push passed all 522 cases of my gate first.
+
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 72.69 | 893 | 0 |

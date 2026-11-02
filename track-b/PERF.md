@@ -9,6 +9,20 @@ Each kept step has the board run that measured it. Anything marked local was tim
 | S (lines) | 91 | 961 |
 | Points | 0 | 79.6 |
 
+## Checking the headline
+
+Points are 50 · log10 K, where K = (Tref/T)^0.5 · min(Mref/M, 50)^0.2 · min(Sref/S, 1)^0.15 · (Dref/D)^0.15. For run-33959bbbe488: (56.35 / 0.08732)^0.5 = 25.40. Memory is 2,200 / 42.13 = 52.2 times smaller, past the cap of 50, so that factor is 50^0.2 = 2.187. Lines give (91 / 961)^0.15 = 0.702, and with no crates the last factor is 1. K = 39.0, and 50 · log10 39.0 = 79.56.
+
+## What didn't work
+
+- PGO (under step 31). 161.21 → 168.09 ms median on seed 1, and slower on seed 10, which the profile never saw.
+- Step 64. Its one board run read 93.4 ms (run-bb4ed7d47695), in a run where A, C and D also read 1.5 to 3.4% above their best, and I reverted it. Measured again locally it was 2.9% faster, so it went back as step 66 and gave my best B run, 87.3 ms.
+- A redesign on the last morning. Before rebuilding B, I measured the most each idea could save (after step 66): an L2-sized term table at most 8.9%, a batched line end about 5%, and starting the pass during planning at most 6 ms. None reached the 10% that would show through the board's noise, so I kept this design.
+
+## How I worked
+
+Every push passed all 524 cases of my gate first, and a change stayed only if the board agreed with my local interleaved runs. When the two disagreed, I measured again before deciding, which is the step 64 story above.
+
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 56.35 | 2200 | 0 |
