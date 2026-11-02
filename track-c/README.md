@@ -10,12 +10,12 @@ has to match the reference byte for byte anyway.
 
 | | Reference | This entry |
 |---|---|---|
-| Time, full dataset, seed 1 | 14.44 s | **19.4 ms** |
-| Peak memory | 367 MB | **11.4 MB** |
+| Time, full dataset, seed 1 | 14.44 s | **19.3 ms** |
+| Peak memory | 367 MB | **11.3 MB** |
 | Code lines | 108 | 348 |
 | Board points | 0 | **83.1** |
 
-About 740× the reference's speed. Every step, with the board run ID that measured it, is in
+About 745× the reference's speed. Every step, with the board run ID that measured it, is in
 [PERF.md](PERF.md).
 
 ## Approach
@@ -75,7 +75,7 @@ cd track-c && cargo build --release --offline
 
 The probe loop and the barrier waits are what is left. Names and notes are hashed still escaped,
 which is exact but touches every byte twice when a note is long; a fast path for the common case
-of an unquoted, unescaped field would shorten the parse. Memory is 11.4 MB against a 7.3 MB cap,
+of an unquoted, unescaped field would shorten the parse. Memory is 11.3 MB against a 7.3 MB cap,
 so the name sets and the mailbox pages are the two places where another megabyte would pay. Twelve
 workers is 7% faster locally but loses about 4 points on one board run in five when the box is
 busy; a cheap in-process contention check that falls back to eleven workers would keep the fast
