@@ -1814,6 +1814,29 @@ the time. Locally, on battery, the packing alone measured −1.6% to −2.4% aga
 
 ## Experiments that did not stay
 
+- **After step 63, where the time goes, measured for three redesigns** (local, turbo off, on AC,
+  seed 1, step 63's binary). The question was whether a larger change could make B 10% faster
+  locally, the least a board trial would need to show through the box's noise (steps 62 and 64).
+  - `perf stat -r 5`: 104.2 ms ±5.7%, 4,111 M instructions, 2,355 M cycles (1.75 per cycle),
+    10.8 M branch misses, 9.09 M loads that missed L2 (0.25 per token of the 36.3 M), 0.38 M
+    that missed L3, 0.33 M page walks. Top-down: retiring 52.9%, bad speculation 14.7 (branch
+    mispredicts 13.2), back end 19.3 (memory 8.9, core 10.4), front end 13.1.
+  - Sampled on the event itself: 87% of the L2 misses fall in the scanning loop's line end. Of
+    the branch misses, 36% are one branch, the tokenizer's `while line != 0`: it exits once per
+    block, after as many ends as the block's text holds, so no history predicts it. The probe's
+    two tests (`find_from`, `position`) take 15%; the rest spread over the line end's loops,
+    none above 3%. Cycles by source line: none above 5.8%.
+  - A timeline from 5 kHz samples (the `profiling` build): the scan starts at 15.3 ms. The first
+    16 ms hold 603 samples where 12 busy CPUs would give 960, idle time worth about 6 ms of the
+    scan on all 12 CPUs, which then runs to 93 ms.
+  - The three redesigns, each against the share it could remove: a term table small enough for
+    L2, at most the 8.9% memory share; a line end batched by the kind of term, already the
+    branch-free token loop of steps 41-47, its remaining misses loop exits whose counts follow
+    the text, about 5% at most; the scan started during the plan, at most the 6 ms idle.
+    Step 64's parallel intern is the largest piece of the last one, re-measured today with
+    `ab.py`, 41 interleaved runs: seed 1 median 94.76 → 92.01 ms, seed 3 93.94 → 91.22 ms, −2.9%.
+    No combination came near 10%, so none was built.
+
 - **After step 62, the tokenizer's hash constant** (seed 1, `perf stat -r 5`, interleaved, two
   rounds). The multiply's 64-bit constant takes a register, so the tokenizer reloads its block's
   address from the stack per token. Freeing it:
