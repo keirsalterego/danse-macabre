@@ -2257,6 +2257,19 @@ Measured and not kept:
   step 41's code), so that their CPUs are awake when the exit kills their threads: `ab.py`, 41
   interleaved runs, 23.37 → 23.35 ms; the output was written at 21.33 against 21.27 ms.
 
+- **Memory charged ahead per CPU, measured after step 54** (local, not built). The kernel charges
+  a cgroup for anonymous and kernel pages in batches of 64 pages per CPU, and memory.peak counts
+  the part of each batch not yet used. A test program in which threads, each on a CPU of its
+  own, touch pages and then wait at a barrier (memory.peak in a fresh scope, 5 runs, KiB): one
+  thread touching 1,536 pages, 7,364–7,952; twelve threads touching 128 each, the same 6 MiB,
+  9,660–10,440; twelve threads touching one page each, 4,516–4,808, against 1,992–2,704 touching
+  none. On step 54, sampling the cgroup's memory.stat during the run (6 runs): peak 10.13–10.62
+  MiB, of which anonymous 6.80–7.08 MiB (name sets about 4.6, mailbox pages 1.1, the region table
+  0.95), kernel 0.66–0.82 MiB (page tables 0.35–0.50), and about 2.4 MiB charged ahead on the
+  twelve CPUs. Only workers that never fault a page avoid it: one CPU would have to fault in
+  about 7 MiB for all of them before they start, about 0.5 to 1 ms that every run waits for, on
+  stacks of their own that the standard library's threads cannot be given. Not built.
+
 ## Profile notes
 
 - Knockouts on v1 (E-cores, cycles:u, a noisier run with v1 at 3.08 G): no name table 1.02 G, no
