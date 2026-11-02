@@ -1,6 +1,6 @@
 # Track C: performance log
 
-Each kept step cites the live-board run that measured it. Numbers marked local come from a laptop (i7-13620H, turbo off) and compare two versions run side by side; changes that were measured and not kept are listed under the step they were tried after.
+Kept steps cite the board run that measured them. Local numbers come from my i7-13620H laptop with turbo off, comparing two versions side by side, and whatever I measured and dropped is listed under the step it followed.
 
 | | Reference (step 0) | Final code (step 54), three board runs |
 |---|---|---|
@@ -67,8 +67,8 @@ Each kept step cites the live-board run that measured it. Numbers marked local c
 | 53 | A worker on every CPU again, as in step 50: final scoring runs each batch with nothing else on the box, so step 51's spare CPU only cost time | run-f9622a221638 | 0.0195 | 11.2 | 83.0 |
 | 54 | 9 fewer lines at the same speed: the name set's probe tests a hit in one closure and takes its tag and group as bytes of the hash, a long name is told by a `let`-`else`, the slow quote scan carries its parity into bit 0, the name's quote counts are not named, the group's byte is written through its word, the mailboxes are leaked, and `main` reads the data directory where it maps the files | run-dc3871163ade | 0.0194 | 11.4 | 83.1 |
 
-Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
-which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
+Local numbers are for full seed 1. "P-cores" means CPUs 0 to 11 with all 12 threads and turbo off,
+which matches the box within about 7%. "E-cores" means CPUs 12 to 15. They have no hyperthreads, so
 they overstate any change that hides memory stalls (see the batching experiment below).
 
 ## Step 1: v1
@@ -107,7 +107,7 @@ THP is "always" on this machine, and the board's 39.3 MB for step 1 is the local
 (37.5 MiB), so the box is likely the same. To find the extra memory, an instrumented copy read the
 cgroup's memory.current and memory.stat at each phase boundary on P-cores. When the workers
 finished, memory.current was 14.8 MiB (anon 12.7, 6.0 of it huge pages), yet memory.peak was
-37.1–37.8 MiB, so 22 MiB existed only for moments inside the worker phase. `/proc/self/smaps` put
+37.1 to 37.8 MiB, so 22 MiB existed only for moments inside the worker phase. `/proc/self/smaps` put
 the 6 MB of huge pages in the mapping that holds the slots and the arena. On 4 E-cores at most 4
 threads fault at once, so the peak there is only about 18 MiB, which is why the first measurements
 missed it.
@@ -146,24 +146,24 @@ P-cores, `perf stat -r 10`, three interleaved rounds:
 
 On the board this code measured 110.1 ms in run-e05eb5fa2929 and 111.3 ms in run-a133933027d0.
 
-S 415 → 402, and memory.peak is unchanged at 14.8–15.4 MiB. Because the old value is now used,
+S 415 → 402, and memory.peak is unchanged at 14.8 to 15.4 MiB. Because the old value is now used,
 the OR compiles to a `lock cmpxchg` loop instead of `lock or`. LLVM can emit `lock bts` for this
 pattern, but only if the optimizer has not already rewritten the bit test, which it had here. The
 loop did not show in task-clock.
 
 ## Step 5: regions parsed in one pass
 
-Profiled alone on a P-core, the old parse of `regions.csv` (200k rows, 2.2 MB) took 10.1–10.5 ms,
+Profiled alone on a P-core, the old parse of `regions.csv` (200k rows, 2.2 MB) took 10.1 to 10.5 ms,
 all before any other thread starts. It made two passes, and each one split the rows at LF
-(1.4–1.6 ms) and then parsed each row (3.5–4 ms), with a search for the comma, a validation loop
+(1.4 to 1.6 ms) and then parsed each row (3.5 to 4 ms), with a search for the comma, a validation loop
 per field and a fold per field.
 
 Region ids ascend (spec §2.3), so the last row's id now sizes the array up front and one pass is
 enough. That pass stores each region's country code and marks the countries present, and once the
 countries are numbered, one walk over the array swaps each code for its group. A row parses as
 digits up to the comma, followed by a fixed `,XYZ` and LF that one slice pattern checks, so the
-row's end comes out of the parse without a separate search. Alone, the new parse takes 2.9–3.1 ms:
-2.5–2.7 ms for the rows, 0.5–0.6 ms for the walk over the 1M-entry array and 0.03 ms to number the
+row's end comes out of the parse without a separate search. Alone, the new parse takes 2.9 to 3.1 ms:
+2.5 to 2.7 ms for the rows, 0.5 to 0.6 ms for the walk over the 1M-entry array and 0.03 ms to number the
 countries.
 
 P-cores, `perf stat -r 10`, three interleaved rounds:
@@ -173,7 +173,7 @@ P-cores, `perf stat -r 10`, three interleaved rounds:
 | task-clock (ms) | 1144 / 1149 / 1164 | 1144 / 1150 / 1145 |
 | elapsed (ms) | 116.8 / 113.1 / 114.1 | 105.6 / 106.7 / 108.3 |
 
-S 402 → 416, and memory.peak is unchanged at 15.0–15.1 MiB. The parse is now stricter outside
+S 402 → 416, and memory.peak is unchanged at 15.0 to 15.1 MiB. The parse is now stricter outside
 the spec: a blank line, a last row without its LF, or an id larger than the last row's returns an
 error, where the old parse accepted them.
 
@@ -184,16 +184,16 @@ inlined into it, 17% in `text_field`, 4.6% in the quote pre-pass and 0.2% in the
 Knockouts of step 5 then split the worker loop (P-cores, `perf stat`, each knockout beside its
 baseline in the same session):
 
-- Without the name table a run takes 557 ms of task-clock and 58–59 ms elapsed, against
-  1129–1142 ms and 106–118 ms. Without the region lookup as well, 553 ms and 56–57 ms. The scan
+- Without the name table a run takes 557 ms of task-clock and 58 to 59 ms elapsed, against
+  1129 to 1142 ms and 106 to 118 ms. Without the region lookup as well, 553 ms and 56 to 57 ms. The scan
   is half the time, the name table the other half, and the region lookup about 2%.
 - Hashing each name and loading its slot costs 0.1 G cycles: 1.39 G against 1.29 G for the scan
   alone. Finding the arena entry, comparing the name and setting the bit cost 0.92 G more when
   the slot is loaded right after the name. The entry adds 2.7 L2 misses per record and 3.8 M page
   walks, which are active in 7% of all cycles, since the arena has had 4 KB pages since step 3.
-- The atomic OR costs 7% of task-clock: 1059–1089 ms when the bitset word is only read, against
-  1146–1166 ms with the OR. It also moves lines between cores: 1.37 M loads are served from
-  another core's cache, against 0.28 M without it. Testing the bit before the OR (1172–1199 ms)
+- The atomic OR costs 7% of task-clock: 1059 to 1089 ms when the bitset word is only read, against
+  1146 to 1166 ms with the OR. It also moves lines between cores: 1.37 M loads are served from
+  another core's cache, against 0.28 M without it. Testing the bit before the OR (1172 to 1199 ms)
   saves nothing, because 90% of records set a new bit.
 
 Names and notes are 37 of a record's 60 bytes on average, and the old `text_field` stepped
@@ -212,7 +212,7 @@ P-cores, `perf stat -r 10`, three interleaved rounds:
 | cycles:u (G) | 2.58 / 2.55 / 2.54 | 2.27 / 2.22 / 2.17 |
 | elapsed (ms) | 110.6 / 105.6 / 108.9 | 94.7 / 95.2 / 93.1 |
 
-S 416 → 426, and memory.peak is unchanged, 14.7–15.0 MiB. On the board this code measured
+S 416 → 426, and memory.peak is unchanged, 14.7 to 15.0 MiB. On the board this code measured
 92.0 ms in run-599ba20d6eb1, at commit 2f88e04, which carries the same track C code.
 
 ## Step 7: each name's slot loaded as soon as the name is scanned
@@ -239,7 +239,7 @@ P-cores, `perf stat -r 10`, three interleaved rounds:
 | elapsed (ms) | 97.8 / 99.2 / 99.7 | 89.6 / 91.1 / 87.4 |
 
 Instructions barely move, 2.035 → 2.046 G. S 426 → 432, and memory.peak in the container with
-the harness's flags is unchanged, 14.8–15.0 MiB. On the board this code measured 79.9 ms in
+the harness's flags is unchanged, 14.8 to 15.0 MiB. On the board this code measured 79.9 ms in
 run-7b03d961ed16, at commit ce4de64, which carries the same track C code. The board skipped
 b9cb846 itself when a newer push replaced it in its queue.
 
@@ -285,13 +285,13 @@ Step 7 → step 8 on P-cores, three interleaved rounds:
 | branch misses (M) | 9.06 | 5.10 |
 
 S 432 → 447: 13 lines for the word parse and 2 for the attributes. memory.peak in the container
-with the harness's flags is unchanged, 14.7–14.8 MiB against 14.8–15.2 MiB for step 7.
+with the harness's flags is unchanged, 14.7 to 14.8 MiB against 14.8 to 15.2 MiB for step 7.
 
 ## Step 9: each distinct name owned by one thread
 
 Steps 2 to 7 tuned one name table that all threads shared, and it still cost about half the
 time. With all name hashing, posting and marking knocked out of the prototype below, the rest ran
-in 42.6 ms (local, median of 11), against 85–88 ms for step 7 in the sessions around it. In
+in 42.6 ms (local, median of 11), against 85 to 88 ms for step 7 in the sessions around it. In
 step 7 each record's lookup missed the cache on a line that other cores also wrote, and set its
 bit with a `lock cmpxchg` loop.
 
@@ -314,7 +314,7 @@ meet at a barrier. After it, each worker marks the letters posted to it in its o
   list.
 - `mallopt(M_MMAP_THRESHOLD, 64 KiB)` runs at startup, and each table reserves room for twice
   its expected names (pages that are never written are never charged). A build without either
-  peaked at 19.8–20.2 MiB. Freeing the regions parse's 2 MB scratch array had raised glibc's
+  peaked at 19.8 to 20.2 MiB. Freeing the regions parse's 2 MB scratch array had raised glibc's
   dynamic mmap threshold to 2 MB, so the tables came from malloc arenas and grew there by
   copying, and the old copies stayed resident.
 
@@ -346,9 +346,9 @@ and barriers stay). So marking cost about
 | elapsed (ms) | 87.7 | 71.8 | 64.2 | 42.6 |
 
 Phases of stage 4, from an instrumented copy that logged timestamps per thread: each worker
-spends 31.5–32.1 ms parsing and posting, 4.5–5.5 ms waiting at 257 barriers (parking 18–21
-times), and 10.2–11.0 ms marking. A wait takes 4–6 µs at the median, 13–21 µs at p90 and
-330–380 µs at p99. Of the marking, reading the letters takes 2.44 ms per worker and finding
+spends 31.5 to 32.1 ms parsing and posting, 4.5 to 5.5 ms waiting at 257 barriers (parking 18 to 21
+times), and 10.2 to 11.0 ms marking. A wait takes 4 to 6 µs at the median, 13 to 21 µs at p90 and
+330 to 380 µs at p99. Of the marking, reading the letters takes 2.44 ms per worker and finding
 their slots 0.09 ms more (2.53 ms in all), against 10.79 ms in full. The entries cost 69
 instructions, 87 cycles and 1.01 L2 misses per letter on top of reading it.
 
@@ -365,10 +365,10 @@ Step 9 is that prototype on top of step 8. P-cores, three interleaved rounds:
 
 Over 21 interleaved runs, the wall-time medians are 80.71 ms for step 8 (min 75.40) and 52.77 ms
 for step 9 (min 51.65), with the stage-5 prototype on step 7 at 59.54 ms in the same session.
-With the private tables, THP no longer changes the peak: 13.80–14.18 MiB with the `prctl` and
-13.76–14.28 MiB without it (4 runs each), so the call stays only as insurance. S 447 → 587.
+With the private tables, THP no longer changes the peak: 13.80 to 14.18 MiB with the `prctl` and
+13.76 to 14.28 MiB without it (4 runs each), so the call stays only as insurance. S 447 → 587.
 
-Correctness checks: the gate (307 pass, 0 fail); fresh seeds 5–7; full seeds 2 and 3 at 1 and
+Correctness checks: the gate (307 pass, 0 fail); fresh seeds 5 to 7; full seeds 2 and 3 at 1 and
 64 threads; and the 400 random cases plus two long-name sets against the reference, at 1, 3,
 12, 37 and 64 threads, and again with 100-byte rounds and 3-letter mailboxes at 1, 2, 3, 12
 and 64 threads, which forces thousands of rounds and early round ends. The long-name sets hold
@@ -378,10 +378,10 @@ twins, `""` escapes at the 8-byte word edges, and quoted and unquoted spellings 
 ## Step 10: guessed run starts, and the input released by the workers
 
 This step goes after the time outside the worker loop. A timeline of step 8 (P-cores, an
-instrumented copy) put the regions parse at 3.1–3.3 ms, the quote pre-pass at 6.4–6.7 ms, the
-workers at 62–68 ms, the merge at 0.7–1.0 ms and the write at 0.05 ms. When the process
+instrumented copy) put the regions parse at 3.1 to 3.3 ms, the quote pre-pass at 6.4 to 6.7 ms, the
+workers at 62 to 68 ms, the merge at 0.7 to 1.0 ms and the write at 0.05 ms. When the process
 exits, the kernel unmaps the 200 MB input on one thread: an explicit `munmap` took 2.8 ms, and
-the time from the program's last timestamp to the end of the wall was 4.5–5.1 ms (medians of
+the time from the program's last timestamp to the end of the wall was 4.5 to 5.1 ms (medians of
 40 runs, two sessions).
 
 1. **Each worker releases its own run.** After the last round, every worker calls
@@ -420,19 +420,19 @@ Both on top of step 9, P-cores, wall time of interleaved runs (`ab.py`), median 
 | session 2, 60 runs each, order reversed | 53.61 / 51.49 | 52.25 / 49.96 | 48.88 / 46.51 | 47.81 / 45.48 |
 | session 3, 60 runs each | 54.04 / 51.19 | | | 47.88 / 45.73 |
 
-The release saves 1.1–1.5 ms and the guesses 4.4–5.0 ms; together 5.5–6.3 ms. In the quietest
+The release saves 1.1 to 1.5 ms and the guesses 4.4 to 5.0 ms; together 5.5 to 6.3 ms. In the quietest
 `perf stat -r 10` round, task-clock was 501.4 ms for step 9, 511.3 with the release, 490.4 with
 the guesses and 501.6 with both. Page faults stay at 6,675: the workers now fault the input in
 as they parse it.
 
 memory.peak in the container with the harness's flags and 12 CPUs, 12 alternating runs each:
-13.3–14.3 MiB (mean 13.99) for step 9 and 13.9–14.6 MiB (mean 14.16) for step 10. S 587 → 630:
+13.3 to 14.3 MiB (mean 13.99) for step 9 and 13.9 to 14.6 MiB (mean 14.16) for step 10. S 587 → 630:
 10 lines for the release and 33 for the guesses, their check and the tail.
 
 Correctness checks:
 
 - The gate (307 pass, 0 fail). Every guess held on all 300 tiny seeds at 1, 3, 12, 37 and 64
-  threads, and on full seeds 1–7 at 1, 12 and 64 threads.
+  threads, and on full seeds 1 to 7 at 1, 12 and 64 threads.
 - The 400 random cases, and 400 hostile ones against the reference at 1, 3, 12 and 64 threads
   with 64-, 200- and 1,000-byte tails. The hostile cases put into names and notes what §2.1
   allows and §2.2 rules out: LFs followed by digits or BOMs, whole fake records, CRLFs, dots and
@@ -467,7 +467,7 @@ On top of step 10, P-cores, wall time of interleaved runs (`ab.py`), median / mi
 | session 2, quieter | 46.44 / 45.60 | 43.17 / 42.58 |
 
 memory.peak in the container with the harness's flags, 8 runs each: median 13.84 MiB
-(13.35–14.01) for step 10 and 12.39 MiB (11.78–12.73) for step 11. S 630 → 622.
+(13.35 to 14.01) for step 10 and 12.39 MiB (11.78 to 12.73) for step 11. S 630 → 622.
 
 Correctness checks: the gate (307 pass, 0 fail); the 402 random cases at the default thread
 count and at 1, 3, 12, 37 and 64 threads; tiny rounds (100-byte rounds, 3-letter mailboxes) at
@@ -502,10 +502,10 @@ in ms. "Lines only" is items 2 to 4 without item 1.
 | session 1 | 43.17 / 41.87 | 43.36 / 41.91 | 40.47 / 39.71 |
 | session 2 | 43.09 / 41.83 | | 40.57 / 39.68 |
 
-memory.peak in the container with the harness's flags, 6 runs each: 12.7–13.3 MB for step 11
-and 12.5–13.5 MB for step 12. Page faults stay at 6,390. S 622 → 563: the pre-pass −23 lines,
-the tail −27 (−40 there, +13 for the mapping and its constants), `Group::EMPTY` −4, the output
-walk −5.
+memory.peak in the container with the harness's flags, 6 runs each: 12.7 to 13.3 MB for step 11
+and 12.5 to 13.5 MB for step 12. Page faults stay at 6,390. S 622 → 563: the pre-pass -23 lines,
+the tail -27 (-40 there, +13 for the mapping and its constants), `Group::EMPTY` -4, the output
+walk -5.
 
 Correctness checks: the gate (307 pass, 0 fail); full seeds 1 to 4 against the reference; the
 400 random and 400 hostile cases at the default thread count and at 1, 3, 12, 37 and 64 threads,
@@ -519,7 +519,7 @@ offsets that are record starts tiled and gave the same output.
 Line cuts in the region table, the exchange and the name set, checked against the machine code:
 the parse loop compiles to the same instructions as step 12's; only the barrier's spin loop and
 the order of one bit test in `NameSet::read` changed. Three cuts that changed the hot loop's
-code were put back: each cost 0.15–0.3 ms. `ab.py`, 50 interleaved runs, median / min: step 12
+code were put back: each cost 0.15 to 0.3 ms. `ab.py`, 50 interleaved runs, median / min: step 12
 40.51 / 39.68 ms, step 13 40.77 / 39.62 ms. memory.peak, 6 runs: 11.68 MiB median, within the
 ±0.8 MiB of the per-CPU charge batching. S 563 → 545. Gate: 307 pass, 0 fail; the 402 random
 cases at 1, 3, 12, 37 and 64 threads and in the tiny-round build; the output hash is unchanged.
@@ -556,9 +556,9 @@ countries without records.
 
 Local, on top of step 13 (P-cores, a loaded machine, 151 interleaved runs, median / min):
 42.34 / 39.60 → 42.08 / 39.53 ms. `perf stat -r 10`, three interleaved rounds: instructions
-1.637 → 1.549 G (−5.4%), cycles and task-clock flat, page faults 6,390 in both. Merged with
+1.637 → 1.549 G (-5.4%), cycles and task-clock flat, page faults 6,390 in both. Merged with
 step 14, S 534 → 523, and 522 after inlining the single-use `KEY` constant, which leaves the machine code
-identical. Gate: 307 pass, 0 fail; full seeds 1–7; the 400 random and 400 hostile
+identical. Gate: 307 pass, 0 fail; full seeds 1 to 7; the 400 random and 400 hostile
 cases at 1, 3, 12, 37 and 64 threads; the forced-cut test on 490,079 offsets of 72 files.
 
 ## Step 16: the region lookup prefetched, four records at a time
@@ -577,13 +577,13 @@ the reorder buffer the way the load did.
 
 On top of step 15, P-cores, wall time of interleaved runs (`ab.py`, 151 runs each), median /
 min: 41.09 / 40.07 → 39.85 / 38.96 ms. `perf stat -r 10`, three interleaved rounds: cycles
-0.953–0.958 → 0.919–0.920 G (−3.7%), task-clock 425–427 → 411–412 ms, instructions 1.550 →
-1.655 G, page faults 6,390 in both. In 101-run sessions, batches of 3 and 4 measured −2.8%, 2
-−1.2%, 6 −1.8% and 16 −1.9%, and the batch of 4 without the prefetch +1.3%. S 522 → 534.
+0.953 to 0.958 → 0.919 to 0.920 G (-3.7%), task-clock 425 to 427 → 411 to 412 ms, instructions 1.550 →
+1.655 G, page faults 6,390 in both. In 101-run sessions, batches of 3 and 4 measured -2.8%, 2
+-1.2%, 6 -1.8% and 16 -1.9%, and the batch of 4 without the prefetch +1.3%. S 522 → 534.
 
 Variants that did not stay, against step 15 in the same sessions:
 - The prefetch alone, with the lookup where it was: flat (41.05 against 41.07 ms).
-- Each record's lookup one record late instead of in batches: −0.8% to −1.1%. The record carried
+- Each record's lookup one record late instead of in batches: -0.8% to -1.1%. The record carried
   past the next parse spilled to the stack, 20 more instructions per record.
 - The batch as a `Vec` in the record loop: +1.9%.
 - A non-temporal prefetch of the input 1 KiB ahead, to keep it out of L2: +2.2%.
@@ -630,8 +630,8 @@ and a name's entry is always one 64-byte line. S 534 → 323.
   39.43 / 38.07 and 39.96 / 38.59 → 39.55 / 38.31 ms; 60 runs on seed 1, 39.92 / 38.77 →
   39.26 / 37.92 ms; 60 runs on seed 3, 40.02 / 38.19 → 39.49 / 38.35 ms.
 - memory.peak: 60 alternating rounds, medians 11.890 → 11.880 MiB; a 6-round sample in another
-  session, 12.17–12.94 → 12.27–13.86 MB.
-- Correctness: the gate, 307 pass, 0 fail; full seeds 1–7 give the reference hashes; the 402
+  session, 12.17 to 12.94 → 12.27 to 13.86 MB.
+- Correctness: the gate, 307 pass, 0 fail; full seeds 1 to 7 give the reference hashes; the 402
   fuzz cases pass at 1, 3, 12, 37 and 64 threads and with 100-byte rounds at 1, 2, 3, 12 and 64;
   the 300 tiny seeds pass at 10 thread counts with 100-byte rounds; the image built offline and
   run with the harness's sandbox flags gives seed 1's hash. Of step 11's region sets, the one
@@ -694,7 +694,7 @@ S 312 → 295. `ab.py` against step 22, 101 interleaved runs, medians / minimums
 seed 1, 39.28 / 38.21 → 39.07 / 38.24 and 39.25 / 38.01 → 39.16 / 38.17 ms; seed 3,
 39.18 / 38.19 → 39.04 / 37.78 and 39.08 / 38.21 → 38.90 / 38.04 ms. memory.peak, 40
 alternating rounds: medians 11.950 → 11.930 MiB, means 12.024 → 11.915 MiB. Correctness: the
-gate, 307 pass, 0 fail; full seeds 1–7 give the reference hashes; the 402 fuzz cases pass at the
+gate, 307 pass, 0 fail; full seeds 1 to 7 give the reference hashes; the 402 fuzz cases pass at the
 default thread count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12
 and 64; the 300 tiny seeds pass at 10 thread counts with 100-byte rounds; clippy reports no
 warnings.
@@ -706,7 +706,7 @@ changes, with `map_file` now inlined into the closure, and `NameSet::read` moves
 the binary, onto a 32-byte boundary instead of a 64-byte one. S 295 → 294. `ab.py` against
 step 23, interleaved, medians / minimums: 101 runs on seed 1, 39.30 / 38.16 → 39.31 / 38.34 ms;
 101 runs on seed 2, 39.24 / 37.95 → 39.21 / 38.06 ms; 61 runs on seed 3, 39.08 / 38.17 →
-39.09 / 38.15 ms. Correctness: the gate, 307 pass, 0 fail; full seeds 1–7 give the reference
+39.09 / 38.15 ms. Correctness: the gate, 307 pass, 0 fail; full seeds 1 to 7 give the reference
 hashes; the fuzz cases, the tiny seeds and the region sets give step 23's results; a missing
 input directory still stops with the file's path in the error.
 
@@ -730,7 +730,7 @@ Two cuts in the record loop on step 24:
 on a build that differed only in the type of the window, 39.23 / 38.56 → 37.33 / 36.55 ms and
 39.40 / 38.48 → 37.45 / 36.82 ms. memory.peak, 17 alternating rounds: medians 12.63 → 12.77 MB,
 means 12.84 → 12.69 MB, the same within this machine's spread. Correctness: the gate, 310 pass,
-0 fail; full seeds 1–7 and 10–12 give the reference hashes; the 402 fuzz cases pass at the
+0 fail; full seeds 1 to 7 and 10 to 12 give the reference hashes; the 402 fuzz cases pass at the
 default thread count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12
 and 64, where that build now asserts that no worker's index runs past its mailbox; the 300 tiny
 seeds pass at 10 thread counts with 100-byte rounds; of step 11's region sets, the one with
@@ -755,8 +755,8 @@ keys match.
 37.20 / 36.45 → 36.76 / 35.92 ms and 37.52 / 36.37 → 36.69 / 35.94 ms; on a build whose
 `same_text` named the two slices through a closure, 37.39 / 36.66 → 36.48 / 35.80 ms and
 37.30 / 36.54 → 36.81 / 35.71 ms. memory.peak, 10 alternating rounds: medians 12.37 → 12.59 MB,
-means 12.49 → 12.69 MB, inside this machine's spread of 12.1–13.6 MB for both. Correctness: the
-gate, 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes; the 402 fuzz cases,
+means 12.49 → 12.69 MB, inside this machine's spread of 12.1 to 13.6 MB for both. Correctness: the
+gate, 310 pass, 0 fail; full seeds 1 to 7 and 10 to 12 give the reference hashes; the 402 fuzz cases,
 two of them sets of long names, pass at the default thread count, at 1, 3, 12, 37 and 64
 threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300 tiny seeds pass at 10 thread
 counts with 100-byte rounds; the region sets give step 25's results; clippy reports no
@@ -799,8 +799,8 @@ interleaved runs, medians / minimums: 36.45 / 35.38 → 33.79 / 33.13 ms and
 36.99 / 35.75 → 34.41 / 33.43 and 36.39 / 35.77 → 34.16 / 33.44 ms. memory.peak, alternating
 rounds: against step 27 (8 rounds) medians 12.82 → 12.89 MB, means 12.98 → 12.77 MB; against
 step 26 (10 rounds) medians 13.54 → 12.51 MB, means 13.18 → 12.72 MB; all inside this
-machine's spread of 11.7–14.0 MB, and no allocation changed. Correctness: the gate, 310 pass,
-0 fail; full seeds 1–7 and 10–12 give the reference hashes; the 402 fuzz cases pass at the
+machine's spread of 11.7 to 14.0 MB, and no allocation changed. Correctness: the gate, 310 pass,
+0 fail; full seeds 1 to 7 and 10 to 12 give the reference hashes; the 402 fuzz cases pass at the
 default thread count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12
 and 64; the 300 tiny seeds pass at 10 thread counts with 100-byte rounds; the region sets give
 step 27's results; clippy reports no warnings.
@@ -822,12 +822,12 @@ medians / minimums: 35.09 / 33.13 → 34.21 / 32.56 ms and 35.18 / 33.29 → 34.
 same source without `#[cold]` against with it, 34.76 / 32.85 → 34.70 / 32.43 ms and
 34.63 / 32.79 → 33.90 / 32.35 ms; on step 27, against step 27, 36.35 / 35.53 → 35.91 / 35.09 ms
 and 36.33 / 35.53 → 35.81 / 35.07 ms. memory.peak, on step 27, 10 seeds × 11 alternating
-rounds: the per-seed medians move by +0.07 MB on average (−0.48 to +0.85 MB), inside this
+rounds: the per-seed medians move by +0.07 MB on average (-0.48 to +0.85 MB), inside this
 machine's spread, and no allocation changed. Correctness: the gate, 310 pass, 0 fail; full
-seeds 1–7 and 10–12 give the reference hashes; the 400 fuzz cases pass at the default thread
+seeds 1 to 7 and 10 to 12 give the reference hashes; the 400 fuzz cases pass at the default thread
 count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300
 tiny seeds pass at 1, 3, 12 and 64 threads with 100-byte rounds; 40 generated sets of names
-pass at 1–4 CPUs; clippy reports no warnings.
+pass at 1 to 4 CPUs; clippy reports no warnings.
 
 ## Step 30: 5 fewer lines
 
@@ -859,7 +859,7 @@ same errors as before.
 Dropped: `format_output` building each line with one `format!` and collecting the lines, 3
 lines. With no `write!` into a `Vec<u8>` left, the binary loses the drop glue of `io::Write`'s
 adapter, which sits in front of the worker, so the worker's code moves by 16 bytes; on step 28
-that build measured 0.26–0.52 ms slower than the same build without it, in three rounds. Also
+that build measured 0.26 to 0.52 ms slower than the same build without it, in three rounds. Also
 dropped: the rehash's probe as one `find` over `hash..`, 2 lines, which clippy's
 `maybe_infinite_iter` flags.
 
@@ -889,9 +889,9 @@ P-cores, twice: 1.442 / 1.443 → 1.415 / 1.417 G. `ab.py` against step 31, whic
 binary, 101 interleaved runs, medians / minimums: 33.50 / 32.31 → 33.05 / 32.07 ms and 33.59 /
 32.60 → 33.17 / 32.50 ms. The worker's code stays where it was; only `NameSet` and `same_text`
 change. S 307 → 309. No allocation changed. Correctness: the gate, 310 pass, 0 fail; full seeds
-1–7 and 10–12 give the reference hashes; the 400 fuzz cases pass at the default thread count, at
+1 to 7 and 10 to 12 give the reference hashes; the 400 fuzz cases pass at the default thread count, at
 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300 tiny seeds
-pass at 1, 3, 12 and 64 threads with 100-byte rounds; 40 generated sets of names pass at 1–4
+pass at 1, 3, 12 and 64 threads with 100-byte rounds; 40 generated sets of names pass at 1 to 4
 CPUs; clippy reports no warnings.
 
 Dropped, by instructions on one E-core against this step's 1402.29 M: the key compare as an OR
@@ -905,18 +905,18 @@ Step 32 built the region table on a pool of its own before the join: each thread
 of one share of `regions.csv`, then the main thread numbered the codes from the lists and wrote
 the array, and only then started the join's threads. On an instrumented copy of step 32 (local,
 P-cores, ms after `main` began), the region threads ran from 0.41 to 0.97, the numbering ended
-at 1.51 and the array's writes at 2.35, and the join's workers started at 2.45–2.63. Now the
+at 1.51 and the array's writes at 2.35, and the join's workers started at 2.45 to 2.63. Now the
 join's workers build the table before their rounds, with no lists, in two steps that end at the
 barrier the rounds use, which moved into `barrier`. In the first, each worker reads its share of
 the rows (`region_rows`) and ORs a bit per country code into a shared set of 26³ bits. In the
 second, every worker numbers the codes from the bits, in index order as the serial pass did, and
 reads its rows again to write each id's group. With a timestamp at the start of each worker's
-rounds, the rounds began 1.33–1.70 ms after `main` began, against 2.44–3.73 ms for step 32
+rounds, the rounds began 1.33 to 1.70 ms after `main` began, against 2.44 to 3.73 ms for step 32
 (4 runs each). The name sets are no longer freed, either: each worker's `munmap` calls stopped
 the other workers for a TLB flush, and the exit unmaps the pages anyway.
 
 Mapped in by every worker, the array's pages raised memory.peak by 1.1 MiB, 13.04 against 11.91
-MiB (medians, 24 alternating runs), and by 0.6–1.4 MiB on each of full seeds 1–7 and 10–12
+MiB (medians, 24 alternating runs), and by 0.6 to 1.4 MiB on each of full seeds 1 to 7 and 10 to 12
 (3 runs each), though `smaps` at exit showed less anonymous memory than step 32's. memcg charges
 a CPU 64 pages at a time and keeps the rest of the batch for that CPU's next pages, and
 memory.peak counts the whole batch. At the end of the rounds memory.current exceeded `anon` +
@@ -932,7 +932,7 @@ groups are made, which reuse its pages: 0.23 MiB less `anon`.
 `ab.py` against step 32, 50 interleaved runs, two rounds, medians / minimums: 32.60 / 31.98 →
 31.58 / 30.87 ms and 33.04 / 32.17 → 31.82 / 31.01 ms. instructions:u on one E-core: 1402.29 →
 1403.90 M, the rows now read twice. S 309 → 319. Correctness: the gate, 310 pass, 0 fail; full
-seeds 1–7 and 10–12 give the reference hashes; the 400 fuzz cases pass at the default thread
+seeds 1 to 7 and 10 to 12 give the reference hashes; the 400 fuzz cases pass at the default thread
 count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300
 tiny seeds pass at 1, 2, 3, 5, 7, 12, 16, 23, 37 and 64 threads with 100-byte rounds; clippy
 reports no warnings.
@@ -957,34 +957,34 @@ bounds checks a few percent each. The cuts, each measured as instructions:u and 
   shifted so that the stop lands in byte 7 minus the decimals for every length, and the bytes
   below it move up over it, so the same three multiplies give the cents. §2.2 bounds the amount
   at 99,999.99, so its digits and its dot fit in one word; a longer one takes the byte loop,
-  which reads the decimals too. −0.4% instructions, −1.3% cycles.
+  which reads the decimals too. -0.4% instructions, -1.3% cycles.
 - **The batch made once per worker** instead of zeroed for every batch: with the amount,
-  −0.8% / −2.5%.
+  -0.8% / -2.5%.
 - **`sent[to]` read once.** The four stores of a letter made the compiler load it again for
   each, with a bounds check. On step 32's code this measured slower (see the experiments below);
-  on top of the amount it measured −4.7% / −3.3%, and borrowing the letter's slot once instead,
-  `&boxes[sent[to]]`, −4.3% / −2.9%.
+  on top of the amount it measured -4.7% / -3.3%, and borrowing the letter's slot once instead,
+  `&boxes[sent[to]]`, -4.3% / -2.9%.
 - **The BOM test from the id's word.** A record starts with a digit or a BOM, so the id is parsed
   first and parsed again from past the BOM when its first byte is 0xEF, which the id's word
-  already holds: no load and no bounds check for the test. On top of the amount, −2.7% / −2.7%.
-  The four together: −7.4% / −5.1 to −5.8% (three sessions).
+  already holds: no load and no bounds check for the test. On top of the amount, -2.7% / -2.7%.
+  The four together: -7.4% / -5.1 to -5.8% (three sessions).
 - **The stop as the first byte below `0`.** Subtracting `0` from every byte replaces the XOR with
   the stop: every stop, `,` or `.`, lies below `0`, and the difference already holds each digit's
-  value, so an id and a region id need no mask. On top of the four: −10.8% / −7.4 to −8.0%.
+  value, so an id and a region id need no mask. On top of the four: -10.8% / -7.4 to -8.0%.
 - **The input prefetched 448 bytes ahead** of each record. PEBS `mem_load_retired.l1_miss` on a
   `profiling` build put 10.1 M L1 misses on a run: 73% on the name set (its slots 27%, the key
   compare 26%, the group's distinct count 20%), 18% on the groups' merge and 7% on the input
   (the quote masks' 64-byte loads and the number words). With the prefetch, L1 misses 10.11 →
-  9.39 M, instructions +0.5% and cycles −1.1% (40 interleaved runs); 384 bytes ahead, −1.0%.
+  9.39 M, instructions +0.5% and cycles -1.1% (40 interleaved runs); 384 bytes ahead, -1.0%.
 
 On AC power again (profile `performance`, turbo off), `ab.py`, 41 interleaved runs, two
 rounds: medians 32.26 and 32.15 → 29.84 and 29.81 ms, minimums 31.34 and 31.29 → 29.13 and
 28.96 ms, 7.1 to 7.5% faster. The counters were measured on battery power before that (local,
-P-cores): `perf stat`, 40 interleaved runs, two rounds, instructions:u 1418.0 → 1271.2 M (−10.4%),
-cycles:u medians 768.5 → 703.0 M and 764.2 → 699.1 M (−8.5%), minimums 758.3 → 694.4 M and
+P-cores): `perf stat`, 40 interleaved runs, two rounds, instructions:u 1418.0 → 1271.2 M (-10.4%),
+cycles:u medians 768.5 → 703.0 M and 764.2 → 699.1 M (-8.5%), minimums 758.3 → 694.4 M and
 754.6 → 694.1 M. memory.peak, 30 alternating runs: medians 12.01 → 11.96 MiB, the highest of 5
 by resampling 12.52 → 12.37 MiB. S 319 → 326. Correctness: the gate, 310 pass, 0 fail; full seeds
-1–7 and 10–12 give the reference hashes; the 400 fuzz cases and the two long-name sets pass at
+1 to 7 and 10 to 12 give the reference hashes; the 400 fuzz cases and the two long-name sets pass at
 the default thread count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12
 and 64; the 300 tiny seeds pass at 1, 2, 3, 5, 7, 12, 16, 23, 37 and 64 threads with 100-byte
 rounds; clippy reports no warnings. The board's run, run-91b80b654f7a, measured 26.9 ms and
@@ -997,15 +997,15 @@ instructions than the misses' cycles, which the hyperthread sibling partly hides
 
 Dropped, on battery power, `perf stat`, 20 interleaved runs against the code before them:
 - Each letter posted right after its name, so that its four words were not held across the note
-  and the numbers: instructions −2.7%, but cycles +2.0%, and backend-bound slots 22.0 → 26.6%.
-- The batch holding a reference to the letter's last word instead of its slot: −0.2%
+  and the numbers: instructions -2.7%, but cycles +2.0%, and backend-bound slots 22.0 → 26.6%.
+- The batch holding a reference to the letter's last word instead of its slot: -0.2%
   instructions, +1.0% cycles.
 - The owner count in a local, instead of the captured thread count: +0.3% instructions, cycles
   within noise.
 - A zero byte past the region table, so that the lookup takes `min` instead of `get`: +1.3%
   instructions, +1.8% cycles.
 - Distinct names counted in a dense array per worker, 2 KiB, instead of in the groups, whose
-  lines took 20% of the L1 misses in the marking loop: −1.1% instructions, cycles within noise.
+  lines took 20% of the L1 misses in the marking loop: -1.1% instructions, cycles within noise.
 
 ## Step 35: 65 fewer instructions per record
 
@@ -1021,37 +1021,37 @@ interleaved runs, two rounds, medians, P-cores):
   comma and the dot, one `pshufb`, with a control picked by their places, right-aligns both
   numbers' digits with the dot dropped, and three multiply-adds give both values at once. Fields
   past those bounds that §2.1 still allows take two number parses, as before. `number` loses its
-  decimals, which only the amount used. Instructions −9.0%, cycles −5.2 to −5.7% (two sessions);
-  `ab.py` −5.2% and −5.3%.
+  decimals, which only the amount used. Instructions -9.0%, cycles -5.2 to -5.7% (two sessions);
+  `ab.py` -5.2% and -5.3%.
 - **A CRC32 name hash** instead of `FxHash`: one `crc32` per word and no fold, and its 32 bits
-  depend on every word. −3.5% / −1.7%, with branch misses the same (2.91 → 2.92 M), so the names
-  spread over the slots as well; `ab.py` −1.2% / −1.4%.
+  depend on every word. -3.5% / -1.7%, with branch misses the same (2.91 → 2.92 M), so the names
+  spread over the slots as well; `ab.py` -1.2% / -1.4%.
 - **The name set's key in one AVX2 register**, from one load and one AND of the letter, compared
   with an XOR and `vptest` against the first 32 bytes of the entry. The cold insert and the
   long-name compare take the key as a vector too: when they took four words, the probe stored
-  every letter's key to the stack for them (+1.2% instructions, +1.0% cycles). −2.7% / −1.4%;
-  `ab.py` −1.0% / −1.7%.
+  every letter's key to the stack for them (+1.2% instructions, +1.0% cycles). -2.7% / -1.4%;
+  `ab.py` -1.0% / -1.7%.
 - **`sent[to]` without its bounds check.** `to` is a 32-bit hash times the thread count, shifted
-  down by 32, so it is below the thread count. −1.7% / +0.1%, `ab.py` −0.2% / +0.1%; but on the
+  down by 32, so it is below the thread count. -1.7% / +0.1%, `ab.py` -0.2% / +0.1%; but on the
   final code, putting the check back cost 2.2% more instructions and 1.4% more cycles, so it stays.
 - **The name and the note from one mask of the 64 bytes at the name.** The prefix XOR of the
   quote mask, one carry-less multiply by all ones as in simdjson, marks the bytes inside quotes;
   the first two commas outside end the two fields, and a field's length is its raw length less
   half its quotes. There is no branch per quote, where `text_field` walked the quotes one by one
   and mispredicted on escaped ones. The 2.2% of records whose note ends past the window take a
-  loop over 64-byte blocks that carries the parity from block to block. −2.0% / −2.6%, branch
-  misses 2.89 → 1.89 M, branches 136.8 → 107.1 M; `ab.py` −2.4% / −2.3%.
+  loop over 64-byte blocks that carries the parity from block to block. -2.0% / -2.6%, branch
+  misses 2.89 → 1.89 M, branches 136.8 → 107.1 M; `ab.py` -2.4% / -2.3%.
 - **The `pshufb` controls 16-byte aligned**, as vectors, so that none straddles two cache lines:
-  cycles −0.2%, `ab.py` within noise.
+  cycles -0.2%, `ab.py` within noise.
 
 On AC power (profile `performance`, turbo off), `ab.py`, 41 interleaved runs, two rounds, against
 step 34: medians 29.66 and 29.46 → 26.72 and 26.50 ms, minimums 28.66 and 28.72 → 25.73 and 25.69
-ms, 9.9 to 10.6% faster. `perf stat`, 20 interleaved runs: instructions:u 1272.1 → 1055.2 M (−17.0%,
-383 → 318 per record), cycles:u 684.4 → 601.9 M (−12.0%). memory.peak, 30 alternating runs, two
+ms, 9.9 to 10.6% faster. `perf stat`, 20 interleaved runs: instructions:u 1272.1 → 1055.2 M (-17.0%,
+383 → 318 per record), cycles:u 684.4 → 601.9 M (-12.0%). memory.peak, 30 alternating runs, two
 rounds: medians 12.00 → 12.19 MiB and 12.05 → 12.17 MiB, the highest of 5 by resampling 12.29 →
 12.54 MiB and 12.41 → 12.67 MiB. S 326 → 387: the step adds 61 lines, kept down by one glob import
 for the intrinsics and by the loss of `text_field` and `quotes`. Correctness: the gate, 310 pass, 0
-fail; full seeds 1–7 and 10–12 give the reference hashes; the 400 fuzz cases and the two long-name
+fail; full seeds 1 to 7 and 10 to 12 give the reference hashes; the 400 fuzz cases and the two long-name
 sets pass at the default thread count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at
 1, 2, 3, 12 and 64; the 300 tiny seeds pass at 1, 2, 3, 5, 7, 12, 16, 23, 37 and 64 threads with
 100-byte rounds; six generated files of edge cases (region ids of 1 to 8 digits against amounts of 1
@@ -1071,12 +1071,12 @@ noted:
 - The marking loop prefetching the slots and entries of the letters 8 or 16 ahead, two shapes:
   L1 misses 9.7 → 5.5 M and L2 misses 2.65 → 0.83 M per run, but instructions +8.6 to +9.0% and
   cycles +0.6 to +1.7%, and the marking took as long, so it does not wait on those misses.
-- The probe's slots read without bounds checks: instructions −0.3%, cycles +0.3%.
+- The probe's slots read without bounds checks: instructions -0.3%, cycles +0.3%.
 - The slow text path counting its quotes byte by byte, which takes fewer lines (on AC power, on
   the final code): instructions +1.3%, cycles +1.5%; 2% of the records is enough for that.
 
 The board's run, run-6252826712db, drew 25.2 ms against 27.2 ms for step 34's second run,
-run-835b63d0f252, and 26.9 ms for its first: −6 to −7%, less than the −10% measured here, while
+run-835b63d0f252, and 26.9 ms for its first: -6 to -7%, less than the -10% measured here, while
 the 61 more lines cost about as many points as 5% of T.
 
 ## Step 36: the batch's loads forwarded from its stores
@@ -1095,16 +1095,16 @@ merge. Three changes, none of which adds a line:
   `ab.py` +0.7%.
 - **The group as one byte.** The group went into the letter's last word with a load, an OR and a
   store. One byte store now writes byte 30, bits 48 to 55, which `name_letter` leaves 0. With the
-  new order, `ab.py` −0.2% to −1.1% against step 35 in six rounds.
+  new order, `ab.py` -0.2% to -1.1% against step 35 in six rounds.
 - **The letter by reference.** The batch holds a reference to the record's letter instead of its
   slot, so the group's store takes no second bounds check or address computation.
 
 On AC power, `ab.py`, 41 interleaved runs, two rounds, against step 35: medians 26.99 and 27.01
-→ 26.39 and 26.54 ms (−2.2% and −1.7%), minimums 26.24 and 26.13 → 25.89 and 25.92 ms; three
-earlier sessions of the same code measured −2.4%, −1.6% and −2.2%. `perf stat`, 20 interleaved
-runs: instructions:u 1055.2 → 1024.6 M (−2.9%, 318 → 309 per record), cycles:u 599.9 → 590.1 M
-(−1.6%). memory.peak, 15 alternating runs: medians 12.55 → 12.36 MiB. S 387 → 387. Correctness:
-the gate, 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes; the 400 fuzz
+→ 26.39 and 26.54 ms (-2.2% and -1.7%), minimums 26.24 and 26.13 → 25.89 and 25.92 ms; three
+earlier sessions of the same code measured -2.4%, -1.6% and -2.2%. `perf stat`, 20 interleaved
+runs: instructions:u 1055.2 → 1024.6 M (-2.9%, 318 → 309 per record), cycles:u 599.9 → 590.1 M
+(-1.6%). memory.peak, 15 alternating runs: medians 12.55 → 12.36 MiB. S 387 → 387. Correctness:
+the gate, 310 pass, 0 fail; full seeds 1 to 7 and 10 to 12 give the reference hashes; the 400 fuzz
 cases and the two long-name sets pass at the default thread count, at 1, 3, 12, 37 and 64
 threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300 tiny seeds pass at 1, 2, 3, 5,
 7, 12, 16, 23, 37 and 64 threads with 100-byte rounds; the six files of edge cases match the
@@ -1121,7 +1121,7 @@ its own, and each such pass is a likely miss.
 Dropped, against the code before them; `ab.py` on AC power, 41 interleaved runs, two rounds, and
 `perf stat`, 20 interleaved runs:
 - **The letter as one AVX2 vector**, from one 32-byte load and one AND, and posted with one
-  32-byte store, with its three words taken out of the vector for the hash: instructions −5.7%,
+  32-byte store, with its three words taken out of the vector for the hash: instructions -5.7%,
   but cycles +1.4% (on battery power) and `ab.py` +1.3% and +1.4%; with the group stored as one
   byte, +0.9% and +0.5%. Top-down: frontend latency 8.4 → 9.6 to 11.1% of the slots. Step 32's
   letter posted right after its name went the same way.
@@ -1130,7 +1130,7 @@ Dropped, against the code before them; `ab.py` on AC power, 41 interleaved runs,
 - **Non-temporal prefetches** (on battery power, `perf stat` only): of the input, cycles +4.7%; of
   the region table, +2.4%; of both, +7.2%.
 - **Batches of 6 and 8 records** instead of 4, on this step's code, three rounds: 6 0.0% to
-  +0.1%, 8 −0.1% to −0.7%. Batches of 3, before the byte store and the reference: +1.6% and
+  +0.1%, 8 -0.1% to -0.7%. Batches of 3, before the byte store and the reference: +1.6% and
   +1.8%.
 - **The distinct names counted from the bits after the last round** (not built): the marking's
   test and count are already one `bts` and one `sbb` on the group's count, and a pass over the
@@ -1148,20 +1148,20 @@ to its line:
   and the compiler compared it with the length of `groups` first, two instructions per record.
   The check can never fail, whatever the input: step 1 writes into `by_id` only the number of a
   code that occurs, which is below `group_count`, the length of `groups`, every other byte stays
-  0, and an id past the table maps to 0. Alone: instructions −0.66%, cycles −0.80%.
+  0, and an id past the table maps to 0. Alone: instructions -0.66%, cycles -0.80%.
 - **The thread count as `sent.len()`.** A letter goes to the thread given by its hash times the
   thread count, shifted down by 32. The worker's closure holds `threads` by reference, so the
   multiply waited on two loads, one after the other: the reference from the stack, then the count
   through it. `sent` holds one mailbox position per thread, so its length is the same count, and
   the multiply now reads it from the stack in one load. On top of the first change: instructions
-  −0.65%, cycles −0.47%.
+  -0.65%, cycles -0.47%.
 
 On AC power, `ab.py`, 41 interleaved runs, four rounds, against step 36: medians 26.35, 26.50,
-26.41 and 26.29 → 26.19, 26.30, 26.41 and 26.19 ms (−0.6%, −0.8%, 0.0% and −0.4%). Six earlier
-rounds of the same machine code, built before the comments were written, measured −0.2% to
-−1.0%. `perf stat`, 20 interleaved runs: instructions:u 1024.4 → 1011.1 M (−1.3%, 309 → 305 per
-record), cycles:u 586.2 → 581.3 M (−0.8%). memory.peak, 15 alternating runs: medians 12.36 →
-12.39 MiB. S 387 → 387. Correctness: the gate, 310 pass, 0 fail; full seeds 1–7 and 10–12 give
+26.41 and 26.29 → 26.19, 26.30, 26.41 and 26.19 ms (-0.6%, -0.8%, 0.0% and -0.4%). Six earlier
+rounds of the same machine code, built before the comments were written, measured -0.2% to
+-1.0%. `perf stat`, 20 interleaved runs: instructions:u 1024.4 → 1011.1 M (-1.3%, 309 → 305 per
+record), cycles:u 586.2 → 581.3 M (-0.8%). memory.peak, 15 alternating runs: medians 12.36 →
+12.39 MiB. S 387 → 387. Correctness: the gate, 310 pass, 0 fail; full seeds 1 to 7 and 10 to 12 give
 the reference hashes; the 400 fuzz cases and the two long-name sets pass at the default thread
 count, at 1, 3, 12, 37 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300
 tiny seeds pass at 1, 2, 3, 5, 7, 12, 16, 23, 37 and 64 threads with 100-byte rounds; the six
@@ -1178,15 +1178,15 @@ Dropped, against step 36 unless noted; `ab.py` on AC power, 41 interleaved runs,
   that the probe would not load the slots' address and length through `self` for every letter:
   instructions +1.1%, cycles +2.6%, `ab.py` +2.1% and +2.6%.
 - **The group unchecked in the marking too**, the distinct count after the barrier, which takes
-  one more line: instructions −1.0%, but cycles −0.6% and −0.8%, no better than the merge's
-  change alone, and in three rounds of `ab.py` with both, +0.3%, −0.2% and +1.0% against it.
+  one more line: instructions -1.0%, but cycles -0.6% and -0.8%, no better than the merge's
+  change alone, and in three rounds of `ab.py` with both, +0.3%, -0.2% and +1.0% against it.
 - **The id's word read unchecked** (`perf stat` only): with every read of `number` unchecked,
-  which is not sound, instructions −1.85% but cycles −0.45%, against the merge's change alone.
+  which is not sound, instructions -1.85% but cycles -0.45%, against the merge's change alone.
   Only the reads at a record's start can be shown in bounds for any input. The slow amount parse
   also calls `number`, from stops that a malformed last record can put at the end of the input,
   and keeping its check takes more lines.
 - **The letter made after the region id and the amount**, on top of both changes: instructions
-  −0.31%, cycles +0.42%.
+  -0.31%, cycles +0.42%.
 
 ## Step 38: the last worker writes the output, with no runtime setup
 
@@ -1216,11 +1216,11 @@ wait's return, the tail took 2,289 µs on step 35, 1,689 µs with the last worke
 freed (step 33).
 
 `ab.py` against step 37, 41 interleaved runs, four rounds: medians 26.09, 26.26, 26.37 and 26.10
-→ 25.66, 25.64, 25.69 and 25.57 ms (−1.6%, −2.4%, −2.6% and −2.0%). memory.peak does not move,
+→ 25.66, 25.64, 25.69 and 25.57 ms (-1.6%, -2.4%, -2.6% and -2.0%). memory.peak does not move,
 as every page goes back after the peak: in a user scope on the P-cores, 80 alternating runs,
 medians 12.31 → 12.33 MiB, and the highest of 5 runs by resampling 12.79 → 12.68 MiB; in the
 harness's container on the E-cores (4 threads), 50 alternating runs, 10.52 → 10.48 MiB. S 387 →
-391. Correctness: the gate, 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes;
+391. Correctness: the gate, 310 pass, 0 fail; full seeds 1 to 7 and 10 to 12 give the reference hashes;
 the 400 fuzz cases and the two long-name sets pass at the default thread count, at 1, 3, 12, 37
 and 64 threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300 tiny seeds pass at 1, 2,
 3, 5, 7, 12, 16, 23, 37 and 64 threads with 100-byte rounds; the six files of edge cases match the
@@ -1238,8 +1238,8 @@ all. `std::env::args` still works, because glibc hands the arguments to the stan
 initializer before `main`. A stack overflow now ends the process with SIGSEGV and no message, and
 SIGPIPE keeps its default action, which a program that writes one file never meets. The binary
 is 122 KiB smaller. `ab.py` against the change above alone, 41 interleaved runs, four rounds:
-25.66, 25.64, 25.69 and 25.57 → 25.36, 25.46, 25.44 and 25.37 ms (−1.2%, −0.7%, −1.0% and
-−0.8%), and against step 37 −2.8%, −3.0%, −3.5% and −2.8%. memory.peak: 12.33 → 12.23 MiB in the
+25.66, 25.64, 25.69 and 25.57 → 25.36, 25.46, 25.44 and 25.37 ms (-1.2%, -0.7%, -1.0% and
+-0.8%), and against step 37 -2.8%, -3.0%, -3.5% and -2.8%. memory.peak: 12.33 → 12.23 MiB in the
 user scope (80 runs; highest of 5, 12.68 → 12.73), 10.48 → 10.52 MiB in the container (50 runs).
 S 391 → 393. The same checks pass, with the same results.
 
@@ -1290,14 +1290,14 @@ holds:
 
 - **The name's 24 bytes.** `text_fields` has just read the 64 bytes from the name's field on, its
   first window, with a checked read, and the name starts there or one byte later, past its
-  quote, so `name_letter`'s 24 bytes lie in that window. 4 instructions per record (−1.3%).
+  quote, so `name_letter`'s 24 bytes lie in that window. 4 instructions per record (-1.3%).
 - **The region id's and the amount's 16 bytes.** `region_amount` reads from one past the comma
   that ends the note. A mask of commas finds only commas, and the 64 bytes of the pad are zeros,
   so that comma is a byte of the input, and the 16 bytes past it end inside the pad at the
-  latest. 5 instructions per record (−1.6%).
+  latest. 5 instructions per record (-1.6%).
 - **The byte after the cents**, the CR or the LF. `region_amount` puts the dot at most 13 bytes
   past the comma's next byte, and `region_amount_slow` at most at the pad's second byte, so the
-  byte 3 past the dot lies in the pad at the latest. 3 instructions per record (−1.0%).
+  byte 3 past the dot lies in the pad at the latest. 3 instructions per record (-1.0%).
 
 The check that stays is the window's: a last record with no comma after its id puts the id's
 stop on the pad's first byte, and the window from the byte after it would end one byte past the
@@ -1307,32 +1307,32 @@ Five smaller ones:
 
 - **A CR told from an LF by its lowest bit.** CR is 0x0D and LF 0x0A, and the byte after the
   cents is one of them or, after the last record, the pad's 0 (§2.1). One instruction per record
-  (−0.33%).
+  (-0.33%).
 - **The region id's length checked with one compare.** The fast path took region ids of 1 to 7
   digits as `comma.wrapping_sub(1) < 7`. An empty region id, which §2.2 rules out, now takes it
   too and parses as 0, as it does in the slow path, so `comma < 8` is enough. One instruction per
-  record (−0.34%).
+  record (-0.34%).
 - **The quotes counted with `bzhi`.** The quotes before a comma were counted as `quotes & ((1 <<
   i) - 1)`. The compiler does not know that `i` is below 64, so it masked the count first;
-  `_bzhi_u64` takes any count. 2 instructions per record (−0.63%).
+  `_bzhi_u64` takes any count. 2 instructions per record (-0.63%).
 - **A slot's entry above its tag.** A slot held its entry's number in its low 24 bits and 8 bits
   of the name's hash on top, so the probe masked it once for each. With the number on top, one
-  shift takes it out and the tag compares as the low byte. 2.3 instructions per record (−0.77%).
+  shift takes it out and the tag compares as the low byte. 2.3 instructions per record (-0.77%).
 - **The marking's group unchecked.** After the barrier, the distinct count indexed `groups` with
   the group that the letter's poster took from `by_id`, which holds 0 or a number below
   `group_count`, the length of every worker's `groups`, since all count the same codes. One
-  instruction per record (−0.33%). Step 37 dropped this change, which then took one more line;
+  instruction per record (-0.33%). Step 37 dropped this change, which then took one more line;
   with the word and the bit taken in one `let`, it takes none.
 
 Together, on AC power, `ab.py`, 41 interleaved runs, five rounds, against step 38: medians 25.64,
-25.65, 25.60, 25.50 and 25.58 → 25.05, 25.07, 24.97, 24.93 and 25.06 ms (−2.3%, −2.3%, −2.5%,
-−2.2% and −2.0%). `perf stat`, 20 interleaved runs: instructions:u 1014.4 → 936.8 M (−7.6%, 306
-→ 282 per record), cycles:u 583.8 → 569.8 M (−2.4%). On step 37's code the same changes took
-1011.2 → 947.0 M instructions (−6.3%) and 582.6 → 567.7 M cycles (−2.6%), and in seven rounds of
-`ab.py` against step 37, −1.7% to −2.7%. Cycles fall by less than instructions: many of the
+25.65, 25.60, 25.50 and 25.58 → 25.05, 25.07, 24.97, 24.93 and 25.06 ms (-2.3%, -2.3%, -2.5%,
+-2.2% and -2.0%). `perf stat`, 20 interleaved runs: instructions:u 1014.4 → 936.8 M (-7.6%, 306
+→ 282 per record), cycles:u 583.8 → 569.8 M (-2.4%). On step 37's code the same changes took
+1011.2 → 947.0 M instructions (-6.3%) and 582.6 → 567.7 M cycles (-2.6%), and in seven rounds of
+`ab.py` against step 37, -1.7% to -2.7%. Cycles fall by less than instructions: many of the
 instructions cut were a compare and a branch that never jumps, which the core fuses into one
 operation. memory.peak, 40 alternating runs: medians 12.36 → 12.33 MiB. S 393 → 393.
-Correctness: the gate, 310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes; the
+Correctness: the gate, 310 pass, 0 fail; full seeds 1 to 7 and 10 to 12 give the reference hashes; the
 400 fuzz cases and the two long-name sets pass at the default thread count, at 1, 3, 12, 37 and
 64 threads, and with 100-byte rounds at 1, 2, 3, 12 and 64; the 300 tiny seeds pass at 1, 2, 3,
 5, 7, 12, 16, 23, 37 and 64 threads with 100-byte rounds; the six files of edge cases match the
@@ -1342,17 +1342,17 @@ stop with the error as step 38 does; clippy reports no warnings.
 
 Dropped, on step 37's code; `ab.py` on AC power, 41 interleaved runs, and `perf stat`, 20
 interleaved runs:
-- **The probe's slot read unchecked**: one instruction per record fewer (−0.32%), but cycles
+- **The probe's slot read unchecked**: one instruction per record fewer (-0.32%), but cycles
   +0.44%, and `ab.py` +0.1% and +0.6% against step 37; on top of the CR's bit, the `bzhi`, the
   slot's layout and the marking's group, +0.3%, +0.2% and +0.5% against them.
 - **The letter posted before the region id and the amount are parsed**, on top of those four:
-  instructions −0.34%, cycles +2.3%. **The letter made after them**, which step 37 dropped too,
+  instructions -0.34%, cycles +2.3%. **The letter made after them**, which step 37 dropped too,
   again on top of those four: instructions +0.35%, cycles +0.63%.
 - **The shuffle controls indexed by `dot << 3 | comma`**, which one `lea` could compute, instead
-  of `comma << 4 | dot`: the compiler shifted and ORed all the same, instructions −0.00%, cycles
+  of `comma << 4 | dot`: the compiler shifted and ORed all the same, instructions -0.00%, cycles
   +0.24%. As a table of 17 dots by 8 commas indexed with no mask, it added a bounds check.
 - **The dot found by a shift past the byte after the comma**, so that its range check would be
-  one compare: instructions −0.02%.
+  one compare: instructions -0.02%.
 
 ## Step 40: the field's word read unchecked
 
@@ -1376,10 +1376,10 @@ line.
 
 On AC power, `ab.py`, 41 interleaved runs, seven rounds, against step 39: medians 25.01, 24.95,
 25.08, 25.11, 25.09, 25.10 and 25.07 → 24.80, 24.74, 24.73, 24.84, 24.78, 24.83 and 24.77 ms
-(−0.8%, −0.8%, −1.4%, −1.1%, −1.2%, −1.1% and −1.2%). `perf stat`, 20 interleaved runs:
-instructions:u 936.6 → 911.0 M (−2.7%, 282 → 274 per record), cycles:u 566.4 → 560.7 M (−1.0%).
+(-0.8%, -0.8%, -1.4%, -1.1%, -1.2%, -1.1% and -1.2%). `perf stat`, 20 interleaved runs:
+instructions:u 936.6 → 911.0 M (-2.7%, 282 → 274 per record), cycles:u 566.4 → 560.7 M (-1.0%).
 memory.peak, 40 alternating runs: medians 12.27 → 12.23 MiB. S 393 → 393. Correctness: the gate,
-310 pass, 0 fail; full seeds 1–7 and 10–12 give the reference hashes; the 400 fuzz cases and the
+310 pass, 0 fail; full seeds 1 to 7 and 10 to 12 give the reference hashes; the 400 fuzz cases and the
 two long-name sets pass at the default thread count, at 1, 3, 12, 37 and 64 threads, and with
 100-byte rounds at 1, 2, 3, 12 and 64; the 300 tiny seeds pass at 1, 2, 3, 5, 7, 12, 16, 23, 37
 and 64 threads with 100-byte rounds; the six files of edge cases match the reference at the
@@ -1415,19 +1415,19 @@ interleaved runs:
 - **The empty name kept out of the exchange.** At full scale 1.0% of the records have an empty
   name, whose letter is all zeros, so its hash and its owner are 0, and worker 0 marked about
   11% more letters than the others. With no worker posting it, and a byte per group, shared and
-  set once, to count it, +4 lines: six rounds from −0.5% to +0.2%, instructions +1.0%, cycles
-  +0.0% and +0.3%. With the branch that sets the byte made cold: three rounds from −0.3% to
+  set once, to count it, +4 lines: six rounds from -0.5% to +0.2%, instructions +1.0%, cycles
+  +0.0% and +0.3%. With the branch that sets the byte made cold: three rounds from -0.3% to
   +0.2%, instructions +0.9%, cycles +0.0%. Not posting it at all, which leaves it out of the
-  counts, as the bound on what balancing worker 0 can gain: three rounds from −0.6% to +0.1%,
+  counts, as the bound on what balancing worker 0 can gain: three rounds from -0.6% to +0.1%,
   instructions +0.2%, cycles +0.2%.
 - **A pad of 128 bytes**, so that the 64-byte window of `text_fields` would be read unchecked
   too: a last record cut short after a BOM puts the id's stop on the pad's third byte, and the
-  window from the byte after it ends 67 bytes into the pad. Alone: instructions −1.46% (4 per
-  record), cycles −0.17%, three rounds 0.0%, 0.0% and −0.3%. With this step's change, against
-  it: instructions −0.77%, cycles −0.02%, seven rounds from −0.2% to +0.2%.
+  window from the byte after it ends 67 bytes into the pad. Alone: instructions -1.46% (4 per
+  record), cycles -0.17%, three rounds 0.0%, 0.0% and -0.3%. With this step's change, against
+  it: instructions -0.77%, cycles -0.02%, seven rounds from -0.2% to +0.2%.
 
 The board's run, run-d1b2c0ca269e (commit ca86ea9), drew 24.0 ms, a slow draw: step 39's code drew
-22.8 ms in its own run, and this step runs 0.8–1.4% faster locally. A second run of the same code,
+22.8 ms in its own run, and this step runs 0.8 to 1.4% faster locally. A second run of the same code,
 run-604f816aac75 (commit 0327cbc, which changed only track A), drew 22.76 ms, 12.5 MB and 80.5 points.
 
 ## Step 41: a name known by its hash
@@ -1450,7 +1450,7 @@ cache line: that 32-byte key and 32 bytes of group bits. At full scale the ~100k
   names per worker, a run merges two names with odds of about 1 in 10^13.
 
 Built up on step 39's code (`perf stat`, 20 interleaved runs, against step 39): the hash and the
-40-byte entries, instructions −4.3%, cycles −3.0%; with the one store, −6.8% and −3.7%. Kept
+40-byte entries, instructions -4.3%, cycles -3.0%; with the one store, -6.8% and -3.7%. Kept
 apart, as an array of keys and an array of group bits, the marking took 21% more L1 misses and
 the runs 0.6% longer; 48-byte entries ran slower than 40-byte ones. Four round keys instead of
 one, with `a` and `b` passed through as many rounds, took five instructions and a table of nine
@@ -1458,11 +1458,11 @@ lines, and gained nothing for names that no adversary chose.
 
 Local, against step 40 (`ab.py`, 41 interleaved runs on the P-cores, four rounds; the first three
 with a browser busy on one P-core, so the minimums are the steadier figures): medians 25.63,
-27.68, 24.22 and 24.81 → 24.69, 25.67, 23.10 and 23.68 ms (−3.7%, −7.3%, −4.6% and −4.6%),
-minimums 24.17, 24.30, 23.87 and 24.32 → 22.92, 23.16, 22.69 and 23.22 ms (−5.2%, −4.7%, −4.9%
-and −4.5%). `perf stat`: instructions:u 909.4 → 852.6 M (−6.3%, 274 → 257 per record).
+27.68, 24.22 and 24.81 → 24.69, 25.67, 23.10 and 23.68 ms (-3.7%, -7.3%, -4.6% and -4.6%),
+minimums 24.17, 24.30, 23.87 and 24.32 → 22.92, 23.16, 22.69 and 23.22 ms (-5.2%, -4.7%, -4.9%
+and -4.5%). `perf stat`: instructions:u 909.4 → 852.6 M (-6.3%, 274 → 257 per record).
 memory.peak, 80 alternating runs: median 12.34 → 10.88 MiB, expected highest of five 12.91 →
-11.06 MiB. S 393 → 381. Correctness: the gate, 310 pass, 0 fail; full seeds 1–7 and 10–12 give
+11.06 MiB. S 393 → 381. Correctness: the gate, 310 pass, 0 fail; full seeds 1 to 7 and 10 to 12 give
 the reference hashes; the fuzz and thread-count suite, 3,000 cases, and the 30 edge-case files
 pass; of the wide region sets, w2 gives the reference, and w0 and w1 stop with the error as
 before; clippy reports no warnings.
@@ -1486,8 +1486,8 @@ Six change it, so they were timed:
 - `parallel`, used once, is written into `join`.
 
 Local, against step 41 (`ab.py`, 41 interleaved runs on the P-cores): the six together, medians
-23.59 and 23.67 → −0.21% and −0.30%, and in a third round 23.69 → 23.62 ms, minimums 23.30 →
-23.02 ms. Each alone: from +0.04% to −1.10%. S 381 → 368. Gate: 310 pass, 0 fail; clippy reports
+23.59 and 23.67 → -0.21% and -0.30%, and in a third round 23.69 → 23.62 ms, minimums 23.30 →
+23.02 ms. Each alone: from +0.04% to -1.10%. S 381 → 368. Gate: 310 pass, 0 fail; clippy reports
 no warnings.
 
 The board ran step 41's code a second time in run-13fb3e0130ce (commit c9d5326, which changed only
@@ -1515,10 +1515,10 @@ instead of 40.
   costs more.
 
 `ab.py` against step 42, 41 interleaved runs, medians / minimums: seed 1, 14.86 / 12.95 → 13.11 /
-12.00 ms (−11.8%); seed 2, 14.20 / 12.99 → 13.26 / 12.16 ms (−6.6%); in the same way with the
-tails printed, seed 1, 14.40 → 13.07 ms (−9.2%), and seed 3, 14.10 → 13.02 ms (−7.7%), p90 17.05 →
+12.00 ms (-11.8%); seed 2, 14.20 / 12.99 → 13.26 / 12.16 ms (-6.6%); in the same way with the
+tails printed, seed 1, 14.40 → 13.07 ms (-9.2%), and seed 3, 14.10 → 13.02 ms (-7.7%), p90 17.05 →
 13.79 ms. With a busy loop of another program on CPU 5 (15 runs): 38.52 → 31.00 ms. memory.peak,
-5 alternating runs: 9.9–10.5 MB for step 42 and 10.2–10.7 MB for this step; no allocation
+5 alternating runs: 9.9 to 10.5 MB for step 42 and 10.2 to 10.7 MB for this step; no allocation
 changed. S 368 → 369. Correctness: the gate, 310 pass, 0 fail; full seeds 1, 2, 3, 7 and 12 give
 the reference hashes, and seed 2 does on 1, 3 and 4 CPUs; clippy reports no warnings.
 
@@ -1548,22 +1548,22 @@ one, the country-code closure inlined into its `collect`, and the rehash's probe
 The gate passes (310 of 310).
 
 On the same machine with turbo off, step 43 runs at 23.5 ms against step 42's 23.62 ms before it:
-the 7–12% that step 43 measured with turbo on most likely came from idle states the board's
+the 7 to 12% that step 43 measured with turbo on most likely came from idle states the board's
 machine does not reach (its run drew 21.88 ms, step 42's 21.86 and 22.25).
 
 ## Step 45: hyperthreads that mark while their sibling parses, and 39 M fewer instructions
 
-A profile of step 44 (P-cores, turbo off, 10 runs of `perf record -e cycles:upp`) put 24–26% of
+A profile of step 44 (P-cores, turbo off, 10 runs of `perf record -e cycles:upp`) put 24 to 26% of
 the samples in `NameSet::read`, 43% of them on the compare of the entry's key, which waits on the
-entry's load, and 5–14% on the barrier's `pause`. The marking runs on all 12 threads at once
+entry's load, and 5 to 14% on the barrier's `pause`. The marking runs on all 12 threads at once
 after each barrier, so both hyperthreads of a core waited on loads at the same time, and both
 parsed at the same time, when the core's ports are the limit (about 1.9 instructions per cycle
 each).
 
 - **Marking beside a parse.** The round loop runs once more than there are rounds, and in each
   round a worker marks the letters of the round before, from the other half of the mailboxes:
-  before its parse if `sched_getcpu()` is even, after it if odd. Both orders mark round r − 1
-  between barriers r − 1 and r, and nothing posts to that half until barrier r has passed, so
+  before its parse if `sched_getcpu()` is even, after it if odd. Both orders mark round r-1
+  between barriers r-1 and r, and nothing posts to that half until barrier r has passed, so
   the result is the same. CPUs 2k and 2k + 1 are the hyperthreads of one core here, so each core
   runs one marking next to one parse at the start and the end of each round. The parity is read
   once per round, so a worker that moves still marks each round once. +6 lines.
@@ -1579,13 +1579,13 @@ each).
   when it changes. 9.1 M fewer instructions (2.6 per record), and two stores fewer.
 
 `perf stat -r 10`, full seed 1: instructions:u 851.3 → 812.2 M for the last three, then 800.2 M
-with the order of marking and parsing; the profile then has 24% in `read` and 5–10% in `pause`.
+with the order of marking and parsing; the profile then has 24% in `read` and 5 to 10% in `pause`.
 `ab.py`, turbo off, interleaved runs, medians / minimums, step 44 → step 45: full seed 1, 51
-runs, 23.39 / 22.89 → 22.68 / 22.02 ms (−3.0%) and 23.43 / 22.85 → 22.52 / 22.08 ms (−3.9%);
-full seed 2, 41 runs, 23.38 / 23.01 → 22.54 / 22.05 ms (−3.6%). The three unchecked reads and
-the branches alone: 23.52 → 23.06 ms and 23.48 → 23.08 ms (−2.0%, −1.7%); the order of marking
-on top of them: 23.04 → 22.74 ms and 23.08 → 22.82 ms (−1.3%, −1.1%). memory.peak, 5 alternating
-runs: 10.3–10.6 MB for step 44 and 10.0–10.4 MB for this step. S 366 → 376. The gate passes
+runs, 23.39 / 22.89 → 22.68 / 22.02 ms (-3.0%) and 23.43 / 22.85 → 22.52 / 22.08 ms (-3.9%);
+full seed 2, 41 runs, 23.38 / 23.01 → 22.54 / 22.05 ms (-3.6%). The three unchecked reads and
+the branches alone: 23.52 → 23.06 ms and 23.48 → 23.08 ms (-2.0%, -1.7%); the order of marking
+on top of them: 23.04 → 22.74 ms and 23.08 → 22.82 ms (-1.3%, -1.1%). memory.peak, 5 alternating
+runs: 10.3 to 10.6 MB for step 44 and 10.0 to 10.4 MB for this step. S 366 → 376. The gate passes
 (310 of 310), full seeds 1 and 2 give the reference hashes, and clippy reports no warnings.
 
 ## Step 46: the name set's loop never calls out of it, and `number` on an SSE window
@@ -1607,8 +1607,8 @@ so the instruction count decides T (see "where step 45 stands" below). Two cuts,
 - **`number` on an SSE window**, as measured on step 45 below: 16 M fewer instructions, the same
   lines. Alone it was within noise (below); with the change above it holds.
 
-`perf stat -r 10`, full seed 1, interleaved: instructions:u 800.6–802.0 M (step 45) → 797.1–799.4
-M (the loop alone) → 773.7–775.1 M (both), branch misses 1.84 M throughout. `ab.py`, turbo off,
+`perf stat -r 10`, full seed 1, interleaved: instructions:u 800.6 to 802.0 M (step 45) → 797.1 to 799.4
+M (the loop alone) → 773.7 to 775.1 M (both), branch misses 1.84 M throughout. `ab.py`, turbo off,
 61 interleaved runs per round, medians / minimums, step 45 → step 46: full seed 1, 23.36 / 22.67
 → 23.07 / 22.21, 23.50 / 22.68 → 23.02 / 22.33, 23.24 / 22.53 → 23.10 / 22.24, 23.28 / 22.86 →
 22.92 / 22.33 and 23.42 / 22.35 → 22.95 / 22.33 ms; full seed 2, 23.24 / 22.57 → 22.91 / 21.99,
@@ -1616,7 +1616,7 @@ M (the loop alone) → 773.7–775.1 M (both), branch misses 1.84 M throughout. 
 busy round, means 30.8 and 31.8 ms) and 23.45 / 22.76 → 22.95 / 22.25 ms. Nine of ten medians
 and all ten minimums lower, typically by 1.5%. The loop alone: 23.30 → 23.19 and 23.30 → 23.15
 ms; `number` alone: 23.30 → 23.20 and 23.30 → 23.29 ms (seed 1, same rounds). memory.peak, 3
-alternating runs: 10.0–10.3 MB for step 45 and 10.1–10.5 MB for this step. S 376 → 377. The gate
+alternating runs: 10.0 to 10.3 MB for step 45 and 10.1 to 10.5 MB for this step. S 376 → 377. The gate
 passes (310 of 310), full seeds 1 and 2 give the reference hashes, and clippy reports no warnings.
 
 ## Step 47: a name one slot past home found without a branch
@@ -1646,17 +1646,17 @@ grow when the marking ends sooner. `ab.py`, turbo off, interleaved, medians / mi
 seed 2, 61 runs, 22.99 / 22.36 → 22.67 / 21.92, 22.97 / 22.37 → 22.65 / 22.09, 23.17 / 22.38 →
 22.99 / 21.68 and 23.17 / 22.43 → 22.93 / 22.16 ms. All nine medians are lower, by 0.6% to 2.3%
 (about 1.2% typically), and eight of nine minimums. memory.peak, 5 alternating runs:
-10.0–10.3 MB for step 46 and 9.8–10.5 MB for this step. S 377 → 384. The gate passes (310 of
+10.0 to 10.3 MB for step 46 and 9.8 to 10.5 MB for this step. S 377 → 384. The gate passes (310 of
 310), full seeds 1 and 2 give the reference hashes, and clippy reports no warnings.
 
 ## Step 48: the region table in one pass
 
 A timeline of step 47 (P-cores, turbo off, an instrumented copy, 8 runs, from the start of
-`main`): the workers start at 0.53–0.73 ms and the last at 0.84–1.17 ms, the last ends step 0
-of the region table at 0.98–1.33 ms, the last ends step 1 at 1.27–1.94 ms and the first round
-starts at 1.33–2.00 ms. Step 1 took 0.25–0.6 ms: two scans of the 17,576 code bits with an
+`main`): the workers start at 0.53 to 0.73 ms and the last at 0.84 to 1.17 ms, the last ends step 0
+of the region table at 0.98 to 1.33 ms, the last ends step 1 at 1.27 to 1.94 ms and the first round
+starts at 1.33 to 2.00 ms. Step 1 took 0.25 to 0.6 ms: two scans of the 17,576 code bits with an
 atomic load each (`present()`), the second parse of the share's rows and a barrier. After the
-last round, the release of the input took 0.51–0.66 ms per worker, the entries 0.03–0.10 ms, and
+last round, the release of the input took 0.51 to 0.66 ms per worker, the entries 0.03 to 0.10 ms, and
 the merge, format and write 0.2 ms.
 
 - **One step.** Each worker parses its share of `regions.csv` once and writes each row's group.
@@ -1676,7 +1676,7 @@ ms; full seed 2, 22.19 / 21.37 → 22.03 / 21.23 and 22.34 / 21.72 → 22.08 / 2
 lines were trimmed (the same code): seed 1, 22.31 / 21.84 → 22.19 / 21.15 and 22.31 / 21.72 →
 21.95 / 21.57 ms; seed 2, 22.24 / 21.67 → 22.03 / 21.67 and 22.20 / 21.72 → 21.96 / 21.57 ms.
 All eight medians lower, by 0.5% to 1.6% (about 1.0%). memory.peak, 5 alternating runs:
-10.3–10.7 MB for step 47 and 10.2–10.6 MB for this step. The gate passes (310 of 310), full seeds
+10.3 to 10.7 MB for step 47 and 10.2 to 10.6 MB for this step. The gate passes (310 of 310), full seeds
 1 and 2 give the reference hashes, and clippy reports no warnings.
 
 ## Step 49: 23 fewer lines
@@ -1685,22 +1685,22 @@ S 384 → 361, in code that runs once per worker, once per round or off the hot 
 
 - `region_rows`, called once, is written into the worker, and the shares of `regions.csv` come
   from the closure that cuts `records.csv` into runs: a row starts with a digit, so the first
-  line after a cut that starts with a digit or a BOM is a row. Its code is one `fold`. −5.
+  line after a cut that starts with a digit or a BOM is a row. Its code is one `fold`. -5.
 - `mallopt(M_MMAP_THRESHOLD)` goes. It was there because the regions parse freed its lists and
   glibc then raised its threshold; nothing that large is freed now, and the name sets' entries,
   the mailboxes and the region table are past glibc's default 128 KiB either way. memory.peak,
   20 alternating runs, medians 11.48 → 11.50 MB (in a `bash` wrapper, so about 1 MB above the
   brief's figure), and `ab.py` 22.03 / 22.09 / 22.09 / 22.13 → 21.99 / 22.02 / 21.93 / 22.26 ms.
-  −2.
+  -2.
 - `map_file` panics with the error and the path instead of returning a `Result` that `main`
-  unwrapped, so the mapping's check is one line. −2.
+  unwrapped, so the mapping's check is one line. -2.
 - `ENTRY`, used once, goes (its doc moves to `NameSet::slots`). The rehash finds its empty slot
   with `find`. The round's mailbox ends are stored with one `for_each` over `0..threads`. The
   output line takes its key through `escape_ascii` instead of a separate `extend_from_slice`.
   `values` shuffles in two statements instead of one split over four lines, `prefix_xor` is two
   `unsafe` expressions, `number` takes its length with `trailing_ones`, and its loop for long
   fields is a `position` and a `fold`. `region_amount` tests the sign inline, and
-  `text_fields_slow` takes the parity at a block's start from its count of quotes so far. −14.
+  `text_fields_slow` takes the parity at a block's start from its count of quotes so far. -14.
 - `too_many_lines` is allowed in `Cargo.toml`: `join` went past clippy's 100 lines.
 
 `perf stat -r 10`, full seed 1, interleaved: instructions:u 762.2, 762.6, 763.2 and 762.1 M at
@@ -1712,7 +1712,7 @@ medians 11.56 → 11.54 MB. The gate passes (310 of 310), and clippy reports no 
 
 Measured and not kept:
 - **The two tails of `text_fields` as one**: the slow path returned the two ends with their
-  quote counts and the fast path's tail computed the lengths for both. −3 lines, but
+  quote counts and the fast path's tail computed the lengths for both. -3 lines, but
   instructions:u 762.0 → 794.9 M (+4.3%).
 - **`number`'s loop for long fields kept as it was**, with the other cuts: the worker's function
   is 7,702 bytes against 8,837 with the `fold`, which LLVM unrolls, yet `ab.py` measured 22.11,
@@ -1736,7 +1736,7 @@ instrumented copy that reads `/proc/self/pagemap` and `memory.stat` there; 4 KiB
 | page tables (memory.stat) | | 0.72 |
 | kernel stacks, 13 threads | | 0.21 |
 | slab | | 0.13 |
-| memory.current less all of the above | 540–610 | 2.2–2.5 |
+| memory.current less all of the above | 540 to 610 | 2.2 to 2.5 |
 
 The last row is memcg's per-CPU charge stock: a CPU that charges a page takes 64 at a time
 from the counter and keeps the rest for its next charges, so each of the 12 CPUs holds 0 to 63
@@ -1757,22 +1757,22 @@ Both alone, `ab.py`, 61 interleaved runs, medians: groups on the heap 22.03 → 
 
 Together, step 49 → step 50, medians / minimums: full seed 1, 22.08 / 21.58 → 21.88 / 21.53,
 22.04 / 21.44 → 21.98 / 21.51 and 22.05 / 21.66 → 21.93 / 21.56 ms; full seed 2, 22.00 / 21.53 →
-21.95 / 21.57 and 22.16 / 21.58 → 21.95 / 21.57 ms (−0.6%). instructions:u 761.9 and 762.5 M →
-762.2 and 763.0 M. memory.peak, the brief's `systemd-run`, 8 alternating runs: 10.2–10.6 MiB
-(median 10.4) → 9.9–10.7 MiB (median 10.15); in the `bash` wrapper, 20 runs, medians 11.52 →
+21.95 / 21.57 and 22.16 / 21.58 → 21.95 / 21.57 ms (-0.6%). instructions:u 761.9 and 762.5 M →
+762.2 and 763.0 M. memory.peak, the brief's `systemd-run`, 8 alternating runs: 10.2 to 10.6 MiB
+(median 10.4) → 9.9 to 10.7 MiB (median 10.15); in the `bash` wrapper, 20 runs, medians 11.52 →
 11.46 MB. S 361 → 365. The gate passes (310 of 310), and clippy reports no warnings.
 
 Costed and not built, for memory:
 - **36-byte entries**, a 32-bit key: the rehash places a slot by its entry's key, so the key
   must hold the home bits, and 32 bits of key with the 8-bit tag leave 40 bits to tell two names
-  apart, about 1 in 2,600 runs merging two names at full scale. −0.4 MB.
+  apart, about 1 in 2,600 runs merging two names at full scale. -0.4 MB.
 - **Mailboxes packed below a page**: a mailbox holds the worst case, every record of a round to
   one owner, so they are a page or more apart and each touches a page per half. With 8-byte
   letters (56 bits of hash) and 2 KiB boxes, with an overflow area for the worst case, the
-  mailboxes would take 144 pages instead of 288, −0.59 MB, for a test per post and about 20
+  mailboxes would take 144 pages instead of 288, -0.59 MB, for a test per post and about 20
   lines.
 - **The input's page tables freed during the rounds** by unmapping each 2 MB the worker has
-  parsed: about −0.3 MB, but `munmap` takes the address space's lock for writing, which the
+  parsed: about -0.3 MB, but `munmap` takes the address space's lock for writing, which the
   workers' unmaps then take one at a time (step 38 measured 0.7 ms for the name sets'), and
   the input would need one mapping per run.
 - **The charge stock**: memcg drains it only under reclaim, at a limit or when another cgroup
@@ -1815,17 +1815,17 @@ same machine code inside it:
 
 - The build stage runs `RUN --mount=type=bind,target=/src cd /src && cargo build …`, as tracks A
   and D do, instead of `WORKDIR /src` and then the mount. Both stages stay. The image's `/app/join`
-  has the local build's sha256. −1.
+  has the local build's sha256. -1.
 - The three `use` lines are two: `arch::x86_64::*` joins the `std::{…}` list, and `Duration`, used
-  once, is written `std::time::Duration` there. −1.
+  once, is written `std::time::Duration` there. -1.
 - Both `prctl` calls set their option to 1, so they are one `map` over `[41, 29]`, with one
-  comment for the two options. −1.
+  comment for the two options. -1.
 - `BOM` and `SPINS`, each used in one place, are written there: the record loop tests for `0xEF`
   and parses the id again 3 bytes on, and the barrier sleeps after 2,000 spins, its counter typed
-  `usize` as `SPINS` made it. The comments keep what their docs said. −2.
-- `half` and `odd` are set in one statement, and so are `names` and `sent`. −2.
+  `usize` as `SPINS` made it. The comments keep what their docs said. -2.
+- `half` and `odd` are set in one statement, and so are `names` and `sent`. -2.
 - `text_fields` names the offsets of its two commas `name` and `note`, as `text_fields_slow`
-  does, which makes the returned tuple short enough to take the name's range directly. −1.
+  does, which makes the returned tuple short enough to take the name's range directly. -1.
 
 Every cut but one leaves the machine code as it was. `names` and `sent` in one statement change
 the worker's code (9,250 → 9,328 bytes) but not what it runs: with one worker (`taskset -c 2`),
@@ -1838,19 +1838,19 @@ memory.peak, the brief's `systemd-run`, 5 alternating runs: medians 9.7 → 9.7 
 and 3; no allocation changed. The gate passes (310 of 310), and clippy reports no warnings.
 
 Measured and not kept:
-- **Each output line as one `format!`**, the lines collected into a `String`: −2 lines, but with
+- **Each output line as one `format!`**, the lines collected into a `String`: -2 lines, but with
   one worker 753.56 → 754.12 M instructions (+551 k per run, about 2,300 per line, since each
   `format!` starts with no capacity and grows), all of it in the last worker's tail after the
   rounds.
-- **`text_fields` returning the note's comma**, the caller adding 1: −1 line, instructions:u
+- **`text_fields` returning the note's comma**, the caller adding 1: -1 line, instructions:u
   765.4 → 768.5 M (+0.4%).
 - **`region_amount_slow` written into `region_amount`'s branch** behind `std::hint::cold_path()`:
-  −3 lines, but the worker grew from 9.3 to 10.3 KB and instructions:u went 765.4 → 778.4 M
+  -3 lines, but the worker grew from 9.3 to 10.3 KB and instructions:u went 765.4 → 778.4 M
   (+1.7%).
 - **`long_letter` written into `name_letter`**, not built: `name_letter` would then call itself,
   and LLVM does not inline a recursive function, here into the record loop.
-- Left for clarity: `NameSet::new` written into the worker (−2), `main` and `join` as one function
-  (−2), the `ALIGN` loop's `i += 1` folded into a tuple assignment (−1).
+- Left for clarity: `NameSet::new` written into the worker (-2), `main` and `join` as one function
+  (-2), the `ALIGN` loop's `i += 1` folded into a tuple assignment (-1).
 
 ## Step 53: a worker on every CPU again
 
@@ -1861,7 +1861,7 @@ itself", one run at a time, and the highest of the five is dropped. Two slow run
 five on an idle box are unlikely, while the spare CPU costs every run.
 
 `ab.py`, 61 interleaved runs, step 52 against step 53, medians / minimums: full seed 12, 23.00 /
-22.68 → 21.44 / 21.01 ms (−6.8%); full seed 1, 22.97 / 22.40 → 21.32 / 20.70 ms (−7.2%), about
+22.68 → 21.44 / 21.01 ms (-6.8%); full seed 1, 22.97 / 22.40 → 21.32 / 20.70 ms (-7.2%), about
 +0.75 points. One run of step 53 on seed 12 was slow under this machine's own load (mean 26.90
 ms), the kind of run final scoring drops. S 357 → 357. Gate: 310 pass, 0 fail.
 
@@ -1872,27 +1872,27 @@ S 357 → 348 (Rust 352 → 343), with the record loop's machine code unchanged:
 - `NameSet::read` tests whether a slot's entry is the name's in one closure, `hit`, which the home
   slot's test and the probe loop share; the loop breaks with the entry's index, and one unchecked
   `get_unchecked_mut` after it takes the entry. The slots' mask is set once with the slices, and the
-  tag and the group are bytes 14 and 15 of `high.to_le_bytes()`, as the docs number them. −3. The
+  tag and the group are bytes 14 and 15 of `high.to_le_bytes()`, as the docs number them. -3. The
   function's machine code has the same 78 instructions, one `shr` moved.
 - `name_letter` takes the length in a `let len @ 0..=32 = … else` that calls `long_letter`, where an
-  `if` returned: `cmp $0x21; jae` for `cmp $0x20; ja`. −1.
+  `if` returned: `cmp $0x21; jae` for `cmp $0x20; ja`. -1.
 - `text_fields_slow` XORs the parity of the quotes before a block into bit 0 of its quote mask,
   which carries it into every bit of the prefix XOR, instead of XORing all ones in after it: one
-  instruction fewer on that cold path. −1.
+  instruction fewer on that cold path. -1.
 - `text_fields` calls `before(name)` and `before(note)` in the lengths, without naming the counts;
-  the compiler computes each once, as before. −1.
+  the compiler computes each once, as before. -1.
 - The batch writes a record's group through `top[1].as_ptr()`, byte 7 of the letter's second word,
-  instead of casting the letter's reference to a byte pointer first. Same machine code. −1.
+  instead of casting the letter's reference to a byte pointer first. Same machine code. -1.
 - The mailboxes are one `Box::leak` split by `as_chunks`, with no `letters` binding: nothing is
-  freed anyway. −1.
+  freed anyway. -1.
 - `main` reads the data directory inside the closure that maps the files (`env::args` imported in
-  place of `fs::write`, now written in full at its one use). −1.
+  place of `fs::write`, now written in full at its one use). -1.
 
 Every function has the same instruction count as at step 53, compared function by function with
 `objdump`, except `main` (191 → 337 instructions: `args` is parsed twice, once per run) and
 `text_fields_slow` (122 → 121); the worker's 1,892 differ only in register choices. `perf stat -r 5`, interleaved, instructions:u, step 53 → step 54: full seed 1, 762.28,
 762.27 and 762.19 M → 762.10, 761.95 and 761.93 M; full seed 2, 762.37, 762.51 and 762.16 M →
-762.00, 762.06 and 764.38 M (that run also took 531.7 M cycles against 485–493 M for the others, a
+762.00, 762.06 and 764.38 M (that run also took 531.7 M cycles against 485 to 493 M for the others, a
 busy CPU). cycles:u 488.6, 488.1 and 486.3 M → 487.0, 483.6 and 483.6 M on seed 1. `ab.py`, turbo
 off, 21 interleaved runs, medians / minimums: full seed 1, 21.89 / 21.39 → 21.59 / 21.26 and 21.84 /
 21.43 → 22.05 / 21.37 ms; full seed 2, 21.94 / 21.36 → 21.93 / 21.37 ms, the same within noise. No
@@ -1906,16 +1906,16 @@ the same push ran at their usual times (16.87, 93.65 and 121.77 ms): the busy CP
 final scoring, with the box to itself, should not see (step 53).
 
 Measured and not kept:
-- **`text_fields` with the note's comma from `let note @ 0..64 = … else`**: −1 line, but the test
+- **`text_fields` with the note's comma from `let note @ 0..64 = … else`**: -1 line, but the test
   became `tzcnt; cmp $0x40; jae` after the `blsr` whose flags the `je` used, one instruction more
   per record.
-- **The posted letter's slot read through `sent`'s reference** at each use, without `slot`: −1
+- **The posted letter's slot read through `sent`'s reference** at each use, without `slot`: -1
   line, but the worker grew from 1,892 to 1,907 instructions (the slot is loaded again after the
   letter's store).
 - **The input's prefetch in one statement**: rustfmt splits it over three lines (104 columns).
-- Left for clarity: `format_output` written into the last worker's tail (−3), `map_file` as a
-  closure in `main` (−1), the rehash without its filter of empty slots, which would place each as
-  entry 0 into an empty slot, a no-op (−1).
+- Left for clarity: `format_output` written into the last worker's tail (-3), `map_file` as a
+  closure in `main` (-1), the rehash without its filter of empty slots, which would place each as
+  entry 0 into an empty slot, a no-op (-1).
 
 ## Experiments that did not stay
 
@@ -1961,8 +1961,8 @@ Measured and not kept:
   `regions.csv` made the spawns 0.1 ms slower and ate the gain. The instrumented copy put the
   first round 1.005 → 0.866 ms after `join` starts. `ab.py`, 61 interleaved runs, medians:
   seed 1, 21.95 → 21.83, 21.96 → 21.87 and 21.96 → 21.83 ms; seed 2, 22.06 → 21.98, 22.04 →
-  21.97 and 21.99 → 21.95 ms; two more sets of six rounds, three- and four-way, −0.49% and
-  −0.31%. About −0.4% for +3 lines (S 365 → 368), worth +0.01 points at most. 96 or 48 shares:
+  21.97 and 21.99 → 21.95 ms; two more sets of six rounds, three- and four-way, -0.49% and
+  -0.31%. About -0.4% for +3 lines (S 365 → 368), worth +0.01 points at most. 96 or 48 shares:
   the same within noise. The gate passes (310 of 310).
 - **Workers that end their own thread** with the `exit` syscall instead of parking, so the
   last worker's exit kills no thread (on step 50's code): the time from the write to the end
@@ -2057,7 +2057,7 @@ Measured and not kept:
 - **The name sets' slots at a quarter load** (local, turbo off, on step 45's code): twice the
   slots, 32,768 per worker at full scale. Branch misses 1.84 → 0.81 M, instructions 800.7 →
   792.4 M, cycles 522.9 → 520.6 M and 526.5 → 517.8 M (`perf stat -r 10`, interleaved), but
-  memory.peak 9.9–10.2 → 10.6–10.9 MB (4 alternating runs): +0.7 MB costs about 0.25 points,
+  memory.peak 9.9 to 10.2 → 10.6 to 10.9 MB (4 alternating runs): +0.7 MB costs about 0.25 points,
   which 1% of T does not pay for.
 - **`number` on an SSE window** (local, turbo off, on step 45's code; kept in step 46 with the
   name set's loop): the id, and every other
@@ -2083,38 +2083,38 @@ Measured and not kept:
     written to a buffer, eight positions at a time with no branch per position. The record
     loop then took five positions per record, so no record waited on the one before. `ab.py`,
     40 interleaved runs, two rounds, medians / minimums 32.73 / 32.15 → 37.02 / 36.20 ms and
-    32.99 / 32.09 → 37.04 / 36.00 ms (+12–13%). `perf stat -r 10` on the P-cores, twice:
-    instructions 1.414 → 1.941 G, IPC per thread 1.75–1.87 → 2.15–2.20, branch misses
+    32.99 / 32.09 → 37.04 / 36.00 ms (+12 to 13%). `perf stat -r 10` on the P-cores, twice:
+    instructions 1.414 → 1.941 G, IPC per thread 1.75 to 1.87 → 2.15 to 2.20, branch misses
     2.87 → 1.93 M. The record loop was not tuned (each field's quotes were counted by a loop),
     but the index alone took about 90 instructions per 64-byte block, about 85 per record.
   - Each record's end from one compare: step 32's parser, plus one 32-byte compare with LF
     right after the note, which gives the next record's start, so the region id, the sign, the
     amount and the CR test leave the chain; the amount's dot stays the fallback when no LF lies
     in those 32 bytes. 33.10 / 32.35 → 33.78 / 33.17 ms and 33.18 / 31.80 → 34.12 / 33.13 ms
-    (+2.1–2.8%); instructions 1.416 → 1.450 G, 10 more per record; IPC per thread
+    (+2.1 to 2.8%); instructions 1.416 → 1.450 G, 10 more per record; IPC per thread
     1.82 → 1.80; branch misses 2.87 → 2.92 M.
   - Without hyperthreads, 6 threads on CPUs 0, 2, …, 10 and 30 interleaved runs, both win:
     45.99 / 44.19 ms for step 32, 45.00 / 42.76 ms for the two stages and 43.70 / 41.59 ms for
     the compare. A thread alone does wait on the chain, but with 12 threads its sibling fills
-    those cycles, two threads at 1.75–1.87 instructions per cycle each, so the instruction
+    those cycles, two threads at 1.75 to 1.87 instructions per cycle each, so the instruction
     count decides T.
   - The full per-record window, masks over the 128 bytes from each record's start with the
     k-th comma or LF taken by `pdep`, was not built: by an estimate from its compares, mask
-    moves and 128-bit bit walks it runs 20–30 more instructions per record than step 32, more
+    moves and 128-bit bit walks it runs 20 to 30 more instructions per record than step 32, more
     than the compare that already lost. On full seed 1, 41% of records are longer than 64 bytes
     and 0.06% longer than 96. A 64-byte mask misses the note's closing quote for 11.2% of
     records when it starts at the record and for 2.2% when it starts at the name, as step 28's
     does. The region id, the amount and the terminator never take more than 17 bytes.
 - **48-byte name-set entries** (local, on step 32's code): the key's words for names of up to
   15 bytes and the 32 bytes of group bits in 48 bytes, with longer names in a side list. M fell
-  on every seed (10 seeds × 11 rounds, per-seed medians −0.33 to −1.02 MB, mean −0.69 MB), but
+  on every seed (10 seeds × 11 rounds, per-seed medians -0.33 to -1.02 MB, mean -0.69 MB), but
   `ab.py` went from 32.88 / 32.04 to 35.28 / 34.47 ms (median / minimum, +7.3%), with
   instructions 1,415 → 1,512 M, branch misses 2.87 → 3.44 M and L1 misses 11.2 → 13.1 M. A
   48-byte stride puts half the entries across two cache lines. Step 32's 64-byte entries moved
   16 bytes off their alignment, so that every entry crosses two lines, cost the same 1.8 M
   extra L1 misses and +2.9% T with fewer instructions, so most of the loss is the layout itself.
 - **Eight slots probed at once** (local, on step 32's code): the tags of eight slots compared
-  with one AVX2 compare and a `tzcnt`. Branch misses fell from 2.87 to 1.34–1.40 M, but no
+  with one AVX2 compare and a `tzcnt`. Branch misses fell from 2.87 to 1.34 to 1.40 M, but no
   variant saved cycles. Unaligned groups with a mirrored tail measured 32.95 → 32.69 ms with
   32 M more instructions and 1.3 M more L1 misses. Aligned groups measured 33.07 → 33.10 ms,
   and with the hit's entry taken from the register, cycles went 736.3 → 735.8 M. Peeking at a
@@ -2131,56 +2131,56 @@ Measured and not kept:
   interleaved runs, two rounds). Step 34 reads it once after all, where on top of its other
   changes it cut cycles:u by 1.9%.
 - **PGO** (local, turbo off, on step 27's code): a profile from three runs on each of full seeds
-  2–4, passed as `-C profile-use`, with every function matching it. `ab.py`, 40 interleaved runs,
+  2 to 4, passed as `-C profile-use`, with every function matching it. `ab.py`, 40 interleaved runs,
   medians / minimums: 36.35 / 35.39 → 37.71 / 36.69 ms and 36.27 / 35.64 → 37.39 / 36.79 ms on
   seed 1; 37.38 / 36.22 → 38.55 / 37.47 ms and 37.14 / 36.35 → 38.39 / 37.31 ms on seed 10, which
   it was not trained on. `perf stat -r 5`: instructions:u the same, 1.535 G; cycles:u 0.841 → 0.875 G.
 - **The empty name counted by its posters** (local, on step 25's code). Every record with an
   empty name posts its letter to one owner, which then gets 11% more letters than the others
-  (306k against 273–277k at full scale) and marks for 0.4–0.5 ms longer. Each poster instead kept
+  (306k against 273 to 277k at full scale) and marks for 0.4 to 0.5 ms longer. Each poster instead kept
   one bit per country for the empty name, ORed together at the end. Not posting those letters
   measured the same, 37.33 against 37.16 ms (`ab.py`, 40 interleaved runs, medians), and keeping
-  the bits in the batch loop, with or without a branch, cost 2.2–2.3 ms through the loop's
+  the bits in the batch loop, with or without a branch, cost 2.2 to 2.3 ms through the loop's
   register allocation.
 
 - **The name slots written at allocation** (`[0].repeat(n)` instead of `vec![0; n]`, local, turbo
   off, on step 17), after track B found that a first load from a calloc'd page maps the shared
   zero page and the store after it interrupts every core: `ab.py`, 40 interleaved runs, medians
   40.16 → 40.18 ms on seed 1 and 39.74 → 39.80 ms on seed 2; page faults 6,350 → 6,351, kernel
-  cycles 64.8 → 62.9–64.2 M. The slots do not fault that way here.
+  cycles 64.8 → 62.9 to 64.2 M. The slots do not fault that way here.
 - **Batched table lookups** (local only): each thread parsed 32 records, then loaded every
   record's region entry and hash slot, then found every name's entry, so the cache misses within
   a batch overlap instead of following one another.
-  - E-cores, three alternating runs: cycles:u 1.95–2.00 → 1.70–1.73 G, task-clock
-    1129–1163 → 987–1010 ms, elapsed 0.324–0.334 → 0.292–0.297 s, instructions:u
+  - E-cores, three alternating runs: cycles:u 1.95 to 2.00 → 1.70 to 1.73 G, task-clock
+    1129 to 1163 → 987 to 1010 ms, elapsed 0.324 to 0.334 → 0.292 to 0.297 s, instructions:u
     2.66 → 2.93 G. S 412 → 448.
   - P-cores, `perf stat -r 10`, interleaved: task-clock 1073/1067/1075 → 1089/1076/1086 ms,
     elapsed 125/115/128 → 119/121/123 ms. No gain: on a P-core the hyperthread sibling already
     runs while one thread waits on a miss. Reverted.
-  - Variants on E-cores: separate intern and OR steps 1.711–1.762 G (the fused form was equal or
-    slightly faster), explicit `prefetcht0` 1.745–1.777 G, and batches of 16 or 64 within noise
+  - Variants on E-cores: separate intern and OR steps 1.711 to 1.762 G (the fused form was equal or
+    slightly faster), explicit `prefetcht0` 1.745 to 1.777 G, and batches of 16 or 64 within noise
     of 32.
 - **Prefetching the entry as well as loading the slot early** (local only, P-cores,
   `perf stat -r 10`, interleaved, on top of step 5). In one variant, a prefetch of the entry was
   issued as soon as the slot's value arrived. In the other, a one-record pipeline marked each
-  record one record late and prefetched its entry in between. They measured 1044–1055 ms and
-  1035–1053 ms of task-clock, against 1036–1068 ms for the early slot load alone (step 7) and
-  1145–1185 ms for step 5. Neither was kept.
+  record one record late and prefetched its entry in between. They measured 1044 to 1055 ms and
+  1035 to 1053 ms of task-clock, against 1036 to 1068 ms for the early slot load alone (step 7) and
+  1145 to 1185 ms for step 5. Neither was kept.
 - **Prefetching entries a few letters ahead while marking** (local only, step 9's stage 4,
   medians of 11 interleaved runs): 4, 8 and 16 letters ahead measured 64.17, 63.39 and
   64.46 ms, against 64.18 ms without.
 - **A region table indexed by rank** (local only, on stage 5 before the byte-wide table): a
   bitset of the ids present plus a running count, so the group array holds only the 200k
-  regions. 65.65 and 67.35 ms against 63.82 and 64.51 ms in two sessions, for 13.99–14.45 MiB
-  against 15.70–15.74 MiB. The byte-wide table with `mallopt` reached 13.9–14.1 MiB at no cost
+  regions. 65.65 and 67.35 ms against 63.82 and 64.51 ms in two sessions, for 13.99 to 14.45 MiB
+  against 15.70 to 15.74 MiB. The byte-wide table with `mallopt` reached 13.9 to 14.1 MiB at no cost
   in time (stage 5).
 - **Slots at three-quarters load instead of half** (local only, on the rank-table build):
-  69.09 against 65.65 ms, for 11.53–12.46 MiB against 13.99–14.11 MiB.
+  69.09 against 65.65 ms, for 11.53 to 12.46 MiB against 13.99 to 14.11 MiB.
 - **Pinning each worker** to the i-th CPU it may run on, with `sched_setaffinity` (local only,
   on stage 5 before the byte-wide table): 63.37 against 63.67 ms over 21 runs, and 63.94
   against 64.17 ms over 15. Letting hyperthread siblings mark in alternate phases on top of
   that: 63.44 ms in the second session. Both are within that build's spread across sessions,
-  63.4–64.5 ms.
+  63.4 to 64.5 ms.
 - **A longer spin before parking**, 20,000 spins instead of 2,000: 59.71 against 59.44 ms.
 - **One name table shared by all parsers, with 4-byte letters** (local, on step 35's code). Each
   parser looked its record's name up in one lock-free table of 262,144 slots, each an id plus one
@@ -2193,7 +2193,7 @@ Measured and not kept:
     ms and 27.21 / 26.33 → 38.00 / 36.58 ms (+40%). With each name's slot prefetched as soon as
     its hash was known and probed after the region id and the amount, as step 7 did, in a second
     session: 26.60 / 25.81 → 35.92 / 35.43 ms and 26.58 / 25.91 → 35.92 / 35.19 ms (+35%).
-    Rounds of 512 KiB, which 4-byte letters allow at one mailbox page each: 35.87–36.06 ms.
+    Rounds of 512 KiB, which 4-byte letters allow at one mailbox page each: 35.87 to 36.06 ms.
   - `perf stat`, 15 interleaved runs: instructions 1055.3 → 1078.9 M (+2.2%), cycles 601.7 →
     867.6 M (+44%), L2 misses 2.52 → 7.36 M. Without the marking, the lookup and its letter
     alone ran 408 M cycles more than step 35 with no name work at all, where all of step 35's
@@ -2206,7 +2206,7 @@ Measured and not kept:
     instructions per cycle, so even with every miss hidden, 2.2% more instructions could not
     have made it faster.
   - memory.peak, 12 alternating runs: medians 12.58 → 13.21 MiB; S 387 → 427, untrimmed. The
-    measured build's table did not grow, so it was checked on full seeds 1–7 and 10–12, which
+    measured build's table did not grow, so it was checked on full seeds 1 to 7 and 10 to 12, which
     give the reference hashes; a build that sizes the table from an upper bound passes the gate
     (310 pass, 0 fail).
 - **The region table indexed by rank, again** (local, turbo off, on step 39's code), for memory:
@@ -2234,7 +2234,7 @@ Measured and not kept:
     measured took full seed 1's as given. With each worker mapping in the groups of its own rows
     instead: 12.91 and 13.15 MiB, 0.6 MiB above step 39.
   - S 387 → 420, untrimmed. At 0.345 points per MB and 0.108 per 1% of T, the 0.4 to 0.5 MB
-    saved is worth about +0.16 points and +7% of T about −0.8. Even the masked build's +3.5%
+    saved is worth about +0.16 points and +7% of T about -0.8. Even the masked build's +3.5%
     would lose 0.38.
 - **The byte-wide table mapped in by the first worker** instead of by main (local, turbo off, on
   step 39's code), so that main would start the threads 0.25 ms sooner, while that worker mapped
@@ -2261,25 +2261,25 @@ Measured and not kept:
   a cgroup for anonymous and kernel pages in batches of 64 pages per CPU, and memory.peak counts
   the part of each batch not yet used. A test program in which threads, each on a CPU of its
   own, touch pages and then wait at a barrier (memory.peak in a fresh scope, 5 runs, KiB): one
-  thread touching 1,536 pages, 7,364–7,952; twelve threads touching 128 each, the same 6 MiB,
-  9,660–10,440; twelve threads touching one page each, 4,516–4,808, against 1,992–2,704 touching
-  none. On step 54, sampling the cgroup's memory.stat during the run (6 runs): peak 10.13–10.62
-  MiB, of which anonymous 6.80–7.08 MiB (name sets about 4.6, mailbox pages 1.1, the region table
-  0.95), kernel 0.66–0.82 MiB (page tables 0.35–0.50), and about 2.4 MiB charged ahead on the
+  thread touching 1,536 pages, 7,364 to 7,952; twelve threads touching 128 each, the same 6 MiB,
+  9,660 to 10,440; twelve threads touching one page each, 4,516 to 4,808, against 1,992 to 2,704 touching
+  none. On step 54, sampling the cgroup's memory.stat during the run (6 runs): peak 10.13 to 10.62
+  MiB, of which anonymous 6.80 to 7.08 MiB (name sets about 4.6, mailbox pages 1.1, the region table
+  0.95), kernel 0.66 to 0.82 MiB (page tables 0.35 to 0.50), and about 2.4 MiB charged ahead on the
   twelve CPUs. memory.current rises in steps of 0.25 MiB, one batch, and what a CPU holds ahead
   is what is left of its last batch, so it depends on how many pages that CPU charged, modulo 64.
   Variants on step 54's code, seed 1 (peaks over 4 to 8 runs; `ab.py` medians, 31 or 41 runs):
   - Workers on stacks that main maps in (`pthread_create`), whose pages 3, 6 or 12 of them map
     in during the region step, so that the others never fault a page: peaks 8.52, 8.52 and
-    9.41–9.52 MiB; times +5.2% and +5.5% (seeds 1, 2), +3.4% and +1.6%; S 348 → 422.
-  - The same with the standard library's threads: 10.05–10.54 MiB, +5.9%.
-  - Main making each worker's name set, groups and posting ends, before the spawn: 8.52–9.38
-    MiB, +3.2% and +3.8%; during the region step: 8.52–8.77 MiB, +3.4%. Three workers making
-    them: 8.77–9.61 MiB, +2.5%. Each worker mapping in its own pages first: 10.31–10.52 MiB.
+    9.41 to 9.52 MiB; times +5.2% and +5.5% (seeds 1, 2), +3.4% and +1.6%; S 348 → 422.
+  - The same with the standard library's threads: 10.05 to 10.54 MiB, +5.9%.
+  - Main making each worker's name set, groups and posting ends, before the spawn: 8.52 to 9.38
+    MiB, +3.2% and +3.8%; during the region step: 8.52 to 8.77 MiB, +3.4%. Three workers making
+    them: 8.77 to 9.61 MiB, +2.5%. Each worker mapping in its own pages first: 10.31 to 10.52 MiB.
   These peaks repeat run after run because each CPU's page count does, but moving pages from
   one CPU to another moves its leftover either way, and a holdout seed with other counts would
   move it again. Averaged over that, only CPUs that charge nothing save, about 0.125 MiB each,
-  against 2.5–5.5% of time. Not kept.
+  against 2.5 to 5.5% of time. Not kept.
 
 ## Profile notes
 
@@ -2288,10 +2288,10 @@ Measured and not kept:
   cost about two thirds of all cycles, which is what step 2 went after.
 - Knockouts after step 2 (E-cores, cycles:u): full 1.97 G, no name table 1.06 G, no region
   lookup 1.72 G, scan only 1.00 G.
-- Phase timeline after step 2 (P-cores, 12 threads, instrumented copy): regions parse 0–11.0 ms
-  on one thread; quote pre-pass 11.5–17.1 ms, about 5.5 ms per thread; workers 17.9 ms to about
-  104 ms, 85.1–86.8 ms each, so the chunks are balanced; merge about 1 ms; distinct counting
-  105.3–114.2 ms on one thread; format and write 0.6 ms. About 20 ms of the 115 ms runs on one
+- Phase timeline after step 2 (P-cores, 12 threads, instrumented copy): regions parse 0 to 11.0 ms
+  on one thread; quote pre-pass 11.5 to 17.1 ms, about 5.5 ms per thread; workers 17.9 ms to about
+  104 ms, 85.1 to 86.8 ms each, so the chunks are balanced; merge about 1 ms; distinct counting
+  105.3 to 114.2 ms on one thread; format and write 0.6 ms. About 20 ms of the 115 ms runs on one
   thread.
 - Setup timeline at step 39 (P-cores, 12 threads, turbo off, instrumented copy, medians of 21
   runs, from the start of `join`): main's allocations and the region table's 1 MB mapped in take

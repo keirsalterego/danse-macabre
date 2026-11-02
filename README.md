@@ -1,57 +1,69 @@
 # Speed Demon 2026: Cause Of Death
 
-Four entries in [Speed Demon 2026](https://speeddemon.dev), one per track, all in Rust with no
-crates. Every track's output is byte-identical to the organisers' reference; each folder carries
-its own performance log with the board run ID behind every change.
+These are my four entries for [Speed Demon 2026](https://speeddemon.dev), one per track. I did it
+solo, all in Rust with no crates, and every program's output matches the organisers' reference
+byte for byte.
 
-| Track | What it does | Reference | This entry | Memory | Lines | Points |
+| Track | What it does | Reference | Mine | Memory | Lines | Points |
 |---|---|---|---|---|---|---|
-| [A: Ingest](track-a/) | log to hourly percentiles | 32.05 s | **16.6 ms** | 16.9 MB | 344 | 87.6 |
-| [B: Index](track-b/) | 50k boolean and phrase queries | 56.35 s | **87.3 ms** | 42.1 MB | 961 | 79.6 |
-| [C: Join](track-c/) | hostile CSV to country aggregates | 14.44 s | **19.3 ms** | 11.3 MB | 348 | 83.1 |
-| [D: Traverse](track-d/) | 2k shortest paths on 5M edges | 72.69 s | **118.4 ms** | 65.7 MB | 424 | 73.6 |
+| [A: Ingest](track-a/) | log to hourly percentiles | 32.05 s | 16.6 ms | 16.9 MB | 344 | 87.6 |
+| [B: Index](track-b/) | 50k boolean and phrase queries | 56.35 s | 87.3 ms | 42.1 MB | 961 | 79.6 |
+| [C: Join](track-c/) | hostile CSV to country aggregates | 14.44 s | 19.3 ms | 11.3 MB | 348 | 83.1 |
+| [D: Traverse](track-d/) | 2k shortest paths on 5M edges | 72.69 s | 118.4 ms | 65.7 MB | 424 | 73.6 |
 
-Times and memory are the final code's best board run for each track on the full public dataset,
-seed 1, with its run ID in the track's `PERF.md`. Points are the board's score for that run. The
-full step-by-step logs are in each folder's `PERF.md`, and the same pages are built from
-[`docs/`](docs/) into a docs site: <https://keir.is-a.dev/danse-macabre/>.
+Each row is the final code's best board run on the full public dataset (seed 1), and the points
+are what the board gave that run. Its run ID is in the track's `PERF.md`, along with every step
+before it. The same READMEs and logs are built from [`docs/`](docs/) into a small book at
+<https://keir.is-a.dev/danse-macabre/>.
 
-## The same five decisions in all four tracks
+## What all four have in common
 
-1. **Map the input, never read it.** Every program `mmap`s `/data` read-only and walks the bytes
-   with one cursor, so no line is copied into a string and the page cache is never re-read.
-2. **One team of 12 threads, one phase.** Each program spawns a fixed team and splits the input
-   into one chunk per thread at safe cut points, then works in phases with short serial steps
-   between them.
-3. **Compact records instead of repeated work.** A parses 239 MB of log into 12 MB of 4-byte
-   records, B indexes only the terms its queries use, C measures escaped fields instead of
-   rewriting them, D packs an edge into 4 bytes.
-4. **Exact answers, checked by hash.** Percentiles are nearest-rank on a counting sort, sums are
-   integers merged in a fixed order, and D's search is Dijkstra with binary weights, not an
-   approximation. Nothing depends on thread scheduling.
-5. **No teardown.** Each process exits straight after the write, and the threads hand their
-   mappings back to the kernel in parallel instead of leaving it to `munmap` at exit.
+<!-- ANCHOR: shared -->
+1. Nothing gets read into a buffer. Every program `mmap`s `/data` read-only and walks the bytes
+   with one cursor, so no line is ever copied into a string and the page cache is never read
+   twice.
+2. One team of 12 threads does everything. The input is cut into one chunk per thread at safe
+   points, and the work runs in phases with short serial steps in between.
+3. Everything gets packed small. A turns 239 MB of log into 12 MB of 4-byte records, B indexes
+   only the terms its queries use, C measures escaped fields without ever rewriting them, and D
+   squeezes an edge into 4 bytes.
+4. Answers are exact, and the output hash checks it. Percentiles are nearest rank on a counting
+   sort, sums are integers merged in a fixed order, and D's search is plain Dijkstra on integer
+   weights. Nothing depends on how the threads get scheduled.
+5. There's no teardown. Each process exits right after its write, and by then the threads have
+   handed their mappings back to the kernel in parallel, so `munmap` at exit has nothing left to
+   do.
+<!-- ANCHOR_END: shared -->
 
-## Running one track
+## Running a track
 
-Each folder builds offline from the pinned images in its `Dockerfile`, with no network:
+Each folder builds offline from the pinned images in its `Dockerfile`: the first stage compiles
+with `rust:1-slim-trixie` and the second copies the binary onto `debian:13-slim`. No network
+needed:
 
 ```
 docker build --network=none track-a
 ```
 
-The board's settings are a read-only `/data`, one writable `/out`, 12 hardware threads and no
-swap; `check.py` reproduces them locally against a data directory. For a native build without
-Docker:
+The board runs the image with a read-only `/data`, one writable `/out`, 12 hardware threads and
+no swap, and `check.py` reproduces that locally:
+
+```
+python3 check.py a --data <folder with the track's input> --expected <sha256>
+```
+
+For a native build without Docker, use the same toolchain as the image:
 
 ```
 cd track-a && cargo +1.99.1 build --release --offline
 ```
 
-`TRACK` is `a` for `track-a` and so on, and each program writes one file: `summary.txt`,
-`results.txt`, `aggregates.txt` or `distances.txt`.
+Every track compiles for `target-cpu=alderlake` (in its `.cargo/config.toml`), which is the
+scoring box's feature set. I never used `native`, because the board builds on a different host.
+Each program writes exactly one file: `summary.txt`, `results.txt`, `aggregates.txt` or
+`distances.txt`, for A to D in that order.
 
-## What is in the repo
+## What's in here
 
 ```
 track-{a,b,c,d}/   Dockerfile, Cargo project, README, PERF.md, .speed-demon.toml
@@ -61,5 +73,5 @@ check.py           builds a track with the board's Docker settings and checks th
 
 ## Licence
 
-MIT, the same licence as the organisers' starter. The reference implementations the numbers are
-measured against are copyright Hackathon Raptors CIC.
+MIT, same as the organisers' starter. The reference implementations my numbers are measured
+against are copyright Hackathon Raptors CIC.

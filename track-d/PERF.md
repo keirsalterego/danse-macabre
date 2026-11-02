@@ -1,6 +1,6 @@
 # Track D: performance log
 
-Each kept step cites the live-board run that measured it. Numbers marked local come from a laptop (i7-13620H, turbo off) and compare two versions run side by side; changes that were measured and not kept are listed under the step they were tried after.
+Every kept step names its board run. A number marked local is from my laptop (i7-13620H, turbo off), comparing two versions run side by side; experiments that didn't stay are under the step they were tried after.
 
 | | Reference (step 0) | Final code (step 20), two board runs |
 |---|---|---|
@@ -33,10 +33,10 @@ Each kept step cites the live-board run that measured it. Numbers marked local c
 | 19 | The query threads that run out of queries drop graph.txt's pages from the page tables, so the exit no longer unmaps them on one thread | run-f3c4ed0faa3c | 0.1246 | 65.6 | 73.1 |
 | 20 | The build's serial parts shortened: `split_runs` hands out the runs as they are asked for instead of collecting them, and the heavy-edge maps hash with `NodeHash` instead of `SipHash` | run-3416bb90eca1 | 0.1221 | 64.9 | 73.3 |
 
-Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0–11 of an
+Local numbers are for full seed 1 unless a seed is named. "P-cores" means CPUs 0 to 11 of an
 i7-13620H (its six P-cores and their hyperthreads), with all 12 threads and turbo off. Each figure
 is `perf stat -r 5`, and variants were interleaved over three rounds. Peak memory is `memory.peak` of a
-systemd-run scope on CPUs 0–11, with the inputs already in the page cache. A single board run is
+systemd-run scope on CPUs 0 to 11, with the inputs already in the page cache. A single board run is
 noisy for this track: v1 scored 380, 438 and 500 ms, and step 3's code scored 166.5 ms here and
 165.2 ms in run-321ee44c222c. So each step below says which local numbers back it.
 
@@ -53,10 +53,10 @@ sum gives every chunk its own run of slots in every block, so the second pass wr
 stores. A third pass counting-sorts each block (about 47 KB, so it stays in L2) by node. Offsets
 became `u32`, and the edge arrays come zeroed from the kernel instead of being cleared.
 
-- P-cores: elapsed 394–410 → 289–296 ms, task-clock 4.34–4.45 → 3.25–3.33 s, cycles 10.1–10.4
-  → 7.4–7.6 G.
+- P-cores: elapsed 394 to 410 → 289 to 296 ms, task-clock 4.34 to 4.45 → 3.25 to 3.33 s, cycles 10.1 to 10.4
+  → 7.4 to 7.6 G.
 - Build phase on P-cores: about 60 ms after the change (21 + 31 + 8 ms for the three passes).
-- Peak memory: 139.7–142.2 → 126.0–129.9 MB, from the narrower offsets. S 217 → 291.
+- Peak memory: 139.7 to 142.2 → 126.0 to 129.9 MB, from the narrower offsets. S 217 → 291.
 
 ## Step 2b: prefetch the next node's edges (c13e637)
 
@@ -66,7 +66,7 @@ row load alone was 22% of all samples and the offsets read 10%. The node settled
 one on top of the heap, so `step` now starts loading that node's edges before it relaxes the
 current node's, which hides the wait behind that work.
 
-- P-cores: elapsed 289–291 → 202–207 ms, task-clock 3.26 → 2.26–2.27 s, cycles 7.45 → 5.06–5.07
+- P-cores: elapsed 289 to 291 → 202 to 207 ms, task-clock 3.26 → 2.26 to 2.27 s, cycles 7.45 → 5.06 to 5.07
   G.
 - Peak memory unchanged. S 291 → 300.
 
@@ -76,7 +76,7 @@ With the edge rows prefetched, the biggest stall became the offsets read for tha
 of samples). The node after next is usually one of the heap root's two children, so `step` also
 prefetches their offsets entries. One step later the top's offsets are already in cache.
 
-- P-cores: elapsed 202–204 → 188–190 ms, task-clock 2.26–2.27 → 2.11 s, cycles 5.06–5.08 → 4.70
+- P-cores: elapsed 202 to 204 → 188 to 190 ms, task-clock 2.26 to 2.27 → 2.11 s, cycles 5.06 to 5.08 → 4.70
   G.
 - Seed 2: 204 → 194 ms. Seed 3: 218 → 198 ms.
 - Peak memory unchanged. S 300 → 306.
@@ -89,8 +89,8 @@ as one `u64` and finds the separator from bit 4, which every digit has and space
 then merges up to 7 digits with three multiplies and no branch. Numbers of 8 or more digits take
 the old loop; on seed 1 that is 50 of the 5M weights.
 
-- P-cores: elapsed 193–216 → 167–190 ms, task-clock 2.09–2.12 → 1.82–1.84 s, cycles 4.66–4.71 →
-  4.03–4.05 G, instructions 6.59 → 5.69 G.
+- P-cores: elapsed 193 to 216 → 167 to 190 ms, task-clock 2.09 to 2.12 → 1.82 to 1.84 s, cycles 4.66 to 4.71 →
+  4.03 to 4.05 G, instructions 6.59 → 5.69 G.
 - Parse passes: 21 → 9 ms and 31 → 20 ms. The build went from 60 to 37 ms.
 - Seed 2: 194 → 168 ms. Seed 3: 201 → 175 ms.
 - Peak memory unchanged. S 306 → 317.
@@ -107,8 +107,8 @@ So the heap's cost was compares and branches, not memory. Each entry is now `dis
 in one `u128`. A `(u64, u32)` tuple compares the distance, then on a tie the node, which takes
 branches. A `u128` compares with one subtract-with-borrow and no branch.
 
-- P-cores: elapsed 165–169 → 157–161 ms, task-clock 1.82–1.84 → 1.73–1.74 s, cycles 4.04–4.06 →
-  3.80–3.81 G, instructions 5.69 → 5.27 G.
+- P-cores: elapsed 165 to 169 → 157 to 161 ms, task-clock 1.82 to 1.84 → 1.73 to 1.74 s, cycles 4.04 to 4.06 →
+  3.80 to 3.81 G, instructions 5.69 → 5.27 G.
 - The heap's share of samples went from 35.0% to 28.2%.
 - Seed 2: 171 → 161 ms. Seed 3: 180 → 165 ms.
 - Peak memory unchanged. S 317 → 323.
@@ -121,7 +121,7 @@ were anonymous memory, and the peak came near the end of the queries. Of that:
 - the two CSRs, 2 × (7 MB of offsets + 40 MB of edges) = 94 MB;
 - the label maps, about 22 MB: of the 24 searches' maps, 17 had grown to 57,344 entries (1.1 MB)
   and 7 to 28,672;
-- 5–10 MB of free heap space, left behind by label maps that grew;
+- 5 to 10 MB of free heap space, left behind by label maps that grew;
 - the heaps, about 1 MB.
 
 The build's own buffers were already small (the edge arrays come zeroed from the kernel, and pass 2
@@ -141,13 +141,13 @@ parked the places in spare bits), so this step cuts the CSRs and the free space:
    `mallopt(M_MMAP_THRESHOLD, 64 KiB)` at the start fixes the threshold, so an outgrown map is
    unmapped.
 
-- P-cores: elapsed 158–162 → 164–167 ms, task-clock 1.75–1.78 → 1.80–1.82 s, cycles 3.82–3.88 →
-  3.97–4.01 G, instructions 5.27 → 5.50 G.
-- Peak memory: 126.6–129.2 → 81.7–81.9 MB.
-- Seed 2: 159 → 164–166 ms, peak 123.0–123.5 → 81.7–84.2 MB. Seed 3: 164 → 170–171 ms, peak
-  123.5–125.5 → 80.1–83.6 MB.
-- Knockouts in the same session: without the row copy, 172–177 ms, task-clock 1.90–1.95 s, peak
-  81.0–82.3 MB; without the fixed threshold, 164–165 ms, task-clock 1.78–1.79 s, peak 90.6–95.6 MB.
+- P-cores: elapsed 158 to 162 → 164 to 167 ms, task-clock 1.75 to 1.78 → 1.80 to 1.82 s, cycles 3.82 to 3.88 →
+  3.97 to 4.01 G, instructions 5.27 → 5.50 G.
+- Peak memory: 126.6 to 129.2 → 81.7 to 81.9 MB.
+- Seed 2: 159 → 164 to 166 ms, peak 123.0 to 123.5 → 81.7 to 84.2 MB. Seed 3: 164 → 170 to 171 ms, peak
+  123.5 to 125.5 → 80.1 to 83.6 MB.
+- Knockouts in the same session: without the row copy, 172 to 177 ms, task-clock 1.90 to 1.95 s, peak
+  81.0 to 82.3 MB; without the fixed threshold, 164 to 165 ms, task-clock 1.78 to 1.79 s, peak 90.6 to 95.6 MB.
 - S 323 → 352.
 
 ## Step 6: the build's arrays faulted in before pass 2
@@ -165,7 +165,7 @@ before the output is written into:
 Outside `main`, the process takes about 1 ms to start and 2 ms at exit to unmap graph.txt.
 
 Pass 2 parses the same text as pass 1 and writes each edge twice, once per direction, yet took twice
-as long. In a run that stopped after the build, 0.21–0.24 G of its 0.95 G cycles were in the kernel,
+as long. In a run that stopped after the build, 0.21 to 0.24 G of its 0.95 G cycles were in the kernel,
 71% of those in `clear_page_erms`, which zeroes new pages. Pass 2 is the first write to the 60 MB of
 edge and place arrays, and every thread writes into every block, so all 12 threads fault on each new
 2 MB huge page at once. Each of them zeroes a huge page; the kernel maps one and frees the rest.
@@ -176,17 +176,17 @@ so each huge page is faulted in by one thread, bar those that straddle two share
 - Phase marks (seed 1, 7 runs each, interleaved): pass 2 18.7 → 13.0 ms, plus 3.3 ms for the new
   step, so 18.7 → 16.2 ms in all, and 156.7 → 154.5 ms before the output. A second session: 19.3 →
   16.4 ms, and 158.9 → 155.6 ms.
-- P-cores, seed 1: elapsed 164.7–165.8 → 161.2–167.9 ms (medians 165.3 → 163.7), task-clock
-  1.80–1.82 → 1.74–1.76 s.
-- Seed 2: medians 170.4 → 166.5 ms, task-clock 1.85–1.87 → 1.81–1.82 s. Seed 3: 173.6–175.8 →
-  170.1–172.1 ms, task-clock 1.90–1.91 → 1.84–1.85 s.
+- P-cores, seed 1: elapsed 164.7 to 165.8 → 161.2 to 167.9 ms (medians 165.3 → 163.7), task-clock
+  1.80 to 1.82 → 1.74 to 1.76 s.
+- Seed 2: medians 170.4 → 166.5 ms, task-clock 1.85 to 1.87 → 1.81 to 1.82 s. Seed 3: 173.6 to 175.8 →
+  170.1 to 172.1 ms, task-clock 1.90 to 1.91 → 1.84 to 1.85 s.
 - With huge pages off (`PR_SET_THP_DISABLE`), the new step takes 0.3 ms and pass 2 faults its 4 KB
   pages as before: 20.8 → 21.2 ms for both, and elapsed medians 173.9 → 173.1 ms. The first
   version wrote once per 4 KB page. That cost 1.6 ms with huge pages off (20.8 → 22.4 ms), and with
   them on it did no better (16.5 against 16.2 ms).
 - This laptop runs Debian 13 with huge pages on for all anonymous memory (`always`), and the
   scoring box runs Debian 13 too.
-- Peak memory unchanged: seed 1 82.2–83.8 → 83.3–85.4 MB, seed 2 79.8–84.1 → 79.4–85.3 MB.
+- Peak memory unchanged: seed 1 82.2 to 83.8 → 83.3 to 85.4 MB, seed 2 79.8 to 84.1 → 79.4 to 85.3 MB.
 - S 352 → 359.
 
 ## Step 7: a bucket queue instead of the binary heap
@@ -205,7 +205,7 @@ algorithm:
   through one shared arena with a free list, so the arena only grows to the most entries queued at
   once. A vector per bucket was slower than the heap, from its cache misses.
 - A key at or past the end of the ring goes to a small binary heap, `far`. Weights go up to
-  2^32 - 1 (spec §2), and the near-2^32 edges in every seed take this path. The ring's size is a
+  2^32-1 (spec §2), and the near-2^32 edges in every seed take this path. The ring's size is a
   constant, not something read from the input, so a graph with only huge weights stays correct
   and pays one heap push per long edge.
 - The queue knows the next nodes it will pop, so each step prefetches the edge row of the node two
@@ -244,11 +244,11 @@ S 450 → 426. Interleaved full runs, medians (fc4ed14 → step 8): seed 1 133.1
 
 ## Step 9: a 2-byte row index, and pass 3 one direction at a time
 
-Round 8 looked at peak memory, 81–84 MB on the board. A time series of the run's cgroup memory on
-seed 1 put the peak near the end of the queries, at 82–83 MB:
+Round 8 looked at peak memory, 81 to 84 MB on the board. A time series of the run's cgroup memory on
+seed 1 put the peak near the end of the queries, at 82 to 83 MB:
 
 - the two CSRs, 53.9 MB: 2 × 20 MB of edges and 2 × 7 MB of offsets;
-- the label maps, 22.3–22.8 MB: each of the 24 keeps the size of the largest search it has run,
+- the label maps, 22.3 to 22.8 MB: each of the 24 keeps the size of the largest search it has run,
   and by the end 17 have 65,536 buckets (1.11 MB) and 7 have 32,768;
 - queues, glibc's arenas, kernel memory and the cgroup's per-CPU charge stock, about 5 MB.
 
@@ -274,20 +274,20 @@ Peak memory, `memory.peak` in MB, 5 runs each, alternating:
 
 | Seed | Step 8 | Pass 3 change alone | Step 9 |
 |---|---|---|---|
-| 1 | 81.3–82.9, median 82.3 | 80.7–82.7, median 81.5 | 74.8–76.9, median 74.9 |
-| 2 | 80.0–84.2, median 84.0 | 78.2–79.7, median 78.7 | 70.5–72.3, median 71.7 |
+| 1 | 81.3 to 82.9, median 82.3 | 80.7 to 82.7, median 81.5 | 74.8 to 76.9, median 74.9 |
+| 2 | 80.0 to 84.2, median 84.0 | 78.2 to 79.7, median 78.7 | 70.5 to 72.3, median 71.7 |
 
-The peak stays near the end of the queries (74–77 MB at 123–125 ms in three time series), and
-the build now tops out at 67–68 MB.
+The peak stays near the end of the queries (74 to 77 MB at 123 to 125 ms in three time series), and
+the build now tops out at 67 to 68 MB.
 
-Time, on a busy machine (load 17–22 from other work on CPUs 12–15):
+Time, on a busy machine (load 17 to 22 from other work on CPUs 12 to 15):
 
 - `ab.py`, alternating full runs, medians, step 8 → step 9: seed 1 151.9 → 151.4 ms (21 runs) and
   142.8 → 144.7 ms (41 runs); seed 2 161.1 → 155.7 and 143.1 → 141.8 ms; seed 3 141.9 → 144.2
   and 152.1 → 151.0 ms.
 - `perf stat -r 5` on P-cores, 4 rounds: seed 1 elapsed medians 137.2 → 137.3 ms, cycles
-  3.26–3.28 → 3.31–3.33 G, instructions 4.75 → 5.04 G; seed 2 144.3 → 141.6 ms, cycles 3.37–3.45 →
-  3.44–3.48 G. Decoding the groups costs 6% more instructions, which the cache misses around
+  3.26 to 3.28 → 3.31 to 3.33 G, instructions 4.75 → 5.04 G; seed 2 144.3 → 141.6 ms, cycles 3.37 to 3.45 →
+  3.44 to 3.48 G. Decoding the groups costs 6% more instructions, which the cache misses around
   them hide.
 
 Correctness: the gate passes, 509 of 509. No seed has a wide group, so 200 generated graphs check
@@ -307,30 +307,30 @@ keeps the size of the largest search its thread ran, about 23 MB in all at full 
 `Dist`, a `u64` in a `#[repr(C, packed(4))]` struct, so an entry is 12 bytes, and a slot with its
 control byte 13 instead of 17.
 
-- Peak memory, 5 runs each, alternating: seed 1 74.4–76.6 → 69.6–71.7 MB (medians 75.8 → 71.3),
-  seed 2 70.5–73.1 → 67.6–68.8 MB (medians 71.5 → 67.8).
+- Peak memory, 5 runs each, alternating: seed 1 74.4 to 76.6 → 69.6 to 71.7 MB (medians 75.8 → 71.3),
+  seed 2 70.5 to 73.1 → 67.6 to 68.8 MB (medians 71.5 → 67.8).
 - `ab.py`, alternating full runs, medians, step 9 → step 10 (31 runs each): seed 1 136.1 → 134.7
   and 136.7 → 136.8 ms, seed 2 137.9 → 135.8 and 137.3 → 136.1 ms, seed 3 142.7 → 141.4 ms.
-- `perf stat -r 5` on P-cores, seed 1, 3 rounds: task-clock 1.430–1.451 → 1.416–1.431 s, cycles
-  3.25–3.30 → 3.22–3.27 G, instructions 5.04 → 5.11 G.
+- `perf stat -r 5` on P-cores, seed 1, 3 rounds: task-clock 1.430 to 1.451 → 1.416 to 1.431 s, cycles
+  3.25 to 3.30 → 3.22 to 3.27 G, instructions 5.04 → 5.11 G.
 - S 443 → 445.
 
 ## Step 11: the queue tops kept between steps
 
 Steps 10 and 11 went to the board in one push, so both rows cite run-37fab0938045.
 
-A time split of step 7 on seed 1: the build takes 35–43 ms, the queries 93–105 ms, the output
+A time split of step 7 on seed 1: the build takes 35 to 43 ms, the queries 93 to 105 ms, the output
 0.08 ms. The search loop asked both queues for their top on every iteration, but a step moves
 only its own side's top. `step` now returns its queue's new top, and `distance` keeps the other
 side's. The side that did not step has an unchanged queue, so its top and the bucket cursor that
 `pop` relies on are still valid, and the stop rule sees the same values as before.
 
 `ab.py` against step 9, alternating full runs on seed 1, five sessions on a busy machine (load
-9–12), medians: 158.5 → 155.4, 142.9 → 139.7, 139.6 → 137.9, 138.8 → 134.3 and 142.2 → 139.8 ms,
-faster on median and minimum in all five, about −2.1% on average. The query phase alone, two
+9 to 12), medians: 158.5 → 155.4, 142.9 → 139.7, 139.6 → 137.9, 138.8 → 134.3 and 142.2 → 139.8 ms,
+faster on median and minimum in all five, about -2.1% on average. The query phase alone, two
 sessions of 21 runs: 96.8 → 94.3 and 97.9 → 94.6 ms. S 445 → 447. Gate: 509 pass, 0 fail.
 
-Measured and not taken: the last threads idle for 3–5 ms at the end, because the top 5% of
+Measured and not taken: the last threads idle for 3 to 5 ms at the end, because the top 5% of
 queries use 53% of the CPU and their cost can't be predicted, so no cheap reordering helps.
 Label and queue resets cost about 0.5 ms of wall time, and the 20 duplicate queries of a seed
 about 0.7 ms, which would take about 10 lines to remove.
@@ -359,7 +359,7 @@ bytes in both builds (`-C llvm-args=-align-all-functions=6`, for this control on
 
 Peak memory, medians: seed 1 70.3 → 70.35 MB (10 runs each), seed 3 69.6 → 69.5 and seed 4
 67.7 → 67.9 (5 runs each). Seed 2 rose from 67.6 to 68.25 MB over 10 runs. Its build maximum
-stayed at 67.4–68.0 MB, but its query phase ended about 1 MB higher in anonymous memory in three
+stayed at 67.4 to 68.0 MB, but its query phase ended about 1 MB higher in anonymous memory in three
 traced runs. The query code is unchanged, so this is most likely where the heap's pieces landed.
 S 447 → 448. Gate: 509 pass, 0 fail.
 
@@ -367,16 +367,16 @@ S 447 → 448. Gate: 509 pass, 0 fail.
 
 After step 12 the peak still came near the end of the queries, and the 24 label tables made about
 17.5 MB of it: 13 bytes a bucket, 17 tables at 65,536 buckets and 7 at 32,768. A label is now a
-`u32` in the first of two maps, so a bucket takes 9 bytes. A label of 2^32 - 1 or more, which only
+`u32` in the first of two maps, so a bucket takes 9 bytes. A label of 2^32-1 or more, which only
 a path over one of the edges near 2^32 can have, is `u32::MAX` in the first map and its full value
 in the second.
 
-A new label starts at `u32::MAX`, so a `via` below 2^32 - 1 beats it with the one compare a
+A new label starts at `u32::MAX`, so a `via` below 2^32-1 beats it with the one compare a
 relaxation already made, and a miss in the first map is final. The second map is read only when
-`via` itself reaches 2^32 - 1, and for the other side's label only behind a `u32::MAX`. On seed 1
+`via` itself reaches 2^32-1, and for the other side's label only behind a `u32::MAX`. On seed 1
 the other side has the node in 5,031 of the 8.65M lookups.
 
-- Peak memory, 6 alternating runs each, seed 1: 69.86–71.17 → 67.34–68.29 MB, medians 70.30 →
+- Peak memory, 6 alternating runs each, seed 1: 69.86 to 71.17 → 67.34 to 68.29 MB, medians 70.30 →
   67.70. In a trace of `memory.current` the queries now end at about 64 MB, and the peak moved to
   pass 3 of the forward direction, while the edges, both place arrays and the forward rows are
   alive. So 2.6 of the 5 MB show.
@@ -411,13 +411,13 @@ byte-identical to step 14's. S 442 → 441. Gate: 509 pass, 0 fail.
 LLVM kept `Queue::push` out of line, so every relaxation in `Search::step` paid for a call and
 its spills. `#[inline(always)]` puts it in the loop (pedantic clippy's `inline_always` is allowed
 in `Cargo.toml`, with the reason). Local, AC power, turbo off, seed 1, 12 threads: `perf stat`,
-5 runs, twice: instructions 5.188 → 5.093 G and 5.206 → 5.112 G (−1.8%), cycles 3.485 → 3.310 G
+5 runs, twice: instructions 5.188 → 5.093 G and 5.206 → 5.112 G (-1.8%), cycles 3.485 → 3.310 G
 and 3.555 → 3.442 G, task-clock 1,458 → 1,384 ms and 1,487 → 1,440 ms. `ab.py`, interleaved
 against step 15, medians (minimums): 31 runs, 132.43 → 130.56 ms (130.38 → 126.92); 41 runs,
 135.63 → 130.98 (128.91 → 126.39); 41 runs, 133.52 → 130.68 (128.87 → 126.43); and on a first
 build, 31 runs twice, 131.09 → 127.92 and 132.38 → 128.69. memory.peak cannot move, as `push`
 runs only in the queries, and did not: 6 alternating runs, median 67.90 → 67.89 MB, highest
-68.17 → 68.22. S 441 → 442. Gate: 512 pass, 0 fail (full seeds 1–12 and every tiny
+68.17 → 68.22. S 441 → 442. Gate: 512 pass, 0 fail (full seeds 1 to 12 and every tiny
 seed).
 
 ## After step 16: where memory.peak comes from, and label changes that did not pay
@@ -426,20 +426,20 @@ Four query-side changes and one build-side change, each measured against step 16
 where noted). None paid, so the code is step 16's. Rows in the table below.
 
 Where memory.peak comes from, read from the cgroup at phase marks (seed 1, 12 threads, 3
-runs, peak 66,044–66,516 KiB): it is reached at the end of pass 3's first direction. Then both
+runs, peak 66,044 to 66,516 KiB): it is reached at the end of pass 3's first direction. Then both
 edge arrays (38.15 MiB), both place arrays (19.07 MiB) and the forward rows (3.32 MiB, written as
 4 KB pages by all 12 threads) are live at once, with about 4.4 MiB on top: the process and its
 wrapper, page tables (520 KiB), slab, and the memory cgroup's per-CPU charge batches. The
 queries top out lower, at about 62,100 KiB (an earlier `memory.current` trace), with 12 threads'
 label tables grown to 32,768 or 65,536 buckets. So a cut to the labels alone cannot move M until
 the build peak falls by about 4.4 MiB. It also explains the measured peaks below: u16 labels
-save 2–3 MB in the queries and nothing in the peak.
+save 2 to 3 MB in the queries and nothing in the peak.
 
 ## Step 17: pass 3 gives back the places it has sorted
 
 A phase trace of step 16 (seed 1, `memory.current` and `memory.peak` of the cgroup at each phase
-mark, KiB, 3 runs) put the peak at the end of pass 3's first direction, 65,856–66,048, against
-62,356–62,388 at the end of pass 2 and 60,488–62,632 when the query threads finish. The difference
+mark, KiB, 3 runs) put the peak at the end of pass 3's first direction, 65,856 to 66,048, against
+62,356 to 62,388 at the end of pass 2 and 60,488 to 62,632 when the query threads finish. The difference
 is the forward rows, written while both directions' places are still alive, plus the sort's
 buffers.
 
@@ -450,13 +450,13 @@ own thread's last one), so after each block the whole 2 MB pages below it that a
 dropped go back with `madvise(MADV_DONTNEED)`. The bounds are 2 MB aligned because a dropped part
 of a huge page stays charged until the rest of it goes. The reverse direction runs the same code.
 
-- Phase trace after (seed 1, 5 runs, KiB): pass 2 ends at 62,192–62,872, the forward pass 3 tops
-  out at 63,436–64,448, and the query threads end at 62,948–63,652. The forward pass still adds
+- Phase trace after (seed 1, 5 runs, KiB): pass 2 ends at 62,192 to 62,872, the forward pass 3 tops
+  out at 63,436 to 64,448, and the query threads end at 62,948 to 63,652. The forward pass still adds
   about 1.2 MiB: the first huge page of places goes only once the slowest thread is past it, and
   the 4 KB pages before it stay.
-- memory.peak, MiB, 6 alternating runs each: seed 1 63.9–64.4 → 61.9–62.7 (medians 64.1 →
-  62.25) and 64.0–64.6 → 61.8–62.4 (64.3 → 62.15); seed 2 63.9–64.5 → 61.8–62.7 (64.1 → 62.35);
-  seed 3 64.0–64.7 → 61.8–62.7 (64.2 → 62.15).
+- memory.peak, MiB, 6 alternating runs each: seed 1 63.9 to 64.4 → 61.9 to 62.7 (medians 64.1 →
+  62.25) and 64.0 to 64.6 → 61.8 to 62.4 (64.3 → 62.15); seed 2 63.9 to 64.5 → 61.8 to 62.7 (64.1 → 62.35);
+  seed 3 64.0 to 64.7 → 61.8 to 62.7 (64.2 → 62.15).
 - `ab.py`, 41 alternating runs per binary, medians (minimums): seed 1 128.75 → 128.01 (126.90 →
   126.43) ms; seed 3 134.67 → 135.20 (132.45 → 132.43) ms. Before two line cuts that leave the
   logic as is (an `if` around the call, and acquire/release orderings): seed 1 128.57 → 128.08
@@ -478,16 +478,16 @@ those widths rather than longer lines. Net code lines per change:
   does, instead of setting `WORKDIR` and copying it: 7 → 5. Built with `docker build
   --network=none`, the binary is byte-identical to the local cargo build (ef900b06).
 - `for_each_line::<N>` parses a line of N numbers into an array, so the edge lines and the query
-  lines share it: −4. The queries are kept as `u32` pairs, so `answer` stores `distance` with no
-  binding: −1.
-- `split_runs` cuts with `split_off_mut`: −4. `sort`'s prefix sum is a `fold`: −2.
+  lines share it: -4. The queries are kept as `u32` pairs, so `answer` stores `distance` with no
+  binding: -1.
+- `split_runs` cuts with `split_off_mut`: -4. `sort`'s prefix sum is a `fold`: -2.
 - `map_file` maps at least one byte, so an empty file (an empty queries.txt) needs no branch: the
-  mapping of an empty file succeeds and the empty slice never reads it. −3.
-- `line_chunks` computes each split point in a closure, from `at - 1` on: −2. Its chunks differ
+  mapping of an empty file succeeds and the empty slice never reads it. -3.
+- `line_chunks` computes each split point in a closure, from `at - 1` on: -2. Its chunks differ
   from step 17's by at most a line at each split, which only reorders edges inside a row.
 - `prefetch` takes an `Option` and `Csr::prefetch` is gone, so `step` makes its two prefetches in
-  two lines: −6.
-- Smaller ones, −1 each: the two arguments through one closure (track A's form), `start` returns
+  two lines: -6.
+- Smaller ones, -1 each: the two arguments through one closure (track A's form), `start` returns
   the queue's top as `step` does, `unpack` mapped over the row, `unpack` and the row copy declared
   together, `Queue::new` without its `Default::default()` binding, and `ahead`'s word and bit read
   from `from` directly.
@@ -498,10 +498,10 @@ more instruction per line: LLVM now lays the heavy-weight test out as a not-take
 instead of a taken branch. Pass 3's prefix sum and the per-query code changed.
 
 Code placement mattered. A first version had `step`'s start 32 bytes past a 64-byte line instead
-of 16, with the same machine code, and that cost 0.4–0.5% of cycles (`perf stat`, 8 and 10
+of 16, with the same machine code, and that cost 0.4 to 0.5% of cycles (`perf stat`, 8 and 10
 interleaved rounds, never lower than step 17; `perf record` put all of it in `step`). With every
 function aligned to 64 bytes (`-C llvm-args=-align-all-functions=6`, for this control only), step
-17's code and this step's both lost 0.4–0.5% too. Reading the arguments through one closure moves
+17's code and this step's both lost 0.4 to 0.5% too. Reading the arguments through one closure moves
 `step` back to 16, and that is the version kept.
 
 Local, turbo off, against step 17, seed 1 unless named:
@@ -514,7 +514,7 @@ Local, turbo off, against step 17, seed 1 unless named:
   131.01). In the third round a second copy of step 17's binary ran too: 127.60 and 133.46 ms.
   About +0.07% on average, within the spread of the two copies.
 - memory.peak, alternating runs: seed 1 median 62.4 → 62.1 MB (5 runs each), seed 3 62.2 →
-  62.35 MB (10 runs each, 61.8–63.0 against 61.8–63.7).
+  62.35 MB (10 runs each, 61.8 to 63.0 against 61.8 to 63.7).
 - S 449 → 419 (Rust 442 → 414, Dockerfile 7 → 5). Gate: 512 pass, 0 fail; `cargo fmt --check`
   and clippy report nothing. An empty queries.txt, a graph with no edges, and files without a
   final LF give the same output as step 17.
@@ -602,32 +602,32 @@ between rows.
 
 | Experiment | Local result (P-cores, seed 1) | Why it lost |
 |---|---|---|
-| Prefetch `offsets[next]` at every push, alone | 281–285 ms, task-clock 3.16–3.18 s, against 289–291 ms and 3.26 s | It also fetches nodes that are settled much later, or never |
-| The push prefetch together with step 2b's prefetch | 208–210 ms, task-clock 2.34–2.35 s, against 202–207 ms and 2.26–2.27 s for step 2b alone | The extra prefetches cost more than they hid |
-| That pair, plus the last line of the next node's edge row | 209–210 ms, task-clock 2.33 s, against 208–210 ms and 2.34–2.35 s without it | No gain in elapsed time |
-| Step 2b's prefetch placed before the stale-entry check | task-clock 2.27–2.28 s against 2.26 s; elapsed 202–205 ms against 203–208 ms, leaving out one noisy round | A tie, and 3 more lines after rustfmt |
-| Prefetch only the closer of the root's two children | 192 / 224 / 194 ms, task-clock 2.10–2.12 s, against 189 / 217 / 191 ms and 2.08–2.11 s for both | Slower than prefetching both |
-| Also prefetch the root's four grandchildren | 191–195 ms, task-clock 2.13–2.14 s, against 190–194 ms and 2.12 s | No gain |
-| Transparent huge pages off (`prctl(PR_SET_THP_DISABLE)`) | 227–240 ms, task-clock 2.48 s, cycles 5.68 G, peak 125.5–129.2 MB, against 211–230 ms, 2.35 s, 5.24 G, 124.6–127.3 MB | The CSR was already 86 of its 94 MB on huge pages mid-run. Its arrays are fully used, so there is no padding to save, and its random reads miss the TLB more on 4 KB pages |
+| Prefetch `offsets[next]` at every push, alone | 281 to 285 ms, task-clock 3.16 to 3.18 s, against 289 to 291 ms and 3.26 s | It also fetches nodes that are settled much later, or never |
+| The push prefetch together with step 2b's prefetch | 208 to 210 ms, task-clock 2.34 to 2.35 s, against 202 to 207 ms and 2.26 to 2.27 s for step 2b alone | The extra prefetches cost more than they hid |
+| That pair, plus the last line of the next node's edge row | 209 to 210 ms, task-clock 2.33 s, against 208 to 210 ms and 2.34 to 2.35 s without it | No gain in elapsed time |
+| Step 2b's prefetch placed before the stale-entry check | task-clock 2.27 to 2.28 s against 2.26 s; elapsed 202 to 205 ms against 203 to 208 ms, leaving out one noisy round | A tie, and 3 more lines after rustfmt |
+| Prefetch only the closer of the root's two children | 192 / 224 / 194 ms, task-clock 2.10 to 2.12 s, against 189 / 217 / 191 ms and 2.08 to 2.11 s for both | Slower than prefetching both |
+| Also prefetch the root's four grandchildren | 191 to 195 ms, task-clock 2.13 to 2.14 s, against 190 to 194 ms and 2.12 s | No gain |
+| Transparent huge pages off (`prctl(PR_SET_THP_DISABLE)`) | 227 to 240 ms, task-clock 2.48 s, cycles 5.68 G, peak 125.5 to 129.2 MB, against 211 to 230 ms, 2.35 s, 5.24 G, 124.6 to 127.3 MB | The CSR was already 86 of its 94 MB on huge pages mid-run. Its arrays are fully used, so there is no padding to save, and its random reads miss the TLB more on 4 KB pages |
 | `MADV_HUGEPAGE` on the CSR | Not built | Only the unaligned array ends (about 8 MB) are on 4 KB pages. Scaled from the 5.5% that all-4 KB pages cost, that is at most about 0.5% |
-| 4-ary heap, child picked by a loop | 202–205 ms, task-clock 2.24 s, 6.71 G instructions, against 166–168 ms, 1.83–1.84 s, 5.69 G | 18% more instructions. The heap tops out at 43 KB and stays in cache, so fewer levels save no misses |
-| 4-ary heap, child picked without branches | 212–213 ms, task-clock 1.96–1.98 s, against 201–205 ms and 1.86–1.88 s (two rounds, on a busy machine) | The same: std's binary heap is already cheap per level on a heap this small |
-| Radix heap, with each bucket's minimum kept on push | 203–208 ms, task-clock 2.25–2.31 s, cycles 4.92–5.07 G, against 170–171 ms, 1.85–1.87 s, 4.04–4.05 G | It can't name the node after next, so step 2c's prefetch is lost, and bucket bookkeeping costs more than a 43 KB binary heap |
-| Labels as `u32` distances, with the rare longer ones in a second map (on step 4) | 163–170 ms, task-clock 1.81 s, 5.65 G instructions, peak 114–116 MB, against 156–158 ms, 1.73 s, 5.27 G, 125–128 MB | 7% more instructions and 28 more lines to save 11 MB |
-| Step 5's rows read in place, but with an NTA hint on the row prefetch, in reverse order, or even edges then odd ones from one load instruction | cycles 4.14–4.35 G, 98–129M L2 prefetches, against 4.07 G and 113M read in place (counters, one `perf stat -r 3` each) | The extra prefetches stayed |
-| Step 5's rows read as 8-byte pairs, or even and odd edges from two load instructions | 55–60M L2 prefetches, but 5.85–5.93 G instructions and cycles 4.07–4.12 G, against 5.45 G and 4.07 G read in place (same session) | The extra instructions ate the gain |
+| 4-ary heap, child picked by a loop | 202 to 205 ms, task-clock 2.24 s, 6.71 G instructions, against 166 to 168 ms, 1.83 to 1.84 s, 5.69 G | 18% more instructions. The heap tops out at 43 KB and stays in cache, so fewer levels save no misses |
+| 4-ary heap, child picked without branches | 212 to 213 ms, task-clock 1.96 to 1.98 s, against 201 to 205 ms and 1.86 to 1.88 s (two rounds, on a busy machine) | The same: std's binary heap is already cheap per level on a heap this small |
+| Radix heap, with each bucket's minimum kept on push | 203 to 208 ms, task-clock 2.25 to 2.31 s, cycles 4.92 to 5.07 G, against 170 to 171 ms, 1.85 to 1.87 s, 4.04 to 4.05 G | It can't name the node after next, so step 2c's prefetch is lost, and bucket bookkeeping costs more than a 43 KB binary heap |
+| Labels as `u32` distances, with the rare longer ones in a second map (on step 4) | 163 to 170 ms, task-clock 1.81 s, 5.65 G instructions, peak 114 to 116 MB, against 156 to 158 ms, 1.73 s, 5.27 G, 125 to 128 MB | 7% more instructions and 28 more lines to save 11 MB |
+| Step 5's rows read in place, but with an NTA hint on the row prefetch, in reverse order, or even edges then odd ones from one load instruction | cycles 4.14 to 4.35 G, 98 to 129M L2 prefetches, against 4.07 G and 113M read in place (counters, one `perf stat -r 3` each) | The extra prefetches stayed |
+| Step 5's rows read as 8-byte pairs, or even and odd edges from two load instructions | 55 to 60M L2 prefetches, but 5.85 to 5.93 G instructions and cycles 4.07 to 4.12 G, against 5.45 G and 4.07 G read in place (same session) | The extra instructions ate the gain |
 | Step 5's row copied by a `memcpy` of its exact length | cycles 3.97 G, 5.71 G instructions, against 3.91 G and 5.50 G for the 32-byte copy (same session) | A library call per row |
 | A 16-byte copy for rows of up to 4 edges | 89M L2 prefetches, cycles 3.99 G, against 55M and 3.91 G for the 32-byte copy (same session) | Rows of 5 to 8 edges still set the prefetchers off |
 | Two or four lines parsed at once per thread, interleaved, in both parse passes (on step 5, phase marks) | Two: pass 1 9.5 → 8.5 ms, pass 2 19.0 → 21.5 ms, 157.1 → 158.1 ms before the output. Four: 10.4, 22.6 and 162.6 ms | Pass 2 lost more than pass 1 gained |
 | Blocks of 4,096, 8,192, 16,384 or 32,768 nodes instead of 2,048 (on step 5, phase marks) | Runs set-up 1.2 → 0.6 / 0.3 / under 0.2 / under 0.2 ms, pass 2 19.1 → 18.6 / 18.2 / 17.8 / 17.6 ms, but pass 3 6.6 → 7.6 / 14.5 / 12.6 / 15.4 ms, so 157.0 → 156.6 / 162.5 / 161.5 / 165.8 ms before the output | A tie at 4,096, and pass 3 slower beyond. Past 64 KB a block's copy is a fresh `mmap`; with one buffer per thread reused instead, pass 3 took 6.6 / 7.7 / 8.8 / 9.9 ms at 2,048 / 4,096 / 8,192 / 16,384, against 6.8 ms for the copy at 2,048 |
 | Step 6's faulting on all 12 threads, or on a third of them | Faulting plus pass 2: 17.1 and 17.2 ms, against 16.4 ms on half (one write per 2 MB). With one write per 4 KB, 17.7 against 17.0 ms | Zeroing is memory traffic, and more threads only contend for it |
 | Step 6's faulting for the edge arrays only | 2.8 + 15.9 = 18.6 ms, against 4.3 + 12.4 = 16.7 ms for all four arrays and 18.8 ms for none (one write per 4 KB) | Pass 2's first writes to the place arrays race the same way |
-| Faulting inside pass 1, with the arrays sized from the header's edge count | Pass 1 9.5 → 15.2–15.9 ms, and 158.6–159.0 ms before the output, against 157.6 ms with step 6's separate step and 160.6 ms with neither | The parse slowed by more than the separate step takes |
+| Faulting inside pass 1, with the arrays sized from the header's edge count | Pass 1 9.5 → 15.2 to 15.9 ms, and 158.6 to 159.0 ms before the output, against 157.6 ms with step 6's separate step and 160.6 ms with neither | The parse slowed by more than the separate step takes |
 | Faulting during pass 1 on 6 extra threads, or on the main thread | Pass 1 9.6 → 23.4 ms (fastest 13.5) and 17.6 ms (fastest 13.8) | The 12 parse threads already fill the 12 CPUs |
 | Unmapping graph.txt and freeing the place arrays on background threads | 160.5 ms median with both, 160.4 ms without the unmap, 161.8 ms without the background free (5 rounds) | No gain in elapsed time worth the lines |
 | A cheaper bounds check in `number` | Pass 1 fastest 9.39 ms, against 9.43 ms | No gain |
 | Pass 2's run lists sized up front | Runs set-up 1.28 → 1.10 ms | 0.18 ms is less than the lines cost |
-| A statically linked binary (`-C target-feature=+crt-static`) | Start-up 1.0 → 0.73–0.77 ms | Not adopted: untested in the Docker build, for about 0.25 ms |
+| A statically linked binary (`-C target-feature=+crt-static`) | Start-up 1.0 → 0.73 to 0.77 ms | Not adopted: untested in the Docker build, for about 0.25 ms |
 | Relabeling nodes in BFS order, computed during the run (on step 7) | Queries 93.8 → 84.8 ms, but the order took 80 ms and permuting the graph 52 ms. An ideal order from the generator's coordinates, which a submission cannot use, reached 83.3 ms | Even a 10× faster order would only about break even |
 | A locality-preserving hash for the label table, on the ideal order above (on step 7) | Queries 110.9 ms against 83.3 ms with the multiplicative hash on the same order | Slower |
 | Labels as 32-bit distances with a fallback map (on step 7) | Queries 95.2 against 93.1 ms, 0.9 MB saved | Slower, for little memory |
@@ -637,15 +637,15 @@ between rows.
 | Exact pruning on `via + other_top >= best`, or checking the other side when a node is settled | Correct, no speedup | |
 | Prefetching the 4th or 5th node ahead, or pre-warming the label slots of the next node's neighbours | No gain | |
 | Balancing the two sides by pop count instead of queue length | Slower | |
-| Label maps emptied after each query once they pass 14,336 entries, or 28,672 (on step 7, with step 9's pass 3 change) | Peak 72.0–72.7 MB against 80.9–82.6, but elapsed median 148.6 against 134.7 ms, task-clock 1.55–1.57 against 1.41–1.42 s | 10% slower: the next big search regrows its map from empty, rehashing at every doubling into freshly mapped pages |
-| Step 9's pass 3 change without faulting the offsets in first (on step 7) | Peak 80.9–85.2 MB against 80.6–83.7, elapsed median 137.2 against 134.1 ms | More threads first-touched each fresh huge page |
-| Pass 1 parsed with AVX2: one 32-byte compare finds a line's three separators (on step 11, phase marks) | Pass 1 fastest 9.4–9.5 → 7.6–7.8 ms, pass 2 unchanged, S +24 | 1.3% of T for 5% more lines, a small loss on the score |
-| A write prefetch of a run's next slots in pass 2, three placements (on step 11, phase marks) | Pass 2 fastest 15.1–15.2 ms against 12.8 ms | Slower |
+| Label maps emptied after each query once they pass 14,336 entries, or 28,672 (on step 7, with step 9's pass 3 change) | Peak 72.0 to 72.7 MB against 80.9 to 82.6, but elapsed median 148.6 against 134.7 ms, task-clock 1.55 to 1.57 against 1.41 to 1.42 s | 10% slower: the next big search regrows its map from empty, rehashing at every doubling into freshly mapped pages |
+| Step 9's pass 3 change without faulting the offsets in first (on step 7) | Peak 80.9 to 85.2 MB against 80.6 to 83.7, elapsed median 137.2 against 134.1 ms | More threads first-touched each fresh huge page |
+| Pass 1 parsed with AVX2: one 32-byte compare finds a line's three separators (on step 11, phase marks) | Pass 1 fastest 9.4 to 9.5 → 7.6 to 7.8 ms, pass 2 unchanged, S +24 | 1.3% of T for 5% more lines, a small loss on the score |
+| A write prefetch of a run's next slots in pass 2, three placements (on step 11, phase marks) | Pass 2 fastest 15.1 to 15.2 ms against 12.8 ms | Slower |
 | `sort`'s counters in a stack array of `BLOCK + 1` instead of a `Vec` per block (on step 11) | Medians 133.30 and 133.63 ms against 133.31 and 133.57 ms (seeds 1 and 2) | No change |
 | Each pass 2 thread drops its chunk's pages of graph.txt from the page tables (`madvise(MADV_DONTNEED)`) when it is done, so that the exit has none to unmap (on step 12) | Medians 131.11, 132.27, 131.01 and 131.92 ms against 131.35, 131.97, 130.69 and 132.26 ms (seeds 1, 2, 1, 2) | A tie, for 4 lines. Unmapping them at the exit takes about 1.7 ms on one thread, and the calls cost about as much, likely in the TLB flushes they send to the other threads |
-| The same `madvise` on all of graph.txt from a 13th thread during the queries (on step 12) | Medians 132.09, 155.11, 133.53 and 133.61 ms against 131.67, 154.59, 132.94 and 132.81 ms | 0.4–0.8 ms slower, likely from the CPU time it takes from the 12 query threads and the TLB flushes it sends them |
-| A static-pie build (`+crt-static`, as tracks A and C use), on step 12 | `ab.py`, 30 interleaved runs, median / min 132.21 / 130.34 ms against 132.01 / 130.38 ms; memory.peak, 6 alternating runs, 70.1–72.1 against 70.1–71.7 MB | No gain: the dynamic loader's quarter of a millisecond is 0.2% of the run |
-| Each pass-2 thread drops its chunk's pages of graph.txt (`madvise(MADV_DONTNEED)`, 3 lines), so the exit has fewer to unmap, as track B's step 17 does | `ab.py`, 30 interleaved runs, medians 132.68 → 131.95, 133.93 → 134.01 (seed 2) and 133.41 → 133.53 ms, minimums 0.6–1.3 ms lower; kernel cycles 155–157 → 163–165 M | No gain in the median: 22k page-cache entries take little time to unmap, and the drops interrupt the threads still parsing |
+| The same `madvise` on all of graph.txt from a 13th thread during the queries (on step 12) | Medians 132.09, 155.11, 133.53 and 133.61 ms against 131.67, 154.59, 132.94 and 132.81 ms | 0.4 to 0.8 ms slower, likely from the CPU time it takes from the 12 query threads and the TLB flushes it sends them |
+| A static-pie build (`+crt-static`, as tracks A and C use), on step 12 | `ab.py`, 30 interleaved runs, median / min 132.21 / 130.34 ms against 132.01 / 130.38 ms; memory.peak, 6 alternating runs, 70.1 to 72.1 against 70.1 to 71.7 MB | No gain: the dynamic loader's quarter of a millisecond is 0.2% of the run |
+| Each pass-2 thread drops its chunk's pages of graph.txt (`madvise(MADV_DONTNEED)`, 3 lines), so the exit has fewer to unmap, as track B's step 17 does | `ab.py`, 30 interleaved runs, medians 132.68 → 131.95, 133.93 → 134.01 (seed 2) and 133.41 → 133.53 ms, minimums 0.6 to 1.3 ms lower; kernel cycles 155 to 157 → 163 to 165 M | No gain in the median: 22k page-cache entries take little time to unmap, and the drops interrupt the threads still parsing |
 | A node's edge back to the node that labelled it skipped, with that parent carried in the queue entry, and a label's old ring entry unlinked when the label improves (on step 12) | `ab.py`, 31 runs: the skip alone 132.85 → 133.60 ms, both 132.25 → 132.40 ms (medians). Instructions 5.10 → 4.98 G, branch misses 19.0 → 23.6 M, cycles 3.36 G in both | The skip is a branch on the data that mispredicts, and the 450k stale pops of 7.57M (seed 1) that the unlinking removes saved no time |
 | Every label table made with room for 32,768 labels (65,536 buckets) from the start, to skip its growth (on a first version of step 13) | `ab.py`, 31 runs, same session: median 130.67 → 135.73 ms | Most queries had run in 32,768 buckets; spread over twice as many, their labels miss the caches more |
 | Line cuts that change the machine code, on step 12: `split_runs` through `split_off_mut` (4 lines), `sort`'s prefix sum as a `fold` (3), its copy iterated in the loop header (1) | `.text` differs from step 12's in 4,175 and 573 lines of disassembly with addresses stripped; the third keeps it but draws a clippy warning (`unnecessary_to_owned`) | Not measured: code placement alone moved this track's time by about 1 ms (step 12) |
@@ -653,28 +653,28 @@ between rows.
 | The side with the smaller queue top advanced instead of the side with the shorter queue, while both tops are below 2^32 (on step 14) | `ab.py`, 21 runs: median 133.19 → 138.99 ms, min 129.42 → 134.71 ms | Equal radii settle more nodes than equal frontiers on this graph |
 | The node hash without its multiply: the id as it is, and its low 7 bits copied to the top for hashbrown's tag (on step 14) | `ab.py`, 31 runs: median 130.96 → 146.39 ms | The tag then repeats the slot's own low bits, so any label whose home is the same slot matches it, and a miss loads a bucket far more often |
 | The edge back to the parent left out with no branch: the parent rides in the queue entry, and a compare over the 8 copied edges moves its edge last and drops it (on step 15) | `ab.py`, 31 runs: median 131.53 → 135.38 ms. Branch misses 18.9 → 17.0 M, but instructions 5.15 → 5.20 G and cycles 3.36 → 3.44 G | The parent's label is a cache hit, so its relaxation was cheap; the compare and the wider queue entries cost more |
-| Labels as `u16` distances, keys packed to 2-byte alignment so a bucket takes 6 bytes, longer labels behind a `u16::MAX` in the second map (on step 16) | `ab.py`, 31 runs, two rounds: medians 128.02 → 127.34 and 128.47 → 129.36 ms, minimums 126.56 → 125.93 and 125.85 → 126.20. `perf stat` on step 15: cycles −1.2%, instructions +0.6%, L1 misses +1.8%. memory.peak, 6 runs: median 67.89 → 67.62 MB, highest 68.17 → 68.10 | A tie in time, and the label memory it saves sits below the build peak |
+| Labels as `u16` distances, keys packed to 2-byte alignment so a bucket takes 6 bytes, longer labels behind a `u16::MAX` in the second map (on step 16) | `ab.py`, 31 runs, two rounds: medians 128.02 → 127.34 and 128.47 → 129.36 ms, minimums 126.56 → 125.93 and 125.85 → 126.20. `perf stat` on step 15: cycles -1.2%, instructions +0.6%, L1 misses +1.8%. memory.peak, 6 runs: median 67.89 → 67.62 MB, highest 68.17 → 68.10 | A tie in time, and the label memory it saves sits below the build peak |
 | One label table per thread for both sides, `[u32; 2]` per node, so the relaxation reads the other side's label from the same bucket instead of a second lookup (on step 16) | `ab.py`, 31 runs, three rounds: medians 127.38 → 131.05, 128.02 → 130.70, 128.47 → 131.54 ms. `perf stat`: instructions 4.994 → 4.977 G, but cycles 3.063 → 3.156 G and L2 load misses 3.55 → 4.65 M | The joint table holds both searches' nodes in 12-byte buckets, 128 Ki of them for the big queries, and that misses L2 more often than the saved lookup gained |
 | The same joint table with `[u16; 2]`, 8-byte buckets (on step 16) | `ab.py`, 31 runs, two rounds: medians 128.02 → 128.64 and 128.47 → 130.07 ms. memory.peak, 6 runs: median 67.89 → 67.75 MB, highest 68.17 → 67.81 | Still slower; the memory sits below the build peak |
 | Labels in a dense `u32` array per search, 2^21 slots, reset through a list of touched nodes (on step 15) | `ab.py`, 11 runs: median 131.04 → 243.08 ms | 24 arrays of 8 MiB written in full on first use, about 200 MB of page faults and zeroing |
-| `#[inline(always)]` on `Search::step` (on step 15) | `perf stat`, 5 runs: cycles 3.137 → 3.111 G (−0.8%), instructions +0.8% | Below `push`'s gain, which step 16 took |
-| The forward CSR built first, then the reverse one by transposing it, so the two place arrays are never live together (on step 15) | memory.peak, 6 runs: median 67.78 → 64.88 MB, highest 67.97 → 65.52. `ab.py`, 31 runs: median 130.61 → 137.06 ms, min 128.61 → 135.52. Build 34.5 → 42.7 ms (forward count 9.1, fault 3.6, scatter 10.9, sort 3.2; reverse count 3.1, fault 1.6, scatter 5.4, sort 3.5) | 2.9 MB saved for 6.5 ms: the queries' own peak, about 64–65 MB, then caps the saving, and the second scatter costs more than pass 2 saves |
-| Step 17's pass 3 in four rounds, each its own `on_threads`, with the sorted places given back between rounds | Not built in full: one `on_threads` of 12 threads that do nothing takes 172–189 µs (average of 20, three runs), so the forward direction's three extra rounds cost about 0.55 ms | Step 17 frees as much with no extra rounds |
-| Step 17 with each thread's sorted blocks counted, and every block below 12 × the least count freed (on step 16) | memory.peak, 6 alternating runs: 62.1–62.5 against 63.9–64.3 MB | The same memory as step 17, which needs no list of block starts |
+| `#[inline(always)]` on `Search::step` (on step 15) | `perf stat`, 5 runs: cycles 3.137 → 3.111 G (-0.8%), instructions +0.8% | Below `push`'s gain, which step 16 took |
+| The forward CSR built first, then the reverse one by transposing it, so the two place arrays are never live together (on step 15) | memory.peak, 6 runs: median 67.78 → 64.88 MB, highest 67.97 → 65.52. `ab.py`, 31 runs: median 130.61 → 137.06 ms, min 128.61 → 135.52. Build 34.5 → 42.7 ms (forward count 9.1, fault 3.6, scatter 10.9, sort 3.2; reverse count 3.1, fault 1.6, scatter 5.4, sort 3.5) | 2.9 MB saved for 6.5 ms: the queries' own peak, about 64 to 65 MB, then caps the saving, and the second scatter costs more than pass 2 saves |
+| Step 17's pass 3 in four rounds, each its own `on_threads`, with the sorted places given back between rounds | Not built in full: one `on_threads` of 12 threads that do nothing takes 172 to 189 µs (average of 20, three runs), so the forward direction's three extra rounds cost about 0.55 ms | Step 17 frees as much with no extra rounds |
+| Step 17 with each thread's sorted blocks counted, and every block below 12 × the least count freed (on step 16) | memory.peak, 6 alternating runs: 62.1 to 62.5 against 63.9 to 64.3 MB | The same memory as step 17, which needs no list of block starts |
 | `Csr::heavy_weight` folded into `unpack` behind `std::hint::cold_path()`, as `Csr::row` does for wide groups, 3 lines fewer (on step 17's code with step 18's first cuts) | `perf stat`, 8 interleaved rounds: instructions 4,996 → 5,081 M (+1.7%), cycles 3,063 → 3,102 M (+1.4%), higher in all 8 | The hash lookup is laid out in the relaxation loop, where `#[cold]` keeps it out of line |
-| Step 19's pieces taken from the query counter by whichever thread is idle, in 2 MB or 8 MB pieces (one more line than step 19) | `ab.py`, 41 runs: 2 MB pieces −0.25%, −1.06%, −0.27% (seeds 1, 3, 2); 8 MB pieces −1.16, −1.12, −0.50, −1.09, −1.64, −1.04, −1.10, −0.83%; the same 8 MB claiming in its rustfmt-compliant form −0.41, +0.04, −0.78, −0.95, −0.94, −0.57, −0.84, −0.78% | No better than step 19's fixed shares, for a line more |
+| Step 19's pieces taken from the query counter by whichever thread is idle, in 2 MB or 8 MB pieces (one more line than step 19) | `ab.py`, 41 runs: 2 MB pieces -0.25%, -1.06%, -0.27% (seeds 1, 3, 2); 8 MB pieces -1.16, -1.12, -0.50, -1.09, -1.64, -1.04, -1.10, -0.83%; the same 8 MB claiming in its rustfmt-compliant form -0.41, +0.04, -0.78, -0.95, -0.94, -0.57, -0.84, -0.78% | No better than step 19's fixed shares, for a line more |
 | The build's faulting by `madvise(MADV_POPULATE_WRITE)` on 6 threads, with the runs set-up on the main thread at the same time (on step 18) | Phase marks, 11 runs: faulting and set-up together 4.5 → 10.6 ms, 1,700-2,250 page faults instead of 410 | The populate faulted 4 KB pages, not 2 MB ones |
 | No signal stack per thread: SIGSEGV and SIGBUS set to `SIG_IGN` from `.init_array`, before std's runtime setup, so std gives no thread an altstack (on step 18 with step 19) | Phase marks, 11 runs: the build 36.21 → 36.00 ms, the queries' end unchanged | 0.2 ms for about 9 lines |
 | The queries on 6 threads instead of 12 (on step 18) | `ab.py`, 11 runs: 125.75 → 157.77 ms | Hyperthreading is worth 1.36× in the queries |
 | Pass 3's blocks taken from a shared counter, each behind a `Mutex`, instead of dealt out in turn (on step 20, 4 more lines) | Phase marks, 21 runs: pass 3's end 36.88 → 35.65 ms median, 34.55 → 34.58 fastest, the queries' end 127.74 → 127.46. `ab.py`, 41 runs, median (min): seed 1 124.46 (122.38) → 124.06 (122.76), seed 3 133.28 (129.82) → 136.08 (130.39) ms | The last block ends sooner, but the run does not |
-| The build's faulting as 2 MB pieces taken from a shared iterator by 6 threads, instead of 6 fixed shares (on step 20, same line count) | Phase marks, 21 runs: faulting 3.57 → 3.43 ms median, 3.45 → 3.13 fastest, idle 3.20 → 1.87 ms·cpu. With the pass 3 counter above, `ab.py`, 41 runs: seed 1 124.70 (122.99) → 124.28 (122.14), seed 3 130.81 (128.17) → 130.25 (127.90) ms | The zeroing is bound by memory bandwidth, so balance saves little: −0.4% for 4 lines |
+| The build's faulting as 2 MB pieces taken from a shared iterator by 6 threads, instead of 6 fixed shares (on step 20, same line count) | Phase marks, 21 runs: faulting 3.57 → 3.43 ms median, 3.45 → 3.13 fastest, idle 3.20 → 1.87 ms·cpu. With the pass 3 counter above, `ab.py`, 41 runs: seed 1 124.70 (122.99) → 124.28 (122.14), seed 3 130.81 (128.17) → 130.25 (127.90) ms | The zeroing is bound by memory bandwidth, so balance saves little: -0.4% for 4 lines |
 | `on_threads` spawning as a tree: each new thread hands half of its items to another new thread (on step 20) | Phase marks, 21 runs: pass 3's last thread starts 28.85 → 32.25 ms, the build ends 35.18 → 38.02, the run 124.31 → 126.89 ms | Each level waits for a new thread to wake up |
 | The rows faulted in on the main thread instead of 2 threads, and `on_threads` running its first item on the calling thread (on step 20, 2 more lines) | `ab.py`, 41 runs: seed 1 124.07 (121.96) → 124.00 (122.28), seed 3 130.05 (128.90) → 129.88 (128.21) ms | No gain: thread start-up is not what the phases wait for |
 | Each line's separators found at once by a 32-byte compare (LLVM makes it `vpcmpeqb` and `vpmovmskb`), so the next line's start does not wait for the numbers (on step 20) | Phase marks, 21 runs: with the fallback as a `cmov`, pass 1 9.6 → 13.4 ms; as a second loop, pass 1 9.6 → 10.8 and pass 2 12.4 → 16.9 ms | The parse is bound by instruction count (step 12), and the mask is more instructions |
 | Two or three queries per thread, advanced one step each in turn, so one query's misses overlap the other's (on step 20) | `ab.py`, 21 runs: 124.77 → 139.64 ms (two), 154.38 ms (three) | Slower |
-| Each direction's rows started on a 2 MB boundary inside an allocation 2 MB larger, so all their 2 MB pages can be huge pages (on step 20, 5 more lines) | PEBS: 45% of the 4 KB page walks are the rows prefetch, 19% the edges prefetch. `perf stat`, 3 runs: 4 KB walks 3.7 → 1.1 M, walk cycles 117 → 46 M, cycles 3.211 → 3.183 G. `ab.py`, 41 runs: seed 1 124.42 (122.06) → 123.19 (121.41), seed 3 130.54 (128.61) → 129.79 (128.12) ms. memory.peak, 8 alternating runs, medians: seed 1 62.5 → 63.1, seed 3 62.35 → 63.15 MB. With the edge arrays aligned too: 0.66 M walks, peak about 2 MB higher | Each array's last 2 MB page becomes a huge page as well, so +0.7 MB, which with 5 lines cancels the −0.8% |
+| Each direction's rows started on a 2 MB boundary inside an allocation 2 MB larger, so all their 2 MB pages can be huge pages (on step 20, 5 more lines) | PEBS: 45% of the 4 KB page walks are the rows prefetch, 19% the edges prefetch. `perf stat`, 3 runs: 4 KB walks 3.7 → 1.1 M, walk cycles 117 → 46 M, cycles 3.211 → 3.183 G. `ab.py`, 41 runs: seed 1 124.42 (122.06) → 123.19 (121.41), seed 3 130.54 (128.61) → 129.79 (128.12) ms. memory.peak, 8 alternating runs, medians: seed 1 62.5 → 63.1, seed 3 62.35 → 63.15 MB. With the edge arrays aligned too: 0.66 M walks, peak about 2 MB higher | Each array's last 2 MB page becomes a huge page as well, so +0.7 MB, which with 5 lines cancels the -0.8% |
 | Both directions' rows in one allocation and both edge arrays in another, so that glibc's header of the second array no longer sits inside a 2 MB page, which then cannot be huge (on step 20, 2 more lines) | `perf stat`, 3 runs: 4 KB walks 5.1 → 0.87 M, cycles 3.2445 → 3.2425 G. `ab.py`, 41 runs: seed 1 125.18 (122.68) → 125.58 (123.15), seed 3 130.83 (128.42) → 132.23 (129.21) ms | Fewer walks, no faster |
-| glibc's mmap threshold raised to 32 MB once the build is done, so the label tables come from the threads' arenas, whose 2 MB pages can be huge pages (on step 20, 1 more line) | `perf stat`, 3 runs: 4 KB walks 5.2 → 4.2 M, cycles 3.199 → 3.186 G. memory.peak, 4 alternating runs: 62.1–62.3 → 66.1–68.6 MB | The arenas keep the tables a table outgrew, and the queries then peak 4 to 6 MB above the build |
+| glibc's mmap threshold raised to 32 MB once the build is done, so the label tables come from the threads' arenas, whose 2 MB pages can be huge pages (on step 20, 1 more line) | `perf stat`, 3 runs: 4 KB walks 5.2 → 4.2 M, cycles 3.199 → 3.186 G. memory.peak, 4 alternating runs: 62.1 to 62.3 → 66.1 to 68.6 MB | The arenas keep the tables a table outgrew, and the queries then peak 4 to 6 MB above the build |
 | `#[inline(always)]` on `Search::step` again, now that `push` is inline (on step 20) | `ab.py`, 41 runs: seed 1 124.37 (122.81) → 126.25 (123.74) ms | Slower |
-| Every function aligned to 64 bytes (`-C llvm-args=-align-all-functions=6`), to keep line cuts from moving the hot loops (on step 17 and on step 18) | `perf stat`, 8 interleaved rounds: cycles +16.1 M (step 17's code) and +12.9 M (step 18's), +0.4–0.5%, higher in all 8 | `step` then starts on a line, which is slower than 16 bytes past one |
+| Every function aligned to 64 bytes (`-C llvm-args=-align-all-functions=6`), to keep line cuts from moving the hot loops (on step 17 and on step 18) | `perf stat`, 8 interleaved rounds: cycles +16.1 M (step 17's code) and +12.9 M (step 18's), +0.4 to 0.5%, higher in all 8 | `step` then starts on a line, which is slower than 16 bytes past one |
 | `sort`'s degree count and prefix sum as `for_each` calls, 4 lines fewer (on step 17) | Same machine code | Pedantic clippy's `needless_for_each` rejects both; the prefix sum went in as a `fold` instead |

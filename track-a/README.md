@@ -1,18 +1,17 @@
 # Track A: Ingest
 
-Read an access log and summarise it: for every hour and endpoint that saw traffic, print the
-request count, the exact 50th, 95th and 99th latency percentiles, the error count and the errors
-per million.
+Read an access log and, for every hour and endpoint that saw traffic, print the request count,
+the exact 50th, 95th and 99th latency percentiles, the error count and the errors per million.
 
-| | Reference | This entry |
+| | Reference | Mine |
 |---|---|---|
-| Time, full dataset, seed 1 | 32.05 s | **16.6 ms** |
-| Peak memory | 228 MB | **16.9 MB** |
+| Time, full dataset, seed 1 | 32.05 s | 16.6 ms |
+| Peak memory | 228 MB | 16.9 MB |
 | Code lines | 56 | 344 |
-| Board points | 0 | **87.6** |
+| Board points | 0 | 87.6 |
 
-That is about 1,900× the reference's speed on the board's dataset. Every step that got here, with
-the board run ID that measured it, is in [PERF.md](PERF.md).
+That's about 1,900 times the reference's speed on the board's dataset. If you only read one step
+in [PERF.md](PERF.md), make it step 8, where the records started following the file's own order.
 
 ## Approach
 
@@ -25,54 +24,48 @@ flowchart LR
     S --> OUT["format straight into<br/>the mapped output file"]
 ```
 
-1. **Map, don't read.** The log is mapped read-only and cut into one chunk per thread at line
-   breaks. Nothing is copied on the way in.
-2. **Parse once.** Each thread turns a line into a 4-byte record: endpoint id, error bit and
-   latency. Latencies too large for the record's 20 bits go to a side list. Endpoint names become
-   small integers through one table that all threads share, so the name is compared once per
-   occurrence and never stored per line.
-3. **Keep the file's order.** Lines arrive in long runs of one hour, so the records stay in file
-   order and each thread records where its runs of an hour start. No hour is stored per line, and
-   there is no sort over the 3.1 million lines.
-4. **Summarise an hour at a time.** Threads take hours smallest first. For one hour a thread
-   walks that hour's runs in every chunk, counts lines per endpoint, places each latency with a
-   counting sort, and picks the percentiles by rank. The hour's records are freed as soon as they
-   are read, which is why the peak stays at 17 MB.
-5. **Write in place.** Once every hour's length is known the output file gets its final size and
-   is mapped. Each thread formats hours directly into the file and returns its pages.
-
-## Why it is fast
-
-- **One pass over 239 MB.** The log is ten times the L3 cache, so a second pass would stream from
-  main memory again. It is parsed once into 12 MB of records instead.
-- **No byte-by-byte scanning.** AVX2 compares find a line's end; the latency, the status and the
-  endpoint's end are read backwards from it at fixed offsets, and the latency's digits convert in
-  one SWAR step.
-- **Cache-sized work.** One hour is about 43,000 lines, so its 170 KB latency buffer stays in L2
-  through the counting sort and the selection.
-- **Nothing is torn down.** The process exits right after the write. Threads hand their records
-  and their share of the mapping back to the kernel in parallel, and the input is unmapped before
-  memory peaks.
-- **Percentiles are exact.** Nearest rank on a counting sort, not an approximation, so the output
-  hashes match the reference on every seed.
+1. The log is mapped and cut into one chunk per thread at line breaks. At 239 MB it's ten times
+   the L3 cache, so it gets parsed exactly once; a second pass would stream it from main memory
+   all over again.
+2. Each thread turns a line into a 4-byte record: endpoint id, error bit and latency. AVX2
+   compares find the line's end, and the latency, the status and the end of the endpoint name are
+   read backwards from there at fixed offsets. The latency's digits convert in one SWAR step, and
+   the rare latency too large for the record's 20 bits goes on a side list. Endpoint names become
+   small integers through one table that all threads share, so a name is compared once per
+   occurrence and never stored per line. The whole log ends up as 12 MB of records.
+3. Lines arrive in long runs of the same hour, so the records stay in file order and each thread
+   just notes where its runs of an hour start. No hour is stored per line, and nothing ever sorts
+   the 3.1 million lines. That's step 8, and it freed the memory that made 4-byte records and the
+   17 MB peak possible. The output order then falls out of one sort of the 1,842 endpoint names.
+4. Threads take the hours one at a time, smallest first. For one hour, a thread walks that hour's
+   runs in every chunk, counts lines per endpoint, places each latency with a counting sort and
+   picks the percentiles by rank. An hour is about 43,000 lines, so its 170 KB latency buffer
+   stays in L2 through the sort and the selection. Nearest rank on a counting sort is exact,
+   which is why the hashes match the reference on every seed. Each hour's records are freed as
+   soon as they're read, and that keeps the peak at 17 MB.
+5. Once every hour's length is known, the output file gets its final size and is mapped. Each
+   thread formats its hours straight into the file and gives those pages back. The process exits
+   right after the write; by then the threads have returned their records and their share of the
+   input to the kernel in parallel, and the input was unmapped before memory peaked.
 
 ## Dependencies
 
-None. The program is Rust with no crates, built offline from the pinned `rust:1-slim-trixie`
-image, and the Dockerfile is a two-stage build so the final image is just the static binary.
+None, just the standard library.
 
 ```
-cd track-a && cargo build --release --offline
+cd track-a && cargo +1.99.1 build --release --offline
 ```
 
-`target-cpu=alderlake` (in `.cargo/config.toml`) keeps the AVX2 paths legal on the scoring box.
-Build with the same toolchain as the image, `cargo +1.99.1`.
+`.cargo/config.toml` links statically and asks for a plain static executable instead of a static
+PIE. On this track that ran the same code in 3.9% fewer user cycles, with half the iTLB misses
+(PERF.md, step 40).
 
 ## With another 24 hours
 
-The remaining time is the parse and the kernel's page-fault work around it. `perf` puts the parse
-at 26% of kernel samples (`next_uptodate_folio`, fault-around), and 47% of the formatting phase in
-`shmem` page-cache insertion. Two next steps: fault the output pages before the hour pass so the
-formatter never takes a fault in its inner loop, and give the parse its own mapped copy of the
-input to see whether fault-around scales with more threads. The two barriers plus the leader's
-serial sort cost 0.36 ms, 2.2% of the run, which is the other thing worth attacking.
+What's left is mostly the parse and the page faults the kernel takes around it. `perf` puts the
+parse at 26% of kernel samples (`next_uptodate_folio`, fault-around), and 47% of the formatting
+phase goes to `shmem` page-cache insertion. First I'd fault the output pages in before the hour
+pass, so the formatter never takes a fault in its inner loop. Then I'd give the parse its own
+mapped copy of the input and see whether fault-around scales with more threads. The last thing
+worth attacking is small: the two barriers plus the leader's serial sort cost 0.36 ms, 2.2% of the
+run.

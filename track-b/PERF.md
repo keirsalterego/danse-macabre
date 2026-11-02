@@ -1,6 +1,6 @@
 # Track B: performance log
 
-Each kept step cites the live-board run that measured it. Numbers marked local come from a laptop (i7-13620H, turbo off) and compare two versions run side by side; changes that were measured and not kept are listed under the step they were tried after.
+Each kept step has the board run that measured it. Anything marked local was timed on my laptop (an i7-13620H with turbo off), two versions run side by side, and every experiment I reverted sits under the step it was tried after, with its numbers.
 
 | | Reference (step 0) | Final code (step 66), board run |
 |---|---|---|
@@ -123,13 +123,13 @@ merges, and the lists set the 174 MB peak.
   counting sort over the match counts it already keeps. This replaced one serial sort of 1.25
   million (query, doc) pairs between the pass and the output.
 
-Locally, step 2 → 3a → 3b: elapsed 0.584–0.592 → 0.469–0.534 → 0.427–0.429 s; cycles 13.28–13.56 →
-9.97–10.08 → 10.04–10.09 G; memory.peak 173.3 → 82.1 → 79.7 MB. S went from 484 to 745.
+Locally, step 2 → 3a → 3b: elapsed 0.584 to 0.592 → 0.469 to 0.534 → 0.427 to 0.429 s; cycles 13.28 to 13.56 →
+9.97 to 10.08 → 10.04 to 10.09 G; memory.peak 173.3 → 82.1 → 79.7 MB. S went from 484 to 745.
 
 ## Step 4: the serial start
 
 Before the pass, one thread parsed the queries and built the plan while the other eleven
-waited: 56–59 ms of a 0.43 s run.
+waited: 56 to 59 ms of a 0.43 s run.
 
 - **Parse, 32 → 15 ms.** Every thread parses a share of the query lines into flat arrays. One
   thread then gives each distinct term its id, in file order, so the ids do not depend on the
@@ -139,7 +139,7 @@ waited: 56–59 ms of a 0.43 s run.
   per query. The phrases and checks each term triggers are collected as pairs and grouped by
   one counting sort, instead of a `Vec` per term.
 
-Locally, step 3 → 4: elapsed 0.4335–0.4380 → 0.3905–0.3929 s; cycles 9.97–10.05 → 9.84–9.87 G;
+Locally, step 3 → 4: elapsed 0.4335 to 0.4380 → 0.3905 to 0.3929 s; cycles 9.97 to 10.05 → 9.84 to 9.87 G;
 memory.peak 79.2 → 69.2 MB. S went from 745 to 803.
 
 ## Step 5: memory
@@ -153,16 +153,16 @@ kept for its whole chunk.
   per-query tally as the other queries, so the output phase treats every query alike. The
   per-query "last matched document" array became a per-document list of matched phrases, and
   the term names are gone: a term's cost reads its length from its key. Local: memory.peak
-  68.3 → 50.8 MB, cycles 9.91–9.97 → 9.85–9.91 G.
+  68.3 → 50.8 MB, cycles 9.91 to 9.97 → 9.85 to 9.91 G.
 - **A fixed mmap threshold.** glibc raises its mmap threshold to the largest mapped block freed
   so far, and parsing and planning free blocks of up to a few MB, so smaller blocks then come
   from per-thread arenas and stay resident after they are freed. With
   `mallopt(M_MMAP_THRESHOLD, 128 KiB)`, every block of 128 KiB or more goes back to the kernel
   when it is freed, such as each thread's first matches once they are grouped. In the first
-  measurement: 50.8–51.2 → 42.4–45.3 MB at the same speed.
+  measurement: 50.8 to 51.2 → 42.4 to 45.3 MB at the same speed.
 
-Locally, step 4 → 5, six interleaved rounds on a busy machine: cycles 9.74–9.89 → 9.73–9.89 G,
-elapsed 0.3926 → 0.3867 s in the quietest round; memory.peak 68.4–69.8 → 39.6–40.8 MB over five
+Locally, step 4 → 5, six interleaved rounds on a busy machine: cycles 9.74 to 9.89 → 9.73 to 9.89 G,
+elapsed 0.3926 → 0.3867 s in the quietest round; memory.peak 68.4 to 69.8 → 39.6 to 40.8 MB over five
 runs. S went from 803 to 790.
 
 ## Step 6: checks without branches
@@ -182,7 +182,7 @@ Where step 5's time went on seed 1, found by switching off one stage at a time:
 
 Branch misses wasted 35% of all pipeline slots; waiting on memory, 5%. So the checks lost
 their branches first. Each change below is measured on top of the ones before it (medians,
-local, turbo off; step 5 ran 384–387 ms in the same sessions):
+local, turbo off; step 5 ran 384 to 387 ms in the same sessions):
 
 1. **Truth tables.** Each per-document BOOL query has at most 6 distinct terms, so it compiles to
    a 64-bit truth table: its AND, OR and NOT applied to six fixed bit masks. The skip for
@@ -192,7 +192,7 @@ local, turbo off; step 5 ran 384–387 ms in the same sessions):
    neighbours, and the check and its tally are prefetched when the trigger term is first seen
    in a document. 320 ms.
 3. **A mask table for the key fold.** A sliding table of 0xFF bytes replaces the u128 shifts,
-   `key_in` inlines, and 2.2 G instructions disappear. 288.5 ms, but memory rose 8–10 MB.
+   `key_in` inlines, and 2.2 G instructions disappear. 288.5 ms, but memory rose 8 to 10 MB.
 4. **The memory back.** Each query keeps only its first ten matches, every per-query tally is
    one u64 (`count << 40 | id sum`), and the check tallies are freed before the grouping.
    296.4 and 296.9 ms over two rounds of 11 runs (min 289.6). memory.peak 44.9 MB against
@@ -223,10 +223,10 @@ large blocks sat on huge pages: the blocks did not start on 2 MiB boundaries, an
   halves the lists of the queries on sets on every thread, and it takes back about 1.1 MB of
   the memory the huge pages add.
 
-Locally, step 6 → 7, three interleaved rounds: cycles 7.07–7.23 → 6.89–7.01 G, task-clock
-3,059–3,131 → 2,958–3,014 ms, elapsed 0.2997–0.3045 → 0.2838–0.2843 s in the two quiet rounds.
+Locally, step 6 → 7, three interleaved rounds: cycles 7.07 to 7.23 → 6.89 to 7.01 G, task-clock
+3,059 to 3,131 → 2,958 to 3,014 ms, elapsed 0.2997 to 0.3045 → 0.2838 to 0.2843 s in the two quiet rounds.
 Alternating runs, 20 each: median wall 295.2 → 285.3 ms. memory.peak over eight runs each:
-41.1–44.2 → 40.2–45.1 MB (medians 41.9 and 43.3). S went from 837 to 871.
+41.1 to 44.2 → 40.2 to 45.1 MB (medians 41.9 and 43.3). S went from 837 to 871.
 
 ## Step 8: the term table sized once
 
@@ -239,7 +239,7 @@ The scan's machine code is unchanged.
 
 Local, the time from start to the end of planning, medians of 6 interleaved runs: 27.96 → 23.5
 ms. User instructions 10.23 → 10.06 G. memory.peak 42.2 → 42.6 MB (noise about ±1 MB). S
-unchanged. Gate: 507 pass, 0 fail; full seeds 1–7 match.
+unchanged. Gate: 507 pass, 0 fail; full seeds 1 to 7 match.
 
 What is left of start-up, and why it stays: query parsing 3 ms (already parallel), intern 6.3,
 sampling 5.6, the plan loop 5.3, grouping and marking 3.2. A parallel sample, mark and plan loop
@@ -254,8 +254,8 @@ term, 21% of them, had the id `u32::MAX` and was skipped with a test. That test 
 checks, which is never set, so clearing it changes nothing and the loop has no branch.
 
 Locally, on step 7 (the scan is the same at step 8): branch misses 76.6 → 68.8 M; over three
-interleaved rounds, cycles 7.07–7.10 → 6.81–6.84 G, task-clock 3,039–3,054 → 2,931–2,943 ms,
-elapsed 0.2858–0.2864 → 0.2781–0.2791 s in the two quiet rounds. Alternating runs, 20 each:
+interleaved rounds, cycles 7.07 to 7.10 → 6.81 to 6.84 G, task-clock 3,039 to 3,054 → 2,931 to 2,943 ms,
+elapsed 0.2858 to 0.2864 → 0.2781 to 0.2791 s in the two quiet rounds. Alternating runs, 20 each:
 median wall 286.0 → 277.3 ms (step 6: 297.9). S unchanged.
 
 ## Step 10: huge pages for the term table only
@@ -265,12 +265,12 @@ only partly fills its last huge page: on the board, 43.1 → 46.3 MB, and still 
 The term table is exactly two huge pages and the pass reads all of it, so it is the one block whose
 huge pages cost no memory. It is now allocated alone at a 2 MiB boundary and advised once, and the
 34-line global allocator goes, with step 8's trim of the keys, which only mattered on huge pages.
-Walk cycles: 427–517 M with no huge pages, 136 M at step 9, 246–257 M now.
+Walk cycles: 427 to 517 M with no huge pages, 136 M at step 9, 246 to 257 M now.
 
-Locally, against step 9, three interleaved rounds: cycles 6.87–6.90 → 6.85–6.90 G, task-clock
-2,952–2,967 → 2,969–2,989 ms, elapsed 0.2755–0.2770 → 0.2770–0.2791 s. Alternating runs, 14 each,
+Locally, against step 9, three interleaved rounds: cycles 6.87 to 6.90 → 6.85 to 6.90 G, task-clock
+2,952 to 2,967 → 2,969 to 2,989 ms, elapsed 0.2755 to 0.2770 → 0.2770 to 0.2791 s. Alternating runs, 14 each,
 twice: median wall 275.6 and 276.9 → 276.8 and 278.7 ms (no huge pages at all: 282.5 and 282.2).
-memory.peak over six runs each: 41.3–44.9 → 41.2–43.8 MB; this machine does not show the
+memory.peak over six runs each: 41.3 to 44.9 → 41.2 to 43.8 MB; this machine does not show the
 board's difference. S 871 → 849. Gate: 507 pass, 0 fail.
 
 ## Step 11: no branch on a check's result
@@ -281,7 +281,7 @@ pattern, so the branch missed 4.2 M times, 6% of all branch misses. `std::hint::
 makes it a conditional move.
 
 Locally, against step 10, three interleaved rounds: branch misses 68.2 → 64.0 M, cycles
-6.80–6.84 → 6.61–6.68 G, task-clock 2,948–2,966 → 2,864–2,896 ms, instructions 10.06 → 10.22 G.
+6.80 to 6.84 → 6.61 to 6.68 G, task-clock 2,948 to 2,966 → 2,864 to 2,896 ms, instructions 10.06 → 10.22 G.
 Alternating runs, 16 each, twice: median wall 278.2 and 276.3 → 270.1 and 269.2 ms. S unchanged.
 Gate: 507 pass, 0 fail.
 
@@ -295,7 +295,7 @@ argument (the probes), so the token callback, a key, a hash and a prefetch, is i
 loop. The `Event` enum goes.
 
 Locally, against step 11, three interleaved rounds: instructions 10.22 → 8.86 G, cycles
-6.60–6.67 → 6.16–6.25 G, task-clock 2,858–2,893 → 2,669–2,710 ms. Alternating runs, 16 each,
+6.60 to 6.67 → 6.16 to 6.25 G, task-clock 2,858 to 2,893 → 2,669 to 2,710 ms. Alternating runs, 16 each,
 twice: median wall 272.0 and 270.5 → 255.4 and 254.0 ms (step 6: 297.5 and 295.6). S 849 → 846.
 Gate: 507 pass, 0 fail.
 
@@ -308,7 +308,7 @@ sequence, which the `head` compare still tells apart, and the slots still come f
 bits of the product.
 
 Locally, against step 12, three interleaved rounds: instructions 8.86 → 8.64 G, cycles
-6.18–6.19 → 6.01–6.04 G, task-clock 2,677–2,681 → 2,609–2,623 ms. Alternating runs, 16 each,
+6.18 to 6.19 → 6.01 to 6.04 G, task-clock 2,677 to 2,681 → 2,609 to 2,623 ms. Alternating runs, 16 each,
 twice: median wall 253.0 and 255.4 → 247.4 and 249.0 ms. S 846 → 844. Gate: 507 pass, 0 fail.
 
 ## Step 14: the first-match counts in bytes
@@ -319,9 +319,9 @@ read at random on 7 M early hits, and mostly from L3. The count now sits in a by
 ([`Tally`]), 50 KB per thread, which stays in cache. The query's cell is no longer touched during
 the pass, so it no longer needs zeroing before the checks' cells are added in.
 
-Locally, against step 13, three interleaved rounds: cycles 6.05–6.15 → 5.94–6.00 G, task-clock
-2,623–2,669 → 2,582–2,607 ms. Alternating runs, 16 each, twice: median wall 247.9 and 247.3 →
-245.4 and 244.8 ms. memory.peak over four runs: 42.2–46.2 → 43.7–44.6 MB (the bytes add 0.6 MB
+Locally, against step 13, three interleaved rounds: cycles 6.05 to 6.15 → 5.94 to 6.00 G, task-clock
+2,623 to 2,669 → 2,582 to 2,607 ms. Alternating runs, 16 each, twice: median wall 247.9 and 247.3 →
+245.4 and 244.8 ms. memory.peak over four runs: 42.2 to 46.2 → 43.7 to 44.6 MB (the bytes add 0.6 MB
 over 12 threads). S 844 → 845. Gate: 507 pass, 0 fail.
 
 Not kept: each check pushing its first ten matches with no per-query count (format already takes
@@ -336,9 +336,9 @@ its 349 bitset rows (179 KB) included, and [`group`] cloned its 50,001 group sta
 fill cursors. The window is now dropped after its last flush, and the grouping uses the starts
 themselves as cursors, then shifts them back by one place.
 
-Locally, memory.peak over seven runs each: 43.1–45.4 MB (median 44.7) → 41.5–42.5 MB
+Locally, memory.peak over seven runs each: 43.1 to 45.4 MB (median 44.7) → 41.5 to 42.5 MB
 (median 41.8). The window alone: median 41.9, but one run at 44.9. Cycles and wall unchanged:
-5.94–5.96 → 5.93–5.94 G; alternating runs, 12 each: median 246.0 → 245.1 ms. S 845 → 848.
+5.94 to 5.96 → 5.93 to 5.94 G; alternating runs, 12 each: median 246.0 → 245.1 ms. S 845 → 848.
 Gate: 507 pass, 0 fail.
 
 ## Step 16: no zero page under the cells
@@ -353,8 +353,8 @@ On seed 1 that happened for 1,111 pages of query cells and 948 pages of check ce
 threads, so 2,059 rounds of interrupts to 11 cores each. [`Tally::new`] now builds the cells with
 `[0].repeat(n)`, which writes them, so each page faults once, on a write.
 
-Locally, against step 15: page faults 18,800 → 16,710, kernel cycles 214 → 156–157 M, user
-cycles unchanged (5.95–6.00 → 5.88–5.99 G). Alternating runs, 16 each, twice: median 246.4 and
+Locally, against step 15: page faults 18,800 → 16,710, kernel cycles 214 → 156 to 157 M, user
+cycles unchanged (5.95 to 6.00 → 5.88 to 5.99 G). Alternating runs, 16 each, twice: median 246.4 and
 246.1 → 244.9 and 243.4 ms, min 244.2 and 244.5 → 241.5 and 241.4 ms. memory.peak over seven
 runs: median 41.7 → 41.8 MB. S 848 → 848. Gate: 507 pass, 0 fail.
 
@@ -377,7 +377,7 @@ the page cache, with the same bytes, as the mapping is private and never written
 Locally, against step 16, alternating runs, 16 each, three rounds: median 245.3, 242.8 and 243.5
 → 241.7, 241.3 and 240.4 ms; min 242.9, 241.6 and 241.1 → 239.7, 236.9 and 238.5 ms. With the
 range rounded inward instead, to the chunk's own whole pages: 242.7 → 240.7 ms. Kernel cycles
-rise a little, 171–182 → 178–192 M in a noisy session (the same work, spread over cores, plus
+rise a little, 171 to 182 → 178 to 192 M in a noisy session (the same work, spread over cores, plus
 one TLB-flush interrupt per thread), but no longer at the end. memory.peak over seven
 interleaved runs: median 41.9 → 42.0 MB. S 848 → 852. Gate: 507 pass, 0 fail.
 
@@ -400,10 +400,10 @@ those read `keys`: 0.2% of the tokens. In the same profile that line falls from 
 to 38, and all samples from 59,522 to 56,962. Ids from 2^28 up would not fit; `TermTable::new`
 stops with an error before that, at 2^28 term occurrences.
 
-Locally, against step 17: user cycles 5.85–5.89 → 5.68–5.70 G over five rounds of `perf stat
+Locally, against step 17: user cycles 5.85 to 5.89 → 5.68 to 5.70 G over five rounds of `perf stat
 -r 5`, instructions 8.573 → 8.687 G (the extra compare). Alternating runs (`ab.py`), 15 or 16
 each, five rounds: median 237.3, 237.9, 237.8, 237.2 and 237.1 → 229.8, 229.8, 230.6, 229.5 and
-229.5 ms (−3.2%). memory.peak over six interleaved runs: median 43.2 → 43.0 MB (the table is
+229.5 ms (-3.2%). memory.peak over six interleaved runs: median 43.2 → 43.0 MB (the table is
 the same size). S 852 → 857. Gate: 510 pass, 0 fail.
 
 ## Step 19: 99 fewer lines
@@ -470,8 +470,8 @@ Locally, against step 19, alternating runs (`ab.py`, 14 each), two rounds: media
 229.6 → 226.6 and 226.4 ms; the same change written with a loop instead of `reduce`, in two
 other rounds: 229.5 and 230.1 → 226.9 and 227.1 ms. The loop form with every function aligned
 to 64 bytes, so that the hot functions, whose code is the same, sit at the same offsets: 230.8
-and 230.8 → 226.8 and 226.7 ms. `perf stat`: user cycles 5.59 → 5.51–5.56 G, instructions 8.739 →
-8.686 G. In a `perf record` timeline the pass starts at 21.4 ms instead of 21.1–22.0 ms, and
+and 230.8 → 226.8 and 226.7 ms. `perf stat`: user cycles 5.59 → 5.51 to 5.56 G, instructions 8.739 →
+8.686 G. In a `perf record` timeline the pass starts at 21.4 ms instead of 21.1 to 22.0 ms, and
 its threads' cycles fall 5.59 → 5.51 G. memory.peak over six interleaved runs: median 41.2 →
 41.0 MB. S 758 → 771. Gate: 510 pass, 0 fail.
 
@@ -481,28 +481,28 @@ Cuts in code that runs once per run or once per thread:
 
 - **One `parallel` helper** (7 lines) runs `work(i)` for each `i` on a thread of its own and
   returns the results in order. The pass, the output and the query parse each spelled out a
-  `thread::scope` in 8 to 12 lines; each now takes 2 to 4 (−15 in all). The sample keeps its
+  `thread::scope` in 8 to 12 lines; each now takes 2 to 4 (-15 in all). The sample keeps its
   own: it adds each part as its thread is joined, and collecting every part first made the
-  sample 0.08–0.19 ms longer (min and median of 15 timed runs).
-- **The intern loop without its prefetch 16 terms ahead** (−5). The serial end of the parse
+  sample 0.08 to 0.19 ms longer (min and median of 15 timed runs).
+- **The intern loop without its prefetch 16 terms ahead** (-5). The serial end of the parse
   (table allocation, merge and intern of seed 1's 152,904 term occurrences) took 5.49 ms with
   it and 5.48 ms without, median of 15 timed runs each.
-- **The output** adds a query's cells over all chunks and splits the total once (−2): together
+- **The output** adds a query's cells over all chunks and splits the total once (-2): together
   the chunks' id sums stay below `2^SUM_BITS`, as each one does, since `answer_all` bounds the
   sum of all ids. The first matches come straight from the chunks through
   `flat_map(..).take(SHOWN_IDS)` instead of a buffer, and `Chunk`'s fields are `at` and `ids`,
-  so its literal fits on one line (−8).
+  so its literal fits on one line (-8).
 - **`Plan::new`** numbers a stored term's bitset row or id list from one two-entry counter
-  (−4), and **`line_bounds`** takes its last bound from the loop: a cut at `docs.len()` finds
-  no LF after it (−1).
+  (-4), and **`line_bounds`** takes its last bound from the loop: a cut at `docs.len()` finds
+  no LF after it (-1).
 
 **Loops on 64-byte boundaries.** Built as before, this step ran slower than step 20 though it
 adds no work: alternating runs (`ab.py`, 61 each), two rounds, median 226.4 and 226.2 → 227.2
 and 227.0 ms. Each cut alone on step 20, two rounds: the helper +0.41 and +0.38 ms, the intern
-loop +0.07 and −0.13 ms, the rest +0.88 and +0.85 ms. The cost is where the hot loops sit. The
+loop +0.07 and -0.13 ms, the rest +0.88 and +0.85 ms. The cost is where the hot loops sit. The
 `Plan::new` cut alone, which runs once and leaves the instruction count at 8,686.1 M, moved the
 scan thread's code, byte for byte the same, from offset 16 of a 64-byte line to offset 0, and
-user cycles rose 0.3–0.6%. `-C llvm-args=-align-loops=64` in `.cargo/config.toml` starts every
+user cycles rose 0.3 to 0.6%. `-C llvm-args=-align-loops=64` in `.cargo/config.toml` starts every
 loop on a 64-byte boundary; executing the padding adds 28 M instructions (8,683 → 8,711 M).
 Step 20 built that way ran 226.5 and 226.3 ms, this step 225.9 and 225.8 ms, in the same
 sessions as step 20 as built before at 226.0 and 226.0 ms. A loop now keeps its offset in a
@@ -519,9 +519,9 @@ Four spots in code that runs once, written so that rustfmt keeps them on fewer l
 
 - In `answer_all`, the chain that reads each chunk's first id and the check on the document
   count each put their receiver in parentheses, so each is a one-call chain that fits on one
-  line (−5).
-- `bit_index_sum` names its per-mask closure, `weight` (−1).
-- `TermTable::new` binds the empty `keys` first, so the struct literal fits on one line (−2).
+  line (-5).
+- `bit_index_sum` names its per-mask closure, `weight` (-1).
+- `TermTable::new` binds the empty `keys` first, so the struct literal fits on one line (-2).
 
 Checks: the built binary's `.text` and `.rodata` are byte for byte those of step 21, and only
 88 bytes of `.data.rel.ro` differ (the line numbers in panic locations), so T and memory are
@@ -543,7 +543,7 @@ reports "Not affected").
 
 Locally, against step 21, whose `.text` and `.rodata` step 22 keeps (alternating runs, `ab.py`,
 20 each), two rounds: median 226.44 and 225.92 → 215.61 and 215.19 ms, min 224.58 and 224.32 →
-214.20 and 213.85 ms. `perf stat`: user cycles 5.64 → 5.30–5.31 G, instructions 8,711 → 7,517
+214.20 and 213.85 ms. `perf stat`: user cycles 5.64 → 5.30 to 5.31 G, instructions 8,711 → 7,517
 M; branch misses 57.3 → 58.7 M. On step 20, built with every function aligned to 64 bytes, the
 unchecked loads alone ran 226.6 → 221.1 ms and the gather on top of them 213.8 ms.
 memory.peak over six alternating runs: median 43.5 → 43.2 MB. S 728 → 732. Gate: 510 pass, 0
@@ -607,8 +607,8 @@ added 2.8 G instructions: 5.76 G user cycles against 5.18 G.
 
 Locally, against step 24 (alternating runs, `ab.py`, 18 each), two clean rounds: median 212.38
 and 211.81 → 183.60 and 183.71 ms, min 210.92 and 210.03 → 182.48 and 183.17 ms. Two other
-rounds, run while the box was loaded (load average 7–8), are left out. `perf stat`: branch
-misses 52.1 → 20.8 M, instructions 7,625 → 8,392 M, user cycles 5.23 → 4.42–4.44 G.
+rounds, run while the box was loaded (load average 7 to 8), are left out. `perf stat`: branch
+misses 52.1 → 20.8 M, instructions 7,625 → 8,392 M, user cycles 5.23 → 4.42 to 4.44 G.
 memory.peak over six alternating runs: median 42.6 → 42.9 MB. S 733 → 738. Gate: 510 pass, 0
 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
 
@@ -627,7 +627,7 @@ fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
 Each alone, against step 25 (median of 18 alternating runs): the stores 3.5 ms, the asm block
 1.7 ms. Locally, against step 25 (alternating runs, `ab.py`, 18 each), two rounds: median
 183.40 and 183.54 → 179.01 and 178.44 ms, min 181.87 and 182.22 → 177.50 and 177.52 ms.
-`perf stat`: user cycles 4.39–4.44 → 4.31 G, instructions 8,392 → 8,236 M, branch misses 20.8
+`perf stat`: user cycles 4.39 to 4.44 → 4.31 G, instructions 8,392 → 8,236 M, branch misses 20.8
 → 20.9 M. memory.peak over six alternating runs: median 42.7 → 43.6 MB. S 738 → 740. Gate:
 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
 
@@ -647,10 +647,10 @@ BOOL query's cover, its checks, or its stored terms.
   test for an empty slot, which mispredicts often, as empty slots lie at random. An empty slot
   holds id 0, whose flags are 0, so every slot now takes the add, without the test.
 
-Timeline over three instrumented runs: the loop 4.9 → 1.0–1.1 ms, adding the flags 1.5 → 0.5–0.7
-ms, and the pass starts at 16.7–17.2 ms instead of 20.7–21.7. Locally, against step 26
+Timeline over three instrumented runs: the loop 4.9 → 1.0 to 1.1 ms, adding the flags 1.5 → 0.5 to 0.7
+ms, and the pass starts at 16.7 to 17.2 ms instead of 20.7 to 21.7. Locally, against step 26
 (alternating runs, `ab.py`, 18 each), two rounds: median 178.38 and 178.94 → 174.46 and 174.79
-ms, min 177.18 and 177.43 → 173.36 and 173.27 ms. `perf stat`: user cycles 4.30–4.31 → 4.31 G,
+ms, min 177.18 and 177.43 → 173.36 and 173.27 ms. `perf stat`: user cycles 4.30 to 4.31 → 4.31 G,
 instructions 8,236 → 8,254 M. memory.peak over ten alternating runs: median 42.5 → 42.0 MB.
 S 740 → 744. Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
 
@@ -668,11 +668,11 @@ Three cuts to the work that runs before the pass:
 - **One line end for the sample.** The sample's end came from `line_bounds(docs, 64)`, which
   reads around all 64 cuts, faulting in their pages, to use one. `line_end` finds that one.
 
-Timeline over three instrumented runs: the intern 4.7–5.0 → 3.9–4.3 ms, the sample's end 0.3 →
-0.05 ms, the sample 4.8–5.1 → 3.4–4.0 ms (a third run of step 27, slowed by other load, took
+Timeline over three instrumented runs: the intern 4.7 to 5.0 → 3.9 to 4.3 ms, the sample's end 0.3 →
+0.05 ms, the sample 4.8 to 5.1 → 3.4 to 4.0 ms (a third run of step 27, slowed by other load, took
 6.5). Locally, against step 27 (alternating runs, `ab.py`, 20 each), three rounds: median
 174.96, 175.52 and 175.31 → 173.39, 173.52 and 173.54 ms, min 174.24, 173.97 and 172.99 →
-172.68, 172.50 and 171.83 ms. `perf stat`: user cycles 4.32–4.34 → 4.34–4.36 G, instructions
+172.68, 172.50 and 171.83 ms. `perf stat`: user cycles 4.32 to 4.34 → 4.34 to 4.36 G, instructions
 8,254 → 8,263 M, branch misses 20.8 → 20.5 M. memory.peak over eight alternating runs: median
 43.0 → 42.4 MB. S 744 → 746. Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their
 reference hashes.
@@ -703,11 +703,11 @@ list entries.
 Built up on step 28 (median of 18 to 20 alternating runs, rounds against the same step 28
 binary): the `u32` code 173.74 → 172.14 ms; the sum per window on top 172.05 → 168.78; the
 lists apart on top of that 169.72 → 168.34. Locally, against step 28 (alternating runs,
-`ab.py`, 18 to 20 each, with other jobs on the box, load average 4–7), three rounds: median
+`ab.py`, 18 to 20 each, with other jobs on the box, load average 4 to 7), three rounds: median
 173.14, 174.52 and 174.12 → 168.32, 168.92 and 169.58 ms, min 171.99, 172.55 and 172.64 →
-167.31, 167.11 and 167.60 ms. `perf stat`: user cycles 4.30–4.31 → 4.15 G, instructions 8,263
+167.31, 167.11 and 167.60 ms. `perf stat`: user cycles 4.30 to 4.31 → 4.15 G, instructions 8,263
 → 8,261 M (the sum saves about 310 M, the second list adds as many), branch misses 20.5 →
-18.3–18.4 M. memory.peak over eight alternating runs: median 41.3 → 40.8 MB. S 746 → 745.
+18.3 to 18.4 M. memory.peak over eight alternating runs: median 41.3 → 40.8 MB. S 746 → 745.
 Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
 
 Comparing a phrase's span term by term instead of as slices, which calls `bcmp`, gained
@@ -751,7 +751,7 @@ binary): the three kept vectors unchecked 168.95 → 165.97 ms; with the seen wo
 vector for the term ids, 169.08 → 163.80; the four as one slice 169.08 → 158.80 (the same
 round); the probes read in place on top of that, 160.05 → 158.60 and 159.58 → 157.92 ms.
 Locally, against step 30 (`ab.py`, 20 alternating runs each, with other jobs on the box, load
-average 7–11), three rounds: median 169.99, 172.52 and 169.26 → 158.49, 159.94 and 158.42 ms,
+average 7 to 11), three rounds: median 169.99, 172.52 and 169.26 → 158.49, 159.94 and 158.42 ms,
 min 167.46, 166.78 and 167.99 → 156.55, 157.30 and 156.29 ms. `perf stat`: user cycles 4.01 →
 3.62 G, instructions 8,268 → 7,338 M, branch misses 18.2 → 18.1 M. memory.peak over eight
 alternating runs: median 41.3 → 40.9 MB. S 745 → 746. Gate: 510 pass, 0 fail; seeds 2, 3, 7,
@@ -761,7 +761,7 @@ Taking `seen` as a slice inside the closure cut 81 M more instructions but did n
 flag in the term table marking a home slot that a term was displaced from, so that a probe
 ends at its home slot unless the flag is set, sent 1.39 million of the 36.8 million lookups
 past the home slot and cut branch misses from 18.4 to 15.6 M, but it added 91 M instructions,
-the user cycles stayed at 4.13–4.16 G, and the wall did not move: 169.69 → 169.10 and 168.87
+the user cycles stayed at 4.13 to 4.16 G, and the wall did not move: 169.69 → 169.10 and 168.87
 → 169.29 ms, for 9 more lines. Without `#[inline(always)]`, its lookup was no longer inlined
 and the run took 11 ms longer.
 
@@ -790,7 +790,7 @@ matches from the queries before the cursor: 678 K of the 16.9 M checks evaluated
 502 K are recorded. It is a method so that LLVM knows the stores to the cells and to the list
 leave `self` alone, and keeps the addresses of its vectors in registers.
 
-Local, against step 31 (`ab.py`, 20 alternating runs, load average 2–6), four rounds: medians
+Local, against step 31 (`ab.py`, 20 alternating runs, load average 2 to 6), four rounds: medians
 156.66, 157.64, 157.21 and 156.48 → 152.23, 152.33, 153.10 and 152.11 ms, minimums 155.37,
 155.21, 155.82 and 155.02 → 151.04, 151.06, 150.88 and 150.80 ms. `perf stat`: user cycles 3.82
 → 3.69 G, instructions 7,338 → 7,257 M, branch misses 18.1 → 16.9 M. memory.peak over five
@@ -798,7 +798,7 @@ alternating runs: median 41.3 → 41.3 MB. S 745 → 750. Gate: 510 pass, 0 fail
 and 12 match their reference hashes.
 
 Moving the loop into the method alone, with the branch on `hit` kept, cut instructions to
-7,202–7,270 M but left branch misses at 18.1 M and user cycles at 3.79–3.82 G, inlined or not.
+7,202 to 7,270 M but left branch misses at 18.1 M and user cycles at 3.79 to 3.82 G, inlined or not.
 Writing every check's (query, document) into the spare capacity of the first-match list and
 adding to its length only for a first match cut branch misses to 16.3 M but added 121 M
 instructions, for 3.81 G cycles. A single compare of the cell against a limit that is 0 on a
@@ -824,13 +824,13 @@ captured references, so it reloaded their addresses after its stores.
 
 Built up on step 33 (`perf stat`): the prefetches by pointer, instructions 7,257 → 7,220 M; the
 probe unchecked as well, 7,079 M, user cycles 3.69 → 3.66 G; the table and `seen` as locals,
-6,980 M and 3.56–3.64 G. Branch misses stayed at 16.8–16.9 M. `ab.py`, 18 alternating runs, two
+6,980 M and 3.56 to 3.64 G. Branch misses stayed at 16.8 to 16.9 M. `ab.py`, 18 alternating runs, two
 rounds, step 33 / the probe unchecked / all three: medians 152.84 / 151.19 / 150.65 and 152.63 /
 150.84 / 150.26 ms, minimums 150.77 / 149.93 / 149.18 and 151.52 / 149.94 / 149.35 ms.
 
-Local, against step 33 (`ab.py`, 20 alternating runs, load average 3–5), three rounds: medians
+Local, against step 33 (`ab.py`, 20 alternating runs, load average 3 to 5), three rounds: medians
 153.42, 153.74 and 152.45 → 151.11, 151.83 and 151.14 ms, minimums 151.91, 152.08 and 151.64 →
-149.87, 148.39 and 149.27 ms. `perf stat`: user cycles 3.69 → 3.56–3.65 G, instructions 7,257 →
+149.87, 148.39 and 149.27 ms. `perf stat`: user cycles 3.69 → 3.56 to 3.65 G, instructions 7,257 →
 6,980 M, branch misses 16.9 → 16.8 M. memory.peak over five alternating runs: median 41.9 → 41.6
 MB. S 750 → 751. Gate: 510 pass, 0 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes.
 
@@ -879,13 +879,13 @@ instructions wherever the machine code showed reloads, bounds checks or tests it
 Measured on battery with the power-saver profile (EPP `power`), so no wall times: `perf stat`
 counts only, battery, not comparable with the steps before. Built up on step 34, instructions:
 the long-key mark in the tail 6,980 → 6,962 M; `add_checks` unchecked 6,823 M; the local slices
-for the rows and lists 6,826 M, with user cycles 24–54 M lower in two rounds; phrases inline
+for the rows and lists 6,826 M, with user cycles 24 to 54 M lower in two rounds; phrases inline
 6,751 M, with branch misses 17.0 → 17.6 M; the checks in a sized slice 6,556 M, branch misses
 16.6 M; the window with one bounds check 6,444 M; the two-word hash 6,370 M; the carried token
 picked once per block 6,179 M.
 
 Against step 34 (`perf stat -r 3`, three alternating rounds; battery, not comparable): user
-cycles 3,661–3,672 → 3,361–3,391 M, instructions 6,980 → 6,178 M, branch misses 16.9 → 16.6 M.
+cycles 3,661 to 3,672 → 3,361 to 3,391 M, instructions 6,980 → 6,178 M, branch misses 16.9 → 16.6 M.
 memory.peak over five alternating runs: median 42.2 → 41.5 MB. S 751 → 761. Gate: 510 pass, 0
 fail; seeds 2, 3, 7, 10 and 12 match their reference hashes. The board's run,
 run-8bf61f0fec95, measured 131.3 ms and 43.3 MB, against 145.5 ms and 41.3 MB for step 33's.
@@ -901,9 +901,9 @@ at an offset from the cursor, one line shorter, added 8.5 M and 0.1 M branch mis
 
 ## Step 36: a shorter serial start
 
-After step 35 the pass started 14.2–14.9 ms into a run on seed 1 (local, on AC, turbo off, a
+After step 35 the pass started 14.2 to 14.9 ms into a run on seed 1 (local, on AC, turbo off, a
 build with timestamps, 12 threads on the P-cores, medians over three rounds of 11 or more
-runs). Interning the query terms on one thread took 3.7 ms, the sample 3.4–3.7 ms and the
+runs). Interning the query terms on one thread took 3.7 ms, the sample 3.4 to 3.7 ms and the
 planning 1.3 ms, all of it before the pass.
 
 - **The intern prefetch put back.** [`TermTable::intern`] takes the parsed keys and an index,
@@ -920,18 +920,18 @@ planning 1.3 ms, all of it before the pass.
   Interning without the prefetch: 3.73 → 3.60 ms.
 - **Costs where the planning reads them.** A term's cost is computed from its sample hits and
   its length when a query is planned, instead of read from a table that one pass over the hits
-  and the keys filled first: the planning 1.30–1.34 → 0.98–1.06 ms.
+  and the keys filled first: the planning 1.30 to 1.34 → 0.98 to 1.06 ms.
 - **The sample in one cell per term.** [`count_hits`] kept, per term, a count and the last
   document counted in two arrays, so each token cost two random accesses, and the second
   array, 606 KB per thread, took 148 page faults on each. A `u32` cell now holds the count in
-  its high half and the last document's number in its low half: the sample 3.40–3.72 →
-  2.33–2.46 ms.
+  its high half and the last document's number in its low half: the sample 3.40 to 3.72 →
+  2.33 to 2.46 ms.
 - **The flags in bytes.** The flags that [`TermTable::mark`] adds to the slots are collected
-  in bytes instead of `u32`s: 0.15–0.16 → 0.04 ms.
+  in bytes instead of `u32`s: 0.15 to 0.16 → 0.04 ms.
 
 In the round that timed both, the pass started at 14.24 ms for step 35 and 12.06 ms for this
-step; over three rounds each, at 14.24–14.86 and 12.06–12.50 ms, and the pass itself took
-118.8–121.6 and 119.5–119.8 ms.
+step; over three rounds each, at 14.24 to 14.86 and 12.06 to 12.50 ms, and the pass itself took
+118.8 to 121.6 and 119.5 to 119.8 ms.
 
 Local, against step 35 (`ab.py`, 20 alternating runs on the P-cores, on AC), two rounds: medians
 139.93 and 140.59 → 137.99 and 138.03 ms, minimums 138.94 and 138.95 → 135.71 and 136.54 ms.
@@ -948,7 +948,7 @@ battery, the plan's groups placed on every thread, a range of keys each, took th
 grouping from 0.47 to 1.33 ms and the checks' from 2.03 to 1.65 ms, and the start from 20.51 to
 21.53 ms; the sample's counts summed on every thread after a barrier took the start from 19.13
 to 18.92 ms, for 15 more lines. A long key found by a binary search in a sorted list of the long
-terms, or in a cold function, instead of in an array by id, added 200–302 M instructions to the
+terms, or in a cold function, instead of in an array by id, added 200 to 302 M instructions to the
 pass, as the probe loop then spilled registers.
 
 The board's run, run-ce4c2e1d13c6, drew 134.2 ms against 131.3 ms for step 35's, on a slow box:
@@ -975,8 +975,8 @@ checks' prefetch: the checks take 1.6 MB, too little for a huge page.
 - **The collapse.** Once the table is written, `madvise(MADV_COLLAPSE)` (Linux 6.1 on) collapses
   its 4 KiB pages into huge pages if its faults found no free one, synchronously, with direct
   compaction if needed, whatever the sysfs THP settings say (`madvise(2)`). Where the faults got
-  huge pages, the call returned in 33–172 µs in three runs. With THP off while the table is
-  written and back on before the call, the collapse took 1.38–1.48 ms and gave back the counts
+  huge pages, the call returned in 33 to 172 µs in three runs. With THP off while the table is
+  written and back on before the call, the collapse took 1.38 to 1.48 ms and gave back the counts
   with THP: cycles 3,521 M, dTLB load misses 2.50 M, memory.peak 41.1 MB. With THP off for the
   whole process, it fails and changes nothing: cycles 3,736 M.
 
@@ -985,7 +985,7 @@ machine, although 5% of its THP faults since boot fell back to 4 KiB pages and 9
 compactions failed (`/proc/vmstat`). So the collapse helps where the faults could not, or did
 not try to, compact memory, and costs a fraction of a millisecond elsewhere.
 
-Local, against step 36 (`ab.py`, 20 alternating runs on the P-cores, on AC, load average 4–6),
+Local, against step 36 (`ab.py`, 20 alternating runs on the P-cores, on AC, load average 4 to 6),
 six rounds: medians 139.16, 137.95, 137.61, 138.70, 138.55 and 137.73 → 138.67, 138.71, 138.53,
 138.27, 138.88 and 137.75 ms, minimums 136.68, 136.40, 136.31, 136.48, 137.41 and 136.07 →
 136.86, 136.79, 137.34, 136.68, 137.12 and 136.98 ms: no change beyond the noise. memory.peak
@@ -1009,8 +1009,8 @@ P-cores, medians of 8 runs): formatting took 1.83 ms on every thread, the frees 
 - **No frees after formatting.** The plan and the chunks are `ManuallyDrop`, so `answer_all` no
   longer unmaps their blocks before it returns: the process exits once the output is written
   ([`main`]), which already left the output itself unfreed. The frees: 1.14 → 0.06 ms, for the
-  queries, still dropped. After step 33 the same leak, plan, chunks and queries, measured −0.96,
-  +0.10 and −1.80 ms in three rounds of 20 runs, too noisy to keep it.
+  queries, still dropped. After step 33 the same leak, plan, chunks and queries, measured -0.96,
+  +0.10 and -1.80 ms in three rounds of 20 runs, too noisy to keep it.
 
 - **Numbers by `format_into`.** `format_into`, with a `NumBuffer`, writes a number's digits
   without the formatting machinery of `write!`. Each number goes out followed by a space, and
@@ -1018,7 +1018,7 @@ P-cores, medians of 8 runs): formatting took 1.83 ms on every thread, the frees 
 
 In the timing build, a run took 135.65 → 134.14 ms (median of 8).
 
-Local, against step 37 (`ab.py`, 20 alternating runs on the P-cores, on AC, load average 4–6),
+Local, against step 37 (`ab.py`, 20 alternating runs on the P-cores, on AC, load average 4 to 6),
 four rounds: medians 138.53, 138.27, 138.88 and 137.75 → 137.86, 138.38, 139.08 and 137.15 ms,
 minimums 137.34, 136.68, 137.12 and 136.98 → 135.85, 136.61, 137.15 and 136.31 ms. memory.peak
 over 8 alternating runs: median 41.1 → 41.1 MB. S 762 → 763. Gate: 510 pass, 0 fail; seeds 2, 3,
@@ -1040,8 +1040,8 @@ their checks: 40,710 checks on seed 1, 1.63 MB, too little for a huge page of th
   writes and `MADV_COLLAPSE` after them, as in step 37. Its size is rounded up to whole 2 MiB
   pages, as a huge page maps only a whole aligned 2 MiB of a block: a block of 1.63 MB got none.
   The counting sort writes the checks straight into it (`group_into`). `perf stat -r 3`, three
-  alternating rounds: dTLB load misses 2.49–2.59 → 0.41–0.47 M, dTLB store misses 0.28–0.30 →
-  0.21 M, page faults 16,646–16,674 → 16,237–16,268, cycles 3,401–3,502 → 3,444–3,455 M,
+  alternating rounds: dTLB load misses 2.49 to 2.59 → 0.41 to 0.47 M, dTLB store misses 0.28 to 0.30 →
+  0.21 M, page faults 16,646 to 16,674 → 16,237 to 16,268, cycles 3,401 to 3,502 → 3,444 to 3,455 M,
   instructions 6,273 → 6,271 M.
 
 - **The sample summed as it comes in.** Each thread adds its part of the sample's counts to the
@@ -1056,7 +1056,7 @@ their checks: 40,710 checks on seed 1, 1.63 MB, too little for a huge page of th
 In the timing build (medians of 10 runs), the walks begin at 14.78 ms instead of 15.36, and the
 passes end at 131.81 ms instead of 133.87.
 
-Local, against step 38 (`ab.py`, 20 alternating runs on the P-cores, on AC, load average 2–6),
+Local, against step 38 (`ab.py`, 20 alternating runs on the P-cores, on AC, load average 2 to 6),
 six rounds: medians 137.54, 137.87, 136.85, 137.32, 137.11 and 137.23 → 134.96, 135.30, 136.33,
 135.57, 135.05 and 135.66 ms, minimums 135.87, 136.16, 135.55, 136.13, 136.14 and 136.46 →
 133.38, 134.02, 134.19, 134.09, 133.95 and 134.47 ms. memory.peak over 28 alternating runs:
@@ -1080,7 +1080,7 @@ takes 1.76 ms instead of 2.45: the helper is done 1.36 ms after it starts, its b
 included, flags the terms in 0.29, numbers the stores in 0.27 and marks the table in 0.52, so
 the join waits for nothing. The walks begin at 14.19 ms instead of 14.89.
 
-Local, against step 39 (`ab.py`, 20 alternating runs on the P-cores, on AC, load average 4–8),
+Local, against step 39 (`ab.py`, 20 alternating runs on the P-cores, on AC, load average 4 to 8),
 six rounds: medians 135.68, 135.60, 135.16, 135.64, 135.55 and 136.89 → 134.71, 134.42, 134.22,
 135.07, 134.36 and 135.32 ms, minimums 134.42, 134.50, 133.46, 133.46, 133.90 and 134.23 →
 133.51, 133.10, 132.99, 132.92, 132.88 and 133.19 ms. memory.peak over 40 alternating runs:
@@ -1117,7 +1117,7 @@ cycles 3,270 and 3,282 → 3,267 and 3,267 M; the walk keying the tokens, 5,936.
 3,199 M; the ids left out, 5,886.6 M, 3,164 and 3,219 M; the ends split at the LFs, 5,794.5 M,
 3,167 and 3,165 M, and branch misses 16.63 → 16.29 M.
 
-Local, against step 39 (`ab.py`, 41 alternating runs on the P-cores, on AC, load average 5–6),
+Local, against step 39 (`ab.py`, 41 alternating runs on the P-cores, on AC, load average 5 to 6),
 two rounds: medians 135.79 and 135.36 → 132.35 and 131.44 ms, minimums 133.76 and 133.45 →
 129.75 and 130.03 ms. memory.peak over 8 alternating runs: median 41.42 → 40.71 MB, highest
 42.97 → 42.06 MB. S 774 → 763 (on step 39's code, 769 → 758). Gate: 510 pass, 0 fail.
@@ -1152,7 +1152,7 @@ cycles 3,182 → 3,070 M; the bound in a register, 5,373.9 M, and cycles 3,109 �
 round; as committed, 5,382.2 M. Against step 41, two rounds: instructions 5,796.0 → 5,382.2 M,
 cycles 3,132 and 3,135 → 2,961 and 2,972 M, branch misses 16.28 → 16.32 M.
 
-Local, against step 41 (`ab.py`, 41 alternating runs on the P-cores, on AC, load average 4.7–7.7
+Local, against step 41 (`ab.py`, 41 alternating runs on the P-cores, on AC, load average 4.7 to 7.7
 with a browser taking half of one P-core, so the minimums are the steadier figures), two rounds:
 medians 132.05 and 137.28 → 127.15 and 132.88 ms, minimums 129.20 and 129.46 → 124.29 and
 124.14 ms. memory.peak over 8 alternating runs: median 41.25 → 40.71 MB, highest 42.02 → 41.94
@@ -1238,7 +1238,7 @@ two more rounds under a higher load: medians 123.80 and 123.09 → 119.52 and 11
 
 ## Step 46: a window's sums from nibble tables
 
-After step 45, `Window::flush` took 5–7% of the cycle samples, and about half of that went to the
+After step 45, `Window::flush` took 5 to 7% of the cycle samples, and about half of that went to the
 sum in `Tally::add_bits`: per word of a query's window, a popcount for its count and six masked
 popcounts for the sum of its bits' positions (`bit_index_sum`), 1,773 queries on sets times 61
 windows. LLVM vectorized them with `pshufb`, a table lookup per nibble for each of the seven.
@@ -1257,7 +1257,7 @@ and 2,769 → 2,656 and 2,677 M on a first form of the same code, and 2,770 → 
 branch misses unchanged (12.6 M). Part of the cycles saved come from the vector ports that the
 other hyperthread's token loop leaves idle, so the wall moves less than the cycles.
 
-Local, against step 45 (`ab.py`, 41 alternating runs, on a box with a load average of 3–4 from
+Local, against step 45 (`ab.py`, 41 alternating runs, on a box with a load average of 3 to 4 from
 other work): the first form, four rounds, medians 122.41, 118.78, 119.17 and 119.52 → 120.71,
 117.86, 117.57 and 117.99 ms, minimums 117.65, 117.41, 117.05 and 116.87 → 117.06, 116.02, 115.58
 and 115.99 ms; as committed, two rounds, medians 120.49 and 118.39 → 120.41 and 117.05 ms,
@@ -1278,7 +1278,7 @@ read that run. One line fewer.
 Against step 46 (`perf stat -r 5`, interleaved, two rounds): instructions 5,264.2 → 5,305.6 M,
 branch misses 12.63 → 11.61 M, cycles 2,719 → 2,706 M in the round without an outlier.
 
-Local, against step 46 (`ab.py`, 41 alternating runs, load average 5–7 from other work), four
+Local, against step 46 (`ab.py`, 41 alternating runs, load average 5 to 7 from other work), four
 rounds: medians 120.51, 119.23, 118.19 and 117.84 → 118.32, 118.01, 117.17 and 117.19 ms, minimums
 117.50, 116.63, 116.03 and 116.29 → 115.37, 115.46, 115.66 and 115.34 ms. memory.peak over 5
 alternating runs: median 40.2 → 37.8 MB, one `Vec` fewer per thread. S 819 → 818. Gate: 510
@@ -1287,13 +1287,13 @@ pass, 0 fail.
 ## Step 48: the first matches in half the memory
 
 A build that sampled the cgroup's `memory.current` and `memory.stat` every 20 µs from a thread of
-its own, with `/proc/self/smaps` at the phase ends, on seed 1 (local medians 39.8–40.8 MB, in two
+its own, with `/proc/self/smaps` at the phase ends, on seed 1 (local medians 39.8 to 40.8 MB, in two
 modes 2 MB apart). Memory rises from 16 MB when the plan is ready to 27 MB as the walks start
 (per thread 400 KB of query cells, 326 KB of check cells, the window's rows and lists), then
 climbs to 39 MB through the walks, and peaks either late in the walks or as the threads group
 their first matches, about level. What climbs is `Tally::first`: about 121,800 (query, doc) pairs
 per thread, 976 KB each, 11.7 MB on 12 threads, the largest piece of the peak. At the peak the
-cgroup held 36.5–38.9 MB of anonymous memory, 1.1 MB of kernel memory (0.74 MB of page tables)
+cgroup held 36.5 to 38.9 MB of anonymous memory, 1.1 MB of kernel memory (0.74 MB of page tables)
 and no file pages. Of the anonymous memory, 6 or 8 MB sat on huge pages: the term table's 4 MB
 and the checks' 2 MB, as meant, and in the higher mode one more 2 MB page under the term keys
 (`TermTable::keys`, 4.9 MB, `calloc`ed, of which only 13 entries, the terms longer than 12
@@ -1312,8 +1312,8 @@ stretch of that block faults in a whole huge page when one is free.
   of, in most runs, a 2 MB huge page.
 
 Local, against step 47: memory.peak over 5 to 6 alternating runs, three sessions: medians 40.0,
-40.85 and 39.8 → 33.8 and 33.7 MB with both changes, 37.9 MB with the keys alone (37.5–39.1
-against 37.5–41.2). `ab.py`, 41 alternating runs, four rounds (the first two on a build identical
+40.85 and 39.8 → 33.8 and 33.7 MB with both changes, 37.9 MB with the keys alone (37.5 to 39.1
+against 37.5 to 41.2). `ab.py`, 41 alternating runs, four rounds (the first two on a build identical
 but for formatting): medians 116.99, 117.29, 117.51 and 117.49 → 116.33, 116.58, 116.68 and 117.01
 ms, minimums 115.09, 115.58, 115.33 and 115.76 → 114.79, 115.16, 115.06 and 115.30 ms. S 818 →
 841. Gate: 510 pass, 0 fail. Step 47's memory median, 40.2 → 37.8 MB, was most likely the keys'
@@ -1330,11 +1330,11 @@ factor did not move. Step 48's 23 lines bought nothing in B.
 This step undoes step 48's first-match list (S 841 → 818) and keeps its other part, the two lines
 that keep the long terms' `keys` off huge pages, which take about 2 MB off a typical run. It then
 spends some of the room under the cap on time: `DENSE_SHARE` 48 instead of 32, so terms held by one
-sampled document in 33 to 48 become bitsets. Measured on step 44, that was −1.1% in four rounds
+sampled document in 33 to 48 become bitsets. Measured on step 44, that was -1.1% in four rounds
 for +0.85 MB.
 
 Full seed 1, step 47 → step 49, `ab.py`, 41 interleaved runs, medians / minimums: 118.95 /
-115.45 → 116.45 / 113.25 ms and 118.12 / 115.67 → 115.96 / 113.58 ms (−2.1%, −1.8%).
+115.45 → 116.45 / 113.25 ms and 118.12 / 115.67 → 115.96 / 113.58 ms (-2.1%, -1.8%).
 memory.peak (systemd-run, alternating): 40.2, 37.6, 40.6 → 39.8, 39.6, 39.1 MiB, under the cap
 with about 2 MB to spare at the board's usual reading. S 818 → 820. The gate passes (510 of 510).
 
@@ -1357,14 +1357,14 @@ the probe's branch.
   address of `check_at`, and the lists' cursor, loaded and stored), as only the six registers a
   call preserves hold values across it.
 
-`perf stat -r 5`, interleaved, two rounds: instructions 5,191.3 → 4,949.2 M (−4.7%), cycles 2,652
-and 2,647 → 2,591 and 2,588 M (−2.2%), branch misses 11.41 → 11.40 M. The address alone: 5,078.3 M
+`perf stat -r 5`, interleaved, two rounds: instructions 5,191.3 → 4,949.2 M (-4.7%), cycles 2,652
+and 2,647 → 2,591 and 2,588 M (-2.2%), branch misses 11.41 → 11.40 M. The address alone: 5,078.3 M
 instructions, cycles 2,650 and 2,647 → 2,596 and 2,595 M.
 
 Local, against step 49 (`ab.py`, 41 alternating runs on the P-cores, turbo off), medians /
 minimums: seed 1, 113.31 / 111.51 → 111.27 / 109.58 ms and 113.30 / 111.73 → 111.50 / 110.06 ms;
-seed 2, 114.00 / 112.49 → 111.92 / 110.26 ms and 114.09 / 112.50 → 111.80 / 110.44 ms (−1.6% to
-−2.0%). memory.peak over 5 alternating runs: 38.6–39.8 → 38.8–39.6 MiB, with the same
+seed 2, 114.00 / 112.49 → 111.92 / 110.26 ms and 114.09 / 112.50 → 111.80 / 110.44 ms (-1.6% to
+-2.0%). memory.peak over 5 alternating runs: 38.6 to 39.8 → 38.8 to 39.6 MiB, with the same
 allocations. S 820 → 826. Gate: 510 pass, 0 fail.
 
 ## Step 51: a short key's tail as it is
@@ -1379,12 +1379,12 @@ half. The loop takes two instructions fewer per token, as the new layout jumps o
 side at every token. One line fewer.
 
 Against step 50 (`perf stat -r 5`, interleaved, two rounds): instructions 4,949.7 → 4,875.4 M
-(−1.5%), cycles 2,585 and 2,584 → 2,536 and 2,541 M (−1.8%), branch misses 11.40 → 11.38 M.
+(-1.5%), cycles 2,585 and 2,584 → 2,536 and 2,541 M (-1.8%), branch misses 11.40 → 11.38 M.
 
 Local, against step 50 (`ab.py`, 41 alternating runs), medians / minimums: seed 1, 111.29 /
 109.86 → 109.85 / 108.60 ms and 111.45 / 110.06 → 110.11 / 108.09 ms; seed 2, 113.15 / 110.19 →
-110.80 / 109.11 ms and 111.90 / 110.24 → 110.68 / 109.06 ms (−1.1% to −2.1%). memory.peak over 3
-alternating runs: 38.5–39.5 → 39.1–40.0 MiB, with the same allocations. S 826 → 825. Gate: 510
+110.80 / 109.11 ms and 111.90 / 110.24 → 110.68 / 109.06 ms (-1.1% to -2.1%). memory.peak over 3
+alternating runs: 38.5 to 39.5 → 39.1 to 40.0 MiB, with the same allocations. S 826 → 825. Gate: 510
 pass, 0 fail.
 
 ## Step 52: the rows' bits set without bounds checks
@@ -1395,12 +1395,12 @@ bounds checks: one on `store[t]` and one on the row. A term id is below `store.l
 with the `ROW` flag has a store below the row count, so both reads go unchecked. 1 more line.
 
 Against step 51 (`perf stat -r 5`, interleaved, two rounds): instructions 4,875.4 → 4,832.1 M
-(−0.9%), cycles 2,546 and 2,545 → 2,522 and 2,518 M (−1.0%).
+(-0.9%), cycles 2,546 and 2,545 → 2,522 and 2,518 M (-1.0%).
 
 Local, against step 51 (`ab.py`, 41 alternating runs), medians / minimums: seed 1, 109.66 /
 108.43 → 109.38 / 107.66 ms, and 109.70 / 108.57 → 109.04 / 107.80 ms as committed; seed 2,
 110.41 / 108.89 → 109.55 / 108.26 ms; seed 3, as committed, 110.22 / 108.37 → 110.13 / 107.86 ms
-(−0.1% to −0.8%). The same allocations. S 825 → 826. Gate: 510 pass, 0 fail.
+(-0.1% to -0.8%). The same allocations. S 825 → 826. Gate: 510 pass, 0 fail.
 
 ## Step 53: 37 fewer lines, the same pass
 
@@ -1408,19 +1408,19 @@ Cuts in code that runs once or once per thread; the hot loops are as they were:
 
 - **The parse.** A thread's share of the lines is a `Queries<Key>`, the same layout as the
   merged queries with each term still its key, so the `Lines` struct goes, and the merge
-  offsets each part's `at` instead of summing a per-query length (−8). A malformed line's error
-  comes from `ok_or_else` (−1).
-- **The plan.** A term's cost is a `u32` that fits on one line (−2); the per-thread plans are
-  unzipped in a statement of their own (−1); a BOOL query's check is compiled first and kept
-  when no cover term is common (−1); the store and row counts share one `let`, and the row and
-  list counts are one field, `sizes` (−3); the term flags are `u32`, and `TermTable::mark`'s
-  loop, now one `for_each` without casts, sits where it runs, in `Plan::new` (−5);
-  `Plan::phrases` joins the other `impl Plan` (−2).
-- **The rest.** One `use` line (−3); `MADV_DONTNEED` named in a comment at its call, like the
-  other advice values (−2); `key_hash` inside `TermTable::home`, its only caller (−2); the
+  offsets each part's `at` instead of summing a per-query length (-8). A malformed line's error
+  comes from `ok_or_else` (-1).
+- **The plan.** A term's cost is a `u32` that fits on one line (-2); the per-thread plans are
+  unzipped in a statement of their own (-1); a BOOL query's check is compiled first and kept
+  when no cover term is common (-1); the store and row counts share one `let`, and the row and
+  list counts are one field, `sizes` (-3); the term flags are `u32`, and `TermTable::mark`'s
+  loop, now one `for_each` without casts, sits where it runs, in `Plan::new` (-5);
+  `Plan::phrases` joins the other `impl Plan` (-2).
+- **The rest.** One `use` line (-3); `MADV_DONTNEED` named in a comment at its call, like the
+  other advice values (-2); `key_hash` inside `TermTable::home`, its only caller (-2); the
   sample makes each new part the sum and adds the old sum into it, with no branch for the first
-  part (−3); `intern`'s push on one line, and the sample's and the scan's per-thread locals
-  declared together (−4).
+  part (-3); `intern`'s push on one line, and the sample's and the scan's per-thread locals
+  declared together (-4).
 
 Against step 52 (`perf stat -r 5`, interleaved, three rounds, seed 1): instructions 4,829.8 →
 4,828.4 M (the plan and the sample), cycles 2,525, 2,480 and 2,523 → 2,488, 2,525 and 2,523 M.
@@ -1447,11 +1447,11 @@ copies them into `Window::group`, one word per block of 64 rows, and the 64th do
 end spills the last, partial 64. A common term in no set query keeps a row nobody reads.
 
 Against step 53 (`perf stat -r 5`, interleaved, two rounds, seed 1): instructions 4,828.4 →
-4,676.3 M (−3.1%), cycles 2,523 and 2,523 → 2,424 and 2,426 M (−3.9%), branch misses 11.4 →
+4,676.3 M (-3.1%), cycles 2,523 and 2,523 → 2,424 and 2,426 M (-3.9%), branch misses 11.4 →
 11.2 M. The renumbering takes under 1 ms on the main thread before the plan.
 
 Local, against step 53 (`ab.py`, 41 alternating runs), medians / minimums: seed 1, 109.06 /
-107.61 → 106.50 / 105.33 ms; seed 2, 110.26 / 108.56 → 107.60 / 105.87 ms (−2.4%).
+107.61 → 106.50 / 105.33 ms; seed 2, 110.26 / 108.56 → 107.60 / 105.87 ms (-2.4%).
 memory.peak over five alternating runs: median 38.7 → 38.8 MB (the rows round up to a multiple
 of 64, and each thread keeps 4.6 KB of blocks). S 789 → 823. Gate: 510 pass, 0 fail.
 
@@ -1469,15 +1469,15 @@ plan's tail, and only it and one more from 9.9 to 11.9:
 | From | To | What | On |
 |---|---|---|---|
 | 0.12 | 0.82 | 12 parse threads spawned, the last at 0.82 | main |
-| 0.25 | 1.68–2.29 | the queries parsed, about 1.45 ms a share | 12 threads |
+| 0.25 | 1.68 to 2.29 | the queries parsed, about 1.45 ms a share | 12 threads |
 | 2.31 | 3.15 | the term table set up: its huge pages' faults and zeroing 0.68, `MADV_COLLAPSE` 0.17 | main |
 | 3.15 | 5.98 | 152,904 term occurrences interned, 18.5 ns each | main |
-| 5.98 | 8.01 | the sample: spawned by 6.11–6.32, counted in 1.05–1.35 ms a thread, 0.22 ms from the last sum to the join | 12 threads |
+| 5.98 | 8.01 | the sample: spawned by 6.11 to 6.32, counted in 1.05 to 1.35 ms a thread, 0.22 ms from the last sum to the join | 12 threads |
 | 8.01 | 8.87 | the renumbering: the partition 0.25, the id map 0.23, `hits` and `lens` 0.21, the long keys 0.06, the queries' terms 0.08 | main |
 | 8.94 | 9.86 | the queries planned, 0.6 ms a share, joined 0.13 ms after the last | 12 threads |
 | 9.86 | 11.93 | the plan's tail: the checks' block 0.47 and grouping 0.88 on their thread; the phrases 0.6 (the spawn included), the flags 0.32, the stores 0.29 and marking the slots 0.84 on main | 2 threads |
 | 11.93 | 12.21 | the plan's lists freed | main |
-| 12.31 | 13.14–13.68 | 12 scanning threads spawned by 12.51, each 0.8–1.2 ms setting up (`Tally::new` 0.6–0.9) | 12 threads |
+| 12.31 | 13.14 to 13.68 | 12 scanning threads spawned by 12.51, each 0.8 to 1.2 ms setting up (`Tally::new` 0.6 to 0.9) | 12 threads |
 
 The largest serial piece is the intern, and the table it needs took 0.84 ms more on the main
 thread while the other threads had nothing to do. The table's size needs only the term count,
@@ -1489,7 +1489,7 @@ parsed, so the ids stay in file order. A line that does not parse stops the pars
 an invalid line counts zero or more terms, so the table holds every term of the shares that
 parse. In the same build, interleaved with step 54 (12 runs each): the table is ready at 2.07 ms
 instead of 3.02, the intern ends at 5.12 instead of 5.87, the plan at 10.94 instead of 11.89,
-the walks start at 12.00–12.44 instead of 13.09–13.80, and the output is written at 102.60
+the walks start at 12.00 to 12.44 instead of 13.09 to 13.80, and the output is written at 102.60
 instead of 103.62 ms.
 
 Local, against step 54 (`ab.py`, 41 alternating runs), medians / minimums, nine rounds: seed 1,
@@ -1497,7 +1497,7 @@ Local, against step 54 (`ab.py`, 41 alternating runs), medians / minimums, nine 
 106.73 / 105.75 → 106.05 / 104.50 ms; seed 1, 106.63 / 105.23 → 105.57 / 104.24 ms; seed 1,
 106.50 / 105.09 → 106.02 / 104.34 ms; seed 3, 106.94 / 105.02 → 106.02 / 104.86 ms; seed 2,
 106.64 / 105.09 → 105.74 / 103.96 ms; seed 4, 107.80 / 106.00 → 106.58 / 105.30 ms; seed 1,
-106.15 / 105.17 → 105.77 / 104.41 ms: −0.36% to −1.13%, −0.76% on average, so a trial.
+106.15 / 105.17 → 105.77 / 104.41 ms: -0.36% to -1.13%, -0.76% on average, so a trial.
 memory.peak over five alternating runs: median 39.2 → 39.0 MB. S 823 → 829. Gate: 510 pass,
 0 fail.
 
@@ -1545,26 +1545,26 @@ of the per-block loop over a block's 9.1 token ends on average, about once per b
   stack. The two entries are now one unchecked `[u32; 2]` load, the four indices one store, and
   the cursor moves on by the range's length, which a loop past the first four fills: the
   ranges of a doc's triggers are disjoint, so `todo`'s 4 spare entries cover the store.
-  Instructions 4,678.8 → 4,474.6 M (−4.4%), cycles 2,398, 2,423 and 2,425 → 2,392, 2,390 and
+  Instructions 4,678.8 → 4,474.6 M (-4.4%), cycles 2,398, 2,423 and 2,425 → 2,392, 2,390 and
   2,417 M: the loop waits on its loads of `check_at` more than it runs.
 
 Both parts were built and measured on step 55's code first, then moved onto step 54's when step
 55 was reverted; neither touches what step 55 changed. Against step 54 (`perf stat -r 5`,
-interleaved, three rounds): instructions 4,676.2 → 4,291.4 M (−8.2%), cycles 2,397, 2,425 and
-2,427 → 2,361, 2,358 and 2,359 M (−2.3%), branch misses 11.2 M both. `ab.py`, 41 alternating
+interleaved, three rounds): instructions 4,676.2 → 4,291.4 M (-8.2%), cycles 2,397, 2,425 and
+2,427 → 2,361, 2,358 and 2,359 M (-2.3%), branch misses 11.2 M both. `ab.py`, 41 alternating
 runs, medians / minimums: seed 1, 106.62 / 105.06 → 104.17 / 102.96 ms; seed 2, 106.85 / 105.30
 → 105.47 / 103.73 ms and 106.92 / 105.63 → 104.94 / 103.49 ms; seed 3, 107.14 / 105.17 → 105.31 /
 103.38 ms; seed 1, 106.40 / 104.74 → 104.25 / 103.08 ms; seed 3, 107.07 / 105.20 → 105.09 / 103.92
-ms (−1.3% to −2.3%, −1.8% on average, so a trial). On step 55's code, against step 55: seed 1,
+ms (-1.3% to -2.3%, -1.8% on average, so a trial). On step 55's code, against step 55: seed 1,
 105.90 / 103.26 → 103.11 / 101.92 ms; seed 2, 106.40 / 104.50 → 103.71 / 102.82 ms; seed 3,
 106.56 / 105.30 → 104.13 / 103.04 ms; the triggers' loop alone, seed 1, 105.67 / 104.56 → 105.24 /
 104.21 ms, seed 2, 106.48 / 105.01 → 106.05 / 104.70 ms. memory.peak over five alternating runs:
-38.2–39.9 → 38.4–40.2 MB. S 823 → 821. Gate: 510 pass, 0 fail.
+38.2 to 39.9 → 38.4 to 40.2 MB. S 823 → 821. Gate: 510 pass, 0 fail.
 
 ## Step 57: the id lists from one log, sorted at the flush
 
 After step 56, a build that skipped the id lists' pushes (wrong answers, to size the stage) ran
-137 M fewer cycles (−5.9%, the flush's lists included), and `perf record` of L2 misses put 27%
+137 M fewer cycles (-5.9%, the flush's lists included), and `perf record` of L2 misses put 27%
 of the pass's 6.6 M on the pushes: about one per push. Seed 1 has 1.75 M of them, a doc's first
 sight of a listed term, about 7 per document, 28.7 K per window. Each loaded the term's store,
 then one of 3,452 `Vec` headers, then wrote the end of that list: the ends of thousands of lists
@@ -1576,17 +1576,17 @@ flush, a counting sort moves them into the lists: a count per list, the sums, an
 log order, so that each list stays ascending; the lists are then `ids[at[j]..at[j + 1]]`. The
 log, 115 KB a window on seed 1, is written in order, and the sort's 13.8 KB of counts stay in
 L1. An entry of a `u64`, `j << 16 | i`, needs no ends, but its log took 2.5 MB more at the
-peak (memory.peak 41.2–41.3 MB) for the same cycles.
+peak (memory.peak 41.2 to 41.3 MB) for the same cycles.
 
 Against step 56, measured after the reboot of Nov 1 with turbo off: `perf stat -r 5`,
 interleaved, instructions 4,291.4 → 4,318.8 M (+0.6%), cycles 2,364 and 2,365 → 2,301 and 2,302
-M (−2.7%), branch misses 11.2 → 11.0 M. `ab.py`, 61 alternating runs, medians / minimums: seed
+M (-2.7%), branch misses 11.2 → 11.0 M. `ab.py`, 61 alternating runs, medians / minimums: seed
 1, 103.47 / 102.07 → 101.56 / 99.99 ms; seed 2, 103.31 / 102.04 → 100.98 / 99.90 ms; seed 3,
-103.56 / 101.78 → 100.92 / 99.69 ms (−1.8% to −2.5%). The same build before `fmt` merged two
+103.56 / 101.78 → 100.92 / 99.69 ms (-1.8% to -2.5%). The same build before `fmt` merged two
 lines: seed 1, 103.49 / 102.11 → 101.20 / 99.56 ms; seed 2, 104.00 / 101.76 → 101.33 / 99.89
-ms; seed 3, 103.70 / 101.90 → 100.90 / 99.78 ms (−2.2% to −2.7%). Against step 54, seed 1:
-105.58 / 104.06 → 101.47 / 99.69 ms (−3.9%). memory.peak over five alternating runs: 38.6–40.1
-→ 38.2–40.0 MB. S 821 → 842. Gate: 510 pass, 0 fail.
+ms; seed 3, 103.70 / 101.90 → 100.90 / 99.78 ms (-2.2% to -2.7%). Against step 54, seed 1:
+105.58 / 104.06 → 101.47 / 99.69 ms (-3.9%). memory.peak over five alternating runs: 38.6 to 40.1
+→ 38.2 to 40.0 MB. S 821 → 842. Gate: 510 pass, 0 fail.
 
 ## Step 58: the most frequent term of each home slot moved into it
 
@@ -1604,19 +1604,19 @@ term (the less frequent of two that share a home). Taking only terms with the sa
 one there, and no term out of a home not its own: 0.84 M, about the same cycles.
 
 On the main thread after the marking, the pass took 0.75 ms, and the wall gained 0.8% to 0.9%
-(seeds 1–3, 100.38 / 99.23, 100.50 / 99.16 and 100.26 / 97.78 against 101.33 / 99.50, 101.34 /
+(seeds 1 to 3, 100.38 / 99.23, 100.50 / 99.16 and 100.26 / 97.78 against 101.33 / 99.50, 101.34 /
 99.97 and 101.21 / 99.68 ms). It now runs on a thread of its own while the main thread groups
 the phrases, flags the terms and numbers the stores (1.2 ms), on the old ids, whose sample hits
 it reads through the renumbering.
 
 Against step 57: `perf stat -r 5`, interleaved, instructions 4,318.8 → 4,279.9 M, cycles 2,304
-and 2,300 → 2,256 and 2,256 M (−2.1%), branch misses 11.0 → 10.1 M. `ab.py`, 61 alternating
+and 2,300 → 2,256 and 2,256 M (-2.1%), branch misses 11.0 → 10.1 M. `ab.py`, 61 alternating
 runs, medians / minimums: seed 1, 101.82 / 100.08 → 100.20 / 98.82 ms; seed 2, 102.41 / 100.24 →
 100.31 / 97.84 ms; seed 3, 100.86 / 99.44 → 99.67 / 98.25 ms; seed 1, 101.26 / 99.77 → 99.72 /
-98.34 ms (−1.2% to −2.1%, −1.6% on average, so a trial). The same change before its lines were
+98.34 ms (-1.2% to -2.1%, -1.6% on average, so a trial). The same change before its lines were
 tightened: seed 1, 101.50 / 100.32 → 99.71 / 98.29 ms; seed 2, 101.09 / 99.98 → 99.52 / 97.59
-ms; seed 3, 101.23 / 99.53 → 99.72 / 98.06 ms. memory.peak over five alternating runs: 39.2–39.5
-→ 39.0–39.7 MB. S 842 → 864. Gate: 510 pass, 0 fail.
+ms; seed 3, 101.23 / 99.53 → 99.72 / 98.06 ms. memory.peak over five alternating runs: 39.2 to 39.5
+→ 39.0 to 39.7 MB. S 842 → 864. Gate: 510 pass, 0 fail.
 
 ## Step 59: the probe's first test as one select, and no prefetch of `check_at`
 
@@ -1624,22 +1624,22 @@ ms; seed 3, 101.23 / 99.53 → 99.72 / 98.06 ms. memory.peak over five alternati
 behind an empty `asm` block that kept LLVM from making two branches of it, and the flags' select
 then tested `found` once more. Now `on` is the key's difference when the slot has `MORE` and 0
 otherwise, one `cmov`, and the branch tests it: two instructions fewer per token in both token
-loops. Alone, against step 58: instructions 4,279.9 → 4,243.1 M, cycles 2,256–2,262 → 2,202–2,232
+loops. Alone, against step 58: instructions 4,279.9 → 4,243.1 M, cycles 2,256 to 2,262 → 2,202 to 2,232
 M; `ab.py`, 61 alternating runs, seed 1, 99.17 / 98.15 → 98.37 / 97.24 ms; seed 2, 99.13 / 98.16
-→ 98.53 / 97.17 ms (−0.6% to −0.8%).
+→ 98.53 / 97.17 ms (-0.6% to -0.8%).
 
 The token loop at the line end also prefetched each token's `check_at` entry for the BOOL
 triggers' loop (step 44), and with every register taken it reloaded `check_at`'s address from
 the stack for it, per token. Without the prefetch: 65 M fewer instructions (1.8 per token), and
-the triggers' loop now waits on loads of `check_at` that are mostly L2 hits; cycles 2,216–2,235
-→ 2,193–2,221 M on top of the select. After step 56 the prefetch's removal alone was within the
+the triggers' loop now waits on loads of `check_at` that are mostly L2 hits; cycles 2,216 to 2,235
+→ 2,193 to 2,221 M on top of the select. After step 56 the prefetch's removal alone was within the
 noise (below).
 
 Against step 58: `perf stat -r 5`, interleaved, instructions 4,279.9 → 4,178.0 M, cycles 2,255
-and 2,255 → 2,220 and 2,217 M (−1.6%), branch misses 10.1 M both. `ab.py`, 61 alternating runs,
+and 2,255 → 2,220 and 2,217 M (-1.6%), branch misses 10.1 M both. `ab.py`, 61 alternating runs,
 medians / minimums: seed 1, 99.64 / 98.41 → 98.34 / 97.12 ms; seed 2, 99.63 / 98.42 → 98.14 /
 96.67 ms; seed 3, 99.19 / 98.14 → 97.71 / 96.19 ms; seed 1, 99.91 / 98.40 → 98.06 / 96.77 ms;
-seed 2, 99.75 / 98.32 → 98.23 / 97.05 ms (−1.3% to −1.9%, −1.5% on average, so a trial). memory.peak over five alternating runs: 38.8–39.7 → 38.3–39.4 MB. S 864 → 863.
+seed 2, 99.75 / 98.32 → 98.23 / 97.05 ms (-1.3% to -1.9%, -1.5% on average, so a trial). memory.peak over five alternating runs: 38.8 to 39.7 → 38.3 to 39.4 MB. S 864 → 863.
 Gate: 510 pass, 0 fail.
 
 ## Step 60: the corpus faulted in during the intern, and the chunks freed during the write
@@ -1657,26 +1657,26 @@ build, interleaved with it:
 | renumbered (main only) | 8.45 | 8.34 | 8.57 | 8.49 |
 | planned | 9.37 | 9.30 | 9.68 | 9.41 |
 | the plan's tail ends (3 threads) | 11.48 | 11.22 | 11.64 | 11.37 |
-| the walks start | 12.76–13.24 | 12.42–12.83 | 12.97–13.56 | 12.59–13.00 |
-| a walk takes | 75.15–76.01 | 74.01–75.32 | 74.91–76.01 | 74.01–74.67 |
-| the walks end | 87.78–89.99 | 86.34–89.19 | 87.73–89.85 | 86.50–88.82 |
-| the scanning threads' tails end | 91.85–93.86 | 90.44–92.68 | 92.19–93.67 | 90.49–92.29 |
+| the walks start | 12.76 to 13.24 | 12.42 to 12.83 | 12.97 to 13.56 | 12.59 to 13.00 |
+| a walk takes | 75.15 to 76.01 | 74.01 to 75.32 | 74.91 to 76.01 | 74.01 to 74.67 |
+| the walks end | 87.78 to 89.99 | 86.34 to 89.19 | 87.73 to 89.85 | 86.50 to 88.82 |
+| the scanning threads' tails end | 91.85 to 93.86 | 90.44 to 92.68 | 92.19 to 93.67 | 90.49 to 92.29 |
 | formatted | 95.22 | 94.09 | 95.10 | 93.62 |
 | `exit` called | 95.81 | 94.76 | 95.75 | 94.26 |
 | the process gone | 97.28 | 95.77 | 97.39 | 95.14 |
 
 From the parse to the walks, only the main thread works for 3.8 ms (the table and the intern)
 and 0.9 ms (the renumbering), and three threads for 1.9 ms (the plan's tail). At the end, the
-walks end 2.1–2.6 ms apart (medians of the spread), and every scanning thread's tail takes
-3.9–4.8 ms: the last one's, on step 58, is the corpus pages dropped 0.72, the flush 0.53, the
+walks end 2.1 to 2.6 ms apart (medians of the spread), and every scanning thread's tail takes
+3.9 to 4.8 ms: the last one's, on step 58, is the corpus pages dropped 0.72, the flush 0.53, the
 window freed 0.92, the merge 0.33 and its first matches grouped 1.61 (placing them 1.08). The
-exit takes 1.55–1.65 ms, against 0.13 for a process that exits at once.
+exit takes 1.55 to 1.65 ms, against 0.13 for a process that exits at once.
 
 The walk's first touch of each 64 KiB of the mapped corpus is a page fault even when the file
 is cached: the fault maps the 16 pages around it. Seed 1 draws about 3,900 of them, some 2.7 µs
 each, in the middle of the walks. So, as soon as the queries are parsed, `answer_all` starts
 `threads / 4` threads (3 of 12) that read the corpus a byte per 64 KiB, each a third of it, and
-are never joined. They run from 2.06–2.09 to 5.45–5.54 ms (seed 1), inside the intern, which
+are never joined. They run from 2.06 to 2.09 to 5.45 to 5.54 ms (seed 1), inside the intern, which
 does not slow. With more of them, one shares the main thread's core and the intern slows. A
 walk takes 1.0 ms less. The faults are as many (17,320 → 17,337 a run, `perf stat -r 10`, two
 rounds), but kernel cycles go 159.0 and 158.4 → 145.7 and 145.3 M. After step 38, helper
@@ -1691,23 +1691,23 @@ saved 0.91 ms of the exit.
 
 Local, against step 59 (`ab.py`, 61 alternating runs), medians / minimums: seed 1, 98.18 / 96.97
 → 96.73 / 95.55 ms; seed 2, 98.08 / 96.44 → 96.60 / 95.22 ms; seed 1, 97.88 / 96.53 → 96.78 /
-95.36 ms; seed 2, 97.94 / 96.96 → 96.49 / 94.54 ms (−1.1% to −1.5%). Before, against step 58:
+95.36 ms; seed 2, 97.94 / 96.96 → 96.49 / 94.54 ms (-1.1% to -1.5%). Before, against step 58:
 seed 1, 99.84 / 98.22 → 97.97 / 96.89; seed 2, 99.34 / 98.51 → 98.18 / 97.14; seed 1, 101.63 /
-98.33 → 99.68 / 96.72; seed 2, 99.58 / 98.19 → 98.41 / 96.73 (−1.2% to −1.9%). First measured
+98.33 → 99.68 / 96.72; seed 2, 99.58 / 98.19 → 98.41 / 96.73 (-1.2% to -1.9%). First measured
 on step 54, against it: seed 1, 105.58 / 104.39 → 104.06 / 102.57; seed 2, 106.14 / 104.31 →
 104.66 / 102.39; seed 1, 105.61 / 104.12 → 103.88 / 102.59; seed 2, 105.12 / 103.95 → 103.46 /
-102.16 (−1.4% to −1.6%); the prefaulting alone, three rounds: seed 1, −0.95%, −1.39%, −0.95%;
-seed 2, −0.78%, −0.34%, −1.31%. memory.peak over five alternating runs, seed 1: 38.8–39.4 →
-39.4–40.2 MB, median 39.3 → 39.7. S 863 → 868. Gate: 510 pass, 0 fail.
+102.16 (-1.4% to -1.6%); the prefaulting alone, three rounds: seed 1, -0.95%, -1.39%, -0.95%;
+seed 2, -0.78%, -0.34%, -1.31%. memory.peak over five alternating runs, seed 1: 38.8 to 39.4 →
+39.4 to 40.2 MB, median 39.3 → 39.7. S 863 → 868. Gate: 510 pass, 0 fail.
 
 ## Step 61: a zero in a register for the line end's selects, and four instructions fewer per token in the tokenizer
 
 The token loop at the line end takes three `cmov`s against 0 per token, and LLVM set a register
 to 0 before each (`mov $0`), as none was free to hold one across the loop. A zero made once per
 line behind an empty `asm` block, which the optimizer cannot see through, now stays in a
-register for all three: 43 M fewer instructions. Alone, on step 59: cycles 2,216–2,226 → 2,204
-M (−0.8%); `ab.py`, 61 alternating runs, seed 1, 98.13 / 96.86 → 97.52 / 96.06 ms; seed 2,
-97.97 / 96.68 → 97.41 / 96.03 ms; seed 3, 97.96 / 96.56 → 97.15 / 95.89 ms (−0.6% to −0.8%),
+register for all three: 43 M fewer instructions. Alone, on step 59: cycles 2,216 to 2,226 → 2,204
+M (-0.8%); `ab.py`, 61 alternating runs, seed 1, 98.13 / 96.86 → 97.52 / 96.06 ms; seed 2,
+97.97 / 96.68 → 97.41 / 96.03 ms; seed 3, 97.96 / 96.56 → 97.15 / 95.89 ms (-0.6% to -0.8%),
 under the bar alone. On step 60: 4,178.7 → 4,135.8 M instructions, cycles 2,225 and 2,221 →
 2,213 and 2,205 M.
 
@@ -1741,10 +1741,10 @@ all.
 `ab.py`, 61 alternating runs, medians / minimums, step 60 → this step: seed 2, 97.69 / 96.00 →
 95.58 / 93.42 ms; seed 1, 96.64 / 94.94 → 94.65 / 93.10 ms; seed 3, 96.32 / 94.81 → 94.22 /
 92.51 ms; the same code before its comments: seed 1, 96.55 / 94.96 → 94.70 / 92.76 ms; seed 3,
-96.27 / 94.86 → 93.72 / 92.56 ms (−1.9% to −2.6%, −2.2% on average). Without the offsets: seed
+96.27 / 94.86 → 93.72 / 92.56 ms (-1.9% to -2.6%, -2.2% on average). Without the offsets: seed
 1, 96.30 / 95.11 → 94.88 / 93.36 ms; seed 2, 96.71 / 95.08 → 95.05 / 93.37 ms; seed 3, 96.01 /
-94.68 → 94.90 / 93.50 ms; seed 2, 96.52 / 95.26 → 94.96 / 93.22 ms (−1.2% to −1.7%).
-memory.peak over five alternating runs, seed 1: 39.2–39.7 → 39.1–40.1 MB, median 39.5 both.
+94.68 → 94.90 / 93.50 ms; seed 2, 96.52 / 95.26 → 94.96 / 93.22 ms (-1.2% to -1.7%).
+memory.peak over five alternating runs, seed 1: 39.2 to 39.7 → 39.1 to 40.1 MB, median 39.5 both.
 S 868 → 877. Gate: 510 pass, 0 fail.
 
 On the board (run-280052ffeb2c) this step drew 97.9 ms against step 60's 95.2 ms, but the same run was slow on
@@ -1798,12 +1798,12 @@ frequent into it. Mispredicts +0.16 M, from the probes past it.
 94.21 / 92.92 → 92.09 / 90.75; seed 2, 94.42 / 93.15 → 92.85 / 91.68; seed 1, 94.60 / 93.26 →
 92.98 / 91.01; seed 2, 94.80 / 93.58 → 92.69 / 91.18; seed 3, 93.84 / 92.91 → 91.91 / 90.30; seed
 1, 94.68 / 93.19 → 92.43 / 91.78; seed 1, 96.86 / 94.50 → 95.12 / 92.60; seed 3, 95.95 / 94.23 →
-94.09 / 92.68 (−1.6% to −2.4%, −2.0% on average). Three-way, step 61, the
+94.09 / 92.68 (-1.6% to -2.4%, -2.0% on average). Three-way, step 61, the
 packing only and this step: seed 1, 94.88 / 93.27, 92.74 / 91.31 and 91.91 / 90.91; seed 3, 94.32
 / 93.07, 92.61 / 91.09 and 91.85 / 90.05. This step against step 61: seed 2, 94.63 / 92.91 →
-91.94 / 90.75; seed 1, 94.45 / 93.18 → 92.55 / 91.01; seed 3, 94.46 / 93.11 → 91.82 / 90.49 (−2.0%
-to −3.1% over five rounds, −2.7% on average). memory.peak over five alternating runs, seed 1:
-39.1–39.5 → 39.5–40.0 MB, median 39.5 → 39.6. S 877 → 901. Gate: 510 pass, 0 fail.
+91.94 / 90.75; seed 1, 94.45 / 93.18 → 92.55 / 91.01; seed 3, 94.46 / 93.11 → 91.82 / 90.49 (-2.0%
+to -3.1% over five rounds, -2.7% on average). memory.peak over five alternating runs, seed 1:
+39.1 to 39.5 → 39.5 to 40.0 MB, median 39.5 → 39.6. S 877 → 901. Gate: 510 pass, 0 fail.
 
 ## Step 63 (trial): step 62's packing alone
 
@@ -1811,16 +1811,16 @@ Step 62 put two changes on the board at once and ran about 7% slower there than 
 packing is computation on the line end's own data; the hash of the key's first word alone puts
 terms that share their first 8 bytes on one home slot, so more probes go past it into the term
 table. This step keeps the packing and step 61's hash, to tell on the board which of the two cost
-the time. Locally, on battery, the packing alone measured −1.6% to −2.4% against step 61 over eight
+the time. Locally, on battery, the packing alone measured -1.6% to -2.4% against step 61 over eight
 `ab.py` rounds (step 62's section). Gate: 510 pass, 0 fail. S 877 → 901 (static_axes).
 
 ## Step 66: step 64's parallel intern again
 
-Step 64's one board run, run-bb4ed7d47695 (93.4 ms), came in a run where A, C and D read 1.5–3.4%
+Step 64's one board run, run-bb4ed7d47695 (93.4 ms), came in a run where A, C and D read 1.5 to 3.4%
 above their best, so it did not show whether the change pays on the box. Re-measured today on
 step 63's code (local, turbo off, `ab.py`, 41 interleaved runs): seed 1 median 94.76 → 92.01 ms
-and, in a second session, 95.05 → 92.26 ms; seed 3 93.94 → 91.22 ms, −2.9%. Gate: 524 pass, 0
-fail, now with unseen full seeds 51–54. S 901 → 961 (`static_axes`). The first push meant to carry
+and, in a second session, 95.05 → 92.26 ms; seed 3 93.94 → 91.22 ms, -2.9%. Gate: 524 pass, 0
+fail, now with unseen full seeds 51 to 54. S 901 → 961 (`static_axes`). The first push meant to carry
 it, 9c3eb3c, lost the source file to a reset of the working tree before the commit and carried
 step 65's code instead, so this is its first board trial since step 64. It was to be kept only if its
 board runs beat step 63's 90.6, 91.1 and 92.9 ms. Its run, run-33959bbbe488, read 87.3 ms, in a
@@ -1830,9 +1830,9 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
 
 - **After step 63, 32-byte aligned checks, a branch-free `add_checks` and immediate vector
   shifts in `pack`** (pushed as 052ab6e). Local, turbo off, `ab.py`, 41 interleaved runs, seed 1:
-  median 95.05 → 94.54 ms (−0.5%, inside the runs' spread). The board counted S 901 → 956, about
+  median 95.05 → 94.54 ms (-0.5%, inside the runs' spread). The board counted S 901 → 956, about
   0.19 points, more than the time could return. Its two board runs (step 65): run-e40ad8747964,
-  94.4 ms, in a run where A, C and D read 14–43% above their best, and run-4d543d6cf37e (pushed as
+  94.4 ms, in a run where A, C and D read 14 to 43% above their best, and run-4d543d6cf37e (pushed as
   9c3eb3c), 95.6 ms, where C and D read 1.6% and 3.4% above theirs. Not kept: B went back to step
   63's code.
 - **After step 63, where the time goes, measured for three redesigns** (local, turbo off, on AC,
@@ -1855,7 +1855,7 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
     branch-free token loop of steps 41-47, its remaining misses loop exits whose counts follow
     the text, about 5% at most; the scan started during the plan, at most the 6 ms idle.
     Step 64's parallel intern is the largest piece of the last one, re-measured today with
-    `ab.py`, 41 interleaved runs: seed 1 median 94.76 → 92.01 ms, seed 3 93.94 → 91.22 ms, −2.9%.
+    `ab.py`, 41 interleaved runs: seed 1 median 94.76 → 92.01 ms, seed 3 93.94 → 91.22 ms, -2.9%.
     No combination came near 10%, so none was built.
 
 - **After step 62, the tokenizer's hash constant** (seed 1, `perf stat -r 5`, interleaved, two
@@ -1879,14 +1879,14 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
   on step 62's code, 25 or 31 alternating runs, medians / minimums, ms):
   - The timeline: parsed 2.17, table set up 3.04, interned 5.86, sample joined 7.53, renumbered
     8.39, planned 9.31, the plan's tail ends 11.21, the scanning threads start setting up at
-    11.74–12.06 and walk from 12.48–13.11, the walks end at 84.48–87.67, the tails at
-    88.55–90.71, formatted at 92.05, written at 92.65; `ab.py`'s wall 95.77. At the exit 21.7 MB
+    11.74 to 12.06 and walk from 12.48 to 13.11, the walks end at 84.48 to 87.67, the tails at
+    88.55 to 90.71, formatted at 92.05, written at 92.65; `ab.py`'s wall 95.77. At the exit 21.7 MB
     is still mapped (18.5 MB anonymous), with 688 KB of page tables and 89 mappings.
   - Ranked by walk end, the first thread to end its walk took 4.9 ms over its tail and the last
-    3.4 ms: the walks end over 2.8 ms (84.10–86.93) and the tails over 1.4 ms (88.99–90.36). The
+    3.4 ms: the walks end over 2.8 ms (84.10 to 86.93) and the tails over 1.4 ms (88.99 to 90.36). The
     last thread's tail: corpus pages dropped 0.89, last flush 0.43, window freed 0.08, merge
     0.22, first matches grouped 1.41 (allocations 0.13, counting 0.21, placing 1.00, the list
-    freed 0.08). The format threads start 0.08–0.24 ms after the join and take 0.93 ms each.
+    freed 0.08). The format threads start 0.08 to 0.24 ms after the join and take 0.93 ms each.
     Over 12 runs each of the 12 chunks was the last to end its walk in some run, so no static
     split of the corpus evens the walks out.
   - The last walk to end leaving its corpus pages to the exit (a counter passed to `scan`), 4
@@ -1897,7 +1897,7 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
   - Each format thread's output reserved once, 64 bytes a line, instead of grown, with the same
     lines: seed 1, 92.03 / 91.27 → 91.90 / 91.13, 92.38 / 90.80 → 91.89 / 90.42 (31 runs) and
     91.96 / 90.90 → 92.23 / 90.54; seed 2, 92.38 / 90.97 → 92.09 / 90.96 and 92.43 / 91.37 →
-    92.13 / 90.85: −0.2% on average, within the noise; memory.peak median 39.5 → 39.6 MB over
+    92.13 / 90.85: -0.2% on average, within the noise; memory.peak median 39.5 → 39.6 MB over
     five alternating runs; gate 510 pass. With the plan and the queries also freed on the
     thread that frees the chunks: seed 1, 91.86 / 91.00, seed 2, 92.16 / 91.04.
   - Not built: the terms deduplicated by each parse thread before the intern, as seed 1's 12
@@ -1921,12 +1921,12 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
   - `parallel` as a tree: each thread spawns the upper half of its share and runs the lower
     half, so the last of 12 starts after 4 spawns, for 4 more lines. With `work` as a `dyn Fn`,
     61 runs, two rounds: seed 1, 98.73 / 97.02 → 98.37 / 95.13 and 98.02 / 96.62 → 98.25 /
-    96.12; seed 2, 98.51 / 97.00 → 98.08 / 96.20 and 97.93 / 96.22 → 97.75 / 96.15 (−0.4% to
+    96.12; seed 2, 98.51 / 97.00 → 98.08 / 96.20 and 97.93 / 96.22 → 97.75 / 96.15 (-0.4% to
     +0.2%). Generic over `work` and a `Range`, scan's line end compiles inside `parallel`'s
     last step instead of the spawned closure, and keeps 0 in a register for the probe's
     `cmove`: one instruction less per token, 4,280.6 → 4,242.4 M instructions, cycles 2,229 and
-    2,269 → 2,236 and 2,235 M. Four rounds (41 or 61 runs): seed 1, −2.3%, −1.2%, −0.9%, −1.0%;
-    seed 2, −1.2%, −1.0%, −1.4%, −1.4%. On top of step 59 and this step it still saves the
+    2,269 → 2,236 and 2,235 M. Four rounds (41 or 61 runs): seed 1, -2.3%, -1.2%, -0.9%, -1.0%;
+    seed 2, -1.2%, -1.0%, -1.4%, -1.4%. On top of step 59 and this step it still saves the
     instruction (4,178.7 → 4,136.3 M, cycles 2,222 and 2,226 → 2,208 and 2,214 M), but the
     wall no longer moves: seed 1, 96.53 / 95.01 → 96.47 / 94.50 and 96.66 / 95.53 → 96.49 /
     94.15; seed 2, 96.76 / 95.06 → 96.38 / 93.58 and 96.36 / 95.24 → 96.43 / 94.64. Not kept.
@@ -1950,17 +1950,17 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
     token's key of 0xFF bytes held in a register: its `vpcmpeqd` became a register move, cycles
     unchanged (step 61 moves it off the common path instead).
   - The probes' room for 32 more tokens, tested once per block, grown by a cold function: 21 M
-    fewer instructions, cycles 2,200–2,204 → 2,198–2,202 M.
+    fewer instructions, cycles 2,200 to 2,204 → 2,198 to 2,202 M.
   - The probes holding the home slot's offset instead of its address: the token loop then kept
     one of its cursors on the stack. Not timed.
   - The gather masked to the real terms' lanes, with a pad id of `u32::MAX`, whose top bit
-    drops its lane: +28 M instructions, cycles 2,212–2,218 → 2,225–2,230 M.
+    drops its lane: +28 M instructions, cycles 2,212 to 2,218 → 2,225 to 2,230 M.
   - A line's token count added once per block (the popcount of its ends), and the probes
     written through a pointer, so that the token loop keeps no count: 7 M fewer instructions,
-    cycles 2,223–2,225 → 2,236–2,244 M.
+    cycles 2,223 to 2,225 → 2,236 to 2,244 M.
   - The phrase triggers' `phrase_at` entries prefetched after the token loop, and their first
     phrase entries after the triggers' loop: +7 M instructions, +0.3 M branch misses, cycles
-    2,220 → 2,240–2,246 M.
+    2,220 → 2,240 to 2,246 M.
   - Of the 12.94 M checks run, 9.20 M hit (71%), and 4.59 M (35%) hold whenever their trigger
     is present (`table & HAS[j] == HAS[j]`, `j` the trigger's lane), so that their gather tells
     nothing; 91% have four distinct terms or fewer. Not built: those checks without the gather
@@ -1974,30 +1974,30 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
     26%.
   - The table's slots marked by `threads` scoped threads, a share each, instead of on the main
     thread: seed 1, 99.84 / 98.64 → 99.55 / 98.42; seed 2, 99.54 / 98.37 → 99.31 / 97.80
-    (−0.3%), for 5 more lines.
+    (-0.3%), for 5 more lines.
   - Each doc's checks run at the next doc's line end, so that the lines its triggers prefetch
     have a whole line of tokens to arrive: two of `seen`, `todo` and `kept`, swapped per doc.
     Fill-buffer hits 39.0 → 51.7 M and L1 load misses 45.7 → 59.1 M, as the lines left L1
-    again before their use; cycles 2,255–2,259 → 2,250–2,283 M. With the triggers' prefetches
-    into L2 only (T1): 2,250–2,276 against 2,260–2,261 M.
-  - The log's entries without their `store` lookup (wrong answers, as a bound): cycles 2,252–
-    2,258 → 2,230–2,235 M (−1.0%). Too little for entries keyed by term id, whose counting sort
+    again before their use; cycles 2,255 to 2,259 → 2,250 to 2,283 M. With the triggers' prefetches
+    into L2 only (T1): 2,250 to 2,276 against 2,260 to 2,261 M.
+  - The log's entries without their `store` lookup (wrong answers, as a bound): cycles 2,252 to
+    2,258 → 2,230 to 2,235 M (-1.0%). Too little for entries keyed by term id, whose counting sort
     at each flush would run over 75,748 starts instead of the 3,452 lists'.
 
 - **After step 57** (`ab.py`, 61 alternating runs, medians / minimums, ms):
-  - Each scanning thread groups its 121,600 or so first matches at its end in 1.2–3.8 ms: 0.3
-    ms of page faults on the grouped ids, 0.1–1.4 ms allocating the 50,001 starts, 0.2 ms
-    counting and 0.5–0.8 ms placing them. With no grouping at all (wrong answers): seed 1,
+  - Each scanning thread groups its 121,600 or so first matches at its end in 1.2 to 3.8 ms: 0.3
+    ms of page faults on the grouped ids, 0.1 to 1.4 ms allocating the 50,001 starts, 0.2 ms
+    counting and 0.5 to 0.8 ms placing them. With no grouping at all (wrong answers): seed 1,
     101.07 / 99.70 → 98.09 / 96.43. The first matches pushed into buckets of 256 queries
     instead, and each output thread grouping its buckets of every chunk into ten ids per query:
     seed 1, 103.32 / 100.65 → 106.08 / 102.99; seed 2, 103.33 / 99.70 → 104.72 / 102.20; and
-    memory.peak 38.1–39.6 → 48.0–48.4 MB, with 196 growing vectors per thread.
+    memory.peak 38.1 to 39.6 → 48.0 to 48.4 MB, with 196 growing vectors per thread.
   - The corpus prefetched ahead of the walk, a line per block, 128, 512 or 4,096 bytes ahead:
-    cycles 2,296 and 2,314 → 2,313–2,329 M, no change.
+    cycles 2,296 and 2,314 → 2,313 to 2,329 M, no change.
 - **After step 56, the per-token work** (`perf stat -r 5`, interleaved, seed 1; `ab.py`, 41
   alternating runs, medians / minimums, ms):
   - The probe's miss test as a branch-free select in `find_from`, the miss mask hidden from
-    LLVM, which made branches of it: 22–33 M fewer instructions, cycles −0.5% at most and none
+    LLVM, which made branches of it: 22 to 33 M fewer instructions, cycles -0.5% at most and none
     on top of the 32-byte checks below. Seed 1, on step 55's code, 104.05 → 103.75.
   - A token's length clamped to 33 in `fold`, with a 0xDF byte before the mask's 0xFF bytes, so
     that a token past 32 bytes takes a key no term has without an `Option`: 74 M fewer
@@ -2005,21 +2005,21 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
   - No prefetch of a token's `check_at` entry: 37 M fewer instructions, cycles mixed; 104.05 →
     103.67, within the noise.
   - A [`Check`] of 32 bytes, its query index moved to a vector of its own read only for first
-    matches and at the pass's end: 7 M fewer instructions, cycles 2,357–2,362 → 2,342–2,348 M
-    (−0.6%). With it, `check_at` and `phrase_at` side by side, one prefetch per token for both:
-    +16 M instructions, cycles −0.4% to −0.8% more; plus a prefetch loop over the phrase
-    entries, +51 M instructions and +0.3 M branch misses for about −0.5%; with the term's store
+    matches and at the pass's end: 7 M fewer instructions, cycles 2,357 to 2,362 → 2,342 to 2,348 M
+    (-0.6%). With it, `check_at` and `phrase_at` side by side, one prefetch per token for both:
+    +16 M instructions, cycles -0.4% to -0.8% more; plus a prefetch loop over the phrase
+    entries, +51 M instructions and +0.3 M branch misses for about -0.5%; with the term's store
     as a third column, +95 M instructions, slower. The 32-byte checks with the pair, against
     step 56: seed 1, 104.85 / 103.12 → 104.23 / 102.44; seed 2, 105.79 / 104.12 → 105.37 /
-    103.63. On top of step 57's log (its `u64` form): cycles −1.6% (2,310 and 2,305 → 2,273 and
+    103.63. On top of step 57's log (its `u64` form): cycles -1.6% (2,310 and 2,305 → 2,273 and
     2,237 M), but seed 1, 102.86 / 101.58 → 102.52 / 101.59; seed 2, 103.02 / 101.99 → 102.70 /
-    100.88; seed 3, 102.93 / 101.35 → 102.84 / 100.88 (61 runs, −0.1% to −0.3%), for 8 more
+    100.88; seed 3, 102.93 / 101.35 → 102.84 / 100.88 (61 runs, -0.1% to -0.3%), for 8 more
     lines.
   - A prefetch of a first match's `shown` count in `add_checks`: 20 M more cycles. The cap on
     `shown` dropped, the first matches extended unconditionally: 10 to 41 M fewer cycles,
     mixed, and about 3 MB more at the memory peak.
   - Bounds (wrong answers, to size each stage): with no phrase checks, 95 M fewer cycles
-    (−4.1%); with no first matches counted, 125 M fewer (−5.4%), mostly their grouping in
+    (-4.1%); with no first matches counted, 125 M fewer (-5.4%), mostly their grouping in
     the tally.
 
 - **After step 54, the serial start and the end of the pass** (local, seed 1 unless stated;
@@ -2041,28 +2041,28 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
     last two, 107.35; on all, 109.64.
   - Not built: the term table's 4 MiB written a word per 4 KiB instead of whole would save about
     0.12 ms of its 0.68; marking the slots on more threads at most 0.26 ms, as the grouping
-    thread ends at 11.09–11.21 against the main thread's 11.73.
+    thread ends at 11.09 to 11.21 against the main thread's 11.73.
 
 - **After step 55, the scanning threads' setup** (`ab.py`, 41 alternating runs against step
   55, medians / minimums, ms):
   - All of the tallies' cells on huge pages ([`huge`]), one block for the 12 tallies made by a
     helper thread during the plan's tail, each scanning thread taking a ready `Tally`: the walks
-    start at 11.58–12.03 instead of 12.02–12.63 ms (the helper ends 0.2 ms after the tail), and
+    start at 11.58 to 12.03 instead of 12.02 to 12.63 ms (the helper ends 0.2 ms after the tail), and
     the walks are a little shorter. Seed 1, 105.58 / 103.65 → 104.42 / 103.12; seed 2, 106.10 /
     104.48 → 104.71 / 103.34; seed 1, 105.36 / 104.04 → 104.43 / 102.98; seed 2, 105.97 /
-    104.83 → 104.46 / 103.59; seed 3, 106.39 / 104.75 → 105.22 / 103.64: −0.9% to −1.4%. But
+    104.83 → 104.46 / 103.59; seed 3, 106.39 / 104.75 → 105.22 / 103.64: -0.9% to -1.4%. But
     memory.peak 38.8 → 44.2 MB. The peak falls at the end of the scans, where each tally's
     check cells, a vector of their own, went back to the system at its merge; on huge pages they
     cannot, as a part of a huge page given back stays charged until the page is split, and the
     whole pages round 8.7 MB of cells up to 10.5. With the check cells in a block of their own,
-    given back whole once every scan is done: 43.5–44.8 MB, as the peak comes before that.
+    given back whole once every scan is done: 43.5 to 44.8 MB, as the peak comes before that.
   - Only the query cells on huge pages: 105.36 → 105.85 and 105.97 → 105.90, and +1.6 MB. Only
     the check cells: seed 3, 106.39 / 104.75 → 105.88 / 104.28, and +4.6 MB.
   - The plan's per-thread check lists freed on the grouping thread, which now owns them, with
     the BOOL flags set before it starts: in the timeline the plan ends 0.46 ms sooner, but seed
     1, 105.67 / 104.71 → 105.83 / 104.82 and seed 2, 106.16 / 104.25 → 106.47 / 104.62. With
     the tallies also made on 4 KiB pages during the tail, by 12 threads the grouping thread
-    spawns: 105.32 / 103.77 and 105.48 / 104.28, −0.3% and −0.6%.
+    spawns: 105.32 / 103.77 and 105.48 / 104.28, -0.3% and -0.6%.
 
 - **After step 54, more of the serial start** (local, seed 1, builds with timestamps, ms since
   `main`, medians of 10 to 12 runs, unless stated):
@@ -2070,16 +2070,16 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
     ms, as the 13th thread on 12 CPUs. Counted with `filter().count()`, a `usize` per pair: 0.44
     ms against 0.23 for the `u32` sum on a quiet core, and the table ready 0.28 ms later.
   - The count and the table on a thread of their own, or each parse thread counting its share
-    and sending it over a channel: the intern ends at 5.13–5.23 ms against 5.21, for 3 to 5 more
+    and sending it over a channel: the intern ends at 5.13 to 5.23 ms against 5.21, for 3 to 5 more
     lines. With 12 parse threads instead of 11, the count and the table competed for a CPU:
-    5.53–5.64 ms. With 10, 5.23 ms.
+    5.53 to 5.64 ms. With 10, 5.23 ms.
   - The scanning threads' `Tally` cells written during the plan's tail, by 12 threads that the
     grouping thread spawns, each scanning thread taking one: its walk started 0.5 ms sooner, but
     the main thread's tail ran 0.4 ms slower with the page faults beside it, and `ab.py` (41
     alternating runs, seeds 1 and 2) drew medians 106.04 and 106.26 ms against 105.94 and 106.21
     without it, for 7 more lines.
   - `lens` written at each id in an array sized like `keys`, instead of pushed and cut back:
-    `parse_queries` alone, 40 times in a loop, 4.72–4.85 → 4.69–4.71 ms, for 2 more lines.
+    `parse_queries` alone, 40 times in a loop, 4.72 to 4.85 → 4.69 to 4.71 ms, for 2 more lines.
   - In a microbenchmark, 12 threads each writing 726 KB of new cells (a `Tally`): the slowest
     took 0.81 ms; zeroed by `calloc` and faulted in by `MADV_POPULATE_WRITE`, 1.27 ms. A 4 MiB
     block on huge pages, one thread: `alloc` and `write_bytes` 0.71 ms, `mmap` and a write per
@@ -2094,7 +2094,7 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
   thread, which sent the BOOL flags back over a channel), the phrases, the queries, the long keys
   and the stores. Seed 1, 108.98 / 107.70 → 106.88 / 105.37 ms, as fast as step 54, but S 789 →
   845. Renumbering before the plan with new `keys` and an extra pass over the slots: S 818, but
-  2.3–3.1 ms on the main thread, 1.5 ms slower than step 54.
+  2.3 to 3.1 ms on the main thread, 1.5 ms slower than step 54.
 - **After step 53, the rows set from a per-doc log of events**: each token's flags pushed to one
   event list, walked at the line end. Instructions +186 M, cycles +1.4%.
 - **After step 53, the rows' read-modify-writes through a 64-doc buffer**, without the
@@ -2116,10 +2116,10 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
 - **After step 52, where the cycles and the wall go** (local, seed 1, turbo off). Topdown: retiring
   55%, bad speculation 14%, frontend 13%, backend 18%, of which memory about 8%; the kernel takes
   6.6% of all cycles. A build with timestamps, in ms since `main`: the queries are parsed and
-  interned at 6.0–6.6, sampled at 8.7–8.9 and planned at 11.8–12.4, and the walks start at
-  12.8–13.5. A walk takes 85.6–89.5 ms, and the slowest chunk is a different one in each run (end
-  spread 2.7–4.1 ms). The last thread's tail takes 2.3–4.3 ms: last flush 0.4–0.6, the window's
-  free 0.2–1.5, merging the cells 0.2–1.0, grouping 1.1–2.4. Formatting then takes 1.5 ms and
+  interned at 6.0 to 6.6, sampled at 8.7 to 8.9 and planned at 11.8 to 12.4, and the walks start at
+  12.8 to 13.5. A walk takes 85.6 to 89.5 ms, and the slowest chunk is a different one in each run (end
+  spread 2.7 to 4.1 ms). The last thread's tail takes 2.3 to 4.3 ms: last flush 0.4 to 0.6, the window's
+  free 0.2 to 1.5, merging the cells 0.2 to 1.0, grouping 1.1 to 2.4. Formatting then takes 1.5 ms and
   the write 0.5. Cycle cuts in the pass reached the wall at about a third or half of their size,
   as below.
 - **After step 52, frequent terms moved into their home slots.** After the sample, a term stored
@@ -2128,12 +2128,12 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
   past their home slot fell from 1.10 to 0.48 M; the rest are a long tail of terms whose home
   holds a more frequent term. Branch misses went 11.4 → 10.6 M, instructions 4,829.8 → 4,800.2 M,
   cycles 2,499 and 2,521 → 2,477 and 2,477 M. Run over all 262,144 slots, the settle took 1.57 ms
-  on the main thread, the plan's critical path, and the wall moved −0.2%. Over only the 11,026
+  on the main thread, the plan's critical path, and the wall moved -0.2%. Over only the 11,026
   slots the intern recorded, it took 0.18 ms. `ab.py`, medians / minimums: seed 1, 109.01 /
   107.80 → 108.47 / 107.13 ms; seed 2, 110.11 / 107.92 → 109.80 / 106.95 ms; seed 3, 61 runs,
-  109.66 / 108.12 → 109.09 / 107.56 ms (−0.3% to −0.5%), for about 20 lines.
+  109.66 / 108.12 → 109.09 / 107.56 ms (-0.3% to -0.5%), for about 20 lines.
 - **After step 52, the rows' loop** (local, seed 1, `perf stat -r 5`, interleaved; plain `b-0`
-  drew 2,482–2,526 M cycles). The rows hold 532 of 75,748 terms, and a doc sets 45 bits in them.
+  drew 2,482 to 2,526 M cycles). The rows hold 532 of 75,748 terms, and a doc sets 45 bits in them.
   With the loop skipped (wrong answers), L1 load misses went 81.3 → 57.0 M and cycles fell 1.3% to
   2.8%. With a row picked from the term id instead of `store` (wrong answers), L1 load misses went
   81.3 → 70.6 M and cycles fell 0.5% to 1.0%. None of these paid:
@@ -2149,7 +2149,7 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
 - **After step 52, `check_at`'s prefetch with another hint**, T1, T2 or NTA instead of T0: cycles
   2,525 and 2,524 M → 2,525 and 2,526 (T1), 2,525 and 2,523 (T2), 2,549 and 2,549 M (NTA).
 - **After step 52, `DENSE_SHARE` 56, 64 and 80** (`ab.py`, 41 alternating runs, seed 1): medians
-  109.02 → 108.92, 108.45 and 108.61 ms; 64 on seed 3 (61 runs): 109.66 → 109.22 ms (−0.4%),
+  109.02 → 108.92, 108.45 and 108.61 ms; 64 on seed 3 (61 runs): 109.66 → 109.22 ms (-0.4%),
   for about 1.9 MB more at the peak (step 44's measure).
 - **After step 52, the tail's blocks released by `MADV_DONTNEED`** and never freed (the window's
   bits, the check cells and the first-match list), so that no `munmap` takes the address space's
@@ -2171,7 +2171,7 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
 - **After step 51, three more cuts in the line end's token loop** (local, seed 1, `perf stat -r 5`,
   interleaved). The long keys' side of the probe marked `std::hint::cold_path()`, which dropped
   the jump that the short side took at every token: instructions 4,875.4 → 4,838.5 M, cycles the
-  same over five rounds (2,510–2,547 against 2,509–2,543 M), `ab.py` median 109.78 → 109.94 ms.
+  same over five rounds (2,510 to 2,547 against 2,509 to 2,543 M), `ab.py` median 109.78 → 109.94 ms.
   The probes past a home slot listed in a sixth run by a store and an add and run after the loop,
   with the per-token work in a closure that both loops call: the closure's cursors stayed in
   memory, loaded and stored at every token, and branch misses rose 11.38 → 19.53 M; cycles 2,501
@@ -2186,12 +2186,12 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
   2,635 M (+1.8%): the walk's token loop, one register short, then rebuilt the hash's constant at
   every token.
 - **The scanning threads' tails mapping and unmapping nothing** (on step 49). The tail's wall time was
-  1.5–6 ms against 1.3–2.2 ms of CPU: each `munmap` and `mmap` waited on the memory-map lock while
+  1.5 to 6 ms against 1.3 to 2.2 ms of CPU: each `munmap` and `mmap` waited on the memory-map lock while
   other threads dropped their 21 MB of corpus pages with `MADV_DONTNEED`. Releasing the window bits,
   check cells and first-match list by `MADV_DONTNEED` instead of freeing them, and reserving the
-  grouping's `at` and `ids` before the walk, took T down 0.89–1.49 ms in six rounds of 41 (seeds 1
+  grouping's `at` and `ids` before the walk, took T down 0.89 to 1.49 ms in six rounds of 41 (seeds 1
   and 2), and 114.47 → 113.56 ms on seed 3. But with no lock waits the threads group at the same
-  moment: memory.peak on seed 3 went 38.5–39.4 → 39.5–42.5 MiB, and 42.5 MiB is over B's 44.0 MB
+  moment: memory.peak on seed 3 went 38.5 to 39.4 → 39.5 to 42.5 MiB, and 42.5 MiB is over B's 44.0 MB
   cap before the board's extra MB. For 12 lines, and `scan` past clippy's line limit, the net was
   about zero. Not kept.
 - **After step 48, the check cells dropped** (local, seed 1). With the first matches halved,
@@ -2210,26 +2210,26 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
   runs, median 37.6 → 42.7 and 44.5 MB.
 
 - **After step 44, where the time goes at turbo off** (local, seed 1, builds with timestamps,
-  12 runs, in ms since `main`). The walks start at 10.5–12.7 ms and end over a spread of 2.2–4
-  ms (104.4–112.1 ms); in one run of twelve one thread ended 5 ms after the rest, which turbo on
-  showed in half the runs (below). After its walk, a thread spends 0.35–0.95 ms dropping its
-  pages, 0.5–0.8 ms on its last flush, 0.1–1.2 ms freeing its window, 0.15–1.25 ms merging its
-  cells (the free included) and 1.2–3.1 ms grouping its 120,700 or so first matches, of which
-  0–1.1 ms is allocating `ids`, 0.1–1.2 ms allocating `at`, 0.15–0.36 ms counting and 0.8–1.6
-  ms placing them, page faults on `ids` included: about 3.5–5 ms in all, whose spread is mostly
+  12 runs, in ms since `main`). The walks start at 10.5 to 12.7 ms and end over a spread of 2.2 to 4
+  ms (104.4 to 112.1 ms); in one run of twelve one thread ended 5 ms after the rest, which turbo on
+  showed in half the runs (below). After its walk, a thread spends 0.35 to 0.95 ms dropping its
+  pages, 0.5 to 0.8 ms on its last flush, 0.1 to 1.2 ms freeing its window, 0.15 to 1.25 ms merging its
+  cells (the free included) and 1.2 to 3.1 ms grouping its 120,700 or so first matches, of which
+  0 to 1.1 ms is allocating `ids`, 0.1 to 1.2 ms allocating `at`, 0.15 to 0.36 ms counting and 0.8 to 1.6
+  ms placing them, page faults on `ids` included: about 3.5 to 5 ms in all, whose spread is mostly
   the frees and allocations queueing on the address space's lock. Formatting then takes
-  1.3–1.8 ms and the write 0.5–0.7 ms. `perf record` with the kernel's samples: 5.3% of all
+  1.3 to 1.8 ms and the write 0.5 to 0.7 ms. `perf record` with the kernel's samples: 5.3% of all
   cycles run in the kernel, two thirds of them in page faults, half of those on the corpus
   mapping. Not taken further: the work is the same on every thread, so only a dynamic handout
   of the corpus would win back the walks' spread, about 1.3 ms above their mean.
 
 - **After step 44, the serial parts and the tail** (local, seed 1, turbo on, so a run takes
   about 69 ms; `ab.py`, 41 alternating runs, two rounds, medians, step 44 first). A build with
-  timestamps (6 to 10 runs, ms since `main`): the plan is ready at 6.6–9.2, the walks end over a
-  spread of 3–5 ms (62.0–68.7), and after its walk a thread spends 0.30–0.40 ms dropping its
-  pages, 0.67–0.79 on its last flush and freeing its window (0.40–0.51 of it the frees), 0.25–0.48
-  merging its cells and 1.18–1.47 grouping its first matches; formatting takes 0.78–0.96 ms,
-  spawns included, and the write 0.40–0.45. In 3 of its first 6 runs two scanning threads ended 15–28
+  timestamps (6 to 10 runs, ms since `main`): the plan is ready at 6.6 to 9.2, the walks end over a
+  spread of 3 to 5 ms (62.0 to 68.7), and after its walk a thread spends 0.30 to 0.40 ms dropping its
+  pages, 0.67 to 0.79 on its last flush and freeing its window (0.40 to 0.51 of it the frees), 0.25 to 0.48
+  merging its cells and 1.18 to 1.47 grouping its first matches; formatting takes 0.78 to 0.96 ms,
+  spawns included, and the write 0.40 to 0.45. In 3 of its first 6 runs two scanning threads ended 15 to 28
   ms after the others, as if they had shared a CPU. On CPUs 0, 2, 4, 6, 8 and 10 alone (6
   threads, one per core) a run takes 77.18 ms against 70.42 on all 12. None of these paid:
   - Each parse thread starting a thread of its own that reads a byte per page of a twelfth of
@@ -2240,17 +2240,17 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
     69.96 and 70.01 ms (means 70.49 and 72.14 → 70.18 and 71.07).
   - The answers formatted by the scanning threads after a barrier, instead of new threads:
     69.21 and 69.37 → 69.17 and 69.48 ms. With the two above: 69.34 and 69.38 → 69.07 and 69.14
-    ms, −0.35%, for about 20 more lines.
+    ms, -0.35%, for about 20 more lines.
   - Every parse thread interning its own terms into the shared table, claiming an empty slot by
     a compare-and-swap of its flags and taking ids from one atomic counter: interning 2.0 → 4.4
     ms, as that counter's cache line moves between cores at each new term, and the plan 0.6 ms
     slower with ids in no file order: 69.78 and 69.64 → 72.86 and 72.23 ms.
-  - `DENSE_SHARE` 16, 48, 64 and 128 instead of 32: 16 +3.0 ms and 128 +1.4 ms; 64 −0.14, −0.60
-    and −0.62 ms, but memory.peak median 40.1 → 42.0 MB over five runs; 48 −0.94, −0.66, −0.69
-    and −0.76 ms in four rounds (−1.1%), but 40.1 → 40.95 MB over ten (+2.1%), about even at the
+  - `DENSE_SHARE` 16, 48, 64 and 128 instead of 32: 16 +3.0 ms and 128 +1.4 ms; 64 -0.14, -0.60
+    and -0.62 ms, but memory.peak median 40.1 → 42.0 MB over five runs; 48 -0.94, -0.66, -0.69
+    and -0.76 ms in four rounds (-1.1%), but 40.1 → 40.95 MB over ten (+2.1%), about even at the
     board's exchange rates. With 48 for which queries run on sets and 32 for which terms keep a
-    row, or the other way round: −0.11 ms each. `WINDOW` 32 or 128: +0.26 and +0.09 ms; 32 with
-    `DENSE_SHARE` 48: −0.23 ms. `SAMPLE_SHARE` 32 or 128: +0.68 and +0.10 ms.
+    row, or the other way round: -0.11 ms each. `WINDOW` 32 or 128: +0.26 and +0.09 ms; 32 with
+    `DENSE_SHARE` 48: -0.23 ms. `SAMPLE_SHARE` 32 or 128: +0.68 and +0.10 ms.
   - A second prefetch per BOOL trigger, of the last byte of its checks, as a 40-byte check ends
     on the next cache line half the time: 69.30 and 69.11 → 70.02 and 69.83 ms.
   - Without the drop of each chunk's corpus pages (step 17): 68.77 → 70.37 ms, so it still pays.
@@ -2290,12 +2290,12 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
 
 - **After step 38, on the serial start** (local, a build with timestamps, seed 1, medians of 10
   runs, in ms since the process was spawned; `main` starts at 2.0, as a trivial static binary's
-  does). The main thread alone spawns the parse threads (2.16–2.59), allocates the term table
+  does). The main thread alone spawns the parse threads (2.16 to 2.59), allocates the term table
   (0.94), interns the terms (3.02, 126 user instructions per occurrence at 4.3 per cycle), sums
   the sample (0.59), groups the phrases (0.26) and the checks (1.34), sets the stores (0.28),
   marks the table (0.73) and frees the planning's lists (0.18): about 8.5 ms, against about 4.5
-  ms in which every thread works. Each scanning thread then takes 0.8–1.0 ms to set up before
-  its walk begins at 15.2–15.7 ms. None of these changes paid:
+  ms in which every thread works. Each scanning thread then takes 0.8 to 1.0 ms to set up before
+  its walk begins at 15.2 to 15.7 ms. None of these changes paid:
   - The intern in a function of its own: 3.02 → 3.35 ms, and the pass about 4 ms slower in the
     same build, from the moved code.
   - The terms' keys touched before the intern, or prefetched 48 keys ahead: 3.05 ms.
@@ -2303,44 +2303,44 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
   - The table marked through the slot positions the intern recorded: 0.61 → 1.37 ms.
   - The corpus faulted in ahead of the pass. With `MADV_POPULATE_READ` on the main thread:
     9.1 ms, for a pass about 2 ms shorter. From helper threads, the intern waited about 10 ms on
-    the `mmap_lock`; per chunk in the scanning threads, 9–10 ms, serialized on the same lock.
+    the `mmap_lock`; per chunk in the scanning threads, 9 to 10 ms, serialized on the same lock.
     Helper threads reading a byte per page at nice 19: the parse, sample and plan about 2 ms
     slower, the pass about 1.6 ms faster, the wall 138.41 → 138.00 ms.
 
 - **After step 33, on the serial parts** (local, a build with timestamps, seed 1). The pass
   starts at 15.4 ms: parsing the queries takes 7.7 ms, of which interning 3.4, the sample 3.5,
   planning the queries 2.9 and marking the term table 1.1 ms. The threads' passes run 129.5 to
-  131.6 ms. At its end, a thread spends 0.3–1.1 ms dropping its pages of the corpus, 0.5–0.75
-  ms on its last window flush, 0.3–1.25 ms freeing its sets, 0.2–0.9 ms merging its cells and
-  1.3–2.3 ms grouping its first matches. Formatting takes about 1.9 ms, the frees after it 1.3
+  131.6 ms. At its end, a thread spends 0.3 to 1.1 ms dropping its pages of the corpus, 0.5 to 0.75
+  ms on its last window flush, 0.3 to 1.25 ms freeing its sets, 0.2 to 0.9 ms merging its cells and
+  1.3 to 2.3 ms grouping its first matches. Formatting takes about 1.9 ms, the frees after it 1.3
   ms and the write 0.5 ms. None of these changes paid:
   - The intern loop's prefetch 16 terms ahead (dropped at step 21) put back, or 8 or 32 ahead:
     interning took about 0.35 ms less, for 3 more lines.
   - The queries, plan and chunks leaked instead of freed after formatting, as after step 17:
-    three rounds of 20 runs, medians −0.96, +0.10 and −1.80 ms.
+    three rounds of 20 runs, medians -0.96, +0.10 and -1.80 ms.
   - Nothing freed at the end of a thread's pass: median 152.28 → 152.27 ms, memory.peak 41.4 →
     50.8 MB.
 - **PGO** (local, turbo off, on step 31's code): a profile from three runs on each of full seeds
-  2–4, passed as `-C profile-use`, with every function matching it. `ab.py`, 16 interleaved runs,
+  2 to 4, passed as `-C profile-use`, with every function matching it. `ab.py`, 16 interleaved runs,
   medians / minimums: 161.21 / 157.44 → 168.09 / 160.76 ms and 158.09 / 155.53 → 161.43 / 159.20 ms
   on seed 1; 158.11 / 156.41 → 161.79 / 159.80 ms and 163.53 / 156.80 → 168.75 / 161.82 ms on seed
   10, which it was not trained on. `perf stat -r 5`, twice: instructions:u 7.34 → 7.73 G, cycles:u
-  3.83–3.87 → 3.84–3.93 G, branch-misses:u 18.1 → 17.8 M.
+  3.83 to 3.87 → 3.84 to 3.93 G, branch-misses:u 18.1 → 17.8 M.
 - **After step 17, on the serial start and the end** (local, alternating runs, 16 each, against
-  step 17 at 238.5–239.6 ms median). Where the time goes on seed 1: 2.1 ms from spawn to `main`,
+  step 17 at 238.5 to 239.6 ms median). Where the time goes on seed 1: 2.1 ms from spawn to `main`,
   parsing to 8.5 ms, the sample 5.3 ms, the per-query planning loop 5.2 ms and the rest of the
-  plan 2.9 ms, so the pass starts at about 22 ms. The threads' passes end over a 4–9 ms spread.
-  After its pass, a thread spends 0.6–0.8 ms on its last window flush, 0.1–0.3 ms each on
-  freeing the window and merging the check cells, and 1–2.7 ms grouping its first matches.
-  Formatting takes 1.5 ms, joining the workers and freeing the chunks, plan and queries 1.3–1.4
+  plan 2.9 ms, so the pass starts at about 22 ms. The threads' passes end over a 4 to 9 ms spread.
+  After its pass, a thread spends 0.6 to 0.8 ms on its last window flush, 0.1 to 0.3 ms each on
+  freeing the window and merging the check cells, and 1 to 2.7 ms grouping its first matches.
+  Formatting takes 1.5 ms, joining the workers and freeing the chunks, plan and queries 1.3 to 1.4
   ms, writing 0.6 ms, and the exit 0.8 ms. None of these changes paid:
   - The sample counted by all threads, one part each, then summed: the plan was ready 1.3 ms
-    sooner (21.4–21.8 → 20.0–20.7 ms), but the wall did not move (239.6 → 240.1 and 238.5 →
+    sooner (21.4 to 21.8 → 20.0 to 20.7 ms), but the wall did not move (239.6 → 240.1 and 238.5 →
     239.1 ms), for 16 more lines (kept at step 20). The sample's slots prefetched as in the pass
     instead (4 more lines) cut the sample from 5.3 to about 4.1 ms: 239.0 → 239.6 and 239.0 →
     240.3 ms (kept at step 28).
   - The queries, plan and chunks leaked instead of freed after formatting: the exit then took
-    1.7–1.9 ms instead of 0.7–1.0, and the wall went from 238.5 to 240.6 ms.
+    1.7 to 1.9 ms instead of 0.7 to 1.0, and the wall went from 238.5 to 240.6 ms.
   - The grouping's two arrays written when allocated, as in step 16: 238.9 → 239.5 ms. Each
     thread's first-match list reserved at its bound (`SHOWN_IDS` per query), so it never moves
     while it grows: 238.5 → 238.6 ms.
@@ -2348,11 +2348,11 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
   `ab.py`, 16 interleaved runs, median / min 246.00 / 245.60 ms against 245.75 / 244.05 ms. The
   dynamic loader's quarter of a millisecond is lost in a 245 ms run.
 - **Transparent huge pages off on top of the fixed threshold** (`prctl(PR_SET_THP_DISABLE)`):
-  41.1–41.2 MB against 42.4–45.3 in the same session, but cycles 9.79–9.83 → 9.91–9.97 G and
-  elapsed 0.383–0.385 → 0.392–0.397 s. Huge pages off without the fixed threshold gave
-  49.8–50.8 MB, and `malloc_trim(0)` after planning 49.2–50.1 MB.
+  41.1 to 41.2 MB against 42.4 to 45.3 in the same session, but cycles 9.79 to 9.83 → 9.91 to 9.97 G and
+  elapsed 0.383 to 0.385 → 0.392 to 0.397 s. Huge pages off without the fixed threshold gave
+  49.8 to 50.8 MB, and `malloc_trim(0)` after planning 49.2 to 50.1 MB.
 - **Every BOOL query checked per document, with no sets at all** (step 3 without the sets):
-  1.29 s, 29.0 G cycles, 53.3 MB, against 0.67–0.75 s and 14.0–14.2 G for step 2 in the same
+  1.29 s, 29.0 G cycles, 53.3 MB, against 0.67 to 0.75 s and 14.0 to 14.2 G for step 2 in the same
   session. That meant about 100 million evaluations, each chasing a query's heap-allocated
   terms and operators.
 - **Step 3a's two paths with per-term arrays instead of table slots:** 15.1 G cycles, 0.64 s,
@@ -2366,7 +2366,7 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
   lines, but cycles 10.0 → 10.6 G and instructions 12.25 → 13.60 G. A shared probe function
   that returned the slot cost 4% more cycles on its own. The pass keeps its loop inline.
 - **A term table sized for every term occurrence up front** instead of doubling: parse
-  13.8–14.7 → 10.7–11.0 ms, but 8.4 MB of slots instead of 4.2, as the queries hold 152,904 term
+  13.8 to 14.7 → 10.7 to 11.0 ms, but 8.4 MB of slots instead of 4.2, as the queries hold 152,904 term
   occurrences and only 75,747 distinct terms.
 - **Huge pages without the `realloc` path**, every resize a new block and a copy: median wall
   288.9 ms against 295.5 for step 6 (285.3 with it). The parse and the plan grow their arrays
@@ -2376,13 +2376,13 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
 - **No branch per token at the line end, on top of step 6** (kept at step 25). A token that
   is no query term resolved to an empty slot with a reserved id and no flags, and the trigger
   lists grew by writing each entry and advancing by 0 or 1. Branch misses fell from 77.6 to
-  65.1 M, but instructions rose from 10.07 to 10.57 G and cycles stayed at 7.19–7.20 G.
+  65.1 M, but instructions rose from 10.07 to 10.57 G and cycles stayed at 7.19 to 7.20 G.
   Prefetching the triggered checks after the token loop, or at first sight behind one branch,
-  was 0.5–1% slower than step 6.
+  was 0.5 to 1% slower than step 6.
 - **The full keys of long tokens prefetched** in a pass between hashing and probing, on a
-  variant of step 5 that was never merged: cycles 8.40–8.44 → 9.09–9.12 G, as the extra pass
+  variant of step 5 that was never merged: cycles 8.40 to 8.44 → 9.09 to 9.12 G, as the extra pass
   stalls on the slot loads it reads. On step 6, skipping the long-key comparison altogether
-  (wrong answers, as an upper bound) saved only 1.5–2.8% of cycles, too little for a prefetch
+  (wrong answers, as an upper bound) saved only 1.5 to 2.8% of cycles, too little for a prefetch
   scheme to chase.
 - **Phrase triggers pushed without a branch** (each position pushed, then dropped again unless
   the term triggers phrases), on top of step 9: branch misses 68.8 → 67.2 M, but instructions
@@ -2392,7 +2392,7 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
   window's end a counting sort groups the log by term into lists that every BOOL query is
   evaluated on, merging with galloping search. Correct on seeds 1 and 2; `ab.py`, 12 runs each,
   two rounds: median 179.82 and 179.46 ms against 183.80 and 183.09 ms, about 2% faster, but
-  memory.peak over four runs 52.1–53.9 MB against 41.9–43.0 MB. Of its 58.8 ms of BOOL work,
+  memory.peak over four runs 52.1 to 53.9 MB against 41.9 to 43.0 MB. Of its 58.8 ms of BOOL work,
   logging took 11.5, grouping 8.3 and evaluation 39.0: at least 55 million merge steps, where
   the per-document checks run 16.9 million times.
 - **The query terms interned on every thread, after step 63** (local, turbo off). Eleven threads
@@ -2403,10 +2403,10 @@ run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best
   threads moved into the plan's tail, two thirds of the threads. Gate 512 pass, 0 fail; 12 runs
   of seed 1 byte-identical (8 on 12 CPUs, 4 on 4). `ab.py`, 41 interleaved runs: seed 1 median
   92.56 → 89.94 ms (min 91.58 → 88.79), seed 3 92.37 → 90.08 ms (min 91.15 → 89.12), about
-  −2.6%. memory.peak, 3 alternating runs: 39.0–39.8 → 39.4–39.7 MB. But S 901 → 961 as pushed:
+  -2.6%. memory.peak, 3 alternating runs: 39.0 to 39.8 → 39.4 to 39.7 MB. But S 901 → 961 as pushed:
   K ×1.004, about +0.08 points, inside the local runs' spread. As step 62 ran 7% slower on the
   board than here, it went to the board as a trial (step 64), to be kept only if its runs beat
   step 63's 91.1 and 92.9 ms by more than their noise. Its run, run-bb4ed7d47695, read 93.4 ms,
-  in a run where A, C and D read 1.5–3.4% above their best: no gain on the box against step 63,
+  in a run where A, C and D read 1.5 to 3.4% above their best: no gain on the box against step 63,
   for 60 more lines. Reverted to step 63's code, whose next run, run-79b6065fa154, read 98.1 ms
   in a slower run still (A 18.3, D 133.6 ms). Step 66 tried it again and kept it.

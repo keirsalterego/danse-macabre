@@ -1,18 +1,18 @@
 # Track B: Index
 
-Answer 50,000 queries over a corpus of about 250,000 documents. Each answer is the number of
-matching documents, the sum of their ids and the ten smallest ids. A query is a boolean
-expression evaluated strictly left to right, or an exact phrase.
+Answer 50,000 queries over a corpus of about 250,000 documents. For each query, print how many
+documents match, the sum of their ids and the ten smallest ids. A query is either a boolean
+expression, evaluated strictly left to right, or an exact phrase.
 
-| | Reference | This entry |
+| | Reference | Mine |
 |---|---|---|
-| Time, full dataset, seed 1 | 56.35 s | **87.3 ms** |
-| Peak memory | 2,200 MB | **42.1 MB** |
+| Time, full dataset, seed 1 | 56.35 s | 87.3 ms |
+| Peak memory | 2,200 MB | 42.1 MB |
 | Code lines | 91 | 961 |
-| Board points | 0 | **79.6** |
+| Board points | 0 | 79.6 |
 
-About 645× the reference's speed. Every step, with the board run ID that measured it, is in
-[PERF.md](PERF.md).
+About 645 times the reference's speed. B is the track I'd most like another shot at, and its
+[PERF.md](PERF.md) is the longest of my four logs, failed experiments and all.
 
 ## Approach
 
@@ -30,60 +30,54 @@ flowchart LR
     M --> O["results.txt"]
 ```
 
-1. **Queries first.** `queries.txt` is read before the corpus (spec §3 allows it) and every
-   distinct query term gets a small id. The corpus is then indexed only for the terms the queries
-   use; a token no query mentions is looked up once and forgotten.
-2. **Triggers.** Tokenising the first 1/64 of the corpus estimates how many documents hold each
-   term. Each query then gets triggers: terms such that every matching document contains at least
-   one of them. A phrase uses its rarest term; a boolean query uses a cover of its terms. Triggers
-   decide how much work is done and never the answer, so a wrong estimate costs time, not
-   correctness.
-3. **One pass over the corpus.** Each thread scans a chunk of whole lines, and an AVX2 classifier
-   finds token starts, token ends and line ends 64 bytes at a time. At the end of each document,
-   the queries its triggers point at are checked against that document alone: a phrase at each
-   position of its trigger term, a boolean query through one lookup in a truth table of which of
-   its terms this document contains. Set operations applied per document give the same answer as
+1. `queries.txt` is read before the corpus (spec §3 allows it), and every distinct query term
+   gets a small id. From then on the corpus is indexed only for terms the queries use. 79% of
+   the corpus's tokens are query terms; the other 21% cost one hash lookup each and nothing more,
+   and no posting list is ever written for a term no query mentions.
+2. Tokenising the first 1/64 of the corpus estimates how many documents hold each term. Each
+   query then gets triggers: terms such that every matching document contains at least one of
+   them. A phrase uses its rarest term, and a boolean query uses a cover of its terms. Triggers
+   only decide how much work gets done, so a bad estimate makes the run slower and can never
+   change an answer.
+3. One pass over the corpus does the rest. Each thread scans a chunk of whole lines, and an AVX2
+   classifier turns every 64-byte block into three masks: token starts, token ends and line feeds.
+   The token loop packs eight tokens at a time. At the end of each document, only the queries its
+   triggers point at get checked, and only against that document. A phrase is checked at each
+   position of its trigger term, and a boolean query takes one lookup in a truth table of which
+   of its terms the document contains. Set operations done per document give the same answer as
    combining whole posting lists (spec §3).
-4. **Sets stay as bitsets.** A boolean query whose cover contains a common term would be checked
-   on too many documents, so it is evaluated on whole sets instead: a bitset per common term and
-   an id list per rare one, window by window, then merged.
-5. **Merge.** Per query, chunk counts and id sums add and the smallest ids come from the earliest
-   chunks.
-
-## Why it is fast
-
-- **Index only what the queries ask for.** 79% of the corpus's tokens are query terms, but the
-  other 21% cost one hash lookup and nothing else, and no posting list is ever written for a term
-  no query uses.
-- **Half the work is skipped per document.** A phrase is checked only at its rarest term's
-  positions, and a boolean query only in documents holding its trigger set.
-- **The scan is bit-level.** Token and line boundaries come from AVX2 compares on 64-byte blocks,
-  not from a byte loop; a block's starts, ends and line feeds are three masks, and the token loop
-  packs eight tokens at a time.
-- **Memory stays flat per thread.** Per query a count, an id sum and the first matches; per kept
-  term one window of documents. No posting list for the whole corpus is ever materialised, which
-  is why the peak is 42 MB against the reference's 2.2 GB.
+4. A boolean query whose cover has a common term in it would get checked in far too many
+   documents, so those run on whole sets instead: a bitset per common term and an id list per
+   rare one, window by window, merged at the end.
+5. Per query, the chunk counts and id sums add up, and the smallest ids come from the earliest
+   chunks. Memory stays flat the whole way: per query a count, an id sum and the first matches,
+   and per kept term one window of documents. No posting list for the whole corpus ever exists,
+   which is how the peak stays at 42 MB next to the reference's 2.2 GB.
 
 ## Dependencies
 
-None. Zero-crate Rust, built offline from the pinned `rust:1-slim-trixie` image.
+None, standard library only.
 
 ```
-cd track-b && cargo build --release --offline
+cd track-b && cargo +1.99.1 build --release --offline
 ```
 
-The binary is static, non-PIE, and built for `alderlake` (`.cargo/config.toml`), which is the
-scoring box's feature set. Build with `cargo +1.99.1`.
+The build has one flag the other tracks don't: every loop starts on a 64-byte boundary, so the
+pass's hot loops keep their speed when a change somewhere else moves their function (PERF.md,
+step 21). Like A and C, it's a plain static executable at a fixed address, with no dynamic
+loader and no position-independent code (PERF.md, step 30).
 
 ## With another 24 hours
 
-The pass costs about 113 instructions per token, and 49% of the cycles sit in the line-end closure
-that consumes each line's probe list (PERF.md, after step 63). The time is spread thin: no source
-line holds more than 5.8% of the cycles. A third of the branch misses are the tokenizer's loop
-exit, once per 64-byte block, which no history predicts, and the start leaves about 6 ms of the 12
-CPUs idle; step 66 parallelised its largest piece, 2.9% locally and 3.6% on the board. The
-fastest B entries on the board run 64-66 ms, two of them in Rust, so the next 24 hours would go to
-a second design rather than another step on this one: each query term's documents collected in
-the pass and the queries answered on those sets afterwards, instead of a check at every line end.
-Memory has nothing to give: the final code's runs use 41.8-42.2 MB, under the 44 MB cap, so a
-smaller peak would score nothing.
+The pass costs about 113 instructions per token, and 49% of the cycles sit in the line-end
+closure that works through each line's probe list (PERF.md, after step 63). Past that the time
+is spread thin, with no source line above 5.8% of the cycles. A third of the branch misses are
+the tokenizer's loop exit, once per 64-byte block, which no history can predict. The start also
+leaves about 6 ms of the 12 CPUs idle; step 66 parallelised its largest piece, for 2.9% locally
+and 3.6% on the board.
+
+The fastest B entries on the board run in about 62 to 66 ms, two of them in Rust, so I wouldn't
+spend another day on this design. I'd build a second one that collects each query term's
+documents during the pass and answers the queries on those sets afterwards, instead of checking
+at every line end. Memory has nothing left to give: the final code's runs use 41.8 to 42.2 MB,
+already under the 44 MB cap, so a smaller peak wouldn't score anything.
