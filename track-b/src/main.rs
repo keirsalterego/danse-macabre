@@ -1531,10 +1531,9 @@ impl TermTable {
                 let [head, rest] = atomic(at);
                 let mut found = head.load(Relaxed);
                 if found == 0 {
-                    found = head
-                        .compare_exchange(0, key[0], Relaxed, Relaxed)
-                        .err()
-                        .unwrap_or(0);
+                    // Either way, the head the slot held before: 0 when this thread claimed it.
+                    let (Ok(f) | Err(f)) = head.compare_exchange(0, key[0], Relaxed, Relaxed);
+                    found = f;
                 }
                 if found == 0 {
                     if ids.is_empty() {
@@ -1546,12 +1545,9 @@ impl TermTable {
                     let len = key.iter().map(|w| 8 - w.leading_zeros() as u8 / 8).sum();
                     // SAFETY: as above; `id` is below the id count ([`TermTable::new`]), the
                     // length of `lens` and `keys`.
-                    unsafe {
-                        *lens.add(id as usize) = len;
-                        if key[1] >> 32 != 0 {
-                            *long.add(id as usize) = *key;
-                        }
-                    }
+                    unsafe { *lens.add(id as usize) = len };
+                    // SAFETY: the same.
+                    (key[1] >> 32 != 0).then(|| unsafe { *long.add(id as usize) = *key });
                     rest.fetch_or(u64::from(Slot::tail(key)) | u64::from(id) << 37, Release);
                     break id;
                 }
