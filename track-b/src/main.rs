@@ -288,6 +288,7 @@ struct Plan {
     /// sit on huge pages of their own ([`huge`]), as the pass reads them at random.
     check_at: Vec<u32>,
     checks: &'static mut [Check],
+    check_q: Vec<u32>,
     /// Per term: how its documents are kept.
     store: Vec<Store>,
     /// The number of bitset rows, counting row 0, which no term keeps, and the number of id lists.
@@ -349,11 +350,11 @@ impl Plan {
                     continue;
                 }
                 bool_cover(queries.steps(i), cost, &mut cover);
-                let check = Check::new(i as u32, queries.steps(i), terms.len() as u32);
+                let check = Check::new(queries.steps(i), terms.len() as u32);
                 if let Some(check) = check.filter(|_| !cover.iter().any(|&t| common(t))) {
                     for (k, &term) in cover.iter().enumerate() {
                         // A document holding an earlier cover term was checked from that term.
-                        checks.push((term, check.unless(&cover[..k])));
+                        checks.push((term, (check.unless(&cover[..k]), i as u32)));
                     }
                     continue;
                 }
@@ -368,9 +369,11 @@ impl Plan {
         // the table, which takes as long.
         thread::scope(|s| {
             let grouping = s.spawn(|| {
+                let total = checks.iter().map(Vec::len).sum();
                 // SAFETY: an all-zero check is a valid one.
-                let grouped = unsafe { huge(checks.iter().map(Vec::len).sum()) };
-                (group_into(n, &checks, grouped), grouped)
+                let grouped = unsafe { huge(total) };
+                let mut check_q = vec![0u32; total];
+                (group_checks(n, &checks, grouped, &mut check_q), grouped, check_q)
             });
             let settling = s.spawn(|| terms.settle(|t| hits[id[t.id() as usize] as usize]));
             let (phrase_at, phrases) = group(n, &phrases);
@@ -396,17 +399,8 @@ impl Plan {
             let terms = settling.join().expect("a panic aborts the process");
             (terms.slots.iter_mut())
                 .for_each(|slot| slot.flags = flags[slot.id() as usize] | slot.flags & Slot::MORE);
-            let (check_at, checks) = grouping.join().expect("a panic aborts the process");
-            Self {
-                terms,
-                phrase_at,
-                phrases,
-                check_at,
-                checks,
-                store,
-                sizes,
-                sets,
-            }
+            let (check_at, checks, check_q) = grouping.join().expect("a panic aborts the process");
+            Self { terms, phrase_at, phrases, check_at, checks, check_q, store, sizes, sets }
         })
     }
 
@@ -441,23 +435,25 @@ fn bool_cover(steps: impl Iterator<Item = Step>, cost: impl Fn(u32) -> u32, cove
 /// `k`'s are `grouped[at[k]..at[k + 1]]`. A counting sort, so it allocates no list per key.
 fn group<T: Copy + Default>(keys: usize, parts: &[Vec<(u32, T)>]) -> (Vec<u32>, Vec<T>) {
     let mut grouped = vec![T::default(); parts.iter().map(Vec::len).sum()];
-    (group_into(keys, parts, &mut grouped), grouped)
-}
-
-/// [`group`] into `grouped`, which holds as many items as `parts`; returns `at`.
-fn group_into<T: Copy>(keys: usize, parts: &[Vec<(u32, T)>], grouped: &mut [T]) -> Vec<u32> {
-    // Written here, as in [`Tally::new`], so the counts' loads find no shared zero page.
     let mut at = [0].repeat(keys + 1);
-    for &(k, _) in parts.iter().flatten() {
-        at[k as usize] += 1;
-    }
-    for k in 1..=keys {
-        at[k] += at[k - 1];
-    }
-    // Each key's end moves back to its start as its items go in, last first.
+    for &(k, _) in parts.iter().flatten() { at[k as usize] += 1; }
+    for k in 1..=keys { at[k] += at[k - 1]; }
     for &(k, item) in parts.iter().flatten().rev() {
         at[k as usize] -= 1;
         grouped[at[k as usize] as usize] = item;
+    }
+    (at, grouped)
+}
+
+/// [`group`] checks into `grouped` and `check_q`; returns `at`.
+fn group_checks(keys: usize, parts: &[Vec<(u32, (Check, u32))>], grouped: &mut [Check], check_q: &mut [u32]) -> Vec<u32> {
+    let mut at = [0].repeat(keys + 1);
+    for &(k, _) in parts.iter().flatten() { at[k as usize] += 1; }
+    for k in 1..=keys { at[k] += at[k - 1]; }
+    for &(k, (item, q)) in parts.iter().flatten().rev() {
+        at[k as usize] -= 1;
+        let idx = at[k as usize] as usize;
+        (grouped[idx], check_q[idx]) = (item, q);
     }
     at
 }
@@ -465,28 +461,22 @@ fn group_into<T: Copy>(keys: usize, parts: &[Vec<(u32, T)>], grouped: &mut [T]) 
 /// A BOOL query compiled for one document at a time: its result as a truth table over which
 /// of its distinct terms the document holds, so that checking it takes no branch.
 #[derive(Clone, Copy, Default)]
+#[repr(C, align(32))]
 struct Check {
+    /// The query's distinct terms, padded with a term id that no document holds.
+    terms: [u32; CHECK_TERMS],
     /// Bit `x` is the query's result on a document that holds `terms[j]` exactly for the bits
     /// `j` set in `x`.
     table: u64,
-    q: u32,
-    /// The query's distinct terms, padded with a term id that no document holds.
-    terms: [u32; CHECK_TERMS],
 }
 
 /// The most distinct terms a [`Check`] takes; spec §2.3 allows 6 terms per BOOL query.
 const CHECK_TERMS: usize = 6;
 
 impl Check {
-    /// Compiles query `q`, or returns `None` when it has too many distinct terms. `pad` is a
+    /// Compiles query steps, or returns `None` when it has too many distinct terms. `pad` is a
     /// term id that no document holds.
-    ///
-    /// On a single document the set operations become boolean ones, applied strictly left to
-    /// right (spec §3): `AND` is `&&`, `OR` is `||` and `NOT` is `&& !`.
-    ///
-    /// Bit `x` of `HAS[j]` is set when input `x` holds `terms[j]`, so applying the operators
-    /// to those masks evaluates the query on all 64 inputs at once.
-    fn new(q: u32, steps: impl Iterator<Item = Step>, pad: u32) -> Option<Self> {
+    fn new(steps: impl Iterator<Item = Step>, pad: u32) -> Option<Self> {
         let (mut terms, mut n, mut table) = ([pad; CHECK_TERMS], 0, 0);
         for (op, t) in steps {
             let j = terms[..n].iter().position(|&u| u == t).unwrap_or(n);
@@ -498,7 +488,7 @@ impl Check {
                 Op::Not => table & !HAS[j],
             };
         }
-        Some(Self { table, q, terms })
+        Some(Self { terms, table })
     }
 
     /// This check, matching only documents that hold none of `skip`.
@@ -510,17 +500,16 @@ impl Check {
     }
 
     /// Whether a document matches, given `seen`, where bit `t` is set when it holds term `t`.
-    /// One AVX2 gather loads the 32-bit words that hold the six terms' bits, and a shift moves
-    /// each bit to the top of its lane, where `movemask` collects them as the table's index.
+    /// Loads 32 bytes with an aligned AVX2 load, masking unused lanes before the gather.
     #[target_feature(enable = "avx2")]
-    fn matches(&self, seen: &[u64]) -> bool {
-        let lanes = _mm256_setr_epi32(-1, -1, -1, -1, -1, -1, 0, 0);
-        // SAFETY: the mask reads the six lanes of `terms` only, and zeroes the other two.
-        let terms = unsafe { _mm256_maskload_epi32(self.terms.as_ptr().cast(), lanes) };
-        let at = _mm256_srli_epi32::<5>(terms);
+    unsafe fn matches(&self, seen: &[u64]) -> bool {
+        // SAFETY: self is aligned to 32 bytes and holds 32 bytes (terms and table).
+        let check_data = unsafe { _mm256_loadu_si256(std::ptr::from_ref(self).cast()) };
+        let at = _mm256_srli_epi32::<5>(check_data);
+        let at_safe = _mm256_and_si256(at, _mm256_setr_epi32(-1, -1, -1, -1, -1, -1, 0, 0));
         // SAFETY: word `t / 32` lies inside `seen`, which `scan` sizes past every id and the pad.
-        let words = unsafe { _mm256_i32gather_epi32::<4>(seen.as_ptr().cast(), at) };
-        let top = _mm256_sllv_epi32(words, _mm256_andnot_si256(terms, _mm256_set1_epi32(31)));
+        let words = unsafe { _mm256_i32gather_epi32::<4>(seen.as_ptr().cast(), at_safe) };
+        let top = _mm256_sllv_epi32(words, _mm256_andnot_si256(check_data, _mm256_set1_epi32(31)));
         // The two zeroed lanes hold term 0's bit; the mask drops them.
         self.table >> (_mm256_movemask_ps(_mm256_castsi256_ps(top)) & 63) & 1 != 0
     }
@@ -787,7 +776,7 @@ impl Tally {
     /// # Safety
     ///
     /// Every index in `todo` is below `checks.len()`.
-    unsafe fn add_checks(&mut self, checks: &[Check], todo: &mut [u32], seen: &[u64], doc: u32) {
+    unsafe fn add_checks(&mut self, checks: &[Check], check_q: &[u32], todo: &mut [u32], seen: &[u64], doc: u32) {
         // A cell per check ([`Tally::new`]), so a check's index is its cell's.
         let cells = &mut self.checks[..checks.len()];
         let (add, mut firsts) = (1 << SUM_BITS | u64::from(doc), 0);
@@ -800,10 +789,12 @@ impl Tally {
             // A conditional move: the compiler makes a product with `hit` a branch.
             *cell += std::hint::select_unpredictable(hit, add, 0);
             // SAFETY: `firsts <= i < todo.len()`, as `firsts` moves on at most once per check.
-            unsafe { *todo.get_unchecked_mut(firsts) = check.q };
+            unsafe { *todo.get_unchecked_mut(firsts) = c as u32 };
             firsts += usize::from(hit && *cell >> SUM_BITS <= SHOWN_IDS as u64);
         }
-        for &q in &todo[..firsts] {
+        for &c in &todo[..firsts] {
+            // SAFETY: c was loaded from todo, whose indices are below check_q.len().
+            let q = unsafe { *check_q.get_unchecked(c as usize) };
             if usize::from(self.shown[q as usize]) < SHOWN_IDS {
                 self.shown[q as usize] += 1;
                 self.first.push((q, doc));
@@ -1006,7 +997,7 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
         let [lists, bools, phrases] = pack(kept, n);
         let terms = &kept[..n];
         // As locals, their addresses stay in registers across the stores to `todo`.
-        let (check_at, checks, cells) = (&plan.check_at[..], &plan.checks[..], &tally.checks[..]);
+        let (check_at, checks, check_q, cells) = (&plan.check_at[..], &plan.checks[..], &plan.check_q[..], &tally.checks[..]);
         let mut triggered = 0;
         for &t in &kept[2 * n + 16..bools] {
             // Term `t` triggers the checks `checks[check_at[t]..check_at[t + 1]]`.
@@ -1059,7 +1050,7 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
         }
         // SAFETY: each index in `todo[..triggered]` lies in a term's range of checks, below the
         // check count.
-        unsafe { tally.add_checks(checks, &mut todo[..triggered], seen, doc) };
+        unsafe { tally.add_checks(checks, check_q, &mut todo[..triggered], seen, doc) };
         // Every set bit is one of the doc's terms, so zeroing their words clears `seen`: a store
         // with no load, so tokens that share a word, as all misses do, do not wait on each other.
         for &t in terms {
@@ -1086,8 +1077,8 @@ fn scan(text: &[u8], ids: std::ops::Range<u32>, queries: &Queries, plan: &Plan) 
     // memory peaks.
     drop(sets);
     // The checks' cells hold their queries' whole counts and sums.
-    for (check, cell) in plan.checks.iter().zip(std::mem::take(&mut tally.checks)) {
-        tally.queries[check.q as usize] += cell;
+    for (&q, cell) in plan.check_q.iter().zip(std::mem::take(&mut tally.checks)) {
+        tally.queries[q as usize] += cell;
     }
     let (at, ids) = tally.take_first();
     Chunk { tally, at, ids }
@@ -1191,16 +1182,14 @@ fn pack(kept: &mut [u32], n: usize) -> [usize; 3] {
             let flags = _mm256_loadu_si256(p.add(k).cast());
             let ids = _mm256_srli_epi32::<5>(flags);
             _mm256_storeu_si256(p.add(k).cast(), ids);
-            let lanes = [(Slot::LISTED, ids), (Slot::BOOL, ids), (Slot::PHRASE, at)];
-            for (run, (bit, from)) in runs.iter_mut().zip(lanes) {
-                // The flag moved to the top bit of each lane, which `movemask` takes.
-                let shift = _mm256_set1_epi32(bit.leading_zeros().cast_signed());
-                let top = _mm256_castsi256_ps(_mm256_sllv_epi32(flags, shift));
-                let m = _mm256_movemask_ps(top).cast_unsigned() as usize;
+            let emit = |m: usize, from: __m256i, run: &mut usize| {
                 let order = _mm256_cvtepu8_epi32(_mm_loadl_epi64(ORDER.as_ptr().add(m).cast()));
                 _mm256_storeu_si256(p.add(*run).cast(), _mm256_permutevar8x32_epi32(from, order));
                 *run += m.count_ones() as usize;
-            }
+            };
+            emit(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_slli_epi32::<28>(flags))).cast_unsigned() as usize, ids, &mut runs[0]);
+            emit(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_slli_epi32::<30>(flags))).cast_unsigned() as usize, ids, &mut runs[1]);
+            emit(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_slli_epi32::<31>(flags))).cast_unsigned() as usize, at, &mut runs[2]);
             at = _mm256_add_epi32(at, _mm256_set1_epi32(8));
         }
     }
