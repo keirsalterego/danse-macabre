@@ -76,6 +76,7 @@ Each kept step cites the live-board run that measured it. Numbers marked local c
 | 62 | Reverted after two board runs (see its section). Trial: the line end's token loop stores each token's flags only, and a doc's terms kept in lists, BOOL triggers and phrase triggers are packed into their runs 8 tokens at a time by a permutation table, 10 instructions fewer per token in the loop for 4.25 in the packing; a key's home slot comes from its first word alone, two instructions fewer per token in the tokenizer | run-e89cc599f8ef | 0.1054 | 40.9 | 77.7 |
 | 63 | Trial: step 62's packing of a doc's runs, 8 tokens at a time, with step 61's hash of the key's first two words | run-51792bbbc94f | 0.0929 | 41.9 | 79.1 |
 | 64 | Reverted after one board run (see the not-kept list). Trial: the query terms interned on every thread into one shared table, a new term's slot claimed by a compare-and-swap of its `head` and its id taken from a block of 64; the page-touching helpers moved into the plan's tail | run-bb4ed7d47695 | 0.0934 | 41.7 | 78.8 |
+| 65 | Reverted after its board run (see its section). Trial: step 64's parallel intern again, on step 63's code | run-4d543d6cf37e | 0.0956 | 42.4 | 78.6 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1812,14 +1813,18 @@ table. This step keeps the packing and step 61's hash, to tell on the board whic
 the time. Locally, on battery, the packing alone measured −1.6% to −2.4% against step 61 over eight
 `ab.py` rounds (step 62's section). Gate: 510 pass, 0 fail. S 877 → 901 (static_axes).
 
-## Step 65 (trial): step 64's parallel intern again
+## Step 65 (reverted): step 64's parallel intern again
 
 Step 64's one board run, run-bb4ed7d47695 (93.4 ms), came in a run where A, C and D read 1.5–3.4%
 above their best, so it did not show whether the change pays on the box. Re-measured today on
 step 63's code (local, turbo off, `ab.py`, 41 interleaved runs): seed 1 median 94.76 → 92.01 ms
 and, in a second session, 95.05 → 92.26 ms; seed 3 93.94 → 91.22 ms, −2.9%. Gate: 524 pass, 0
-fail, now with unseen full seeds 51–54. The code is step 64's as pushed (S 961). It is kept only
-if its board runs beat step 63's 90.6, 91.1 and 92.9 ms.
+fail, now with unseen full seeds 51–54. The code is step 64's as pushed (S 961 by
+`static_axes` here, 956 as the board counted it). It was to be kept only if its board runs beat
+step 63's 90.6, 91.1 and 92.9 ms. Its run, run-4d543d6cf37e, read 95.6 ms (42.4 MB, 78.6 points),
+in a run where C and D read 1.6% and 3.4% above their best and A 29%. With step 64's 93.4 ms
+that is two board runs of this code, neither near step 63's: the local −2.9% does not show on the
+box, and the 60 lines cost about 0.2 points. Reverted to step 63's code.
 
 ## Experiments that did not stay
 
@@ -1827,7 +1832,7 @@ if its board runs beat step 63's 90.6, 91.1 and 92.9 ms.
   shifts in `pack`** (pushed as 052ab6e). Local, turbo off, `ab.py`, 41 interleaved runs, seed 1:
   median 95.05 → 94.54 ms (−0.5%, inside the runs' spread). The board counted S 901 → 956, about
   0.19 points, more than the time could return; its one run, run-e40ad8747964 (94.4 ms), came in a
-  run where A, C and D read 14–43% above their best. Replaced by step 65's trial.
+  run where A, C and D read 14–43% above their best. Not kept: B is back on step 63's code.
 - **After step 63, where the time goes, measured for three redesigns** (local, turbo off, on AC,
   seed 1, step 63's binary). The question was whether a larger change could make B 10% faster
   locally, the least a board trial would need to show through the box's noise (steps 62 and 64).
