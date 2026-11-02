@@ -6,12 +6,12 @@ expression evaluated strictly left to right, or an exact phrase.
 
 | | Reference | This entry |
 |---|---|---|
-| Time, full dataset, seed 1 | 56.35 s | **91.1 ms** |
-| Peak memory | 2,200 MB | **42.2 MB** |
+| Time, full dataset, seed 1 | 56.35 s | **90.6 ms** |
+| Peak memory | 2,200 MB | **41.8 MB** |
 | Code lines | 91 | 901 |
-| Board points | 0 | **79.3** |
+| Board points | 0 | **79.4** |
 
-About 618× the reference's speed. Every step, with the board run ID that measured it, is in
+About 620× the reference's speed. Every step, with the board run ID that measured it, is in
 [PERF.md](PERF.md).
 
 ## Approach

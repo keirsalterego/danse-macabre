@@ -2,12 +2,12 @@
 
 Each kept step cites the live-board run that measured it. Numbers marked local come from a laptop (i7-13620H, turbo off) and compare two versions run side by side; changes that were measured and not kept are listed under the step they were tried after.
 
-| | Reference (step 0) | Final code (step 63), two board runs |
+| | Reference (step 0) | Final code (step 63), three board runs |
 |---|---|---|
-| T | 56.35 s | 91.1 ms (run-97ee561ab7e6), 92.9 ms (run-51792bbbc94f) |
-| M | 2,200 MB | 42.2 MB, 41.9 MB |
+| T | 56.35 s | 90.6 ms (run-6549e04a12b0), 91.1 ms (run-97ee561ab7e6), 92.9 ms (run-51792bbbc94f) |
+| M | 2,200 MB | 41.8 MB, 42.2 MB, 41.9 MB |
 | S (lines) | 91 | 901 |
-| Points | 0 | 79.3, 79.1 |
+| Points | 0 | 79.4, 79.3, 79.1 |
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|

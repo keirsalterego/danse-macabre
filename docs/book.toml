@@ -1,4 +1,4 @@
-# The submission's docs site, built with mdBook and served at keirsalterego.github.io/danse-macabre.
+# The submission's docs site, built with mdBook and served at keir.is-a.dev/danse-macabre (the account's Pages domain).
 # Copied in from the speed-demon skill at kickoff; replace danse-macabre with the repo name then.
 [book]
 title = "Speed Demon 2026: keirsalterego"

@@ -5,9 +5,9 @@ every seed; each track's `PERF.md` names the board run that measured every chang
 
 | Track | Reference | Best run | Memory | Lines | Points |
 |---|---|---|---|---|---|
-| A: Ingest | 32.05 s | 16.1 ms | 17.3 MB | 346 | 87.8 |
-| B: Index | 56.35 s | 91.1 ms | 42.2 MB | 901 | 79.3 |
-| C: Join | 14.44 s | 19.5 ms | 11.2 MB | 357 | 83.0 |
+| A: Ingest | 32.05 s | 16.6 ms | 16.9 MB | 344 | 87.6 |
+| B: Index | 56.35 s | 90.6 ms | 41.8 MB | 901 | 79.4 |
+| C: Join | 14.44 s | 19.4 ms | 11.4 MB | 348 | 83.1 |
 | D: Traverse | 72.69 s | 118.4 ms | 65.7 MB | 424 | 73.6 |
 
 ## The change to ask about first, per track

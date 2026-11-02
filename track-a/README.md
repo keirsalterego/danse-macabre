@@ -6,12 +6,12 @@ per million.
 
 | | Reference | This entry |
 |---|---|---|
-| Time, full dataset, seed 1 | 32.05 s | **16.1 ms** |
-| Peak memory | 228 MB | **17.3 MB** |
-| Code lines | 56 | 346 |
-| Board points | 0 | **87.8** |
+| Time, full dataset, seed 1 | 32.05 s | **16.6 ms** |
+| Peak memory | 228 MB | **16.9 MB** |
+| Code lines | 56 | 344 |
+| Board points | 0 | **87.6** |
 
-That is about 2,000× the reference's speed on the board's dataset. Every step that got here, with
+That is about 1,900× the reference's speed on the board's dataset. Every step that got here, with
 the board run ID that measured it, is in [PERF.md](PERF.md).
 
 ## Approach
