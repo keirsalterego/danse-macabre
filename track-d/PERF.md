@@ -1,6 +1,13 @@
 # Track D: performance log
 
-Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
+Each kept step cites the live-board run that measured it. Numbers marked local come from a laptop (i7-13620H, turbo off) and compare two versions run side by side; changes that were measured and not kept are listed under the step they were tried after.
+
+| | Reference (step 0) | Final code (step 20), two board runs |
+|---|---|---|
+| T | 72.69 s | 118.4 ms (run-4e0f7e6bd2df), 121.8 ms (run-56ed132a3ad9) |
+| M | 893 MB | 65.7 MB, 65.8 MB |
+| S (lines) | 43 | 424 |
+| Points | 0 | 73.6, 73.3 |
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
