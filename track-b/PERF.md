@@ -1812,8 +1812,22 @@ table. This step keeps the packing and step 61's hash, to tell on the board whic
 the time. Locally, on battery, the packing alone measured −1.6% to −2.4% against step 61 over eight
 `ab.py` rounds (step 62's section). Gate: 510 pass, 0 fail. S 877 → 901 (static_axes).
 
+## Step 65 (trial): step 64's parallel intern again
+
+Step 64's one board run, run-bb4ed7d47695 (93.4 ms), came in a run where A, C and D read 1.5–3.4%
+above their best, so it did not show whether the change pays on the box. Re-measured today on
+step 63's code (local, turbo off, `ab.py`, 41 interleaved runs): seed 1 median 94.76 → 92.01 ms
+and, in a second session, 95.05 → 92.26 ms; seed 3 93.94 → 91.22 ms, −2.9%. Gate: 524 pass, 0
+fail, now with unseen full seeds 51–54. The code is step 64's as pushed (S 961). It is kept only
+if its board runs beat step 63's 90.6, 91.1 and 92.9 ms.
+
 ## Experiments that did not stay
 
+- **After step 63, 32-byte aligned checks, a branch-free `add_checks` and immediate vector
+  shifts in `pack`** (pushed as 052ab6e). Local, turbo off, `ab.py`, 41 interleaved runs, seed 1:
+  median 95.05 → 94.54 ms (−0.5%, inside the runs' spread). The board counted S 901 → 956, about
+  0.19 points, more than the time could return; its one run, run-e40ad8747964 (94.4 ms), came in a
+  run where A, C and D read 14–43% above their best. Replaced by step 65's trial.
 - **After step 63, where the time goes, measured for three redesigns** (local, turbo off, on AC,
   seed 1, step 63's binary). The question was whether a larger change could make B 10% faster
   locally, the least a board trial would need to show through the box's noise (steps 62 and 64).
