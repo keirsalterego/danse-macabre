@@ -506,7 +506,7 @@ impl Check {
     /// On a single document the set operations become boolean ones, applied strictly left to
     /// right (spec §3): `AND` is `&&`, `OR` is `||` and `NOT` is `&& !`.
     ///
-    /// Bit `x` of `HAS[j]` is set when input `x` holds `terms[j]`, so applying the operators
+    /// Bit `x` of `has(j)` is set when input `x` holds `terms[j]`, so applying the operators
     /// to those masks evaluates the query on all 64 inputs at once.
     fn new(q: u32, steps: impl Iterator<Item = Step>, pad: u32) -> Option<Self> {
         let (mut terms, mut n, mut table) = ([pad; CHECK_TERMS], 0, 0);
@@ -515,9 +515,9 @@ impl Check {
             *terms.get_mut(j)? = t;
             n = n.max(j + 1);
             table = match op {
-                Op::And => table & HAS[j],
-                Op::Or => table | HAS[j],
-                Op::Not => table & !HAS[j],
+                Op::And => table & has(j),
+                Op::Or => table | has(j),
+                Op::Not => table & !has(j),
             };
         }
         Some(Self { table, q, terms })
@@ -526,7 +526,7 @@ impl Check {
     /// This check, matching only documents that hold none of `skip`.
     fn unless(mut self, skip: &[u32]) -> Self {
         for (j, _) in (self.terms.iter().enumerate()).filter(|(_, t)| skip.contains(t)) {
-            self.table &= !HAS[j];
+            self.table &= !has(j);
         }
         self
     }
@@ -1137,15 +1137,13 @@ fn format_range(range: std::ops::Range<usize>, chunks: &[Chunk]) -> Vec<u8> {
     out
 }
 
-/// Mask `k` keeps the bits whose position has bit `k` set.
-const HAS: [u64; 6] = [
-    0xAAAA_AAAA_AAAA_AAAA,
-    0xCCCC_CCCC_CCCC_CCCC,
-    0xF0F0_F0F0_F0F0_F0F0,
-    0xFF00_FF00_FF00_FF00,
-    0xFFFF_0000_FFFF_0000,
-    0xFFFF_FFFF_0000_0000,
-];
+/// Mask `k` keeps the bits whose position has bit `k` set: alternate groups of `2^k` zeros and
+/// ones, from bit 0 up (`0xAAAA...`, `0xCCCC...`, up to `0xFFFF_FFFF_0000_0000` for `k` = 5). The
+/// division puts a group of ones at the bottom of every group pair; the shift moves it up.
+fn has(k: usize) -> u64 {
+    let width = 1 << k;
+    (!0 / ((1 << width) + 1)) << width
+}
 
 /// The cell ([`Tally::queries`]) of the documents `start + i` for each bit `i` set in `bits`.
 /// Four words at a time, a lookup per nibble gives each byte's bit count and the sum of its bits'
