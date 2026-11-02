@@ -58,7 +58,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 51 | One worker fewer than the CPUs, so a CPU taken by another program leaves a spare one instead of halving a worker and every round | run-d27954c1c3a9 | 0.0217 | 10.7 | 82.0 |
 | 52 | 8 fewer lines at the same speed: the Dockerfile's build folded into one `RUN`, the imports in two lines, both `prctl` calls in one, `BOM` and `SPINS` written where they are used, two pairs of variables set in one statement each, and the name's range returned straight from `text_fields` | run-486577623ea1 | 0.0212 | 10.5 | 82.4 |
 | 53 | A worker on every CPU again, as in step 50: final scoring runs each batch with nothing else on the box, so step 51's spare CPU only cost time | run-f9622a221638 | 0.0195 | 11.2 | 83.0 |
-| 54 | 9 fewer lines at the same speed: the name set's probe tests a hit in one closure and takes its tag and group as bytes of the hash, a long name is told by a `let`-`else`, the slow quote scan carries its parity into bit 0, the name's quote counts are not named, the group's byte is written through its word, the mailboxes are leaked, and `main` reads the data directory where it maps the files | | | | |
+| 54 | 9 fewer lines at the same speed: the name set's probe tests a hit in one closure and takes its tag and group as bytes of the hash, a long name is told by a `let`-`else`, the slow quote scan carries its parity into bit 0, the name's quote counts are not named, the group's byte is written through its word, the mailboxes are leaked, and `main` reads the data directory where it maps the files | run-dc3871163ade | 0.0194 | 11.4 | 83.1 |
 
 Local numbers are for full seed 1. "P-cores" means CPUs 0–11 with all 12 threads and turbo off,
 which matches the box within about 7%. "E-cores" means CPUs 12–15. They have no hyperthreads, so
@@ -1890,6 +1890,13 @@ busy CPU). cycles:u 488.6, 488.1 and 486.3 M → 487.0, 483.6 and 483.6 M on see
 off, 21 interleaved runs, medians / minimums: full seed 1, 21.89 / 21.39 → 21.59 / 21.26 and 21.84 /
 21.43 → 22.05 / 21.37 ms; full seed 2, 21.94 / 21.36 → 21.93 / 21.37 ms, the same within noise. No
 allocation changed. The gate passes (310 of 310), and clippy reports no warnings.
+
+On the board: step 54's first run, run-83d1167e1735, came on a slow box, and the next push replaced
+its queued rerun. The C code has not changed since, so every later C run measures step 54:
+run-dc3871163ade (pushed with 0491b7f) took 19.42 ms, 11.36 MB, 83.07 points, and run-a69fa3d057dc
+(47858fc) 19.63 ms. One later run, run-e75aab520ba9 (61a6ab7), took 53.37 ms while A, B and D in
+the same push ran at their usual times (16.87, 93.65 and 121.77 ms): the busy CPU of step 51, which
+final scoring, with the box to itself, should not see (step 53).
 
 Measured and not kept:
 - **`text_fields` with the note's comma from `let note @ 0..64 = … else`**: −1 line, but the test
