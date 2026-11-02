@@ -2266,9 +2266,20 @@ Measured and not kept:
   none. On step 54, sampling the cgroup's memory.stat during the run (6 runs): peak 10.13–10.62
   MiB, of which anonymous 6.80–7.08 MiB (name sets about 4.6, mailbox pages 1.1, the region table
   0.95), kernel 0.66–0.82 MiB (page tables 0.35–0.50), and about 2.4 MiB charged ahead on the
-  twelve CPUs. Only workers that never fault a page avoid it: one CPU would have to fault in
-  about 7 MiB for all of them before they start, about 0.5 to 1 ms that every run waits for, on
-  stacks of their own that the standard library's threads cannot be given. Not built.
+  twelve CPUs. memory.current rises in steps of 0.25 MiB, one batch, and what a CPU holds ahead
+  is what is left of its last batch, so it depends on how many pages that CPU charged, modulo 64.
+  Variants on step 54's code, seed 1 (peaks over 4 to 8 runs; `ab.py` medians, 31 or 41 runs):
+  - Workers on stacks that main maps in (`pthread_create`), whose pages 3, 6 or 12 of them map
+    in during the region step, so that the others never fault a page: peaks 8.52, 8.52 and
+    9.41–9.52 MiB; times +5.2% and +5.5% (seeds 1, 2), +3.4% and +1.6%; S 348 → 422.
+  - The same with the standard library's threads: 10.05–10.54 MiB, +5.9%.
+  - Main making each worker's name set, groups and posting ends, before the spawn: 8.52–9.38
+    MiB, +3.2% and +3.8%; during the region step: 8.52–8.77 MiB, +3.4%. Three workers making
+    them: 8.77–9.61 MiB, +2.5%. Each worker mapping in its own pages first: 10.31–10.52 MiB.
+  These peaks repeat run after run because each CPU's page count does, but moving pages from
+  one CPU to another moves its leftover either way, and a holdout seed with other counts would
+  move it again. Averaged over that, only CPUs that charge nothing save, about 0.125 MiB each,
+  against 2.5–5.5% of time. Not kept.
 
 ## Profile notes
 
