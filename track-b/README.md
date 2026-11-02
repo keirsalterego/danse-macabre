@@ -6,12 +6,12 @@ expression, evaluated strictly left to right, or an exact phrase.
 
 | | Reference | Mine |
 |---|---|---|
-| Time, full dataset, seed 1 | 56.35 s | 87.3 ms |
-| Peak memory | 2,200 MB | 42.1 MB |
-| Code lines | 91 | 961 |
-| Board points | 0 | 79.6 |
+| Time, full dataset, seed 1 | 56.35 s | 87.8 ms |
+| Peak memory | 2,200 MB | 42.0 MB |
+| Code lines | 91 | 947 |
+| Board points | 0 | 79.5 |
 
-About 645 times the reference's speed. B is the track I'd most like another shot at, and its
+About 640 times the reference's speed. B is the track I'd most like another shot at, and its
 [PERF.md](PERF.md) is the longest of my four logs, failed experiments and all.
 
 ## Approach

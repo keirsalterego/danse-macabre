@@ -2,16 +2,16 @@
 
 Each kept step has the board run that measured it. Anything marked local was timed on my laptop (an i7-13620H with turbo off), two versions run side by side, and every experiment I reverted sits under the step it was tried after, with its numbers.
 
-| | Reference (step 0) | Final code (step 66), board run |
+| | Reference (step 0) | Final code (step 69), board run |
 |---|---|---|
-| T | 56.35 s | 87.3 ms (run-33959bbbe488) |
-| M | 2,200 MB | 42.1 MB |
-| S (lines) | 91 | 961 |
-| Points | 0 | 79.6 |
+| T | 56.35 s | 87.8 ms (run-11827b164aaf) |
+| M | 2,200 MB | 42.0 MB |
+| S (lines) | 91 | 947 |
+| Points | 0 | 79.5 |
 
 ## Checking the headline
 
-Points are 50 · log10 K, where K = (Tref/T)^0.5 · min(Mref/M, 50)^0.2 · min(Sref/S, 1)^0.15 · (Dref/D)^0.15. For run-33959bbbe488: (56.35 / 0.08732)^0.5 = 25.40. Memory is 2,200 / 42.13 = 52.2 times smaller, past the cap of 50, so that factor is 50^0.2 = 2.187. Lines give (91 / 961)^0.15 = 0.702, and with no crates the last factor is 1. K = 39.0, and 50 · log10 39.0 = 79.56.
+Points are 50 · log10 K, where K = (Tref/T)^0.5 · min(Mref/M, 50)^0.2 · min(Sref/S, 1)^0.15 · (Dref/D)^0.15. For run-11827b164aaf: (56.35 / 0.08783)^0.5 = 25.33. Memory is 2,200 / 42.03 = 52.3 times smaller, past the cap of 50, so that factor is 50^0.2 = 2.187. Lines give (91 / 947)^0.15 = 0.704, and with no crates the last factor is 1. K = 39.0, and 50 · log10 39.0 = 79.54. My best B run, run-33959bbbe488 (87.3 ms, step 66, 79.56 points), came before steps 67 to 69, which only cut lines.
 
 ## What didn't work
 
@@ -92,6 +92,8 @@ Every push passed all 524 cases of my gate first, and a change stayed only if th
 | 64 | Reverted after one board run (see the not-kept list). Trial: the query terms interned on every thread into one shared table, a new term's slot claimed by a compare-and-swap of its `head` and its id taken from a block of 64; the page-touching helpers moved into the plan's tail | run-bb4ed7d47695 | 0.0934 | 41.7 | 78.8 |
 | 65 | Reverted after two board runs (see the not-kept list). Trial, pushed as 052ab6e: 32-byte aligned checks, a branch-free `add_checks` and immediate vector shifts in `pack`, S 901 → 956 | run-e40ad8747964 | 0.0944 | 41.7 | 78.7 |
 | 66 | Step 64's parallel intern again, on step 63's code (see its section) | run-33959bbbe488 | 0.0873 | 42.1 | 79.6 |
+| 67 | 4 fewer lines: `group_into`'s two counting loops as one-line `for_each` calls. Below board resolution | run-2655357b685f | 0.0884 | 41.8 | 79.4 |
+| 68–69 | 10 fewer lines: the six check masks computed by `has(k)`; the intern's slot claim as one `let`, its two stores as one-line statements. Below board resolution | run-11827b164aaf | 0.0878 | 42.0 | 79.5 |
 
 A second run of the step 1 code, run-85b6361ddf94, measured 0.703 s and 181.1 MB.
 
@@ -1839,6 +1841,30 @@ it, 9c3eb3c, lost the source file to a reset of the working tree before the comm
 step 65's code instead, so this is its first board trial since step 64. It was to be kept only if its
 board runs beat step 63's 90.6, 91.1 and 92.9 ms. Its run, run-33959bbbe488, read 87.3 ms, in a
 run where A and C read 3.1% and 0.5% above their best: 3.6% below step 63's best run. Kept.
+
+## Steps 67 to 69: 14 fewer lines, same code paths
+
+The last afternoon, no time left for speed work, so I went after lines that cost points and do
+nothing for speed. All three changes sit outside the document walk (the plan, the grouping and
+the start-up intern), each passed the 524-case gate, and S went 961 → 957 → 953 → 947
+(`static_axes`). Each is worth about 0.02 points at the same T, far below what one board run
+resolves, so they share the rows above.
+
+- Step 67: `group_into` counts and prefix-sums with `for_each` on one line each, instead of two
+  three-line `for` loops. Local, turbo off, `ab.py`, 41 interleaved runs on seed 1: median
+  96.37 → 93.00 ms (noise; the minimums are 90.52 and 90.18 ms).
+- Step 68: the eight-line table of the six check masks became `has(k)`, three lines. Mask `k` is
+  `(!0 / (2^(2^k) + 1)) << 2^k`: the division repeats a group of `2^k` ones in every `2^(k+1)`
+  bits, and the shift puts the zeros first. A standalone check compared all six against the old
+  table before the swap. Local, turbo off, 41 runs, two rounds with the order swapped: medians
+  96.15 → 107.75 ms and 94.87 → 93.77 ms, means 104.06 → 105.32 and 101.62 → 101.84 ms, so the
+  first round's median is B's two-mode noise, not the change. The masks are only built while
+  planning.
+- Step 69: in the intern, the claim of an empty slot is
+  `let (Ok(f) | Err(f)) = head.compare_exchange(...)` (both arms hold the slot's previous head,
+  0 when this thread won it), in place of a four-line `.err().unwrap_or(0)` chain, and the
+  length and long-key stores are two one-line statements instead of a six-line block. Local,
+  turbo off, 41 runs: median 90.68 → 90.44 ms.
 
 ## Experiments that did not stay
 
