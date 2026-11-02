@@ -574,6 +574,27 @@ Step 19's timeline has two serial steps on the main thread between the parallel 
 (medians 62.55 → 62.7, 6 runs each); both builds show the rare 64 MB runs. S 422 → 424. Gate:
 512 pass, 0 fail; `cargo fmt --check` and clippy report nothing.
 
+## After step 20: the graph's structure, measured for two pruning ideas (not built)
+
+The queries take about 89 of step 20's 124 ms (the build ends at 35 ms), so a large gain has to
+come from settling fewer nodes. Two ideas need no preprocessing beyond the build, so we measured
+how much each could save on seed 1 (a Python script over graph.txt, counting each node's distinct
+neighbours with edge direction ignored):
+
+- Neighbours per node: 17 nodes have none, 101,147 have one, 441,141 two, 701,013 three, 444,748
+  four and 52,446 five or more.
+- **Dead-end trees.** Peeling one-neighbour nodes until none is left leaves a core of 1,622,683
+  nodes. The other 117,829 (6.8%), the 17 isolated ones aside, sit in trees that each hang off a single core node, and a search
+  never needs to enter a tree that holds neither s nor t. So pruning them saves at most 6.8% of
+  the settled nodes, and costs a bit test on every relaxation.
+- **Chains.** 476,632 of the core's nodes (29%) have exactly two neighbours. Contracting those
+  chains into shortcut edges would settle up to that many fewer nodes. It costs a contraction
+  pass in the build, a third edge array, and special cases for an s or t inside a chain.
+
+Both at their ideal settle about 34% fewer nodes, so at most about 30 ms of the 89. We did not build
+either: the time left before the freeze would not cover both the build and a check of every edge
+case against the hash, and track D is not one of our three scored tracks.
+
 ## Tried and reverted (local, turbo off, no run ID)
 
 Each row's baseline ran in the same interleaved session as the experiment, so baselines differ
