@@ -77,9 +77,13 @@ scoring box's feature set. Build with `cargo +1.99.1`.
 
 ## With another 24 hours
 
-The pass costs about 110 instructions per token, and 51.7% of samples sit in the line-end closure
-that consumes each line's probe list. Two directions: batch a line's probes so the posting-slot
-updates run without the per-token `Vec` push, and try a cheaper hash than the current single
-multiply for the common terms. Memory also needs headroom: runs land between 42 and 46 MB against
-the 44 MB cap, so a run that crosses it loses a fraction of a point on the memory axis. Shaving
-4 MB is worth more than another 1% of time.
+The pass costs about 113 instructions per token, and 49% of the cycles sit in the line-end closure
+that consumes each line's probe list (PERF.md, after step 63). The time is spread thin: no source
+line holds more than 5.8% of the cycles. A third of the branch misses are the tokenizer's loop
+exit, once per 64-byte block, which no history predicts, and the start leaves about 6 ms of the 12
+CPUs idle; step 64 parallelised its largest piece for 2.9% locally and nothing on the board. The
+fastest B entries on the board run 64-68 ms, two of them in Rust, so the next 24 hours would go to
+a second design rather than another step on this one: each query term's documents collected in
+the pass and the queries answered on those sets afterwards, instead of a check at every line end.
+Memory has nothing to give: the final code's runs use 41.8-42.2 MB, under the 44 MB cap, so a
+smaller peak would score nothing.
