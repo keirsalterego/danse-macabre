@@ -19,15 +19,14 @@ before it. The same READMEs and logs are built from [`docs/`](docs/) into a smal
 ## What all four have in common
 
 <!-- ANCHOR: shared -->
-1. Nothing gets read into a buffer. Every program `mmap`s `/data` read-only and walks the bytes
-   with one cursor, so no line is ever copied into a string and the page cache is never read
+1. Every program `mmap`s `/data` read-only and walks the bytes with one cursor, so no line is ever copied into a string and the page cache is never read
    twice.
-2. One team of 12 threads does everything. The input is cut into one chunk per thread at safe
-   points, and the work runs in phases with short serial steps in between.
-3. Everything gets packed small. A turns 239 MB of log into 12 MB of 4-byte records, B indexes
+2. Each one runs a single team of 12 threads. The input is cut into one chunk per thread at safe
+   points, and the work goes in phases with short serial steps in between.
+3. The data gets packed small: A turns 239 MB of log into 12 MB of 4-byte records, B indexes
    only the terms its queries use, C measures escaped fields without ever rewriting them, and D
    squeezes an edge into 4 bytes.
-4. Answers are exact, and the output hash checks it. Percentiles are nearest rank on a counting
+4. Answers are exact, and the output hash checks that. Percentiles are nearest rank on a counting
    sort, sums are integers merged in a fixed order, and D's search is plain Dijkstra on integer
    weights. Nothing depends on how the threads get scheduled.
 5. There's no teardown. Each process exits right after its write, and by then the threads have

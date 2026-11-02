@@ -46,7 +46,7 @@ flowchart LR
 4. Each distinct name belongs to one thread, which keeps a hash table with 64 bits of the name's
    hash and one bit per country. Threads trade 16-byte letters (a 128-bit hash plus the group) in
    rounds with a barrier between them. A table line never bounces between cores, and the only
-   atomic left is one per thread per round, at the barrier. The reference contends on every
+   atomic left is one per thread per round, at the barrier, where the reference contends on every
    record.
 5. Codes are written bytewise, so the country order falls out of the table without a sort, and
    the per-thread integer sums merge in any order.
@@ -56,7 +56,7 @@ region table.
 
 ## Dependencies
 
-None, standard library only.
+None again.
 
 ```
 cd track-c && cargo +1.99.1 build --release --offline

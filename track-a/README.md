@@ -66,6 +66,5 @@ What's left is mostly the parse and the page faults the kernel takes around it. 
 parse at 26% of kernel samples (`next_uptodate_folio`, fault-around), and 47% of the formatting
 phase goes to `shmem` page-cache insertion. First I'd fault the output pages in before the hour
 pass, so the formatter never takes a fault in its inner loop. Then I'd give the parse its own
-mapped copy of the input and see whether fault-around scales with more threads. The last thing
-worth attacking is small: the two barriers plus the leader's serial sort cost 0.36 ms, 2.2% of the
-run.
+mapped copy of the input and see whether fault-around scales with more threads. After that come
+the two barriers and the leader's serial sort, which together cost 0.36 ms, 2.2% of the run.

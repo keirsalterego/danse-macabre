@@ -56,7 +56,7 @@ flowchart LR
 
 ## Dependencies
 
-None, standard library only.
+No crates, only std.
 
 ```
 cd track-b && cargo +1.99.1 build --release --offline
@@ -76,8 +76,7 @@ the tokenizer's loop exit, once per 64-byte block, which no history can predict.
 leaves about 6 ms of the 12 CPUs idle; step 66 parallelised its largest piece, for 2.9% locally
 and 3.6% on the board.
 
-The fastest B entries on the board run in about 62 to 66 ms, two of them in Rust, so I wouldn't
-spend another day on this design. I'd build a second one that collects each query term's
-documents during the pass and answers the queries on those sets afterwards, instead of checking
-at every line end. Memory has nothing left to give: the final code's runs use 41.8 to 42.2 MB,
+The fastest B entries on the board run in about 62 to 66 ms, two of them in Rust, so my next day
+would go into a second design: collect each query term's documents during the pass and answer
+the queries on those sets afterwards, instead of checking at every line end. Memory has nothing left to give: the final code's runs use 41.8 to 42.2 MB,
 already under the 44 MB cap, so a smaller peak wouldn't score anything.
